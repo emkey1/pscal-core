@@ -1,13 +1,9 @@
-#ifndef PSCAL_SDL_H
-#define PSCAL_SDL_H
+#ifndef PSCAL_SDL_RUNTIME_H
+#define PSCAL_SDL_RUNTIME_H
 
 #ifdef SDL
 #include "core/sdl_headers.h"
-#if defined(PSCALI_SDL3)
-#include <SDL3/SDL.h>
-#else
-#include <SDL2/SDL.h>
-#endif
+#include PSCALI_SDL_HEADER
 #include PSCALI_SDL_TTF_HEADER
 #include PSCALI_SDL_IMAGE_HEADER
 #include "core/types.h"
@@ -47,6 +43,7 @@ bool sdlPollNextKey(SDL_Keycode* outCode);
 bool sdlTextInputActive(void);
 void sdlStartTextInput(void);
 void sdlStopTextInput(void);
+void sdlFlushSpuriousQuitEvents(void);
 
 
 // System Functions
@@ -106,4 +103,4 @@ Value vmBuiltinUpdatetexture(struct VM_s* vm, int arg_count, Value* args);
 #endif
 
 #endif
-#endif // PSCAL_SDL_H
+#endif // PSCAL_SDL_RUNTIME_H
