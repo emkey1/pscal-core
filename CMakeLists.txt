@@ -72,6 +72,7 @@ set(PSCAL_CORE_SOURCES
     ${SRC}/ext_builtins/math/fibonacci.c ${SRC}/ext_builtins/math/mandelbrot.c
     ${SRC}/ext_builtins/math/register.c
     ${SRC}/ext_builtins/strings/register.c ${SRC}/ext_builtins/strings/atoi.c
+    ${SRC}/ext_builtins/strings/parse.c
     ${SRC}/ext_builtins/system/fileexists.c ${SRC}/ext_builtins/system/getcurrentdir.c
     ${SRC}/ext_builtins/system/getpid.c ${SRC}/ext_builtins/system/realtimeclock.c
     ${SRC}/ext_builtins/system/swap.c ${SRC}/ext_builtins/system/register.c
