@@ -93,16 +93,19 @@ target_compile_definitions(pscal_core_static PRIVATE PSCAL_NO_CLI_ENTRYPOINTS)
 target_link_libraries(pscal_core_static PUBLIC Threads::Threads m)
 
 # ---- Install ----------------------------------------------------------------
-# pscal-core is the shared runtime library. Front ends normally consume it via
-# FetchContent, but installing it makes the static lib + public headers available
-# to external consumers too. The VM docs ship alongside.
-include(GNUInstallDirs)
-install(TARGETS pscal_core_static ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
-install(DIRECTORY ${SRC}/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/pscal-core
-        FILES_MATCHING PATTERN "*.h")
-install(FILES ${CMAKE_BINARY_DIR}/generated/pscal_paths.h
-        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/pscal-core)
-install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/docs/
-        DESTINATION ${CMAKE_INSTALL_DOCDIR})
-install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/README.md
-        DESTINATION ${CMAKE_INSTALL_DOCDIR})
+# pscal-core is the shared runtime library. Installing it makes the static lib +
+# public headers available to external consumers. Guard to standalone builds so
+# that front ends which FetchContent pscal-core do not drag its lib/headers/docs
+# into their own `cmake --install`.
+if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
+    include(GNUInstallDirs)
+    install(TARGETS pscal_core_static ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+    install(DIRECTORY ${SRC}/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/pscal-core
+            FILES_MATCHING PATTERN "*.h")
+    install(FILES ${CMAKE_BINARY_DIR}/generated/pscal_paths.h
+            DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/pscal-core)
+    install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/docs/
+            DESTINATION ${CMAKE_INSTALL_DOCDIR})
+    install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/README.md
+            DESTINATION ${CMAKE_INSTALL_DOCDIR})
+endif()
