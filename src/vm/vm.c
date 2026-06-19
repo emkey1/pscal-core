@@ -4746,18 +4746,21 @@ static Value vmHostInterfaceIs(VM* vm) {
     bool matches = (strcmp(lowered_target, classCell->s_val) == 0);
     free(lowered_target);
 
-    freeValue(&targetTypeVal);
-    freeValue(&ifaceVal);
     // In this dialect `is` is a safe cast: yield the narrowed receiver pointer
     // when the dynamic type matches, or nil otherwise. This mirrors `as`
     // (vmHostInterfaceAssert), which returns the same receiver alias but raises
     // instead of returning nil on a mismatch. Returning the pointer (rather than
     // a boolean) lets callers compare the result against the original instance
-    // and use it as a non-nil/ nil truthy value.
-    if (matches) {
-        return copyInterfaceReceiverAlias(receiverCell);
-    }
-    return makeNil();
+    // and use it as a non-nil / nil truthy value.
+    //
+    // Materialise the alias BEFORE releasing ifaceVal: receiverCell points into
+    // ifaceVal's payload, so freeing the interface first would leave
+    // copyInterfaceReceiverAlias reading freed memory (mirrors the ordering in
+    // vmHostInterfaceAssert).
+    Value result = matches ? copyInterfaceReceiverAlias(receiverCell) : makeNil();
+    freeValue(&targetTypeVal);
+    freeValue(&ifaceVal);
+    return result;
 }
 
 static Value vmHostWaitThread(VM* vm) {
