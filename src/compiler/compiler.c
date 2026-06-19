@@ -433,6 +433,7 @@ static int inline_routine_exit_capacity = 0;
 static int addStringConstant(BytecodeChunk* chunk, const char* str);
 static int addIntConstant(BytecodeChunk* chunk, long long intValue);
 static void noteLocalSlotUse(FunctionCompilerState* fc, int slot);
+static void addLocal(FunctionCompilerState* fc, const char* name, int line, bool is_ref);
 static int resolveLocal(FunctionCompilerState* fc, const char* name);
 static AST* resolveTypeAlias(AST* type_node);
 static const char* ensureSerializableTypeName(AST* type_node);
@@ -1530,8 +1531,11 @@ static void emitGlobalInitializerForVar(AST* var_decl, AST* varNameNode,
             AST* sub = array_type->children[0];
             Value low_v = evaluateCompileTimeValue(sub->left);
             Value high_v = evaluateCompileTimeValue(sub->right);
-            int low = (low_v.type == TYPE_INTEGER) ? (int)low_v.i_val : 0;
-            int high = (high_v.type == TYPE_INTEGER) ? (int)high_v.i_val : -1;
+            long long low_ord = 0, high_ord = -1;
+            valueToOrdinal(&low_v, &low_ord);
+            valueToOrdinal(&high_v, &high_ord);
+            int low = (int)low_ord;
+            int high = (int)high_ord;
             freeValue(&low_v);
             freeValue(&high_v);
             int lb[1] = { low };
@@ -3143,6 +3147,118 @@ static void emitEmptyArrayLiteralForType(AST* targetType, BytecodeChunk* chunk, 
     emitConstant(chunk, constIdx, line);
 }
 
+// A non-empty array literal whose elements are heap objects (class/record
+// pointers) cannot be materialized as a compile-time constant: `new T {...}`
+// and references to runtime variables are not compile-time evaluable, so the
+// constant path would store void/garbage and the elements would lose their
+// pointer-to-record identity. Detect that case so it can be built at runtime.
+static bool arrayLiteralRequiresRuntimeInit(AST* arrayLiteral) {
+    if (!arrayLiteral) return false;
+    for (int i = 0; i < arrayLiteral->child_count; i++) {
+        AST* el = arrayLiteral->children[i];
+        if (!el) continue;
+        if (el->var_type == TYPE_POINTER || el->var_type == TYPE_RECORD) {
+            return true;
+        }
+        if (el->type == AST_NEW) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Determine the element VarType / type AST for an object-array literal by
+// scanning the literal's elements for the first one carrying usable type info.
+static VarType resolveArrayLiteralElementType(AST* arrayLiteral, AST** out_type_node) {
+    if (out_type_node) *out_type_node = NULL;
+    VarType elemType = TYPE_VOID;
+    for (int i = 0; i < arrayLiteral->child_count; i++) {
+        AST* el = arrayLiteral->children[i];
+        if (!el) continue;
+        if (el->var_type != TYPE_VOID && el->var_type != TYPE_UNKNOWN) {
+            elemType = el->var_type;
+            if (out_type_node) {
+                if (el->type_def) {
+                    *out_type_node = el->type_def;
+                } else if (el->type == AST_NEW && el->token && el->token->value) {
+                    char lowerName[MAX_SYMBOL_LENGTH];
+                    strncpy(lowerName, el->token->value, sizeof(lowerName) - 1);
+                    lowerName[sizeof(lowerName) - 1] = '\0';
+                    toLowerString(lowerName);
+                    *out_type_node = lookupType(lowerName);
+                }
+            }
+            break;
+        }
+    }
+    if (elemType == TYPE_VOID) {
+        // Best effort: object literals always lower to pointers.
+        elemType = TYPE_POINTER;
+    }
+    return elemType;
+}
+
+// Build a non-empty array literal whose elements must be evaluated at runtime
+// (e.g. arrays of `new`-constructed objects). Stores the array in a scratch
+// local, fills each slot with a full r-value evaluation of the element (so
+// heap objects keep their pointer identity), and leaves the finished array on
+// the stack. Mirrors the working append path (setlength + indexed store).
+// Requires a function-compiler context for the scratch local; returns false so
+// the caller can fall back to the constant path otherwise.
+static bool emitArrayLiteralRuntime(AST* arrayLiteral, BytecodeChunk* chunk, int line) {
+    if (!current_function_compiler) {
+        return false;
+    }
+
+    int count = arrayLiteral->child_count;
+
+    AST* elemTypeNode = NULL;
+    VarType elemType = resolveArrayLiteralElementType(arrayLiteral, &elemTypeNode);
+
+    // Reserve a scratch local slot to hold the array while we fill it.
+    int slot = current_function_compiler->local_count;
+    addLocal(current_function_compiler, "__array_literal_tmp", line, false);
+    if (current_function_compiler->local_count <= slot) {
+        return false; // addLocal failed (e.g. too many locals)
+    }
+
+    // Allocate the backing array (N default-initialized slots of elemType) and
+    // store it into the scratch local.
+    int lower = 0;
+    int upper = count - 1;
+    Value arrVal = makeArrayND(1, &lower, &upper, elemType, elemTypeNode);
+    int constIdx = addConstantToChunk(chunk, &arrVal);
+    freeValue(&arrVal);
+    emitConstant(chunk, constIdx, line);
+    noteLocalSlotUse(current_function_compiler, slot);
+    writeBytecodeChunk(chunk, SET_LOCAL, line);
+    writeBytecodeChunk(chunk, (uint8_t)slot, line);
+
+    // Fill each element at runtime:  arr[i] := <element i>
+    for (int i = 0; i < count; i++) {
+        AST* element = arrayLiteral->children[i];
+        int elem_line = element ? getLine(element) : line;
+
+        // Push index, then the array base address, then resolve &arr[i].
+        emitConstant(chunk, addIntConstant(chunk, i), elem_line);
+        noteLocalSlotUse(current_function_compiler, slot);
+        writeBytecodeChunk(chunk, GET_LOCAL_ADDRESS, elem_line);
+        writeBytecodeChunk(chunk, (uint8_t)slot, elem_line);
+        writeBytecodeChunk(chunk, GET_ELEMENT_ADDRESS, elem_line);
+        writeBytecodeChunk(chunk, (uint8_t)1, elem_line);
+
+        // Evaluate the element with full r-value semantics and store it.
+        compileRValue(element, chunk, elem_line);
+        writeBytecodeChunk(chunk, SET_INDIRECT, elem_line);
+    }
+
+    // Leave the finished array on the stack as the literal's value.
+    noteLocalSlotUse(current_function_compiler, slot);
+    writeBytecodeChunk(chunk, GET_LOCAL, line);
+    writeBytecodeChunk(chunk, (uint8_t)slot, line);
+    return true;
+}
+
 static bool emitArrayLiteralConstant(AST* arrayLiteral, BytecodeChunk* chunk, int line) {
     if (!arrayLiteral || arrayLiteral->type != AST_ARRAY_LITERAL) {
         return false;
@@ -3154,6 +3270,13 @@ static bool emitArrayLiteralConstant(AST* arrayLiteral, BytecodeChunk* chunk, in
         freeValue(&emptyArray);
         emitConstant(chunk, constIdx, line);
         return true;
+    }
+
+    // Arrays of heap objects/records must be constructed at runtime so the
+    // elements retain their pointer-to-record nature (the compile-time constant
+    // path can only hold values it can evaluate now, which objects are not).
+    if (current_function_compiler && arrayLiteralRequiresRuntimeInit(arrayLiteral)) {
+        return emitArrayLiteralRuntime(arrayLiteral, chunk, line);
     }
 
     int lower = 0;
@@ -3576,6 +3699,29 @@ static bool buildReceiverMethodName(AST* receiverExpr, const char* memberName,
 
     toLowerString(outName);
     return true;
+}
+
+// Distinguish a receiver-style helper from a true class method at a qualified
+// call site. A receiver-style helper (for example an Aether `fn m(self: T, ...)`
+// invoked as `obj.m(...)`) carries the receiver as an explicit leading
+// parameter, so the receiver must flow through the normal argument list. A true
+// Pascal class method (`procedure T.M(...)`) instead reads the hidden `myself`
+// global and does NOT list the receiver among its parameters. The two are told
+// apart by arity: a helper declares exactly one more parameter than the call
+// supplies as value arguments, and that surplus leading parameter is the
+// receiver. Returns true when the receiver is an explicit parameter (helper).
+static bool receiverIsExplicitMethodParam(Symbol* methodSym, AST* callNode, AST* callReceiver) {
+    if (!methodSym || !methodSym->type_def || !callNode) {
+        return false;
+    }
+    int declared_params = methodSym->type_def->child_count;
+    bool receiver_is_child = (callReceiver && callNode->child_count > 0 &&
+                              callNode->children[0] == callReceiver);
+    int supplied_value_args = callNode->child_count - (receiver_is_child ? 1 : 0);
+    if (supplied_value_args < 0) {
+        supplied_value_args = 0;
+    }
+    return declared_params == supplied_value_args + 1;
 }
 
 static void compileMethodReceiverReference(AST* receiverExpr, BytecodeChunk* chunk, int line) {
@@ -4782,7 +4928,11 @@ static int resolveUpvalue(FunctionCompilerState* fc, const char* name) {
 
     int upvalueIndex = resolveUpvalue(fc->enclosing, name);
     if (upvalueIndex != -1) {
-        return addUpvalue(fc, (uint8_t)upvalueIndex, false, false, false);
+        // Carry the by-ref-ness of the original VAR parameter down the capture
+        // chain so a transitively captured VAR parameter is still addressed
+        // through its reference rather than the upvalue cell.
+        bool source_is_ref = fc->enclosing->upvalues[upvalueIndex].source_is_ref;
+        return addUpvalue(fc, (uint8_t)upvalueIndex, false, false, source_is_ref);
     }
 
     return -1;
@@ -5801,7 +5951,18 @@ static void compileLValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                     upvalue_slot = resolveUpvalue(current_function_compiler, varName);
                 }
                 if (upvalue_slot != -1) {
-                    writeBytecodeChunk(chunk, GET_UPVALUE_ADDRESS, line);
+                    // A by-ref upvalue (a captured VAR parameter) holds the
+                    // referent's address in its cell, mirroring a by-ref local.
+                    // Load that address with GET_UPVALUE instead of taking the
+                    // address of the cell (GET_UPVALUE_ADDRESS); otherwise the
+                    // referent is reached through one indirection too many — e.g.
+                    // element access then sees a pointer rather than the array.
+                    if (current_function_compiler &&
+                        current_function_compiler->upvalues[upvalue_slot].source_is_ref) {
+                        writeBytecodeChunk(chunk, GET_UPVALUE, line);
+                    } else {
+                        writeBytecodeChunk(chunk, GET_UPVALUE_ADDRESS, line);
+                    }
                     writeBytecodeChunk(chunk, (uint8_t)upvalue_slot, line);
                 } else {
                     if (!globalVariableExists(varName) && !lookupGlobalSymbol(varName)) {
@@ -7062,8 +7223,21 @@ static void compileNode(AST* node, BytecodeChunk* chunk, int current_line_approx
                         writeBytecodeChunk(chunk, (uint8_t)slot, getLine(varNameNode));
                     }
 
-                    // Handle optional initializer for local variables
-                    if (node->left) {
+                    // Handle optional initializer for local variables.
+                    //
+                    // An empty array literal (`= []`) carries no element type, so
+                    // assigning it would overwrite the correctly-typed empty array
+                    // that INIT_LOCAL_ARRAY just created above and strip the element
+                    // type to UNKNOWN (which later trips an UNKNOWN_VAR_TYPE warning
+                    // when the array is grown via setlength). The INIT_LOCAL_ARRAY
+                    // result is already an empty array of the right type, so skip the
+                    // redundant assignment entirely.
+                    bool skipEmptyArrayInit =
+                        node->left &&
+                        node->var_type == TYPE_ARRAY &&
+                        node->left->type == AST_ARRAY_LITERAL &&
+                        node->left->child_count == 0;
+                    if (node->left && !skipEmptyArrayInit) {
                         if (node->var_type == TYPE_ARRAY && node->left->type == AST_ARRAY_LITERAL) {
                             AST* array_type = actual_type_def_node;
                             int dimension_count = array_type->child_count;
@@ -7071,8 +7245,14 @@ static void compileNode(AST* node, BytecodeChunk* chunk, int current_line_approx
                                 AST* sub = array_type->children[0];
                                 Value low_v = evaluateCompileTimeValue(sub->left);
                                 Value high_v = evaluateCompileTimeValue(sub->right);
-                                int low = (low_v.type == TYPE_INTEGER) ? (int)low_v.i_val : 0;
-                                int high = (high_v.type == TYPE_INTEGER) ? (int)high_v.i_val : -1;
+                                // Bounds nodes are tagged TYPE_INT64 by the front
+                                // ends, so use valueToOrdinal (like the no-init path)
+                                // rather than an exact TYPE_INTEGER/TYPE_INT32 check.
+                                long long low_ord = 0, high_ord = -1;
+                                valueToOrdinal(&low_v, &low_ord);
+                                valueToOrdinal(&high_v, &high_ord);
+                                int low = (int)low_ord;
+                                int high = (int)high_ord;
                                 freeValue(&low_v); freeValue(&high_v);
                                 int lb[1] = { low };
                                 int ub[1] = { high };
@@ -7122,8 +7302,11 @@ static void compileNode(AST* node, BytecodeChunk* chunk, int current_line_approx
                         AST* sub = actual_type_def_node->children[0];
                         Value low_v = evaluateCompileTimeValue(sub->left);
                         Value high_v = evaluateCompileTimeValue(sub->right);
-                        int low = (low_v.type == TYPE_INTEGER) ? (int)low_v.i_val : 0;
-                        int high = (high_v.type == TYPE_INTEGER) ? (int)high_v.i_val : -1;
+                        long long low_ord = 0, high_ord = -1;
+                        valueToOrdinal(&low_v, &low_ord);
+                        valueToOrdinal(&high_v, &high_ord);
+                        int low = (int)low_ord;
+                        int high = (int)high_ord;
                         freeValue(&low_v);
                         freeValue(&high_v);
                         int lb[1] = { low };
@@ -8046,11 +8229,48 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
             // in the local symbol table so they can be referenced in subsequent
             // expressions within the same scope.
             if (current_function_compiler != NULL && node->token) {
-                Value const_val = evaluateCompileTimeValue(node->left);
                 AST *type_node = node->right ? node->right : node->left;
+                AST *actual_type_def_node = type_node;
+                if (actual_type_def_node && actual_type_def_node->type == AST_TYPE_REFERENCE &&
+                    actual_type_def_node->token) {
+                    AST *resolved = lookupType(actual_type_def_node->token->value);
+                    if (resolved) actual_type_def_node = resolved;
+                }
+
+                // Fixed-size array constants (e.g. `const int xs[3] = [1,2,3];`)
+                // must be materialised from the array literal. evaluateCompileTimeValue
+                // does not handle AST_ARRAY_LITERAL and would yield a VOID value,
+                // leaving the local const symbol unindexable at runtime. Mirror the
+                // array-building logic used by the AST_CONST_DECL path in compileNode.
+                Value const_val;
+                if (node->var_type == TYPE_ARRAY && node->left &&
+                    node->left->type == AST_ARRAY_LITERAL &&
+                    actual_type_def_node && actual_type_def_node->type == AST_ARRAY_TYPE &&
+                    actual_type_def_node->child_count == 1) {
+                    AST *sub = actual_type_def_node->children[0];
+                    Value low_v = evaluateCompileTimeValue(sub->left);
+                    Value high_v = evaluateCompileTimeValue(sub->right);
+                    long long low_ord = 0, high_ord = -1;
+                    valueToOrdinal(&low_v, &low_ord);
+                    valueToOrdinal(&high_v, &high_ord);
+                    freeValue(&low_v);
+                    freeValue(&high_v);
+                    int lb[1] = { (int)low_ord };
+                    int ub[1] = { (int)high_ord };
+                    AST *elem_type_node = actual_type_def_node->right;
+                    VarType elem_type = elem_type_node ? elem_type_node->var_type : TYPE_UNKNOWN;
+                    const_val = makeArrayND(1, lb, ub, elem_type, elem_type_node);
+                    if (!populateCompileTimeArrayLiteral(&const_val, node->left, getLine(node->left))) {
+                        freeValue(&const_val);
+                        break;
+                    }
+                } else {
+                    const_val = evaluateCompileTimeValue(node->left);
+                }
+
                 Symbol *sym = insertLocalSymbol(node->token->value,
                                                 const_val.type,
-                                                type_node,
+                                                actual_type_def_node ? actual_type_def_node : type_node,
                                                 false);
                 if (sym && sym->value) {
                     freeValue(sym->value);
@@ -8802,11 +9022,14 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
             if (isReceiverStyleMethod && !isVirtualMethod && !isInterfaceDispatch) {
                 /*
                  * Receiver-style helpers collected from top-level declarations
-                 * still have an explicit first parameter, so the receiver must
-                 * flow through the normal argument list instead of the hidden
-                 * `myself` global path used by true class methods.
+                 * carry the receiver as an explicit leading parameter, so the
+                 * receiver flows through the normal argument list. A true class
+                 * method instead reads the hidden `myself` global and does not
+                 * list the receiver among its parameters; route the receiver to
+                 * `myself` only for that case. (Forcing one convention for both
+                 * regressed the other: see receiverIsExplicitMethodParam.)
                  */
-                usesReceiverGlobal = false;
+                usesReceiverGlobal = !receiverIsExplicitMethodParam(proc_symbol, node, callReceiver);
             }
 
             bool receiverInFirstChild = (callReceiver && node->child_count > 0 &&
@@ -10688,11 +10911,14 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
             if (isReceiverStyleMethod && !isVirtualMethod && !isInterfaceDispatch) {
                 /*
                  * Receiver-style helpers collected from top-level declarations
-                 * still have an explicit first parameter, so the receiver must
-                 * flow through the normal argument list instead of the hidden
-                 * `myself` global path used by true class methods.
+                 * carry the receiver as an explicit leading parameter, so the
+                 * receiver flows through the normal argument list. A true class
+                 * method instead reads the hidden `myself` global and does not
+                 * list the receiver among its parameters; route the receiver to
+                 * `myself` only for that case. (Forcing one convention for both
+                 * regressed the other: see receiverIsExplicitMethodParam.)
                  */
-                usesReceiverGlobal = false;
+                usesReceiverGlobal = !receiverIsExplicitMethodParam(func_symbol, node, callReceiver);
             }
 
             bool receiverInFirstChild = (callReceiver && node->child_count > 0 &&

@@ -918,6 +918,13 @@ static bool coerceValueToBoolean(const Value* value, bool* out_truth) {
         *out_truth = false;
         return true;
     }
+    // A pointer is truthy when it refers to something and falsy when nil. This
+    // lets a safe-cast result (e.g. `iface is T`, which yields the narrowed
+    // object pointer or nil) be used directly in a boolean context.
+    if (value->type == TYPE_POINTER) {
+        *out_truth = (value->ptr_val != NULL);
+        return true;
+    }
     return false;
 }
 
@@ -4704,15 +4711,22 @@ static Value vmHostInterfaceIs(VM* vm) {
         freeValue(&targetTypeVal);
         freeValue(&ifaceVal);
         runtimeError(vm, "VM Error: Interface payload missing receiver metadata.");
-        return makeBoolean(false);
+        return makeNil();
     }
 
+    Value* receiverCell = payload->slots[0];
     Value* classCell = payload->slots[2];
+    if (!receiverCell) {
+        freeValue(&targetTypeVal);
+        freeValue(&ifaceVal);
+        runtimeError(vm, "VM Error: Interface payload missing receiver value.");
+        return makeNil();
+    }
     if (!classCell || classCell->type != TYPE_STRING || !classCell->s_val) {
         freeValue(&targetTypeVal);
         freeValue(&ifaceVal);
         runtimeError(vm, "VM Error: Interface payload missing class identity.");
-        return makeBoolean(false);
+        return makeNil();
     }
 
     size_t type_len = strlen(targetTypeVal.s_val);
@@ -4734,7 +4748,16 @@ static Value vmHostInterfaceIs(VM* vm) {
 
     freeValue(&targetTypeVal);
     freeValue(&ifaceVal);
-    return makeBoolean(matches);
+    // In this dialect `is` is a safe cast: yield the narrowed receiver pointer
+    // when the dynamic type matches, or nil otherwise. This mirrors `as`
+    // (vmHostInterfaceAssert), which returns the same receiver alias but raises
+    // instead of returning nil on a mismatch. Returning the pointer (rather than
+    // a boolean) lets callers compare the result against the original instance
+    // and use it as a non-nil/ nil truthy value.
+    if (matches) {
+        return copyInterfaceReceiverAlias(receiverCell);
+    }
+    return makeNil();
 }
 
 static Value vmHostWaitThread(VM* vm) {
@@ -9401,6 +9424,10 @@ comparison_error_label:
                     condition_truth = AS_CHAR(condition_value) != '\0';
                 } else if (condition_value.type == TYPE_NIL) {
                     condition_truth = false;
+                } else if (condition_value.type == TYPE_POINTER) {
+                    // A pointer is truthy when non-nil, falsy when nil, so a
+                    // safe-cast result (e.g. `iface is T`) works as a condition.
+                    condition_truth = (condition_value.ptr_val != NULL);
                 } else {
                     value_valid = false;
                 }
