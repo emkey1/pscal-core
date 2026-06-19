@@ -3386,6 +3386,54 @@ static void emitDefaultFieldInitializers(AST* recordType, BytecodeChunk* chunk, 
     }
 }
 
+// Emit the field-setting bytecode for a record-literal initializer attached to an
+// AST_NEW node (`new T { field: value, ... }`). The freshly constructed object is
+// already on top of the stack when this is called; for each named field we emit
+// DUP (object stays beneath), GET_FIELD_OFFSET <offset> (push the field address),
+// compile the value, and SET_INDIRECT, leaving the object on the stack. This mirrors
+// exactly how the Rea compiler lowers `obj.field = value;` -- field access on a
+// heap object created by `new` resolves to a numeric slot offset (the runtime record
+// is not keyed by field name), so partial sets simply leave the remaining slots at
+// their default-constructed values. Offsets are taken from `classType` by field name
+// and shifted by one when the class carries a hidden __vtable slot at offset 0. The
+// initializers live on the node's `extra` slot as an AST_COMPOUND of
+// AST_ASSIGN(left = bare field-name AST_VARIABLE, right = value).
+static void emitNewFieldInitializers(AST* node, AST* classType, bool hasVTable,
+                                     BytecodeChunk* chunk, int line) {
+    if (!node || !node->extra) return;
+    AST* inits = node->extra;
+    if (inits->type != AST_COMPOUND) return;
+    for (int i = 0; i < inits->child_count; i++) {
+        AST* fieldAssign = inits->children[i];
+        if (!fieldAssign || fieldAssign->type != AST_ASSIGN ||
+            !fieldAssign->left || !fieldAssign->right ||
+            !fieldAssign->left->token || !fieldAssign->left->token->value) {
+            fprintf(stderr, "L%d: Compiler error: malformed field initializer in 'new' record literal.\n", line);
+            compiler_had_error = true;
+            continue;
+        }
+        const char* fieldName = fieldAssign->left->token->value;
+        int offset = getRecordFieldOffset(classType, fieldName);
+        if (offset < 0) {
+            fprintf(stderr, "L%d: Compiler error: field '%s' not found in record initializer for '%s'.\n",
+                    line, fieldName, (node->token && node->token->value) ? node->token->value : "?");
+            compiler_had_error = true;
+            continue;
+        }
+        if (hasVTable) offset++;
+        writeBytecodeChunk(chunk, DUP, line);
+        if (offset <= UINT8_MAX) {
+            writeBytecodeChunk(chunk, GET_FIELD_OFFSET, line);
+            writeBytecodeChunk(chunk, (uint8_t)offset, line);
+        } else {
+            writeBytecodeChunk(chunk, GET_FIELD_OFFSET16, line);
+            emitShort(chunk, (uint16_t)offset, line);
+        }
+        compileRValue(fieldAssign->right, chunk, getLine(fieldAssign->right));
+        writeBytecodeChunk(chunk, SET_INDIRECT, line);
+    }
+}
+
 // Determine the record type for an expression used as an object base.
 static AST* getRecordTypeFromExpr(AST* expr) {
     if (!expr) return NULL;
@@ -5928,6 +5976,9 @@ static void compileLValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                 emitShort(chunk, (uint16_t)ctorNameIdx, line);
                 writeBytecodeChunk(chunk, (uint8_t)(node->child_count + 1), line);
             }
+            // Record-literal initializer (`new T { field: value, ... }`): set the
+            // named fields on the constructed object, which is left on the stack.
+            emitNewFieldInitializers(node, classType, hasVTable, chunk, line);
             global_init_new_depth--;
             break;
         }
@@ -9657,6 +9708,9 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                 emitShort(chunk, (uint16_t)ctorNameIdx, line);
                 writeBytecodeChunk(chunk, (uint8_t)(node->child_count + 1), line);
             }
+            // Record-literal initializer (`new T { field: value, ... }`): set the
+            // named fields on the constructed object, which is left on the stack.
+            emitNewFieldInitializers(node, classType, hasVTable, chunk, line);
             global_init_new_depth--;
             break;
         }
