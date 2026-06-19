@@ -91,3 +91,18 @@ set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/third-party/nextvi/vi.c 
 add_library(pscal_core_static STATIC ${PSCAL_CORE_SOURCES})
 target_compile_definitions(pscal_core_static PRIVATE PSCAL_NO_CLI_ENTRYPOINTS)
 target_link_libraries(pscal_core_static PUBLIC Threads::Threads m)
+
+# ---- Install ----------------------------------------------------------------
+# pscal-core is the shared runtime library. Front ends normally consume it via
+# FetchContent, but installing it makes the static lib + public headers available
+# to external consumers too. The VM docs ship alongside.
+include(GNUInstallDirs)
+install(TARGETS pscal_core_static ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
+install(DIRECTORY ${SRC}/ DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/pscal-core
+        FILES_MATCHING PATTERN "*.h")
+install(FILES ${CMAKE_BINARY_DIR}/generated/pscal_paths.h
+        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}/pscal-core)
+install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/docs/
+        DESTINATION ${CMAKE_INSTALL_DOCDIR})
+install(FILES ${CMAKE_CURRENT_SOURCE_DIR}/README.md
+        DESTINATION ${CMAKE_INSTALL_DOCDIR})

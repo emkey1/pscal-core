@@ -21,6 +21,27 @@ dependency-light configuration (links only `libm` and threads). Optional
 features (SDL graphics/audio, libcurl networking, SQLite) are gated and added as
 the build matures.
 
+## Install
+
+```sh
+cmake --install build --prefix /usr/local
+```
+
+Installs `libpscal_core_static.a` to `<prefix>/lib`, the public headers to
+`<prefix>/include/pscal-core` (preserving the `src/` layout), and the VM docs to
+`<prefix>/share/doc/pscal-core`. External projects can then link the runtime
+directly instead of vendoring it via FetchContent.
+
+## Docs
+
+VM and runtime reference lives in [`docs/`](docs/):
+
+- [`pscal_vm_overview.md`](docs/pscal_vm_overview.md): VM architecture and opcode reference
+- [`pscal_vm_builtins.md`](docs/pscal_vm_builtins.md): catalog of built-in functions
+- [`pscalasm.md`](docs/pscalasm.md): the PSCAL assembler
+- [`pscaljson2bc.md`](docs/pscaljson2bc.md): JSON-to-bytecode reference
+- [`object_layout.md`](docs/object_layout.md): runtime object layout
+
 ## Layout
 
 - `src/vm`, `src/compiler` — the bytecode VM and AST -> bytecode compiler (the ISA).
