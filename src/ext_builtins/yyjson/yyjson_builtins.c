@@ -620,6 +620,13 @@ static Value vmBuiltinYyjsonGetLength(struct VM_s *vm, int arg_count, Value *arg
         result = makeInt((long long)yyjson_obj_size(val));
         goto cleanup;
     }
+    if (yyjson_is_null(val)) {
+        /* A JSON null is an empty collection for length purposes: toon_null() and
+           a key that resolved to null degrade to 0 rather than crashing, matching
+           the missing-key / type-mismatch degrade used by the value getters. */
+        result = makeInt(0);
+        goto cleanup;
+    }
 
     runtimeError(vm, "YyjsonGetLength requires an array or object value handle.");
 
