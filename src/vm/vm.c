@@ -9771,6 +9771,10 @@ comparison_error_label:
                             long double tmp = asLd(*arg_val);
                             setTypeValue(arg_val, param_ast->var_type);
                             SET_REAL_VALUE(arg_val, tmp);
+                        } else if (isIntlikeType(param_ast->var_type) && isRealType(arg_val->type)) {
+                            long double tmp = asLd(*arg_val);
+                            setTypeValue(arg_val, param_ast->var_type);
+                            assignRealToIntChecked(vm, arg_val, tmp);
                         }
                     }
                 }
@@ -9866,6 +9870,10 @@ comparison_error_label:
                             long double tmp = asLd(*arg_val);
                             setTypeValue(arg_val, param_ast->var_type);
                             SET_REAL_VALUE(arg_val, tmp);
+                        } else if (isIntlikeType(param_ast->var_type) && isRealType(arg_val->type)) {
+                            long double tmp = asLd(*arg_val);
+                            setTypeValue(arg_val, param_ast->var_type);
+                            assignRealToIntChecked(vm, arg_val, tmp);
                         }
                     }
                 }
@@ -9990,6 +9998,10 @@ comparison_error_label:
                             long double tmp = asLd(*arg_val);
                             setTypeValue(arg_val, param_ast->var_type);
                             SET_REAL_VALUE(arg_val, tmp);
+                        } else if (isIntlikeType(param_ast->var_type) && isRealType(arg_val->type)) {
+                            long double tmp = asLd(*arg_val);
+                            setTypeValue(arg_val, param_ast->var_type);
+                            assignRealToIntChecked(vm, arg_val, tmp);
                         }
                     }
                 }
@@ -10135,6 +10147,10 @@ comparison_error_label:
                             long double tmp = asLd(*arg_val);
                             setTypeValue(arg_val, param_ast->var_type);
                             SET_REAL_VALUE(arg_val, tmp);
+                        } else if (isIntlikeType(param_ast->var_type) && isRealType(arg_val->type)) {
+                            long double tmp = asLd(*arg_val);
+                            setTypeValue(arg_val, param_ast->var_type);
+                            assignRealToIntChecked(vm, arg_val, tmp);
                         }
                     }
                 }
@@ -10250,6 +10266,10 @@ comparison_error_label:
                             long double tmp = asLd(*arg_val);
                             setTypeValue(arg_val, param_ast->var_type);
                             SET_REAL_VALUE(arg_val, tmp);
+                        } else if (isIntlikeType(param_ast->var_type) && isRealType(arg_val->type)) {
+                            long double tmp = asLd(*arg_val);
+                            setTypeValue(arg_val, param_ast->var_type);
+                            assignRealToIntChecked(vm, arg_val, tmp);
                         }
                     }
                 }
