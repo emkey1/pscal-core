@@ -3701,6 +3701,25 @@ static bool buildReceiverMethodName(AST* receiverExpr, const char* memberName,
     return true;
 }
 
+// A receiver call places the receiver both as node->left and as children[0].
+// In rea, when the receiver is `self`, semantic analysis stores a *copy* of the
+// receiver in children[0] (to avoid a double-free), so the pointer no longer
+// equals node->left. Treat children[0] as the receiver when it is pointer-equal
+// OR a structurally-equivalent receiver variable (same identifier token).
+static bool firstChildIsReceiver(AST* callNode, AST* callReceiver) {
+    if (!callReceiver || !callNode || callNode->child_count == 0) return false;
+    AST* first = callNode->children[0];
+    if (!first) return false;
+    if (first == callReceiver) return true;
+    if (first->type == AST_VARIABLE && callReceiver->type == AST_VARIABLE &&
+        first->token && first->token->value &&
+        callReceiver->token && callReceiver->token->value &&
+        strcasecmp(first->token->value, callReceiver->token->value) == 0) {
+        return true;
+    }
+    return false;
+}
+
 // Distinguish a receiver-style helper from a true class method at a qualified
 // call site. A receiver-style helper (for example an Aether `fn m(self: T, ...)`
 // invoked as `obj.m(...)`) carries the receiver as an explicit leading
@@ -3715,8 +3734,7 @@ static bool receiverIsExplicitMethodParam(Symbol* methodSym, AST* callNode, AST*
         return false;
     }
     int declared_params = methodSym->type_def->child_count;
-    bool receiver_is_child = (callReceiver && callNode->child_count > 0 &&
-                              callNode->children[0] == callReceiver);
+    bool receiver_is_child = firstChildIsReceiver(callNode, callReceiver);
     int supplied_value_args = callNode->child_count - (receiver_is_child ? 1 : 0);
     if (supplied_value_args < 0) {
         supplied_value_args = 0;
@@ -9076,8 +9094,7 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                 usesReceiverGlobal = !receiverIsExplicitMethodParam(proc_symbol, node, callReceiver);
             }
 
-            bool receiverInFirstChild = (callReceiver && node->child_count > 0 &&
-                                         node->children[0] == callReceiver);
+            bool receiverInFirstChild = firstChildIsReceiver(node, callReceiver);
             int receiver_offset = (usesReceiverGlobal && receiverInFirstChild) ? 1 : 0;
 
             if (frontendIsRea() && !proc_symbol && node->child_count > 0 && node->children[0]) {
@@ -10965,8 +10982,7 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                 usesReceiverGlobal = !receiverIsExplicitMethodParam(func_symbol, node, callReceiver);
             }
 
-            bool receiverInFirstChild = (callReceiver && node->child_count > 0 &&
-                                         node->children[0] == callReceiver);
+            bool receiverInFirstChild = firstChildIsReceiver(node, callReceiver);
             int receiver_offset = (usesReceiverGlobal && receiverInFirstChild) ? 1 : 0;
 
             // Inline function calls directly when marked inline.
