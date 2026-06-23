@@ -1616,7 +1616,28 @@ resolved_field: ;
                 if (node->left) {
                     AST *arrayType = resolveTypeAlias(node->left->type_def);
                     if (arrayType && arrayType->type == AST_ARRAY_TYPE) {
-                        AST *elemType = resolveTypeAlias(arrayType->right);
+                        // A single AST_ARRAY_ACCESS node may carry more index
+                        // children than the current array level has dimensions
+                        // (e.g. a chained `arr[i][j]` over an array-of-arrays /
+                        // jagged value, where each bracket peels one level).
+                        // Peel one array level per group of consumed indices so
+                        // the access resolves to the true scalar element type
+                        // instead of an intermediate array/row type.  A flat
+                        // multi-dim level (`array[1..3,1..3]`) consumes all of
+                        // its dimensions at once and is unaffected.
+                        AST *levelType = arrayType;
+                        int remaining = node->child_count > 0 ? node->child_count : 1;
+                        AST *elemType = resolveTypeAlias(levelType->right);
+                        while (levelType && levelType->type == AST_ARRAY_TYPE && remaining > 0) {
+                            int level_dims = levelType->child_count > 0 ? levelType->child_count : 1;
+                            remaining -= level_dims;
+                            elemType = resolveTypeAlias(levelType->right);
+                            if (remaining > 0 && elemType && elemType->type == AST_ARRAY_TYPE) {
+                                levelType = elemType;
+                            } else {
+                                break;
+                            }
+                        }
                         if (elemType) {
                             node->type_def = elemType;
                             if (elemType->type == AST_POINTER_TYPE) {

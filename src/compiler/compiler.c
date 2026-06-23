@@ -5487,6 +5487,25 @@ static AST* resolveArrayTypeForExpression(AST* expr) {
     return type_node;
 }
 
+// Lower a multi-index array access (e.g. dp[i][j]) into a chain of nested
+// single-/multi-index accesses when the base is an array-of-arrays (a jagged /
+// dynamic value).  This matters because dynamic arrays declared with open
+// dimensions -- e.g. Aether's `Int[][]` -- are built JAGGED at runtime: dp is a
+// 1-D dynamic array whose elements are themselves 1-D arrays.  The flat
+// LOAD_ELEMENT_VALUE / GET_ELEMENT_ADDRESS path computes a single flat offset
+// over `dimensions` and therefore silently drops trailing indices on such
+// values.  Rewriting `dp[i][j]` to `(dp[i])[j]` makes each bracket index peel
+// exactly one level, which the VM handles correctly for jagged storage.
+//
+// Two array shapes are handled per level:
+//   * FIXED multi-dim levels (the AST_ARRAY_TYPE carries subrange children,
+//     child_count > 0): consume up to child_count indices as a single flat
+//     access at that level, matching the contiguous Pascal-style layout.
+//   * OPEN/dynamic levels (child_count == 0): consume exactly ONE index as a
+//     single-index access and continue nesting for any remaining indices.  The
+//     static element type may be a scalar even though the value is jagged, so
+//     we keep peeling one level per remaining index regardless of the declared
+//     element type.
 static AST* buildNestedArrayAccessChain(AST* node) {
     if (!node || node->type != AST_ARRAY_ACCESS || !node->left || node->child_count <= 1) {
         return NULL;
@@ -5497,6 +5516,9 @@ static AST* buildNestedArrayAccessChain(AST* node) {
         return NULL;
     }
 
+    // If the very first level already accounts for every index (a true flat
+    // multi-dimensional array such as `array[1..3,1..3] of integer`), there is
+    // nothing to nest -- let the flat path handle it.
     int initial_direct_dims = current_array_type->child_count > 0 ? current_array_type->child_count : 1;
     if (initial_direct_dims >= node->child_count) {
         return NULL;
@@ -5511,15 +5533,17 @@ static AST* buildNestedArrayAccessChain(AST* node) {
     int consumed = 0;
 
     while (consumed < node->child_count) {
-        AST* array_type = resolveTypeAlias(current_array_type);
-        if (!array_type || array_type->type != AST_ARRAY_TYPE) {
-            if (current_base) {
-                freeAST(current_base);
-            }
-            return NULL;
+        AST* array_type = current_array_type ? resolveTypeAlias(current_array_type) : NULL;
+        bool is_array_level = (array_type && array_type->type == AST_ARRAY_TYPE);
+
+        // For a fixed multi-dim level consume its full dimension count; for an
+        // open/dynamic level (or once the static type runs out but indices
+        // remain on a jagged value) consume exactly one index per level.
+        int direct_dims = 1;
+        if (is_array_level && array_type->child_count > 0) {
+            direct_dims = array_type->child_count;
         }
 
-        int direct_dims = array_type->child_count > 0 ? array_type->child_count : 1;
         int remaining = node->child_count - consumed;
         int use_dims = (remaining < direct_dims) ? remaining : direct_dims;
 
@@ -5531,10 +5555,18 @@ static AST* buildNestedArrayAccessChain(AST* node) {
             addChild(segment, copyAST(node->children[consumed + i]));
         }
 
-        AST* element_type = array_type->right ? resolveTypeAlias(array_type->right) : NULL;
+        AST* element_type = (is_array_level && array_type->right)
+                                ? resolveTypeAlias(array_type->right)
+                                : NULL;
         if (element_type) {
             segment->type_def = copyAST(element_type);
             segment->var_type = element_type->var_type;
+        } else {
+            // Unknown jagged element: leave the type for the semantic layer to
+            // refine; mark as array so further nesting (if any) still works.
+            segment->var_type = (consumed + use_dims < node->child_count)
+                                    ? TYPE_ARRAY
+                                    : TYPE_UNKNOWN;
         }
 
         consumed += use_dims;
@@ -5544,13 +5576,25 @@ static AST* buildNestedArrayAccessChain(AST* node) {
             break;
         }
 
-        if (use_dims != direct_dims || !element_type || element_type->type != AST_ARRAY_TYPE) {
+        // More indices remain: descend one level.  If the element type is a
+        // nested array type, continue with it; otherwise (a jagged dynamic
+        // array whose declared element type is scalar) keep peeling one index
+        // per level with no static type to guide us.
+        if (use_dims != direct_dims) {
+            // Partial consumption of a fixed multi-dim level is not
+            // representable as a nested access -- bail to the flat path.
             freeAST(segment);
             return NULL;
         }
 
         current_base = segment;
-        current_array_type = element_type;
+        if (element_type && element_type->type == AST_ARRAY_TYPE) {
+            current_array_type = element_type;
+        } else {
+            // No further static array type: treat remaining indices as
+            // single-level dynamic peels.
+            current_array_type = NULL;
+        }
     }
 
     return root;
