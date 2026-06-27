@@ -1848,6 +1848,7 @@ static VmBuiltinMapping vmBuiltinDispatchTable[] = {
     {"popscreen", vmBuiltinPopscreen},
     {"pos", vmBuiltinPos},
     {"power", vmBuiltinPower},
+    {"pow", vmBuiltinPower},   /* C-style alias of power(base, exp) */
     {"printf", vmBuiltinPrintf},
     {"fopen", vmBuiltinFopen},
     {"fclose", vmBuiltinFclose},
@@ -10710,6 +10711,7 @@ static void populateBuiltinRegistry(void) {
     registerBuiltinFunctionUnlocked("PopScreen", AST_PROCEDURE_DECL, NULL);
     registerBuiltinFunctionUnlocked("Pos", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("Power", AST_FUNCTION_DECL, NULL);
+    registerBuiltinFunctionUnlocked("pow", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("PushScreen", AST_PROCEDURE_DECL, NULL);
     registerBuiltinFunctionUnlocked("QuitRequested", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("Random", AST_FUNCTION_DECL, NULL);

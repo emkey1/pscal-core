@@ -1834,6 +1834,7 @@ VarType getBuiltinReturnType(const char* name) {
         strcasecmp(name, "arccos") == 0 ||
         strcasecmp(name, "cotan")  == 0 ||
         strcasecmp(name, "power")  == 0 ||
+        strcasecmp(name, "pow")    == 0 ||
         strcasecmp(name, "log10")  == 0 ||
         strcasecmp(name, "sinh")   == 0 ||
         strcasecmp(name, "cosh")   == 0 ||
