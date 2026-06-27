@@ -9266,6 +9266,20 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                         }
                         bool match = typesMatch(param_type, arg_node, false);
                         if (!match) {
+                            /* Integer-family coercion for arguments: a value of one
+                             * integer type (e.g. length()'s INTEGER == INT32) passed to
+                             * a param of another (an Int == INT64) is safe -- the VM
+                             * coerces integers -- and is the common f(..., length(x))
+                             * pattern. Builtins already coerce; allow user calls too. */
+                            {
+                                AST *pa_i = resolveTypeAlias(param_type);
+                                AST *aa_i = arg_node ? resolveTypeAlias(arg_node->type_def) : NULL;
+                                VarType pvt_i = pa_i ? pa_i->var_type : (param_type ? param_type->var_type : TYPE_UNKNOWN);
+                                VarType avt_i = aa_i ? aa_i->var_type : (arg_node ? arg_node->var_type : TYPE_UNKNOWN);
+                                if (isIntlikeType(pvt_i) && isIntlikeType(avt_i)) {
+                                    continue;
+                                }
+                            }
                             if (getInterfaceASTForParam(param_node, param_type)) {
                                 continue;
                             }
@@ -9406,6 +9420,19 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                     }
                     bool match = typesMatch(param_type, arg_node, callee_is_builtin);
                     if (!match) {
+                        /* Integer-family coercion for arguments (see note above): one
+                         * integer type into a param of another is safe and is the common
+                         * f(..., length(x)) pattern. Builtins already coerce; allow user
+                         * function calls the same allowance. */
+                        {
+                            AST *pa_i = resolveTypeAlias(param_type);
+                            AST *aa_i = arg_node ? resolveTypeAlias(arg_node->type_def) : NULL;
+                            VarType pvt_i = pa_i ? pa_i->var_type : (param_type ? param_type->var_type : TYPE_UNKNOWN);
+                            VarType avt_i = aa_i ? aa_i->var_type : (arg_node ? arg_node->var_type : TYPE_UNKNOWN);
+                            if (isIntlikeType(pvt_i) && isIntlikeType(avt_i)) {
+                                continue;
+                            }
+                        }
                         if (getInterfaceASTForParam(param_node, param_type)) {
                             continue;
                         }
