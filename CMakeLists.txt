@@ -16,6 +16,8 @@ if(CMAKE_C_COMPILER_ID STREQUAL "AppleClang")
     add_compile_options(-Wno-nullability-completeness)
 endif()
 
+option(PSCAL_SDL "Enable the SDL graphics/audio backend (sdl/gl/audio + 3D)" OFF)
+
 set(SRC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 find_package(Threads REQUIRED)
@@ -91,6 +93,48 @@ set_source_files_properties(${CMAKE_CURRENT_SOURCE_DIR}/third-party/nextvi/vi.c 
 add_library(pscal_core_static STATIC ${PSCAL_CORE_SOURCES})
 target_compile_definitions(pscal_core_static PRIVATE PSCAL_NO_CLI_ENTRYPOINTS)
 target_link_libraries(pscal_core_static PUBLIC Threads::Threads m)
+
+# ---- Optional SDL graphics/audio backend -------------------------------------
+# Compiles the SDL-gated sources (sdl/gl/audio + the platform 3D backend) and
+# links SDL2 + OpenGL (plus the Metal/Quartz/Foundation frameworks on Apple). The
+# `SDL` define and the libraries are PUBLIC, so any consumer that links
+# pscal_core_static (e.g. aether) inherits both. Mirrors the umbrella recipe.
+if(PSCAL_SDL)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(PC_SDL2       REQUIRED IMPORTED_TARGET sdl2)
+    pkg_check_modules(PC_SDL2_IMAGE REQUIRED IMPORTED_TARGET SDL2_image)
+    pkg_check_modules(PC_SDL2_TTF   REQUIRED IMPORTED_TARGET SDL2_ttf)
+    pkg_check_modules(PC_SDL2_MIXER REQUIRED IMPORTED_TARGET SDL2_mixer)
+    find_package(OpenGL REQUIRED)
+
+    set(_PSCAL_SDL_SRCS
+        ${SRC}/backend_ast/sdl.c
+        ${SRC}/backend_ast/sdl3d.c
+        ${SRC}/backend_ast/gl.c
+        ${SRC}/backend_ast/audio.c
+        ${SRC}/common/smallclue_applets_stub.c)
+    if(APPLE)
+        enable_language(OBJC)
+        list(APPEND _PSCAL_SDL_SRCS
+            ${SRC}/backend_ast/graphics_3d_backend_ios.c
+            ${SRC}/backend_ast/graphics_3d_metal_apple.m)
+    else()
+        list(APPEND _PSCAL_SDL_SRCS
+            ${SRC}/backend_ast/graphics_3d_backend_gl.c)
+    endif()
+    target_sources(pscal_core_static PRIVATE ${_PSCAL_SDL_SRCS})
+
+    target_compile_definitions(pscal_core_static PUBLIC SDL)
+    target_link_libraries(pscal_core_static PUBLIC
+        PkgConfig::PC_SDL2 PkgConfig::PC_SDL2_IMAGE
+        PkgConfig::PC_SDL2_TTF PkgConfig::PC_SDL2_MIXER
+        OpenGL::GL)
+    if(APPLE)
+        target_link_libraries(pscal_core_static PUBLIC
+            "-framework Metal" "-framework QuartzCore" "-framework Foundation")
+    endif()
+    message(STATUS "pscal-core: SDL backend ENABLED (sdl/gl/audio + 3D)")
+endif()
 
 # ---- Install ----------------------------------------------------------------
 # pscal-core is the shared runtime library. Installing it makes the static lib +
