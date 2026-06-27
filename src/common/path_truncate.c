@@ -376,6 +376,7 @@ static const PathTruncateFrontendAlias kPathTruncateFrontendAliases[] = {
     {"pascal", "/bin/pscal_tool_runner"},
     {"clike", "/bin/pscal_tool_runner"},
     {"rea", "/bin/pscal_tool_runner"},
+    {"aether", "/bin/pscal_tool_runner"},
     {"pscalvm", "/bin/pscal_tool_runner"},
     {"pscaljson2bc", "/bin/pscal_tool_runner"},
 #ifdef BUILD_DASCAL

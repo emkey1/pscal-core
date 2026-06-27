@@ -2,6 +2,7 @@
 #include "compiler/compiler.h"
 #include "ast/ast.h"
 #include "core/types.h"
+#include "core/type_registry.h"
 
 AST* rea_lookupType(const char* name) {
     return lookupType(name);

@@ -221,6 +221,7 @@ static void shellInvalidateFrontendState(FrontendKind kind) {
             clikeInvalidateGlobalState();
             break;
         case FRONTEND_KIND_REA:
+        case FRONTEND_KIND_AETHER:
             reaInvalidateGlobalState();
             break;
         case FRONTEND_KIND_SHELL:
