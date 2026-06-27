@@ -3905,6 +3905,20 @@ static bool isSubclassOf(AST* sub, AST* base) {
 // `arg_node->type_def` provides the full type of the argument (including any
 // array structure) which allows for structural comparisons, especially when
 // checking VAR parameters that are themselves arrays.
+/* Bit-width of an integer-family VarType, for SAFE (widening-only) argument
+ * coercion: a narrower int may flow into a wider param (no information lost), but
+ * never a wider int into a narrower param (that would silently truncate high bits).
+ * Returns 0 for non-integer-family types. */
+static int pscalIntWidthRank(VarType t) {
+    switch (t) {
+        case TYPE_INT8:  case TYPE_UINT8:  case TYPE_BYTE: return 8;
+        case TYPE_INT16: case TYPE_UINT16: case TYPE_WORD: return 16;
+        case TYPE_INT32: case TYPE_UINT32: return 32; /* TYPE_INTEGER == TYPE_INT32 */
+        case TYPE_INT64: case TYPE_UINT64: return 64;
+        default: return 0;
+    }
+}
+
 static bool typesMatch(AST* param_type, AST* arg_node, bool allow_coercion) {
     if (!param_type || !arg_node) return false;
 
@@ -9429,7 +9443,10 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                             AST *aa_i = arg_node ? resolveTypeAlias(arg_node->type_def) : NULL;
                             VarType pvt_i = pa_i ? pa_i->var_type : (param_type ? param_type->var_type : TYPE_UNKNOWN);
                             VarType avt_i = aa_i ? aa_i->var_type : (arg_node ? arg_node->var_type : TYPE_UNKNOWN);
-                            if (isIntlikeType(pvt_i) && isIntlikeType(avt_i)) {
+                            /* widening only: a narrower int into a wider param is
+                             * safe; never narrow a wider int (would truncate). */
+                            if (pscalIntWidthRank(avt_i) > 0 &&
+                                pscalIntWidthRank(pvt_i) >= pscalIntWidthRank(avt_i)) {
                                 continue;
                             }
                         }
