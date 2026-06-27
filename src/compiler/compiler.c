@@ -5127,7 +5127,10 @@ Value evaluateCompileTimeValue(AST* node) {
                     advance == len) {
                     return makeWideChar((int)codepoint);
                 }
-                if (len == 1) {
+                /* A length-1 literal the frontend parser already typed as a string
+                 * (a double-quoted "x" in rea/aether) stays a string; an untyped or
+                 * char-typed one (Pascal/clike 'x') is a Char as before. */
+                if (len == 1 && !isPascalStringType(node->var_type)) {
                     return makeChar((unsigned char)node->token->value[0]);
                 }
                 if (node->var_type == TYPE_UNICODE_STRING ||
@@ -10197,10 +10200,11 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                 emitConstant(chunk, constIndex, line);
                 break;
             }
-            if (len == 1) {
-                /* Single-character string literals represent CHAR constants.
-                 * Cast through unsigned char so values in the 128..255 range
-                 * are preserved correctly. */
+            if (len == 1 && !isPascalStringType(node->var_type)) {
+                /* A length-1 literal already typed as a string by the frontend
+                 * parser (rea/aether's double-quoted "x") stays a string; an
+                 * untyped/char-typed one (Pascal/clike 'x') is a Char as before.
+                 * Cast through unsigned char so 128..255 are preserved. */
                 Value val = makeChar((unsigned char)node_token->value[0]);
                 int constIndex = addConstantToChunk(chunk, &val);
                 emitConstant(chunk, constIndex, line);

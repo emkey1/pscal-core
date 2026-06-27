@@ -1663,8 +1663,14 @@ resolved_field: ;
                 node->var_type = (node->token && node->token->type == TOKEN_REAL_CONST) ? TYPE_REAL : TYPE_INTEGER;
                 break;
             case AST_STRING:
+                /* A node the frontend parser already typed is kept as-is; only an
+                 * untyped literal is inferred below. Including TYPE_STRING here is
+                 * what lets a double-quoted single char (rea/aether's "x", typed
+                 * STRING by the parser) stay a 1-char string instead of being
+                 * demoted to Char. Pascal/clike char literals are TYPE_CHAR, so they
+                 * are unaffected. */
                 if (node->var_type == TYPE_CHAR || node->var_type == TYPE_WIDECHAR ||
-                    node->var_type == TYPE_UNICODE_STRING) {
+                    node->var_type == TYPE_UNICODE_STRING || node->var_type == TYPE_STRING) {
                     break;
                 }
                 if (node->token && node->token->value) {
