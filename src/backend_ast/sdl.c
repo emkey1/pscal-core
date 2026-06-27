@@ -876,7 +876,7 @@ void sdlCleanupAtExit(void) {
 
 
 PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinInitgraph) {
-    if (arg_count != 3 || !IS_INTLIKE(args[0]) || !IS_INTLIKE(args[1]) || args[2].type != TYPE_STRING) {
+    if (arg_count != 3 || !IS_INTLIKE(args[0]) || !IS_INTLIKE(args[1]) || !isPascalStringType(args[2].type)) {
         runtimeError(vm, "VM Error: InitGraph expects (Integer, Integer, String)");
         return makeVoid();
     }
@@ -1845,7 +1845,7 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinInittextsystem) {
     Value fontNameVal = args[0];
     Value fontSizeVal = args[1];
 
-    if (fontNameVal.type != TYPE_STRING || !isIntlikeType(fontSizeVal.type)) {
+    if (!isPascalStringType(fontNameVal.type) || !isIntlikeType(fontSizeVal.type)) {
         runtimeError(vm, "InitTextSystem argument type mismatch. Expected (String, Integer).");
         return makeVoid(); // Don't free args, they are on the VM stack
     }
@@ -2103,7 +2103,7 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinGetpixelcolor) {
 }
 
 PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinLoadimagetotexture) {
-    if (arg_count != 1 || args[0].type != TYPE_STRING) { runtimeError(vm, "LoadImageToTexture expects 1 argument (FilePath: String)."); return makeInt(-1); }
+    if (arg_count != 1 || !isPascalStringType(args[0].type)) { runtimeError(vm, "LoadImageToTexture expects 1 argument (FilePath: String)."); return makeInt(-1); }
     if (!gSdlInitialized || !gSdlRenderer) { runtimeError(vm, "Graphics system not initialized before LoadImageToTexture."); return makeInt(-1); }
 
     if (!gSdlImageInitialized) {
@@ -2143,7 +2143,7 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinOuttextxy) {
     if (!gSdlInitialized || !gSdlRenderer) { runtimeError(vm, "Graphics system not initialized before OutTextXY."); return makeVoid(); }
     if (!gSdlTtfInitialized || !gSdlFont) { runtimeError(vm, "Text system or font not initialized before OutTextXY."); return makeVoid(); }
 
-    if (!IS_INTLIKE(args[0]) || !IS_INTLIKE(args[1]) || args[2].type != TYPE_STRING) { runtimeError(vm, "OutTextXY argument type mismatch."); return makeVoid(); }
+    if (!IS_INTLIKE(args[0]) || !IS_INTLIKE(args[1]) || !isPascalStringType(args[2].type)) { runtimeError(vm, "OutTextXY argument type mismatch."); return makeVoid(); }
 
     int x = (int)AS_INTEGER(args[0]);
     int y = (int)AS_INTEGER(args[1]);
