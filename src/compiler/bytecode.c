@@ -516,6 +516,7 @@ static void printConstantValue(const Value* value) {
             fprintf(stderr, "%Lf", AS_REAL(*value));
             break;
         case TYPE_STRING:
+        case TYPE_UNICODE_STRING:
             if (value->s_val) {
                 printEscapedString(value->s_val);
             } else {
