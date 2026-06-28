@@ -2353,6 +2353,7 @@ typedef struct {
 
 /* Forward declaration; defined later. */
 static void vprocDeliverPendingSignalsForCurrent(void);
+static bool vprocCurrentHasInterruptingSignal(void);
 static const struct pscal_fd_ops kVprocLocationFdOps;
 typedef void (*VprocLocationReadersChangedFn)(int readers, void *context);
 static VprocLocationReadersChangedFn gLocationReaderObserver = NULL;
@@ -2425,6 +2426,21 @@ static bool vprocInprocPipeShouldDestroy(VprocInprocPipe *pipe) {
     return destroy;
 }
 
+/* Bound the cond wait so blocking pipe I/O periodically rechecks for a pending
+ * virtualized signal. We cannot interrupt a pthread_cond_wait with a host
+ * signal the way iSH interrupts real_poll_wait with SIGUSR1, so a short
+ * absolute-deadline poll (CLOCK_REALTIME, matching the default cond clock on
+ * Apple/Linux) is how Ctrl-C/Ctrl-Z reach a stage parked on an empty/full
+ * pipe. */
+static void vprocInprocPipeWaitDeadline(struct timespec *ts) {
+    clock_gettime(CLOCK_REALTIME, ts);
+    ts->tv_nsec += 100L * 1000000L; /* 100ms interrupt-poll interval */
+    if (ts->tv_nsec >= 1000000000L) {
+        ts->tv_sec += 1;
+        ts->tv_nsec -= 1000000000L;
+    }
+}
+
 static ssize_t vprocInprocPipeRead(struct pscal_fd *fd, void *buf, size_t bufsize) {
     if (!fd || !buf) {
         return _EBADF;
@@ -2438,8 +2454,20 @@ static ssize_t vprocInprocPipeRead(struct pscal_fd *fd, void *buf, size_t bufsiz
     pipe->active_ops++;
     while (pipe->count == 0 && !pipe->write_closed) {
         pipe->wait_readers++;
-        pthread_cond_wait(&pipe->cond_read, &pipe->mu);
+        struct timespec ts;
+        vprocInprocPipeWaitDeadline(&ts);
+        pthread_cond_timedwait(&pipe->cond_read, &pipe->mu, &ts);
         pipe->wait_readers--;
+        if (pipe->count == 0 && !pipe->write_closed &&
+            vprocCurrentHasInterruptingSignal()) {
+            pipe->active_ops--;
+            bool destroy = vprocInprocPipeShouldDestroy(pipe);
+            pthread_mutex_unlock(&pipe->mu);
+            if (destroy) {
+                vprocInprocPipeFree(pipe);
+            }
+            return _EINTR;
+        }
     }
     if (pipe->count == 0 && pipe->write_closed) {
         pipe->active_ops--;
@@ -2488,8 +2516,20 @@ static ssize_t vprocInprocPipeWrite(struct pscal_fd *fd, const void *buf, size_t
     }
     while (pipe->count == pipe->cap && !pipe->read_closed) {
         pipe->wait_writers++;
-        pthread_cond_wait(&pipe->cond_write, &pipe->mu);
+        struct timespec ts;
+        vprocInprocPipeWaitDeadline(&ts);
+        pthread_cond_timedwait(&pipe->cond_write, &pipe->mu, &ts);
         pipe->wait_writers--;
+        if (pipe->count == pipe->cap && !pipe->read_closed &&
+            vprocCurrentHasInterruptingSignal()) {
+            pipe->active_ops--;
+            bool destroy = vprocInprocPipeShouldDestroy(pipe);
+            pthread_mutex_unlock(&pipe->mu);
+            if (destroy) {
+                vprocInprocPipeFree(pipe);
+            }
+            return _EINTR;
+        }
     }
     if (pipe->read_closed) {
         pipe->active_ops--;
@@ -4547,6 +4587,51 @@ static bool vprocDeliverPendingSignalsLocked(VProcTaskEntry *entry) {
         entry->pending_counts[sig] = 0;
     }
     return exit_current;
+}
+
+/*
+ * True when the calling thread's vproc has a pending signal that should
+ * interrupt a blocking wait (in-proc pipe read/write, poll/select). Mirrors
+ * iSH's poll_wait recheck of `pending & ~blocked`, but also skips signals whose
+ * effective disposition is ignore/no-op so we don't spuriously EINTR on
+ * SIGCHLD/SIGWINCH and friends. Locks the task table; it is safe to call while
+ * holding an unrelated pipe mutex because no path holds gVProcTasks.mu across a
+ * pipe op (vprocInvokeHandlerLocked drops the table lock before running
+ * handlers), so the order pipe->mu -> gVProcTasks.mu never inverts.
+ */
+static bool vprocCurrentHasInterruptingSignal(void) {
+    VProc *vp = vprocCurrent();
+    if (!vp) {
+        return false;
+    }
+    int pid = vprocPid(vp);
+    if (pid <= 0) {
+        return false;
+    }
+    bool interrupt = false;
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    if (entry && entry->pending_signals) {
+        for (int sig = 1; sig < 32; ++sig) {
+            uint32_t mask = vprocSigMask(sig);
+            if (!(entry->pending_signals & mask)) {
+                continue;
+            }
+            if (vprocSignalBlockedLocked(entry, sig)) {
+                continue;
+            }
+            if (vprocSignalIgnoredLocked(entry, sig)) {
+                continue;
+            }
+            if (vprocEffectiveSignalActionLocked(entry, sig) == VPROC_SIG_IGNORE) {
+                continue;
+            }
+            interrupt = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    return interrupt;
 }
 
 typedef struct {
@@ -9973,6 +10058,13 @@ int vprocKillShim(pid_t pid, int sig) {
     pthread_cond_broadcast(&gVProcTasks.cv);
     pthread_mutex_unlock(&gVProcTasks.mu);
 
+    /* gVProcTasks.cv only wakes waiters parked on the task table (waitpid,
+     * stop-wait). Threads blocked in poll/select sleep on the global poll-wake
+     * pipe, and in-proc pipe waiters re-check on their timed wait -- poke the
+     * wake pipe so a queued signal (Ctrl-C/Ctrl-Z) is observed promptly as
+     * EINTR rather than only at the next cooperative checkpoint. */
+    pscal_fd_poll_wakeup(NULL, POLLIN);
+
     for (size_t i = 0; i < cancel_count; ++i) {
         pthread_cancel(cancel_list[i]);
     }
@@ -13107,6 +13199,9 @@ ssize_t vprocReadShim(int fd, void *buf, size_t count) {
         ssize_t res = pscal_fd->ops->read(pscal_fd, buf, count);
         pscal_fd_close(pscal_fd);
         if (res < 0) {
+            if ((int)res == _EINTR) {
+                vprocDeliverPendingSignalsForCurrent();
+            }
             return vprocSetCompatErrno((int)res);
         }
         return res;
@@ -13169,6 +13264,9 @@ ssize_t vprocWriteShim(int fd, const void *buf, size_t count) {
         ssize_t res = pscal_fd->ops->write(pscal_fd, buf, count);
         pscal_fd_close(pscal_fd);
         if (res < 0) {
+            if ((int)res == _EINTR) {
+                vprocDeliverPendingSignalsForCurrent();
+            }
             return vprocSetCompatErrno((int)res);
         }
         return res;
@@ -14944,6 +15042,20 @@ int vprocPollShim(struct pollfd *fds, nfds_t nfds, int timeout) {
             }
 
             ready_count = host_ready_count + pscal_ready;
+            if (ready_count == 0 && vprocCurrentHasInterruptingSignal()) {
+                /* Woken (or timed out) with nothing ready but a deliverable
+                 * signal pending: return EINTR so the blocked poll/select can
+                 * be interrupted by Ctrl-C/Ctrl-Z instead of looping forever
+                 * on an infinite timeout. */
+                for (nfds_t k = 0; k < nfds; ++k) {
+                    if (pscal_fds[k]) {
+                        pscal_fd_close(pscal_fds[k]);
+                    }
+                }
+                vprocDeliverPendingSignalsForCurrent();
+                errno = EINTR;
+                return -1;
+            }
             if (ready_count > 0 || effective_wait == 0) {
                 break;
             }
