@@ -3643,6 +3643,14 @@ typedef struct {
     pthread_t worker_thread;
     pthread_t main_thread;
     bool use_shell_context;
+#if defined(PSCAL_TARGET_IOS)
+    /* Dedicated SIGINT catcher: sits in sigwait() (SIGINT blocked everywhere) so
+     * a foreground Ctrl-C is dequeued reliably and turned into a SIGUSR1 poke to
+     * the worker (longjmp interrupt) plus the VM abort flag. */
+    pthread_t sigint_catcher_thread;
+    volatile sig_atomic_t sigint_catcher_stop;
+    bool sigint_catcher_active;
+#endif
 } ShellToolThreadContext;
 
 static __thread sigjmp_buf gShellThreadJumpBuf;
@@ -3718,14 +3726,42 @@ static void *shellToolThreadMain(void *arg) {
     (void)ctx->stdout_fd;
     (void)ctx->stderr_fd;
 
-    /* Unblock SIGINT for this thread */
+    /* On iOS SIGINT is owned centrally: it stays BLOCKED on every thread and a
+     * foreground Ctrl-C is dequeued by the tool-runner's dedicated sigwait
+     * catcher, which sets the cooperative abort flag the VM polls
+     * per-instruction (a longjmp out of a mid-instruction VM would corrupt it,
+     * so we do not interrupt the worker via a signal). Keep SIGINT blocked here
+     * and install no SIGINT handler. On other platforms SIGINT drives the
+     * longjmp interrupt handler as before. */
+    /* VM frontends abort cooperatively via the flag (a longjmp out of a
+     * mid-instruction VM would corrupt it). Applets are plain read loops that
+     * cannot poll the flag, so they need their blocking read() interrupted. */
+    bool vm_frontend = (ctx->frontend_kind == FRONTEND_KIND_PASCAL ||
+                        ctx->frontend_kind == FRONTEND_KIND_REA ||
+                        ctx->frontend_kind == FRONTEND_KIND_AETHER ||
+                        ctx->frontend_kind == FRONTEND_KIND_CLIKE);
     sigset_t unblock_mask;
     sigemptyset(&unblock_mask);
+#if !defined(PSCAL_TARGET_IOS)
     sigaddset(&unblock_mask, SIGINT);
+#else
+    /* On iOS SIGINT stays BLOCKED on every worker (the sigwait catcher owns it).
+     * For applets, unblock SIGUSR1 so the catcher's poke fires the longjmp
+     * handler and unwinds the blocked read(). VM frontends keep SIGUSR1 blocked
+     * (poke is then a harmless no-op) and rely on the flag. */
+    if (!vm_frontend) {
+        sigaddset(&unblock_mask, SIGUSR1);
+    }
+#endif
     sigaddset(&unblock_mask, SIGTSTP);
     pthread_sigmask(SIG_UNBLOCK, &unblock_mask, NULL);
 
-    /* Install safe termination handler */
+    /* Install the cooperative longjmp handler. On iOS it is the SIGINT
+     * disposition purely as a safety net (SIGINT stays blocked so it never
+     * fires async -- it just guarantees the disposition is never SIG_DFL), and
+     * for applets it is ALSO bound to SIGUSR1, which the catcher pokes to
+     * interrupt a blocked read(). On other platforms it is the live SIGINT
+     * interrupt handler. */
     struct sigaction sa, old_sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = shellThreadSigintHandler;
@@ -3733,6 +3769,12 @@ static void *shellToolThreadMain(void *arg) {
     /* SA_RESTART is purposely omitted so we interrupt blocking calls */
     sa.sa_flags = 0;
     sigaction(SIGINT, &sa, &old_sa);
+#if defined(PSCAL_TARGET_IOS)
+    if (!vm_frontend) {
+        struct sigaction usr1_old;
+        sigaction(SIGUSR1, &sa, &usr1_old);
+    }
+#endif
 
     FrontendKind previous_kind = frontendPushKind(ctx->frontend_kind);
     ShellRuntimeState *thread_ctx = NULL;
@@ -3780,7 +3822,7 @@ static void *shellToolThreadMain(void *arg) {
 
     (void)ctx->status;
 
-    /* Restore signal handler */
+    /* Restore signal handler. */
     sigaction(SIGINT, &old_sa, NULL);
     if (ctx->session_stdio) {
         vprocSessionStdioActivate(prev_stdio);
@@ -3820,6 +3862,44 @@ static void *shellToolWaiterMain(void *arg) {
     }
     return NULL;
 }
+
+#if defined(PSCAL_TARGET_IOS)
+/* Dedicated SIGINT catcher thread. With SIGINT blocked on every thread during
+ * tool execution, a foreground Ctrl-C is delivered to whichever thread waits in
+ * sigwait() for it -- reliably, and without ever reaching a SIG_DFL async
+ * disposition that would kill the shell. Each catch (a) pokes the worker with
+ * SIGUSR1 so a blocked applet read() or the VM loop unwinds via siglongjmp, and
+ * (b) sets the cooperative abort flag the VM also polls per-instruction, plus a
+ * poll-wake for blocked vproc waits. The owner stops it by setting
+ * sigint_catcher_stop and delivering one SIGINT to break the final sigwait(). */
+static void *shellToolSigintCatcherMain(void *arg) {
+    ShellToolThreadContext *ctx = (ShellToolThreadContext *)arg;
+    sigset_t wait_set;
+    sigemptyset(&wait_set);
+    sigaddset(&wait_set, SIGINT);
+    while (!ctx->sigint_catcher_stop) {
+        int caught = 0;
+        if (sigwait(&wait_set, &caught) != 0) {
+            continue;
+        }
+        if (ctx->sigint_catcher_stop) {
+            break;
+        }
+        if (caught == SIGINT) {
+            /* Set the cooperative abort flag the VM polls per-instruction (the
+             * safe path for frontends), wake any blocked vproc pipe/poll wait,
+             * and poke the worker with SIGUSR1. The poke fires the longjmp
+             * handler only on applet workers (which unblock SIGUSR1) to unwind a
+             * blocked read(); VM-frontend workers keep SIGUSR1 blocked so the
+             * poke is a harmless no-op for them. */
+            pscalRuntimeRequestSigint();
+            pscal_fd_poll_wakeup(NULL, 0);
+            (void)pthread_kill(ctx->worker_thread, SIGUSR1);
+        }
+    }
+    return NULL;
+}
+#endif
 
 static int shellRunToolInThread(ShellToolEntryFn entry,
                                 int argc,
@@ -3974,6 +4054,14 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
         return context.status;
     }
 
+#if defined(PSCAL_TARGET_IOS)
+    /* Dedicated SIGINT catcher (sigwait): owns the foreground Ctrl-C. */
+    context.sigint_catcher_stop = 0;
+    context.sigint_catcher_active =
+        (pthread_create(&context.sigint_catcher_thread, NULL,
+                        shellToolSigintCatcherMain, &context) == 0);
+#endif
+
     /* Main Loop */
     sigset_t wait_mask;
     sigemptyset(&wait_mask);
@@ -3983,6 +4071,13 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
     while (!context.finished) {
         sigset_t pending;
         sigemptyset(&pending);
+#if defined(PSCAL_TARGET_IOS)
+        /* SIGINT is handled by the dedicated catcher thread; here only relay a
+         * cooperative SIGTSTP request to vproc job control. */
+        if (pscalRuntimeConsumeSigtstp()) {
+            (void)vprocRequestControlSignal(SIGTSTP);
+        }
+#else
         if (pscalRuntimeConsumeSigint()) {
             pthread_kill(context.worker_thread, SIGINT);
         }
@@ -3992,6 +4087,7 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
         if (sigpending(&pending) == 0 && sigismember(&pending, SIGINT)) {
             pthread_kill(context.worker_thread, SIGINT);
         }
+#endif
         struct timespec ts;
         ts.tv_sec = 0;
         ts.tv_nsec = 200 * 1000 * 1000; /* 200ms */
@@ -3999,6 +4095,15 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
         /* Poll for completion to avoid hanging if SIGURG never arrives. */
     }
 
+#if defined(PSCAL_TARGET_IOS)
+    if (context.sigint_catcher_active) {
+        context.sigint_catcher_stop = 1;
+        /* Break the catcher's blocking sigwait() with one directed SIGINT. */
+        pthread_kill(context.sigint_catcher_thread, SIGINT);
+        pthread_join(context.sigint_catcher_thread, NULL);
+        context.sigint_catcher_active = false;
+    }
+#endif
     pthread_join(waiter_thread, NULL);
     pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
     if (stdin_termios_valid) {
