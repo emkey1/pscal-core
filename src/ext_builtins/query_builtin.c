@@ -29,7 +29,8 @@ typedef struct {
   const char *signature;
   const char *usage;
   const char *category;
-  bool effectful;
+  bool effectful;          /* informational; emit derives from pscalBuiltinNameIsEffectful() */
+  const char *source;      /* NULL => "aether_alias"; raw VM builtins set "vm_builtin" */
 } AetherBuiltinMeta;
 
 static const AetherBuiltinMeta kAetherBuiltinMeta[] = {
@@ -175,6 +176,188 @@ static const AetherBuiltinMeta kAetherBuiltinMeta[] = {
     {"builtin_info", "aetherbuiltininfo", "function", "Text",
      "builtin_info(name: Text) -> Text",
      "Structured JSON metadata for one Aether-visible builtin.", "capability", false},
+
+    /* --- Raw VM builtins with curated signatures (source: vm_builtin) --- */
+    /* Files and environment (effectful; call inside fx). */
+    {"fileexists", NULL, "function", "Bool",
+     "fileexists(path: Text) -> Bool",
+     "True if a file or directory exists at path.", "filesystem", true, "vm_builtin"},
+    {"getcurrentdir", NULL, "function", "Text",
+     "getcurrentdir() -> Text",
+     "Current working directory.", "filesystem", true, "vm_builtin"},
+    {"getenv", NULL, "function", "Text",
+     "getenv(name: Text) -> Text",
+     "Environment variable value, or empty Text if unset.", "system", true, "vm_builtin"},
+    {"getenvint", NULL, "function", "Int",
+     "getenvint(name: Text, fallback: Int) -> Int",
+     "Environment variable parsed as Int, or fallback.", "system", true, "vm_builtin"},
+    {"paramcount", NULL, "function", "Int",
+     "paramcount() -> Int",
+     "Count of command-line arguments.", "system", true, "vm_builtin"},
+    {"paramstr", NULL, "function", "Text",
+     "paramstr(i: Int) -> Text",
+     "i-th command-line argument; paramstr(0) is the program.", "system", true, "vm_builtin"},
+    /* Text helpers (pure). */
+    {"copy", NULL, "function", "Text",
+     "copy(s: Text, start: Int, count: Int) -> Text",
+     "Substring of length count from 1-based start.", "strings", false, "vm_builtin"},
+    {"pos", NULL, "function", "Int",
+     "pos(needle: Text, s: Text) -> Int",
+     "1-based index of needle in s, or 0 if absent.", "strings", false, "vm_builtin"},
+    {"trim", NULL, "function", "Text",
+     "trim(s: Text) -> Text",
+     "Strip leading and trailing whitespace.", "strings", false, "vm_builtin"},
+    {"stringofchar", NULL, "function", "Text",
+     "stringofchar(ch: Text, n: Int) -> Text",
+     "Text of n copies of single-character ch.", "strings", false, "vm_builtin"},
+    {"realtostr", NULL, "function", "Text",
+     "realtostr(value: Real) -> Text",
+     "Real to Text with 6 decimals.", "conversion", false, "vm_builtin"},
+    {"formatfloat", NULL, "function", "Text",
+     "formatfloat(value: Real, precision: Int) -> Text",
+     "Real to Text with the given decimal precision.", "conversion", false, "vm_builtin"},
+    /* Nondeterminism (effectful). */
+    {"random", NULL, "function", "Real",
+     "random() -> Real in [0,1); random(n: Int) -> Int in [0,n)",
+     "Pseudorandom value; seed with randomize().", "system", true, "vm_builtin"},
+    {"randomize", NULL, "procedure", "Void",
+     "randomize() -> Void",
+     "Seed the pseudorandom generator.", "system", true, "vm_builtin"},
+    /* HTTP (effectful; session + memory-stream model). */
+    {"httpsession", NULL, "function", "Int",
+     "httpsession() -> Int",
+     "Open an HTTP session; returns a session id (-1 on failure).", "network", true, "vm_builtin"},
+    {"httpclose", NULL, "procedure", "Void",
+     "httpclose(session: Int) -> Void",
+     "Close an HTTP session.", "network", true, "vm_builtin"},
+    {"httpsetheader", NULL, "procedure", "Void",
+     "httpsetheader(session: Int, name: Text, value: Text) -> Void",
+     "Set a request header on a session.", "network", true, "vm_builtin"},
+    {"httprequest", NULL, "function", "Int",
+     "httprequest(session: Int, method: Text, url: Text, body: Text, out: MStream) -> Int",
+     "Perform a request; writes the response body into out, returns the HTTP status.", "network", true, "vm_builtin"},
+    {"httperrorcode", NULL, "function", "Int",
+     "httperrorcode(session: Int) -> Int",
+     "Transport-level error code for the last request on a session.", "network", true, "vm_builtin"},
+    {"httplasterror", NULL, "function", "Text",
+     "httplasterror(session: Int) -> Text",
+     "Human-readable last error for a session.", "network", true, "vm_builtin"},
+    {"httpgetheader", NULL, "function", "Text",
+     "httpgetheader(session: Int, name: Text) -> Text",
+     "Read a response header from the last request.", "network", true, "vm_builtin"},
+    {"httpgetlastheaders", NULL, "function", "Text",
+     "httpgetlastheaders(session: Int) -> Text",
+     "All response headers from the last request.", "network", true, "vm_builtin"},
+    {"httpclearheaders", NULL, "procedure", "Void",
+     "httpclearheaders(session: Int) -> Void",
+     "Clear request headers set on a session.", "network", true, "vm_builtin"},
+    {"httpsetoption", NULL, "procedure", "Void",
+     "httpsetoption(session: Int, key: Text, value: Int) -> Void",
+     "Set a transport option (value may be Int or Text).", "network", true, "vm_builtin"},
+    {"httprequesttofile", NULL, "function", "Int",
+     "httprequesttofile(session: Int, method: Text, url: Text, body: Text, out: Text) -> Int",
+     "Like httprequest but writes the body to file path out; returns status.", "network", true, "vm_builtin"},
+    {"httprequestasync", NULL, "function", "Int",
+     "httprequestasync(session: Int, method: Text, url: Text, body: Text) -> Int",
+     "Start an async request; returns an async id for httpisdone/httpawait.", "network", true, "vm_builtin"},
+    {"httpisdone", NULL, "function", "Bool",
+     "httpisdone(id: Int) -> Bool",
+     "Whether an async request has completed.", "network", true, "vm_builtin"},
+    {"httpcancel", NULL, "procedure", "Void",
+     "httpcancel(id: Int) -> Void",
+     "Cancel an in-flight async request.", "network", true, "vm_builtin"},
+    {"httpawait", NULL, "function", "Int",
+     "httpawait(id: Int, out: MStream) -> Int",
+     "Block until an async request finishes; writes body to out, returns status.", "network", true, "vm_builtin"},
+    {"httptryawait", NULL, "function", "Int",
+     "httptryawait(id: Int, out: MStream) -> Int",
+     "Non-blocking await; returns status if done, else a pending indicator.", "network", true, "vm_builtin"},
+    {"httprequestasynctofile", NULL, "function", "Int",
+     "httprequestasynctofile(session: Int, method: Text, url: Text, body: Text, out: Text) -> Int",
+     "Start an async request writing the body to file path out.", "network", true, "vm_builtin"},
+    {"httpgetasyncprogress", NULL, "function", "Int",
+     "httpgetasyncprogress(id: Int) -> Int",
+     "Bytes received so far for an async request.", "network", true, "vm_builtin"},
+    {"httpgetasynctotal", NULL, "function", "Int",
+     "httpgetasynctotal(id: Int) -> Int",
+     "Total expected bytes for an async request (-1 if unknown).", "network", true, "vm_builtin"},
+    /* Filesystem mutation (effectful). */
+    {"mkdir", NULL, "function", "Int",
+     "mkdir(path: Text) -> Int",
+     "Create a directory; returns 0 on success or an errno.", "filesystem", true, "vm_builtin"},
+    {"rmdir", NULL, "function", "Int",
+     "rmdir(path: Text) -> Int",
+     "Remove an empty directory; returns 0 on success or an errno.", "filesystem", true, "vm_builtin"},
+    {"mstreamloadfromfile", NULL, "procedure", "Void",
+     "mstreamloadfromfile(s: MStream, filename: Text) -> Void",
+     "Load a file's bytes into a memory stream.", "filesystem", true, "vm_builtin"},
+    {"mstreamsavetofile", NULL, "procedure", "Void",
+     "mstreamsavetofile(s: MStream, filename: Text) -> Void",
+     "Write a memory stream's bytes to a file.", "filesystem", true, "vm_builtin"},
+    /* SQLite (effectful; integer db/stmt handles). */
+    {"sqliteopen", NULL, "function", "Int",
+     "sqliteopen(path: Text) -> Int",
+     "Open a database; returns a db handle (-1 on failure).", "sqlite", true, "vm_builtin"},
+    {"sqliteclose", NULL, "function", "Int",
+     "sqliteclose(db: Int) -> Int",
+     "Close a database handle.", "sqlite", true, "vm_builtin"},
+    {"sqliteexec", NULL, "function", "Int",
+     "sqliteexec(db: Int, sql: Text) -> Int",
+     "Execute SQL with no result rows; returns a status code.", "sqlite", true, "vm_builtin"},
+    {"sqliteprepare", NULL, "function", "Int",
+     "sqliteprepare(db: Int, sql: Text) -> Int",
+     "Compile a statement; returns a stmt handle.", "sqlite", true, "vm_builtin"},
+    {"sqlitefinalize", NULL, "function", "Int",
+     "sqlitefinalize(stmt: Int) -> Int",
+     "Release a prepared statement.", "sqlite", true, "vm_builtin"},
+    {"sqlitestep", NULL, "function", "Int",
+     "sqlitestep(stmt: Int) -> Int",
+     "Advance a statement; returns the step result code.", "sqlite", true, "vm_builtin"},
+    {"sqlitereset", NULL, "function", "Int",
+     "sqlitereset(stmt: Int) -> Int",
+     "Reset a statement for re-execution.", "sqlite", true, "vm_builtin"},
+    {"sqlitecolumncount", NULL, "function", "Int",
+     "sqlitecolumncount(stmt: Int) -> Int",
+     "Number of result columns.", "sqlite", true, "vm_builtin"},
+    {"sqlitecolumntype", NULL, "function", "Int",
+     "sqlitecolumntype(stmt: Int, column: Int) -> Int",
+     "SQLite type code of a result column.", "sqlite", true, "vm_builtin"},
+    {"sqlitecolumnname", NULL, "function", "Text",
+     "sqlitecolumnname(stmt: Int, column: Int) -> Text",
+     "Name of a result column.", "sqlite", true, "vm_builtin"},
+    {"sqlitecolumnint", NULL, "function", "Int",
+     "sqlitecolumnint(stmt: Int, column: Int) -> Int",
+     "Int value of a result column.", "sqlite", true, "vm_builtin"},
+    {"sqlitecolumndouble", NULL, "function", "Real",
+     "sqlitecolumndouble(stmt: Int, column: Int) -> Real",
+     "Real value of a result column.", "sqlite", true, "vm_builtin"},
+    {"sqlitecolumntext", NULL, "function", "Text",
+     "sqlitecolumntext(stmt: Int, column: Int) -> Text",
+     "Text value of a result column.", "sqlite", true, "vm_builtin"},
+    {"sqlitebindtext", NULL, "function", "Int",
+     "sqlitebindtext(stmt: Int, index: Int, value: Text) -> Int",
+     "Bind Text to a 1-based parameter.", "sqlite", true, "vm_builtin"},
+    {"sqlitebindint", NULL, "function", "Int",
+     "sqlitebindint(stmt: Int, index: Int, value: Int) -> Int",
+     "Bind Int to a 1-based parameter.", "sqlite", true, "vm_builtin"},
+    {"sqlitebinddouble", NULL, "function", "Int",
+     "sqlitebinddouble(stmt: Int, index: Int, value: Real) -> Int",
+     "Bind Real to a 1-based parameter.", "sqlite", true, "vm_builtin"},
+    {"sqlitebindnull", NULL, "function", "Int",
+     "sqlitebindnull(stmt: Int, index: Int) -> Int",
+     "Bind NULL to a 1-based parameter.", "sqlite", true, "vm_builtin"},
+    {"sqliteclearbindings", NULL, "function", "Int",
+     "sqliteclearbindings(stmt: Int) -> Int",
+     "Clear all bound parameters on a statement.", "sqlite", true, "vm_builtin"},
+    {"sqliteerrmsg", NULL, "function", "Text",
+     "sqliteerrmsg(db: Int) -> Text",
+     "Most recent error message for a database.", "sqlite", true, "vm_builtin"},
+    {"sqlitelastinsertrowid", NULL, "function", "Int",
+     "sqlitelastinsertrowid(db: Int) -> Int",
+     "Rowid of the most recent insert.", "sqlite", true, "vm_builtin"},
+    {"sqlitechanges", NULL, "function", "Int",
+     "sqlitechanges(db: Int) -> Int",
+     "Rows changed by the most recent statement.", "sqlite", true, "vm_builtin"},
 };
 
 static void jsonTextInit(JsonText *text) {
@@ -381,7 +564,8 @@ static bool appendAetherMetaObject(JsonText *json,
   if (!jsonTextAppend(json, "{")) return false;
   if (!jsonTextAppend(json, "\"name\":")) return false;
   if (!jsonTextAppendEscaped(json, meta->aether_name)) return false;
-  if (!jsonTextAppend(json, ",\"source\":\"aether_alias\"")) return false;
+  if (!jsonTextAppend(json, ",\"source\":")) return false;
+  if (!jsonTextAppendEscaped(json, meta->source ? meta->source : "aether_alias")) return false;
   if (meta->backend_name) {
     if (!jsonTextAppend(json, ",\"backend_name\":")) return false;
     if (!jsonTextAppendEscaped(json, meta->backend_name)) return false;
@@ -391,7 +575,7 @@ static bool appendAetherMetaObject(JsonText *json,
   if (!jsonTextAppend(json, ",\"category\":")) return false;
   if (!jsonTextAppendEscaped(json, meta->category)) return false;
   if (!jsonTextAppend(json, ",\"effectful\":")) return false;
-  if (!jsonTextAppend(json, meta->effectful ? "true" : "false")) return false;
+  if (!jsonTextAppend(json, pscalBuiltinNameIsEffectful(meta->aether_name) ? "true" : "false")) return false;
   if (!jsonTextAppend(json, ",\"return_type\":")) return false;
   if (!jsonTextAppendEscaped(json, meta->return_type)) return false;
   if (detailed) {
@@ -429,6 +613,8 @@ static bool appendVmBuiltinObject(JsonText *json,
   if (!jsonTextAppendEscaped(json, builtinTypeName(type))) return false;
   if (!jsonTextAppend(json, ",\"category\":")) return false;
   if (!jsonTextAppendEscaped(json, category)) return false;
+  if (!jsonTextAppend(json, ",\"effectful\":")) return false;
+  if (!jsonTextAppend(json, pscalBuiltinNameIsEffectful(name) ? "true" : "false")) return false;
   if (group && strcasecmp(group, kDefaultGroupName) != 0) {
     if (!jsonTextAppend(json, ",\"group\":")) return false;
     if (!jsonTextAppendEscaped(json, group)) return false;
@@ -534,7 +720,7 @@ static Value vmBuiltinHasExtBuiltin(struct VM_s *vm, int arg_count,
     runtimeError(vm, "HasExtBuiltin expects exactly 2 arguments.");
     return makeBoolean(0);
   }
-  if (args[0].type != TYPE_STRING || args[1].type != TYPE_STRING) {
+  if (!isPascalStringType(args[0].type) || !isPascalStringType(args[1].type)) {
     runtimeError(vm, "HasExtBuiltin expects string arguments.");
     return makeBoolean(0);
   }

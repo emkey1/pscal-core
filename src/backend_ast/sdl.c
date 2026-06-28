@@ -661,7 +661,7 @@ static SDL_Scancode resolveScancodeFromValue(Value arg, bool* out_ok) {
         *out_ok = false;
     }
 
-    if (arg.type == TYPE_STRING && arg.s_val != NULL) {
+    if (isPascalStringType(arg.type) && arg.s_val != NULL) {
         SDL_Scancode sc = resolveScancodeFromName(arg.s_val);
         if (sc != SDL_SCANCODE_UNKNOWN && out_ok) {
             *out_ok = true;

@@ -2095,6 +2095,71 @@ static void initBuiltinRegistryMutex(void) {
     }
 }
 
+bool pscalBuiltinNameIsEffectful(const char *name) {
+    if (!name) return false;
+    /* Single source of truth for builtin effectfulness. Anything that touches
+     * the outside world, is nondeterministic, or observes concurrent state.
+     * Pure builtins (math, string, conversion, in-memory streams, TOON reads,
+     * type predicates) are deliberately absent. Includes both raw VM names and
+     * the Aether-spelling aliases (ai_chat, sleep, task_*) so a single check
+     * serves every front end and the introspection metadata. */
+    static const char *kEffectfulNames[] = {
+        /* output / stdio */
+        "print", "printf", "println", "fprintf", "write", "writeln",
+        "read", "readln", "flush",
+        /* process control */
+        "exit", "halt", "store", "swap", "fetch",
+        /* timing (raw + Aether alias) */
+        "delay", "sleep",
+        /* AI (raw + Aether alias) */
+        "openaichatcompletions", "ai_chat",
+        /* tasks / threads (Aether aliases + raw) */
+        "task_spawn", "task_queue", "task_wait", "task_lookup", "task_status",
+        "task_result", "task_stats", "task_cancel", "task_pause", "task_resume",
+        "task_set_name",
+        "thread_spawn_named", "thread_pool_submit", "thread_set_name",
+        "thread_cancel", "thread_pause", "thread_resume", "thread_get_result",
+        "thread_get_status", "thread_lookup", "thread_stats",
+        "threadspawnbuiltin", "waitforthread",
+        /* filesystem + file-handle I/O */
+        "fileexists", "getcurrentdir", "mkdir", "rmdir", "rename", "erase",
+        "findfirst", "findnext", "getfattr", "fopen", "fclose", "fflush",
+        "filesize", "blockread", "blockwrite", "ioresult", "eof", "assignfile",
+        "closefile", "mstreamloadfromfile", "mstreamsavetofile", "toon_parse_file",
+        /* environment / process / CLI */
+        "getenv", "getenvint", "paramstr", "paramcount", "getpid", "exec", "beep",
+        "dosexec", "dosgetenv", "dosfindfirst", "dosfindnext", "dosgetdate",
+        "dosgettime", "dosgetfattr", "dosmkdir", "dosrmdir",
+        /* nondeterminism */
+        "random", "randomize",
+        /* external clock */
+        "gettime", "getdate", "realtimeclock",
+        /* console input */
+        "readkey", "keypressed",
+        /* network */
+        "dnslookup", "apisend", "apireceive",
+        "httpsession", "httpclose", "httperrorcode", "httpgetlastheaders",
+        "httpgetheader", "httpsetheader", "httpclearheaders", "httpsetoption",
+        "httprequest", "httprequesttofile", "httprequestasync",
+        "httprequestasynctofile", "httpisdone", "httptryawait", "httpcancel",
+        "httpgetasyncprogress", "httpgetasynctotal", "httpawait", "httplasterror",
+        /* database (sqlite) */
+        "sqliteopen", "sqliteclose", "sqliteexec", "sqliteprepare",
+        "sqlitefinalize", "sqlitestep", "sqlitereset", "sqlitecolumncount",
+        "sqlitecolumntype", "sqlitecolumnname", "sqlitecolumnint",
+        "sqlitecolumndouble", "sqlitecolumntext", "sqlitebindtext",
+        "sqlitebindint", "sqlitebinddouble", "sqlitebindnull",
+        "sqliteclearbindings", "sqliteerrmsg", "sqlitelastinsertrowid",
+        "sqlitechanges",
+    };
+    for (size_t i = 0; i < sizeof(kEffectfulNames) / sizeof(kEffectfulNames[0]); ++i) {
+        if (strcasecmp(kEffectfulNames[i], name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void registerVmBuiltin(const char *name, VmBuiltinFn handler,
         BuiltinRoutineType type, const char *display_name) {
     if (!name || !handler) return;
@@ -6784,7 +6849,7 @@ Value vmBuiltinLow(VM* vm, int arg_count, Value* args) {
     }
 
     // Extract type name or type information from the argument
-    if (arg.type == TYPE_STRING) {
+    if (isPascalStringType(arg.type)) {
         typeName = AS_STRING(arg);
     } else if (arg.type == TYPE_ENUM) {
         typeName = arg.enum_val.enum_name;
@@ -6851,7 +6916,7 @@ Value vmBuiltinHigh(VM* vm, int arg_count, Value* args) {
         return makeInt(0);
     }
 
-    if (arg.type == TYPE_STRING) {
+    if (isPascalStringType(arg.type)) {
         typeName = AS_STRING(arg);
     } else if (arg.type == TYPE_ENUM) {
         typeName = arg.enum_val.enum_name;
@@ -7066,7 +7131,7 @@ Value vmBuiltinAssign(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "First arg to Assign must be a file variable.");
         return makeVoid();
     }
-    if (fileNameVal.type != TYPE_STRING) {
+    if (!isPascalStringType(fileNameVal.type)) {
         runtimeError(vm, "Second arg to Assign must be a string. Got type %s.", varTypeToString(fileNameVal.type));
         return makeVoid();
     }
@@ -8387,7 +8452,7 @@ Value vmBuiltinVal(VM* vm, int arg_count, Value* args) {
     Value src = args[0];
     Value dstPtr = args[1];
     Value codePtr = args[2];
-    if (src.type != TYPE_STRING || dstPtr.type != TYPE_POINTER || codePtr.type != TYPE_POINTER) {
+    if (!isPascalStringType(src.type) || dstPtr.type != TYPE_POINTER || codePtr.type != TYPE_POINTER) {
         runtimeError(vm, "Val expects (string, var numeric, var integer).");
         return makeVoid();
     }
@@ -8540,7 +8605,7 @@ Value vmBuiltinDosMkdir(VM* vm, int arg_count, Value* args) {
         return makeInt(EINVAL);
     }
     /* Accept optional flags like -p, ignoring others for now. */
-    if (args[0].type == TYPE_STRING && AS_STRING(args[0])[0] == '-') {
+    if (isPascalStringType(args[0].type) && AS_STRING(args[0])[0] == '-') {
         const char *opt = AS_STRING(args[0]);
         if (strcmp(opt, "-p") == 0) {
             parents = true;
@@ -8553,7 +8618,7 @@ Value vmBuiltinDosMkdir(VM* vm, int arg_count, Value* args) {
     int last_err = 0;
     bool any = false;
     for (int i = first_path_idx; i < arg_count; i++) {
-        if (args[i].type != TYPE_STRING) {
+        if (!isPascalStringType(args[i].type)) {
             runtimeError(vm, "dosMkdir: path %d is not a string", i - first_path_idx + 1);
             return makeInt(EINVAL);
         }
@@ -8581,7 +8646,7 @@ Value vmBuiltinDosMkdir(VM* vm, int arg_count, Value* args) {
 }
 
 Value vmBuiltinDosRmdir(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || args[0].type != TYPE_STRING) {
+    if (arg_count != 1 || !isPascalStringType(args[0].type)) {
         runtimeError(vm, "dosRmdir expects 1 string argument.");
         return makeInt(errno);
     }
@@ -8595,7 +8660,7 @@ Value vmBuiltinDosRmdir(VM* vm, int arg_count, Value* args) {
 }
 
 Value vmBuiltinDosFindfirst(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || args[0].type != TYPE_STRING) {
+    if (arg_count != 1 || !isPascalStringType(args[0].type)) {
         runtimeError(vm, "dosFindfirst expects 1 string argument.");
         return makeString("");
     }
@@ -8629,7 +8694,7 @@ Value vmBuiltinDosFindnext(VM* vm, int arg_count, Value* args) {
 }
 
 Value vmBuiltinDosGetfattr(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || args[0].type != TYPE_STRING) {
+    if (arg_count != 1 || !isPascalStringType(args[0].type)) {
         runtimeError(vm, "dosGetfattr expects 1 string argument.");
         return makeInt(0);
     }
@@ -8757,7 +8822,7 @@ Value vmBuiltinMstreamloadfromfile(VM* vm, int arg_count, Value* args) {
     }
 
     // Argument 1 is the filename string
-    if (args[1].type != TYPE_STRING || args[1].s_val == NULL) {
+    if (!isPascalStringType(args[1].type) || args[1].s_val == NULL) {
         runtimeError(vm, "MStreamLoadFromFile: Second argument must be a string filename.");
         return makeBoolean(0); // No need to free args[1] here, vm stack manages
     }
@@ -9695,7 +9760,7 @@ static Value threadSpawnOrSubmitCommon(VM* vm, int arg_count, Value* args, bool 
     Value target = args[0];
     int builtin_id = -1;
     const char* builtin_name = NULL;
-    if (target.type == TYPE_STRING || target.type == TYPE_POINTER) {
+    if (isPascalStringType(target.type) || target.type == TYPE_POINTER) {
         const char* source_name = builtinValueToCString(&target);
         if (!source_name || !*source_name) {
             runtimeError(vm, "%s requires a builtin name or id.", opName);

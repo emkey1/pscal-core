@@ -43,6 +43,12 @@ int getVmBuiltinID(const char* name);
 void registerVmBuiltin(const char *vm_name, VmBuiltinFn handler,
                        BuiltinRoutineType type, const char *display_name);
 
+/* Authoritative predicate: is this builtin effectful (touches the outside world,
+ * is nondeterministic, or observes concurrent state)? Single source of truth for
+ * effectfulness, shared by the Aether FX-001 gate and the builtin-introspection
+ * metadata (builtins_json / builtin_info). Case-insensitive. */
+bool pscalBuiltinNameIsEffectful(const char *name);
+
 /* Optional hook for externally linked built-ins.  The weak
  * definition in builtin.c does nothing unless overridden. */
 void registerExtendedBuiltins(void);

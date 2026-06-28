@@ -7,7 +7,7 @@ static Value vmBuiltinFileExists(struct VM_s* vm, int arg_count, Value* args) {
         runtimeError(vm, "FileExists expects exactly 1 argument.");
         return makeBoolean(0);
     }
-    if (args[0].type != TYPE_STRING) {
+    if (!isPascalStringType(args[0].type)) {
         runtimeError(vm, "FileExists argument must be a string.");
         return makeBoolean(0);
     }
