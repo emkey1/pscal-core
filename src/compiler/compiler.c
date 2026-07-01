@@ -3491,6 +3491,9 @@ static void emitDefaultFieldInitializers(AST* recordType, BytecodeChunk* chunk, 
             if (hasVTable) offset++;
             if (offset < 0) continue;
 
+            // Type-zero the field from its declared type. This establishes the field's
+            // runtime type and (for strings) its dynamic capacity, which the stores
+            // below rely on for correct coercion.
             defaultValue = makeValueForType(decl->var_type, actual_type ? actual_type : type_node, NULL);
             constIdx = addConstantToChunk(chunk, &defaultValue);
             freeValue(&defaultValue);
@@ -3505,6 +3508,29 @@ static void emitDefaultFieldInitializers(AST* recordType, BytecodeChunk* chunk, 
             }
             emitConstant(chunk, constIdx, line);
             writeBytecodeChunk(chunk, SET_INDIRECT, line);
+
+            // Apply a declared constant default (`field: Type = <const>`) on top of the
+            // type-zero, exactly as a `new T { field: value }` initializer does (see
+            // emitNewFieldInitializers). Storing onto the already type-correct field lets
+            // SET_INDIRECT coerce the constant to the field's type and capacity (int->real
+            // widening; dynamic string capacity) rather than overwriting the slot with the
+            // literal's own representation. This runs for every `new T()` and for the unset
+            // fields of `new T { ... }` (the record-literal inits are emitted afterwards and
+            // cleanly override the fields they set). The frontend attaches the default to
+            // the field VAR_DECL's `left` and has verified it is a compile-time constant of
+            // a matching type.
+            if (decl->left) {
+                writeBytecodeChunk(chunk, DUP, line);
+                if (offset <= UINT8_MAX) {
+                    writeBytecodeChunk(chunk, GET_FIELD_OFFSET, line);
+                    writeBytecodeChunk(chunk, (uint8_t)offset, line);
+                } else {
+                    writeBytecodeChunk(chunk, GET_FIELD_OFFSET16, line);
+                    emitShort(chunk, (uint16_t)offset, line);
+                }
+                compileRValue(decl->left, chunk, getLine(decl->left));
+                writeBytecodeChunk(chunk, SET_INDIRECT, line);
+            }
         }
     }
 }
