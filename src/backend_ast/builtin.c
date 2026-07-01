@@ -1667,8 +1667,8 @@ static Value vmBuiltinToBool(VM* vm, int arg_count, Value* args) {
 }
 
 // The new dispatch table for the VM - MUST be defined before the function that uses it
-// Legacy entries remain sorted alphabetically by name (lowercase). Append new builtins above
-// the placeholder block at the end of the array to avoid shifting established builtin IDs.
+// Legacy entries remain sorted alphabetically by name (lowercase). Append new builtins at the
+// end of the array to avoid shifting established builtin IDs.
 // SDL/graphics builtins use NULL placeholders; registerGraphicsBuiltins() overrides them when
 // SDL support is enabled so legacy builtin IDs remain stable.
 static VmBuiltinMapping vmBuiltinDispatchTable[] = {
@@ -1943,14 +1943,13 @@ static VmBuiltinMapping vmBuiltinDispatchTable[] = {
     {"blockwrite", vmBuiltinBlockwrite},
     {"sizeof", vmBuiltinSizeof},
     {"filesize", vmBuiltinFilesize},
-    {"glcullface", NULL}, // Append new builtins above the placeholder to avoid shifting legacy IDs.
+    {"glcullface", NULL}, // Append new builtins at the end of the array to avoid shifting legacy IDs.
     {"gllinewidth", NULL},
     {"gldepthmask", NULL},
     {"gldepthfunc", NULL},
     {"fflush", vmBuiltinFflush},
     {"socketpeeraddr", vmBuiltinSocketPeerAddr},
     {"odd", vmBuiltinOdd},
-    {"to be filled", NULL}
 };
 
 static const size_t num_vm_builtins = sizeof(vmBuiltinDispatchTable) / sizeof(vmBuiltinDispatchTable[0]);
