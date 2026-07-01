@@ -2125,6 +2125,7 @@ bool pscalBuiltinNameIsEffectful(const char *name) {
         "findfirst", "findnext", "getfattr", "fopen", "fclose", "fflush",
         "filesize", "blockread", "blockwrite", "ioresult", "eof", "assignfile",
         "closefile", "mstreamloadfromfile", "mstreamsavetofile", "toon_parse_file",
+        "yyjsonreadfile", /* canonical lowering of toon_parse_file */
         /* environment / process / CLI */
         "getenv", "getenvint", "paramstr", "paramcount", "getpid", "exec", "beep",
         "dosexec", "dosgetenv", "dosfindfirst", "dosfindnext", "dosgetdate",
