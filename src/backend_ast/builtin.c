@@ -1848,7 +1848,6 @@ static VmBuiltinMapping vmBuiltinDispatchTable[] = {
     {"popscreen", vmBuiltinPopscreen},
     {"pos", vmBuiltinPos},
     {"power", vmBuiltinPower},
-    {"pow", vmBuiltinPower},   /* C-style alias of power(base, exp) */
     {"printf", vmBuiltinPrintf},
     {"fopen", vmBuiltinFopen},
     {"fclose", vmBuiltinFclose},
@@ -1950,6 +1949,9 @@ static VmBuiltinMapping vmBuiltinDispatchTable[] = {
     {"fflush", vmBuiltinFflush},
     {"socketpeeraddr", vmBuiltinSocketPeerAddr},
     {"odd", vmBuiltinOdd},
+    /* pow was briefly inserted next to power (mid-table), which shifted every
+     * id after it and broke bytecode compatibility; appended here instead. */
+    {"pow", vmBuiltinPower},   /* C-style alias of power(base, exp) */
 };
 
 static const size_t num_vm_builtins = sizeof(vmBuiltinDispatchTable) / sizeof(vmBuiltinDispatchTable[0]);
@@ -2074,12 +2076,50 @@ static VmBuiltinMapping *builtinRegistryLookupMappingUnlocked(const char *canoni
     return NULL;
 }
 
+/* Builtin ids ARE the dispatch-table indices, and CALL_BUILTIN_PROC bakes
+ * them into compiled bytecode, so the table layout is an ABI: never insert,
+ * remove, or reorder entries mid-table. Append new builtins at the end and
+ * keep {"name", NULL} placeholders for retired ones. These sentinels pin a
+ * spread of well-known ids and fail fast at startup when the invariant is
+ * broken (a mid-table insertion shifts everything after it and makes stale
+ * bytecode dispatch to the WRONG builtin). Extend the list when appending. */
+static const struct { size_t id; const char *name; } kBuiltinIdSentinels[] = {
+    {0,   "abs"},
+    {175, "power"},
+    {181, "write"},
+    {182, "fprintf"},
+    {276, "odd"},
+    {277, "pow"},
+};
+
+static void verifyBuiltinIdSentinels(void) {
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(kBuiltinIdSentinels) / sizeof(kBuiltinIdSentinels[0]); ++i) {
+        size_t id = kBuiltinIdSentinels[i].id;
+        const char *want = kBuiltinIdSentinels[i].name;
+        const char *have = (id < num_vm_builtins) ? vmBuiltinDispatchTable[id].name : NULL;
+        if (!have || strcasecmp(have, want) != 0) {
+            fprintf(stderr,
+                    "FATAL: builtin id %zu is '%s' but must be '%s'. Builtin ids are baked "
+                    "into compiled bytecode; vmBuiltinDispatchTable is append-only (use a "
+                    "{\"name\", NULL} placeholder to retire an entry, never remove/reorder).\n",
+                    id, have ? have : "<out of range>", want);
+            ok = false;
+        }
+    }
+    if (!ok) {
+        EXIT_FAILURE_HANDLER();
+    }
+}
+
 static void initBuiltinRegistryMutex(void) {
     pthread_mutexattr_t attr;
     pthread_mutexattr_init(&attr);
     pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
     pthread_mutex_init(&builtin_registry_mutex, &attr);
     pthread_mutexattr_destroy(&attr);
+
+    verifyBuiltinIdSentinels();
 
     builtinRegistryHash = createHashTable();
     if (!builtinRegistryHash) {

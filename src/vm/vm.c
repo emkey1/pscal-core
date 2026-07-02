@@ -9485,8 +9485,25 @@ comparison_error_label:
                 VmBuiltinMapping mapping;
                 bool have_mapping = false;
 
-                if ((!handler || !canonical_name) && encoded_name && *encoded_name) {
+                /* The registry id baked into the bytecode is only trusted when
+                 * it agrees with the builtin name compiled alongside it; a
+                 * mismatch means the bytecode was produced against a different
+                 * registry layout (stale cache, older binary), and dispatching
+                 * by that id would run the WRONG builtin. The name is the
+                 * stable contract — re-resolve by it. */
+                bool id_name_mismatch = handler && builtin_name &&
+                                        encoded_name && *encoded_name &&
+                                        strcasecmp(builtin_name, encoded_name) != 0;
+                if ((!handler || !canonical_name || id_name_mismatch) &&
+                    encoded_name && *encoded_name) {
                     have_mapping = getVmBuiltinMapping(encoded_name, &mapping, &resolved_id);
+                    if (id_name_mismatch && !have_mapping) {
+                        /* Name unknown to this binary: the id cannot be right
+                         * either (it names something else), so fail loudly
+                         * rather than silently running a different builtin. */
+                        handler = NULL;
+                        canonical_name = encoded_name;
+                    }
                 } else if (!handler && canonical_name) {
                     have_mapping = getVmBuiltinMapping(canonical_name, &mapping, &resolved_id);
                 }
