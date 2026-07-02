@@ -1044,6 +1044,12 @@ static bool pascalVarTypeSize(VarType type, long long *out_bytes) {
     }
 }
 
+/* Deepest legitimate nesting of embedded records (fields embedding records
+ * embedding records...) plus inheritance chains. Real programs stay in the
+ * single digits; the limit only exists to turn an embedding CYCLE into a
+ * diagnosable error instead of a stack-overflow segfault. */
+#define PSCAL_MAX_RECORD_EMBED_DEPTH 256
+
 FieldValue *createEmptyRecord(AST *recordType) {
     recordType = resolveTypeAliasForRecord(recordType);
 
@@ -1053,6 +1059,22 @@ FieldValue *createEmptyRecord(AST *recordType) {
                 recordType ? astTypeToString(recordType->type) : "NULL");
         return NULL; // Return NULL explicitly on error
     }
+
+    /* Recursion guard (defense in depth): a record type whose embedded fields
+     * cycle back to itself would recurse forever through makeValueForType and
+     * die as a bare segfault. Frontends are expected to make class-typed
+     * fields references (rea) or reject incomplete embedded types (pascal),
+     * so tripping this means a frontend let a cycle through -- fail loudly. */
+    static _Thread_local int embedDepth = 0;
+    if (embedDepth >= PSCAL_MAX_RECORD_EMBED_DEPTH) {
+        const char *typeName = (recordType->token && recordType->token->value)
+                                   ? recordType->token->value : "<anonymous>";
+        fprintf(stderr, "Error in createEmptyRecord: record type nesting exceeded %d levels "
+                        "while building '%s'; embedded record definitions likely form a cycle.\n",
+                PSCAL_MAX_RECORD_EMBED_DEPTH, typeName);
+        return NULL;
+    }
+    embedDepth++;
 
     FieldValue *head = NULL, **ptr = &head; // Use pointer-to-pointer for easy list building
 
@@ -1211,6 +1233,7 @@ FieldValue *createEmptyRecord(AST *recordType) {
         }
     }
     free(slotOwners);
+    embedDepth--;
     return head; // Return the head of the linked list of fields
 }
 
