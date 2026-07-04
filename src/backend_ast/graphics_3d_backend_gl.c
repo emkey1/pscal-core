@@ -178,4 +178,47 @@ void gfx3dPresent(void) {
 void gfx3dReleaseResources(void) {
 }
 
+#include "backend_ast/graphics_3d_metal_apple.h"
+
+bool pscalMetal3DIsSupported(void) {
+    return false;
+}
+
+bool pscalMetal3DEnsureRenderer(struct SDL_Renderer* renderer) {
+    (void)renderer;
+    return false;
+}
+
+void pscalMetal3DSetViewport(int x, int y, int width, int height) {
+    (void)x; (void)y; (void)width; (void)height;
+}
+
+bool pscalMetal3DBeginFrame(bool clearColor, const float clearColorRgba[4],
+                            bool clearDepth, float clearDepthValue) {
+    (void)clearColor; (void)clearColorRgba; (void)clearDepth; (void)clearDepthValue;
+    return false;
+}
+
+bool pscalMetal3DDrawTriangles(const PscalMetalVertex* vertices, size_t vertexCount,
+                               bool depthTestEnabled, bool depthWriteEnabled, unsigned int depthFunc,
+                               bool blendEnabled, unsigned int blendSrc, unsigned int blendDst) {
+    (void)vertices; (void)vertexCount; (void)depthTestEnabled; (void)depthWriteEnabled;
+    (void)depthFunc; (void)blendEnabled; (void)blendSrc; (void)blendDst;
+    return false;
+}
+
+bool pscalMetal3DDrawLines(const PscalMetalVertex* vertices, size_t vertexCount,
+                           bool depthTestEnabled, bool depthWriteEnabled, unsigned int depthFunc,
+                           bool blendEnabled, unsigned int blendSrc, unsigned int blendDst) {
+    (void)vertices; (void)vertexCount; (void)depthTestEnabled; (void)depthWriteEnabled;
+    (void)depthFunc; (void)blendEnabled; (void)blendSrc; (void)blendDst;
+    return false;
+}
+
+void pscalMetal3DPresent(void) {
+}
+
+void pscalMetal3DShutdown(void) {
+}
+
 #endif // !defined(PSCAL_TARGET_IOS) && !defined(__APPLE__)
