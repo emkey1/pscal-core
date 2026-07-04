@@ -567,8 +567,8 @@ static void emitRoutineResultSlotInit(AST* type_specifier_node,
         int len = 0;
         if (actual_type_def_node->right) {
             Value len_val = evaluateCompileTimeValue(actual_type_def_node->right);
-            if (len_val.type == TYPE_INTEGER) {
-                len = (int)len_val.i_val;
+            if (VALUE_TYPE(len_val) == TYPE_INTEGER) {
+                len = (int)VAL_INT(len_val);
                 if (len < 0 || len > 255) {
                     fprintf(stderr, "L%d: Compiler error: Fixed string length out of range (0-255).\n", line);
                     compiler_had_error = true;
@@ -1251,7 +1251,7 @@ static void emitVTables(BytecodeChunk* chunk) {
         Value arr = makeArrayND(1, &lb, &ub, TYPE_INT32, NULL);
         for (int j = 0; j < vt->method_count; j++) {
             int addr = vt->addrs[j];
-            arr.array_val[j] = makeInt(addr == NO_VTABLE_ENTRY ? 0 : addr);
+            AS_ARRAY(arr)[j] = makeInt(addr == NO_VTABLE_ENTRY ? 0 : addr);
         }
         int cidx = addConstantToChunk(chunk, &arr);
         for (int j = 0; j < vt->method_count; j++) {
@@ -1484,7 +1484,7 @@ static void queueDeferredGlobalInitializer(AST* var_decl) {
 }
 
 static bool populateCompileTimeArrayLiteral(Value* arr_val, AST* array_literal, int line) {
-    if (!arr_val || arr_val->type != TYPE_ARRAY || !array_literal ||
+    if (!arr_val || VALUE_TYPE(*arr_val) != TYPE_ARRAY || !array_literal ||
         array_literal->type != AST_ARRAY_LITERAL) {
         return false;
     }
@@ -1502,10 +1502,10 @@ static bool populateCompileTimeArrayLiteral(Value* arr_val, AST* array_literal, 
                 freeValue(&ev);
                 return false;
             }
-            arr_val->array_raw[j] = (uint8_t)ordinal;
+            AS_ARRAY_RAW(*arr_val)[j] = (uint8_t)ordinal;
         } else {
-            freeValue(&arr_val->array_val[j]);
-            arr_val->array_val[j] = makeCopyOfValue(&ev);
+            freeValue(&AS_ARRAY(*arr_val)[j]);
+            AS_ARRAY(*arr_val)[j] = makeCopyOfValue(&ev);
         }
         freeValue(&ev);
     }
@@ -1687,8 +1687,8 @@ static void emitGlobalVarDefinition(AST* var_decl,
             int max_len = 0;
             if (actual_type_def_node && actual_type_def_node->right) {
                 Value len_val = evaluateCompileTimeValue(actual_type_def_node->right);
-                if (len_val.type == TYPE_INTEGER) {
-                    max_len = (int)len_val.i_val;
+                if (VALUE_TYPE(len_val) == TYPE_INTEGER) {
+                    max_len = (int)VAL_INT(len_val);
                 }
                 freeValue(&len_val);
             }
@@ -1831,7 +1831,7 @@ static bool constantFitsInIntType(AST* expr, VarType targetType) {
     Value const_val = evaluateCompileTimeValue(expr);
     bool fits = false;
 
-    if (const_val.type == TYPE_VOID || const_val.type == TYPE_UNKNOWN) {
+    if (VALUE_TYPE(const_val) == TYPE_VOID || VALUE_TYPE(const_val) == TYPE_UNKNOWN) {
         freeValue(&const_val);
         return false;
     }
@@ -1841,18 +1841,18 @@ static bool constantFitsInIntType(AST* expr, VarType targetType) {
     unsigned long long uval = 0;
     bool value_is_unsigned = false;
 
-    if (const_val.type == TYPE_ENUM) {
-        sval = const_val.enum_val.ordinal;
-        uval = (unsigned long long)const_val.enum_val.ordinal;
+    if (VALUE_TYPE(const_val) == TYPE_ENUM) {
+        sval = AS_ENUM(const_val).ordinal;
+        uval = (unsigned long long)AS_ENUM(const_val).ordinal;
         hasOrdinal = true;
-        value_is_unsigned = (const_val.enum_val.ordinal >= 0);
+        value_is_unsigned = (AS_ENUM(const_val).ordinal >= 0);
     } else if (isIntlikeType(const_val.type)) {
-        sval = const_val.i_val;
-        uval = const_val.u_val;
+        sval = VAL_INT(const_val);
+        uval = VAL_UINT(const_val);
         hasOrdinal = true;
         value_is_unsigned = isUnsignedIntVarType(const_val.type) ||
-                            const_val.type == TYPE_BOOLEAN ||
-                            const_val.type == TYPE_CHAR;
+                            VALUE_TYPE(const_val) == TYPE_BOOLEAN ||
+                            VALUE_TYPE(const_val) == TYPE_CHAR;
     }
 
     if (!hasOrdinal) {
@@ -1916,7 +1916,7 @@ static bool emitImmediateConstant(BytecodeChunk* chunk, int constant_index, int 
     Value* value = &chunk->constants[constant_index];
     switch (value->type) {
         case TYPE_INTEGER: {
-            long long iv = value->i_val;
+            long long iv = VAL_INT(*value);
             if (iv == 0) {
                 writeBytecodeChunk(chunk, CONST_0, line);
                 return true;
@@ -1934,7 +1934,7 @@ static bool emitImmediateConstant(BytecodeChunk* chunk, int constant_index, int 
             break;
         }
         case TYPE_BOOLEAN:
-            writeBytecodeChunk(chunk, value->i_val ? CONST_TRUE : CONST_FALSE, line);
+            writeBytecodeChunk(chunk, VAL_INT(*value) ? CONST_TRUE : CONST_FALSE, line);
             return true;
         default:
             break;
@@ -5062,17 +5062,17 @@ static bool compileTimeValueToUtf8(const Value *value, const char **out_text, ch
     }
     *out_text = NULL;
     if (isPascalStringType(value->type)) {
-        *out_text = value->s_val ? value->s_val : "";
+        *out_text = AS_STRING(*value) ? AS_STRING(*value) : "";
         return true;
     }
-    if (value->type == TYPE_CHAR) {
-        encoded[0] = (char)value->c_val;
+    if (VALUE_TYPE(*value) == TYPE_CHAR) {
+        encoded[0] = (char)AS_CHAR(*value);
         encoded[1] = '\0';
         *out_text = encoded;
         return true;
     }
-    if (value->type == TYPE_WIDECHAR) {
-        encodeUtf8Codepoint((uint32_t)value->c_val, encoded);
+    if (VALUE_TYPE(*value) == TYPE_WIDECHAR) {
+        encodeUtf8Codepoint((uint32_t)AS_CHAR(*value), encoded);
         *out_text = encoded;
         return true;
     }
@@ -5103,8 +5103,8 @@ static Value foldCompileTimeStringConcat(const Value *left_val, const Value *rig
     combined[left_len + right_len] = '\0';
 
     bool result_unicode =
-        left_val->type == TYPE_UNICODE_STRING || right_val->type == TYPE_UNICODE_STRING ||
-        left_val->type == TYPE_WIDECHAR || right_val->type == TYPE_WIDECHAR;
+        VALUE_TYPE(*left_val) == TYPE_UNICODE_STRING || VALUE_TYPE(*right_val) == TYPE_UNICODE_STRING ||
+        VALUE_TYPE(*left_val) == TYPE_WIDECHAR || VALUE_TYPE(*right_val) == TYPE_WIDECHAR;
     Value result = result_unicode
         ? makeUnicodeStringLen(combined, left_len + right_len)
         : makeStringLen(combined, left_len + right_len);
@@ -5216,8 +5216,8 @@ Value evaluateCompileTimeValue(AST* node) {
                         }
                     } else if (strcasecmp(funcName, "chr") == 0 && node->child_count == 1) {
                         Value arg = evaluateCompileTimeValue(node->children[0]);
-                        if (arg.type == TYPE_INTEGER) {
-                            long long code = arg.i_val;
+                        if (VALUE_TYPE(arg) == TYPE_INTEGER) {
+                            long long code = VAL_INT(arg);
                             if (code >= 0 && code <= PASCAL_CHAR_MAX) {
                                 Value result = makeChar((int)code);
                                 freeValue(&arg);
@@ -5228,15 +5228,15 @@ Value evaluateCompileTimeValue(AST* node) {
                     } else if (strcasecmp(funcName, "ord") == 0 && node->child_count == 1) {
                         Value arg = evaluateCompileTimeValue(node->children[0]);
                         Value result = makeVoid();
-                        if (arg.type == TYPE_CHAR || arg.type == TYPE_WIDECHAR) {
-                            result = makeInt(arg.c_val);
-                        } else if (arg.type == TYPE_BOOLEAN) {
-                            result = makeInt(arg.i_val ? 1 : 0);
-                        } else if (arg.type == TYPE_ENUM) {
-                            result = makeInt(arg.enum_val.ordinal);
+                        if (VALUE_TYPE(arg) == TYPE_CHAR || VALUE_TYPE(arg) == TYPE_WIDECHAR) {
+                            result = makeInt(AS_CHAR(arg));
+                        } else if (VALUE_TYPE(arg) == TYPE_BOOLEAN) {
+                            result = makeInt(VAL_INT(arg) ? 1 : 0);
+                        } else if (VALUE_TYPE(arg) == TYPE_ENUM) {
+                            result = makeInt(AS_ENUM(arg).ordinal);
                         }
                         freeValue(&arg);
-                        if (result.type != TYPE_VOID) return result;
+                        if (VALUE_TYPE(result) != TYPE_VOID) return result;
                     }
                 }
             }
@@ -5247,8 +5247,8 @@ Value evaluateCompileTimeValue(AST* node) {
                 Value left_val = evaluateCompileTimeValue(node->left);
                 Value right_val = evaluateCompileTimeValue(node->right);
 
-                if (left_val.type == TYPE_VOID || left_val.type == TYPE_UNKNOWN ||
-                    right_val.type == TYPE_VOID || right_val.type == TYPE_UNKNOWN) {
+                if (VALUE_TYPE(left_val) == TYPE_VOID || VALUE_TYPE(left_val) == TYPE_UNKNOWN ||
+                    VALUE_TYPE(right_val) == TYPE_VOID || VALUE_TYPE(right_val) == TYPE_UNKNOWN) {
                     freeValue(&left_val);
                     freeValue(&right_val);
                     return makeVoid();
@@ -5296,8 +5296,8 @@ Value evaluateCompileTimeValue(AST* node) {
                 } else if (left_is_real || right_is_real) {
                     fprintf(stderr, "Compile-time Error: Mixing real and integer in constant expression.\n");
                 } else { // Both operands are integers
-                    long long a = left_val.i_val;
-                    long long b = right_val.i_val;
+                    long long a = VAL_INT(left_val);
+                    long long b = VAL_INT(right_val);
                     switch (node->token->type) {
                         case TOKEN_PLUS:
                             result = makeInt(a + b);
@@ -5342,7 +5342,7 @@ Value evaluateCompileTimeValue(AST* node) {
         case AST_UNARY_OP:
             if (node->left && node->token) {
                 Value operand_val = evaluateCompileTimeValue(node->left);
-                if (operand_val.type == TYPE_VOID || operand_val.type == TYPE_UNKNOWN) {
+                if (VALUE_TYPE(operand_val) == TYPE_VOID || VALUE_TYPE(operand_val) == TYPE_UNKNOWN) {
                     freeValue(&operand_val);
                     return makeVoid();
                 }
@@ -5353,7 +5353,7 @@ Value evaluateCompileTimeValue(AST* node) {
                         // whole integer family here, not just TYPE_INTEGER — otherwise
                         // `-5` in a compile-time context (e.g. an array literal element)
                         // falls through to makeVoid().
-                        operand_val.i_val = -operand_val.i_val;
+                        VAL_INT(operand_val) = -VAL_INT(operand_val);
                         return operand_val; // Return the modified value
                     } else if (isRealType(operand_val.type)) {
                         double tmp = -(double)AS_REAL(operand_val);
@@ -5495,7 +5495,7 @@ static bool isValidConstArrayBase(AST* expr) {
 static bool valueToOrdinal(const Value* value, long long* out) {
     if (!value || !out) return false;
     if (isIntlikeType(value->type)) {
-        *out = value->i_val;
+        *out = VAL_INT(*value);
         return true;
     }
     if (isRealType(value->type)) {
@@ -5506,16 +5506,16 @@ static bool valueToOrdinal(const Value* value, long long* out) {
             return true;
         }
     }
-    if (value->type == TYPE_CHAR) {
-        *out = (unsigned char)value->c_val;
+    if (VALUE_TYPE(*value) == TYPE_CHAR) {
+        *out = (unsigned char)AS_CHAR(*value);
         return true;
     }
-    if (value->type == TYPE_BOOLEAN) {
-        *out = value->i_val ? 1 : 0;
+    if (VALUE_TYPE(*value) == TYPE_BOOLEAN) {
+        *out = VAL_INT(*value) ? 1 : 0;
         return true;
     }
-    if (value->type == TYPE_ENUM) {
-        *out = value->enum_val.ordinal;
+    if (VALUE_TYPE(*value) == TYPE_ENUM) {
+        *out = AS_ENUM(*value).ordinal;
         return true;
     }
     return false;
@@ -6451,13 +6451,13 @@ static void applyPeepholeOptimizations(BytecodeChunk* chunk) {
                     builtin_name_idx < chunk->constants_count &&
                     constant_index < chunk->constants_count) {
                     Value* builtin_name_val = &chunk->constants[builtin_name_idx];
-                    if (builtin_name_val->type == TYPE_STRING &&
-                        builtin_name_val->s_val &&
-                        strcasecmp(builtin_name_val->s_val, "byte") == 0) {
+                    if (VALUE_TYPE(*builtin_name_val) == TYPE_STRING &&
+                        AS_STRING(*builtin_name_val) &&
+                        strcasecmp(AS_STRING(*builtin_name_val), "byte") == 0) {
                         Value const_val = chunk->constants[constant_index];
                         if (isIntlikeType(const_val.type) &&
-                            const_val.type != TYPE_BOOLEAN &&
-                            const_val.type != TYPE_CHAR) {
+                            VALUE_TYPE(const_val) != TYPE_BOOLEAN &&
+                            VALUE_TYPE(const_val) != TYPE_CHAR) {
                             long long iv = AS_INTEGER(const_val);
                             if (iv >= 0 && iv <= 255) {
                                 int replacement_start = write_index;
@@ -6741,18 +6741,17 @@ static void applyPeepholeOptimizations(BytecodeChunk* chunk) {
         int element_index = address_constant_entries[i].element_index;
         if (element_index >= 0) {
             Value* array_const = &chunk->constants[const_index];
-            if (array_const->type == TYPE_ARRAY && array_const->array_val) {
+            if (VALUE_TYPE(*array_const) == TYPE_ARRAY && AS_ARRAY(*array_const)) {
                 int total = calculateArrayTotalSize(array_const);
                 if (element_index >= 0 && element_index < total) {
-                    Value* elem = &array_const->array_val[element_index];
+                    Value* elem = &AS_ARRAY(*array_const)[element_index];
                     SET_INT_VALUE(elem, mapped);
-                    elem->type = TYPE_INT32;
+                    SET_VALUE_TYPE(elem, TYPE_INT32);
                 }
             }
         } else {
             Value* val = &chunk->constants[const_index];
-            val->i_val = (long long)mapped;
-            val->u_val = (unsigned long long)mapped;
+            SET_INT_VALUE(val, (long long)mapped);
         }
     }
     abort_optimizations = false;
@@ -7243,8 +7242,8 @@ static void compileNode(AST* node, BytecodeChunk* chunk, int current_line_approx
                         int len = 0;
                         if (actual_type_def_node->right) {
                             Value len_val = evaluateCompileTimeValue(actual_type_def_node->right);
-                            if (len_val.type == TYPE_INTEGER) {
-                                len = (int)len_val.i_val;
+                            if (VALUE_TYPE(len_val) == TYPE_INTEGER) {
+                                len = (int)VAL_INT(len_val);
                                 if (len < 0 || len > 255) {
                                     fprintf(stderr, "L%d: Compiler error: Fixed string length out of range (0-255).\n", getLine(varNameNode));
                                     compiler_had_error = true;
@@ -7434,7 +7433,7 @@ static void compileNode(AST* node, BytecodeChunk* chunk, int current_line_approx
                 const_val = evaluateCompileTimeValue(node->left);
             }
 
-            if (const_val.type == TYPE_VOID || const_val.type == TYPE_UNKNOWN) {
+            if (VALUE_TYPE(const_val) == TYPE_VOID || VALUE_TYPE(const_val) == TYPE_UNKNOWN) {
                 fprintf(stderr, "L%d: Constant '%s' must be compile-time evaluable.\n", line, node->token->value);
                 compiler_had_error = true;
                 freeValue(&const_val);
@@ -7669,8 +7668,8 @@ static void compileDefinedFunction(AST* func_decl_node, BytecodeChunk* chunk, in
                 proc_symbol->type_def = copyAST(func_decl_node);
                 Value *v = (Value *)calloc(1, sizeof(Value));
                 if (v) {
-                    v->type = TYPE_POINTER;
-                    v->ptr_val = (Value *)func_decl_node;
+                    SET_VALUE_TYPE(v, TYPE_POINTER);
+                    AS_POINTER(*v) = (Value *)func_decl_node;
                     proc_symbol->value = v;
                 }
                 hashTableInsert(procedure_table, proc_symbol);
@@ -11524,14 +11523,14 @@ void finalizeBytecode(BytecodeChunk* chunk) {
                 }
 
                 Value name_val = chunk->constants[name_index];
-                if (name_val.type != TYPE_STRING) {
+                if (VALUE_TYPE(name_val) != TYPE_STRING) {
                     fprintf(stderr, "Compiler Error: Constant at index %d is not a string for CALL.\n", name_index);
                     compiler_had_error = true;
                     offset += 6; // Skip
                     continue;
                 }
 
-                const char* proc_name = name_val.s_val;
+                const char* proc_name = AS_STRING(name_val);
 
                 // The procedure table stores all routine names in lowercase.
                 // Convert the looked-up name to lowercase before searching.

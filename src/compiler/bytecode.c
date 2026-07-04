@@ -151,8 +151,8 @@ void writeBytecodeChunk(BytecodeChunk* chunk, uint8_t byte, int line) { // From 
 int addConstantToChunk(BytecodeChunk* chunk, const Value* value) {
 #ifdef DEBUG
     fprintf(stderr, "[DEBUG addConstantToChunk] ENTER. Adding value type %s. chunk ptr: %p\n", varTypeToString(value->type), (void*)chunk);
-    if (value->type == TYPE_STRING) {
-        fprintf(stderr, "[DEBUG addConstantToChunk] String value to add: '%s'\n", value->s_val ? value->s_val : "NULL_SVAL");
+    if (VALUE_TYPE(*value) == TYPE_STRING) {
+        fprintf(stderr, "[DEBUG addConstantToChunk] String value to add: '%s'\n", AS_STRING(*value) ? AS_STRING(*value) : "NULL_SVAL");
     }
     fflush(stderr);
 #endif
@@ -161,10 +161,10 @@ int addConstantToChunk(BytecodeChunk* chunk, const Value* value) {
     for (int i = 0; i < chunk->constants_count; i++) {
         Value* existing = &chunk->constants[i];
         if (existing->type == value->type) {
-            if (existing->type == TYPE_INTEGER && existing->i_val == value->i_val) return i;
+            if (VALUE_TYPE(*existing) == TYPE_INTEGER && VAL_INT(*existing) == VAL_INT(*value)) return i;
             if (isRealType(existing->type) && AS_REAL(*existing) == AS_REAL(*value)) return i;
-            if (existing->type == TYPE_STRING && existing->s_val && value->s_val && strcmp(existing->s_val, value->s_val) == 0) return i;
-            if (existing->type == TYPE_CHAR && existing->c_val == value->c_val) return i;
+            if (VALUE_TYPE(*existing) == TYPE_STRING && AS_STRING(*existing) && AS_STRING(*value) && strcmp(AS_STRING(*existing), AS_STRING(*value)) == 0) return i;
+            if (VALUE_TYPE(*existing) == TYPE_CHAR && AS_CHAR(*existing) == AS_CHAR(*value)) return i;
         }
     }
 
@@ -508,7 +508,7 @@ static void printConstantValue(const Value* value) {
 
     switch (value->type) {
         case TYPE_INTEGER:
-            fprintf(stderr, "%lld", value->i_val);
+            fprintf(stderr, "%lld", VAL_INT(*value));
             break;
         case TYPE_FLOAT:
         case TYPE_DOUBLE:
@@ -517,31 +517,31 @@ static void printConstantValue(const Value* value) {
             break;
         case TYPE_STRING:
         case TYPE_UNICODE_STRING:
-            if (value->s_val) {
-                printEscapedString(value->s_val);
+            if (AS_STRING(*value)) {
+                printEscapedString(AS_STRING(*value));
             } else {
                 fprintf(stderr, "NULL_STR");
             }
             break;
         case TYPE_CHAR:
-            printEscapedChar(value->c_val);
+            printEscapedChar(AS_CHAR(*value));
             break;
         case TYPE_BOOLEAN:
-            fprintf(stderr, "%s", value->i_val ? "true" : "false");
+            fprintf(stderr, "%s", VAL_INT(*value) ? "true" : "false");
             break;
         case TYPE_NIL:
             fprintf(stderr, "nil");
             break;
         case TYPE_CLOSURE: {
-            fprintf(stderr, "closure(entry=%u", value->closure.entry_offset);
-            if (value->closure.symbol && value->closure.symbol->name) {
-                fprintf(stderr, ", symbol=%s", value->closure.symbol->name);
+            fprintf(stderr, "closure(entry=%u", AS_CLOSURE(*value).entry_offset);
+            if (AS_CLOSURE(*value).symbol && AS_CLOSURE(*value).symbol->name) {
+                fprintf(stderr, ", symbol=%s", AS_CLOSURE(*value).symbol->name);
             }
-            if (value->closure.env) {
+            if (AS_CLOSURE(*value).env) {
                 fprintf(stderr, ", env=%p, slots=%u, ref=%u)",
-                        (void*)value->closure.env,
-                        (unsigned)value->closure.env->slot_count,
-                        (unsigned)value->closure.env->refcount);
+                        (void*)AS_CLOSURE(*value).env,
+                        (unsigned)AS_CLOSURE(*value).env->slot_count,
+                        (unsigned)AS_CLOSURE(*value).env->refcount);
             } else {
                 fprintf(stderr, ", env=NULL)");
             }
@@ -673,8 +673,8 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
             uint8_t name_idx = chunk->code[offset + 1];
             VarType declaredType = (VarType)chunk->code[offset + 2];
             fprintf(stderr, "%-16s NameIdx:%-3d ", "DEFINE_GLOBAL", name_idx);
-            if (name_idx < chunk->constants_count && chunk->constants[name_idx].type == TYPE_STRING) {
-                fprintf(stderr, "'%s' ", chunk->constants[name_idx].s_val);
+            if (name_idx < chunk->constants_count && VALUE_TYPE(chunk->constants[name_idx]) == TYPE_STRING) {
+                fprintf(stderr, "'%s' ", AS_STRING(chunk->constants[name_idx]));
             } else {
                 fprintf(stderr, "INVALID_NAME_IDX ");
             }
@@ -690,7 +690,7 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
                             current_offset += 2;
                             uint16_t upper_idx = (uint16_t)((chunk->code[current_offset] << 8) | chunk->code[current_offset + 1]);
                             current_offset += 2;
-                            fprintf(stderr, "%lld..%lld%s", chunk->constants[lower_idx].i_val, chunk->constants[upper_idx].i_val,
+                            fprintf(stderr, "%lld..%lld%s", VAL_INT(chunk->constants[lower_idx]), VAL_INT(chunk->constants[upper_idx]),
                                    (i == dimension_count - 1) ? "" : ", ");
                         }
                     }
@@ -703,8 +703,8 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
                                 (uint16_t)((chunk->code[current_offset] << 8) | chunk->code[current_offset + 1]);
                             current_offset += 2;
                             if (elem_name_idx < chunk->constants_count &&
-                                chunk->constants[elem_name_idx].type == TYPE_STRING) {
-                                fprintf(stderr, "('%s')", chunk->constants[elem_name_idx].s_val);
+                                VALUE_TYPE(chunk->constants[elem_name_idx]) == TYPE_STRING) {
+                                fprintf(stderr, "('%s')", AS_STRING(chunk->constants[elem_name_idx]));
                             }
                         }
                     }
@@ -715,15 +715,15 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
                         (uint16_t)((chunk->code[current_offset] << 8) | chunk->code[current_offset + 1]);
                     current_offset += 2;
                     if (type_name_idx > 0 && type_name_idx < chunk->constants_count &&
-                        chunk->constants[type_name_idx].type == TYPE_STRING) {
-                        fprintf(stderr, "('%s')", chunk->constants[type_name_idx].s_val);
+                        VALUE_TYPE(chunk->constants[type_name_idx]) == TYPE_STRING) {
+                        fprintf(stderr, "('%s')", AS_STRING(chunk->constants[type_name_idx]));
                     }
                     if (declaredType == TYPE_STRING && current_offset + 1 < chunk->count) {
                         uint16_t len_idx =
                             (uint16_t)((chunk->code[current_offset] << 8) | chunk->code[current_offset + 1]);
                         current_offset += 2;
-                        if (len_idx < chunk->constants_count && chunk->constants[len_idx].type == TYPE_INTEGER) {
-                            fprintf(stderr, " len=%lld", chunk->constants[len_idx].i_val);
+                        if (len_idx < chunk->constants_count && VALUE_TYPE(chunk->constants[len_idx]) == TYPE_INTEGER) {
+                            fprintf(stderr, " len=%lld", VAL_INT(chunk->constants[len_idx]));
                         }
                     } else if (declaredType == TYPE_FILE && current_offset + 2 < chunk->count) {
                         VarType elem_type = (VarType)chunk->code[current_offset++];
@@ -732,8 +732,8 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
                         current_offset += 2;
                         fprintf(stderr, " elem=%s", varTypeToString(elem_type));
                         if (elem_name_idx != 0xFFFF && elem_name_idx < chunk->constants_count &&
-                            chunk->constants[elem_name_idx].type == TYPE_STRING) {
-                            fprintf(stderr, " ('%s')", chunk->constants[elem_name_idx].s_val);
+                            VALUE_TYPE(chunk->constants[elem_name_idx]) == TYPE_STRING) {
+                            fprintf(stderr, " ('%s')", AS_STRING(chunk->constants[elem_name_idx]));
                         }
                     }
                 }
@@ -746,8 +746,8 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
             uint16_t name_idx = (uint16_t)((chunk->code[offset + 1] << 8) | chunk->code[offset + 2]);
             VarType declaredType = (VarType)chunk->code[offset + 3];
             fprintf(stderr, "%-16s NameIdx:%-3d ", "DEFINE_GLOBAL16", name_idx);
-            if (name_idx < chunk->constants_count && chunk->constants[name_idx].type == TYPE_STRING) {
-                fprintf(stderr, "'%s' ", chunk->constants[name_idx].s_val);
+            if (name_idx < chunk->constants_count && VALUE_TYPE(chunk->constants[name_idx]) == TYPE_STRING) {
+                fprintf(stderr, "'%s' ", AS_STRING(chunk->constants[name_idx]));
             } else {
                 fprintf(stderr, "INVALID_NAME_IDX ");
             }
@@ -763,7 +763,7 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
                             current_offset += 2;
                             uint16_t upper_idx = (uint16_t)((chunk->code[current_offset] << 8) | chunk->code[current_offset + 1]);
                             current_offset += 2;
-                            fprintf(stderr, "%lld..%lld%s", chunk->constants[lower_idx].i_val, chunk->constants[upper_idx].i_val,
+                            fprintf(stderr, "%lld..%lld%s", VAL_INT(chunk->constants[lower_idx]), VAL_INT(chunk->constants[upper_idx]),
                                    (i == dimension_count - 1) ? "" : ", ");
                         }
                     }
@@ -776,8 +776,8 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
                                 (uint16_t)((chunk->code[current_offset] << 8) | chunk->code[current_offset + 1]);
                             current_offset += 2;
                             if (elem_name_idx < chunk->constants_count &&
-                                chunk->constants[elem_name_idx].type == TYPE_STRING) {
-                                fprintf(stderr, "('%s')", chunk->constants[elem_name_idx].s_val);
+                                VALUE_TYPE(chunk->constants[elem_name_idx]) == TYPE_STRING) {
+                                fprintf(stderr, "('%s')", AS_STRING(chunk->constants[elem_name_idx]));
                             }
                         }
                     }
@@ -788,15 +788,15 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
                         (uint16_t)((chunk->code[current_offset] << 8) | chunk->code[current_offset + 1]);
                     current_offset += 2;
                     if (type_name_idx > 0 && type_name_idx < chunk->constants_count &&
-                        chunk->constants[type_name_idx].type == TYPE_STRING) {
-                        fprintf(stderr, "('%s')", chunk->constants[type_name_idx].s_val);
+                        VALUE_TYPE(chunk->constants[type_name_idx]) == TYPE_STRING) {
+                        fprintf(stderr, "('%s')", AS_STRING(chunk->constants[type_name_idx]));
                     }
                     if (declaredType == TYPE_STRING && current_offset + 1 < chunk->count) {
                         uint16_t len_idx =
                             (uint16_t)((chunk->code[current_offset] << 8) | chunk->code[current_offset + 1]);
                         current_offset += 2;
-                        if (len_idx < chunk->constants_count && chunk->constants[len_idx].type == TYPE_INTEGER) {
-                            fprintf(stderr, " len=%lld", chunk->constants[len_idx].i_val);
+                        if (len_idx < chunk->constants_count && VALUE_TYPE(chunk->constants[len_idx]) == TYPE_INTEGER) {
+                            fprintf(stderr, " len=%lld", VAL_INT(chunk->constants[len_idx]));
                         }
                     }
                 }
@@ -807,9 +807,9 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
         case GET_GLOBAL: {
             uint8_t name_index = chunk->code[offset + 1];
             const char* name = (name_index < chunk->constants_count &&
-                                chunk->constants[name_index].type == TYPE_STRING &&
-                                chunk->constants[name_index].s_val)
-                                   ? chunk->constants[name_index].s_val
+                                VALUE_TYPE(chunk->constants[name_index]) == TYPE_STRING &&
+                                AS_STRING(chunk->constants[name_index]))
+                                   ? AS_STRING(chunk->constants[name_index])
                                    : "<invalid>";
             uintptr_t cached = readInlineCachePtr(chunk, offset + 2);
             char cache_buffer[32];
@@ -821,9 +821,9 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
         case SET_GLOBAL: {
             uint8_t name_index = chunk->code[offset + 1];
             const char* name = (name_index < chunk->constants_count &&
-                                chunk->constants[name_index].type == TYPE_STRING &&
-                                chunk->constants[name_index].s_val)
-                                   ? chunk->constants[name_index].s_val
+                                VALUE_TYPE(chunk->constants[name_index]) == TYPE_STRING &&
+                                AS_STRING(chunk->constants[name_index]))
+                                   ? AS_STRING(chunk->constants[name_index])
                                    : "<invalid>";
             uintptr_t cached = readInlineCachePtr(chunk, offset + 2);
             char cache_buffer[32];
@@ -858,9 +858,9 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
         case GET_GLOBAL16: {
             uint16_t name_index = (uint16_t)((chunk->code[offset + 1] << 8) | chunk->code[offset + 2]);
             const char* name = (name_index < chunk->constants_count &&
-                                chunk->constants[name_index].type == TYPE_STRING &&
-                                chunk->constants[name_index].s_val)
-                                   ? chunk->constants[name_index].s_val
+                                VALUE_TYPE(chunk->constants[name_index]) == TYPE_STRING &&
+                                AS_STRING(chunk->constants[name_index]))
+                                   ? AS_STRING(chunk->constants[name_index])
                                    : "<invalid>";
             uintptr_t cached = readInlineCachePtr(chunk, offset + 3);
             char cache_buffer[32];
@@ -872,9 +872,9 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
         case SET_GLOBAL16: {
             uint16_t name_index = (uint16_t)((chunk->code[offset + 1] << 8) | chunk->code[offset + 2]);
             const char* name = (name_index < chunk->constants_count &&
-                                chunk->constants[name_index].type == TYPE_STRING &&
-                                chunk->constants[name_index].s_val)
-                                   ? chunk->constants[name_index].s_val
+                                VALUE_TYPE(chunk->constants[name_index]) == TYPE_STRING &&
+                                AS_STRING(chunk->constants[name_index]))
+                                   ? AS_STRING(chunk->constants[name_index])
                                    : "<invalid>";
             uintptr_t cached = readInlineCachePtr(chunk, offset + 3);
             char cache_buffer[32];
@@ -956,9 +956,9 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
                     current_offset += 2;
                     if (elem_name_idx != 0xFFFF &&
                         elem_name_idx < chunk->constants_count &&
-                        chunk->constants[elem_name_idx].type == TYPE_STRING &&
-                        chunk->constants[elem_name_idx].s_val) {
-                        fprintf(stderr, " ('%s')", chunk->constants[elem_name_idx].s_val);
+                        VALUE_TYPE(chunk->constants[elem_name_idx]) == TYPE_STRING &&
+                        AS_STRING(chunk->constants[elem_name_idx])) {
+                        fprintf(stderr, " ('%s')", AS_STRING(chunk->constants[elem_name_idx]));
                     } else if (elem_name_idx != 0xFFFF) {
                         fprintf(stderr, " idx=%u", elem_name_idx);
                     }
@@ -982,9 +982,9 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
                     current_offset += 2;
                     if (elem_name_idx != 0xFFFF &&
                         elem_name_idx < chunk->constants_count &&
-                        chunk->constants[elem_name_idx].type == TYPE_STRING &&
-                        chunk->constants[elem_name_idx].s_val) {
-                        fprintf(stderr, " ('%s')", chunk->constants[elem_name_idx].s_val);
+                        VALUE_TYPE(chunk->constants[elem_name_idx]) == TYPE_STRING &&
+                        AS_STRING(chunk->constants[elem_name_idx])) {
+                        fprintf(stderr, " ('%s')", AS_STRING(chunk->constants[elem_name_idx]));
                     } else if (elem_name_idx != 0xFFFF) {
                         fprintf(stderr, " idx=%u", elem_name_idx);
                     }
@@ -1000,9 +1000,9 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
             fprintf(stderr, "%-16s %4d (slot) %-8s", "INIT_LOCAL_FILE", slot, varTypeToString(elem_type));
             if (name_idx != 0xFFFF) {
                 fprintf(stderr, " idx=%u", name_idx);
-                if (name_idx < chunk->constants_count && chunk->constants[name_idx].type == TYPE_STRING &&
-                    chunk->constants[name_idx].s_val) {
-                    fprintf(stderr, " '%s'", chunk->constants[name_idx].s_val);
+                if (name_idx < chunk->constants_count && VALUE_TYPE(chunk->constants[name_idx]) == TYPE_STRING &&
+                    AS_STRING(chunk->constants[name_idx])) {
+                    fprintf(stderr, " '%s'", AS_STRING(chunk->constants[name_idx]));
                 }
             }
             fprintf(stderr, "\n");
@@ -1019,8 +1019,8 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
             uint16_t name_idx = (uint16_t)(chunk->code[offset + 2] << 8) | chunk->code[offset + 3];
             fprintf(stderr, "%-16s %4d (slot) %4d", "INIT_LOCAL_POINTER", slot, name_idx);
             if (name_idx < chunk->constants_count &&
-                chunk->constants[name_idx].type == TYPE_STRING) {
-                fprintf(stderr, " '%s'", chunk->constants[name_idx].s_val);
+                VALUE_TYPE(chunk->constants[name_idx]) == TYPE_STRING) {
+                fprintf(stderr, " '%s'", AS_STRING(chunk->constants[name_idx]));
             }
             fprintf(stderr, "\n");
             return offset + 4;
@@ -1039,7 +1039,7 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
             uint8_t const_idx = chunk->code[offset + 1];
             fprintf(stderr, "%-16s %4d ", "GET_FIELD_ADDRESS", const_idx);
             if (const_idx < chunk->constants_count &&
-                chunk->constants[const_idx].type == TYPE_STRING) {
+                VALUE_TYPE(chunk->constants[const_idx]) == TYPE_STRING) {
                 fprintf(stderr, "'%s'\n", AS_STRING(chunk->constants[const_idx]));
             } else {
                 fprintf(stderr, "<INVALID FIELD CONST>\n");
@@ -1050,7 +1050,7 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
             uint8_t const_idx = chunk->code[offset + 1];
             fprintf(stderr, "%-16s %4d ", "GET_FIELD_ADDRESS_KEEP", const_idx);
             if (const_idx < chunk->constants_count &&
-                chunk->constants[const_idx].type == TYPE_STRING) {
+                VALUE_TYPE(chunk->constants[const_idx]) == TYPE_STRING) {
                 fprintf(stderr, "'%s'\n", AS_STRING(chunk->constants[const_idx]));
             } else {
                 fprintf(stderr, "<INVALID FIELD CONST>\n");
@@ -1062,7 +1062,7 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
                                  chunk->code[offset + 2];
             fprintf(stderr, "%-16s %4d ", "GET_FIELD_ADDRESS16", const_idx);
             if (const_idx < chunk->constants_count &&
-                chunk->constants[const_idx].type == TYPE_STRING) {
+                VALUE_TYPE(chunk->constants[const_idx]) == TYPE_STRING) {
                 fprintf(stderr, "'%s'\n", AS_STRING(chunk->constants[const_idx]));
             } else {
                 fprintf(stderr, "<INVALID FIELD CONST>\n");
@@ -1074,7 +1074,7 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
                                  chunk->code[offset + 2];
             fprintf(stderr, "%-16s %4d ", "GET_FIELD_ADDRESS_KEEP16", const_idx);
             if (const_idx < chunk->constants_count &&
-                chunk->constants[const_idx].type == TYPE_STRING) {
+                VALUE_TYPE(chunk->constants[const_idx]) == TYPE_STRING) {
                 fprintf(stderr, "'%s'\n", AS_STRING(chunk->constants[const_idx]));
             } else {
                 fprintf(stderr, "<INVALID FIELD CONST>\n");
@@ -1085,7 +1085,7 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
             uint8_t const_idx = chunk->code[offset + 1];
             fprintf(stderr, "%-16s %4d ", "LOAD_FIELD_VALUE_BY_NAME", const_idx);
             if (const_idx < chunk->constants_count &&
-                chunk->constants[const_idx].type == TYPE_STRING) {
+                VALUE_TYPE(chunk->constants[const_idx]) == TYPE_STRING) {
                 fprintf(stderr, "'%s'\n", AS_STRING(chunk->constants[const_idx]));
             } else {
                 fprintf(stderr, "<INVALID FIELD CONST>\n");
@@ -1097,7 +1097,7 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
                                  chunk->code[offset + 2];
             fprintf(stderr, "%-16s %4d ", "LOAD_FIELD_VALUE_BY_NAME16", const_idx);
             if (const_idx < chunk->constants_count &&
-                chunk->constants[const_idx].type == TYPE_STRING) {
+                VALUE_TYPE(chunk->constants[const_idx]) == TYPE_STRING) {
                 fprintf(stderr, "'%s'\n", AS_STRING(chunk->constants[const_idx]));
             } else {
                 fprintf(stderr, "<INVALID FIELD CONST>\n");
@@ -1191,14 +1191,14 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
             uint8_t arg_count = chunk->code[offset + 3];
             const char* name = "<INVALID>";
             if (name_index < chunk->constants_count &&
-                chunk->constants[name_index].type == TYPE_STRING &&
+                VALUE_TYPE(chunk->constants[name_index]) == TYPE_STRING &&
                 AS_STRING(chunk->constants[name_index])) {
                 name = AS_STRING(chunk->constants[name_index]);
             }
             const char* lower_name = NULL;
             int lower_idx = getBuiltinLowercaseIndex(chunk, (int)name_index);
             if (lower_idx >= 0 && lower_idx < chunk->constants_count &&
-                chunk->constants[lower_idx].type == TYPE_STRING &&
+                VALUE_TYPE(chunk->constants[lower_idx]) == TYPE_STRING &&
                 AS_STRING(chunk->constants[lower_idx])) {
                 lower_name = AS_STRING(chunk->constants[lower_idx]);
             }
@@ -1221,7 +1221,7 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
             uint8_t arg_count = chunk->code[offset + 5];
             const char* name = NULL;
             if (name_index < chunk->constants_count &&
-                chunk->constants[name_index].type == TYPE_STRING &&
+                VALUE_TYPE(chunk->constants[name_index]) == TYPE_STRING &&
                 AS_STRING(chunk->constants[name_index])) {
                 name = AS_STRING(chunk->constants[name_index]);
             }
@@ -1239,7 +1239,7 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
             uint8_t arg_count = chunk->code[offset + 3];
             const char* name = NULL;
             if (name_index < chunk->constants_count &&
-                chunk->constants[name_index].type == TYPE_STRING &&
+                VALUE_TYPE(chunk->constants[name_index]) == TYPE_STRING &&
                 AS_STRING(chunk->constants[name_index])) {
                 name = AS_STRING(chunk->constants[name_index]);
             }
@@ -1285,7 +1285,7 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
             uint8_t declared_arity = chunk->code[offset + 5];
             const char* targetProcName = "<INVALID>";
             if (name_index < chunk->constants_count &&
-                chunk->constants[name_index].type == TYPE_STRING &&
+                VALUE_TYPE(chunk->constants[name_index]) == TYPE_STRING &&
                 AS_STRING(chunk->constants[name_index])) {
                 targetProcName = AS_STRING(chunk->constants[name_index]);
             }
@@ -1382,7 +1382,7 @@ void disassembleBytecodeChunk(BytecodeChunk* chunk, const char* name, HashTable*
             Value constantValue = chunk->constants[i];
             switch(constantValue.type) {
                 case TYPE_INTEGER:
-                    fprintf(stderr, "INT   %lld\n", constantValue.i_val);
+                    fprintf(stderr, "INT   %lld\n", VAL_INT(constantValue));
                     break;
                 case TYPE_FLOAT:
                 case TYPE_DOUBLE:
@@ -1392,19 +1392,19 @@ void disassembleBytecodeChunk(BytecodeChunk* chunk, const char* name, HashTable*
                 case TYPE_STRING:
                 case TYPE_UNICODE_STRING:
                     fprintf(stderr, "STR   \"");
-                    if (constantValue.s_val) {
-                        printEscapedString(constantValue.s_val);
+                    if (AS_STRING(constantValue)) {
+                        printEscapedString(AS_STRING(constantValue));
                     } else {
                     fprintf(stderr, "NULL_STR");
                     }
                     fprintf(stderr, "\"");
                     int lower_idx = getBuiltinLowercaseIndex(chunk, i);
                     if (lower_idx >= 0 && lower_idx < chunk->constants_count &&
-                        chunk->constants[lower_idx].type == TYPE_STRING &&
-                        chunk->constants[lower_idx].s_val &&
-                        (!constantValue.s_val || strcmp(constantValue.s_val, chunk->constants[lower_idx].s_val) != 0)) {
+                        VALUE_TYPE(chunk->constants[lower_idx]) == TYPE_STRING &&
+                        AS_STRING(chunk->constants[lower_idx]) &&
+                        (!AS_STRING(constantValue) || strcmp(AS_STRING(constantValue), AS_STRING(chunk->constants[lower_idx])) != 0)) {
                         fprintf(stderr, " (lower -> %04d: \"", lower_idx);
-                        printEscapedString(chunk->constants[lower_idx].s_val);
+                        printEscapedString(AS_STRING(chunk->constants[lower_idx]));
                         fprintf(stderr, "\"");
                     }
                     fprintf(stderr, "\n");
@@ -1412,11 +1412,11 @@ void disassembleBytecodeChunk(BytecodeChunk* chunk, const char* name, HashTable*
                 case TYPE_CHAR:
                 case TYPE_WIDECHAR:
                     fprintf(stderr, "CHAR  '");
-                    printEscapedChar(constantValue.c_val);
+                    printEscapedChar(AS_CHAR(constantValue));
                     fprintf(stderr, "'\n");
                     break;
                 case TYPE_BOOLEAN:
-                    fprintf(stderr, "BOOL  %s\n", constantValue.i_val ? "true" : "false");
+                    fprintf(stderr, "BOOL  %s\n", VAL_INT(constantValue) ? "true" : "false");
                     break;
                 case TYPE_CLOSURE:
                     fprintf(stderr, "CLOS  ");

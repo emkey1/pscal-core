@@ -487,16 +487,16 @@ bool pscalRuntimeVmIsSharedFileStream(FILE* stream) {
 #endif
 
 static void vmMaybeCloseFileValue(Value *file_value) {
-    if (!file_value || file_value->type != TYPE_FILE || !file_value->f_val) {
+    if (!file_value || VALUE_TYPE(*file_value) != TYPE_FILE || !AS_FILE(*file_value)) {
         return;
     }
-    FILE *fp = file_value->f_val;
+    FILE *fp = AS_FILE(*file_value);
     if (pscalRuntimeVmIsSharedFileStream(fp)) {
         fflush(fp);
     } else {
         fclose(fp);
     }
-    file_value->f_val = NULL;
+    AS_FILE(*file_value) = NULL;
 }
 
 #if defined(__APPLE__)
@@ -530,17 +530,17 @@ static bool vmShouldBypassTerminalControl(void) {
 static const Value* resolveStringPointerBuiltin(const Value* value) {
     const Value* current = value;
     int depth = 0;
-    while (current && current->type == TYPE_POINTER &&
+    while (current && VALUE_TYPE(*current) == TYPE_POINTER &&
            current->base_type_node != STRING_CHAR_PTR_SENTINEL &&
            current->base_type_node != SERIALIZED_CHAR_PTR_SENTINEL &&
            current->base_type_node != STRING_LENGTH_SENTINEL &&
            current->base_type_node != BYTE_ARRAY_PTR_SENTINEL &&
            current->base_type_node != SHELL_FUNCTION_PTR_SENTINEL &&
            current->base_type_node != OPAQUE_POINTER_SENTINEL) {
-        if (!current->ptr_val) {
+        if (!AS_POINTER(*current)) {
             return NULL;
         }
-        current = (const Value*)current->ptr_val;
+        current = (const Value*)AS_POINTER(*current);
         if (++depth > 16) {
             return NULL;
         }
@@ -550,14 +550,14 @@ static const Value* resolveStringPointerBuiltin(const Value* value) {
 
 static int builtinValueIsStringLike(const Value* value) {
     if (!value) return 0;
-    if (isPascalStringType(value->type)) return 1;
-    if (value->type == TYPE_POINTER) {
+    if (isPascalStringType(VALUE_TYPE(*value))) return 1;
+    if (VALUE_TYPE(*value) == TYPE_POINTER) {
         if (value->base_type_node == STRING_CHAR_PTR_SENTINEL ||
             value->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) return 1;
         const Value* resolved = resolveStringPointerBuiltin(value);
         if (!resolved) return 0;
-        if (isPascalStringType(resolved->type)) return 1;
-        if (resolved->type == TYPE_POINTER &&
+        if (isPascalStringType(VALUE_TYPE(*resolved))) return 1;
+        if (VALUE_TYPE(*resolved) == TYPE_POINTER &&
             (resolved->base_type_node == STRING_CHAR_PTR_SENTINEL ||
              resolved->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL)) {
             return 1;
@@ -568,21 +568,21 @@ static int builtinValueIsStringLike(const Value* value) {
 
 static const char* builtinValueToCString(const Value* value) {
     if (!value) return NULL;
-    if (isPascalStringType(value->type)) return value->s_val ? value->s_val : "";
-    if (value->type == TYPE_POINTER) {
+    if (isPascalStringType(VALUE_TYPE(*value))) return AS_STRING(*value) ? AS_STRING(*value) : "";
+    if (VALUE_TYPE(*value) == TYPE_POINTER) {
         if (value->base_type_node == STRING_CHAR_PTR_SENTINEL ||
             value->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
-            return (const char*)value->ptr_val;
+            return (const char*)AS_POINTER(*value);
         }
         const Value* resolved = resolveStringPointerBuiltin(value);
         if (!resolved) return NULL;
-        if (isPascalStringType(resolved->type)) {
-            return resolved->s_val ? resolved->s_val : "";
+        if (isPascalStringType(VALUE_TYPE(*resolved))) {
+            return AS_STRING(*resolved) ? AS_STRING(*resolved) : "";
         }
-        if (resolved->type == TYPE_POINTER &&
+        if (VALUE_TYPE(*resolved) == TYPE_POINTER &&
             (resolved->base_type_node == STRING_CHAR_PTR_SENTINEL ||
              resolved->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL)) {
-            return (const char*)resolved->ptr_val;
+            return (const char*)AS_POINTER(*resolved);
         }
     }
     return NULL;
@@ -592,7 +592,7 @@ static bool valueIsByteCompatible(const Value* value) {
     if (!value) {
         return false;
     }
-    switch (value->type) {
+    switch (VALUE_TYPE(*value)) {
         case TYPE_BYTE:
         case TYPE_UINT8:
         case TYPE_INT8:
@@ -608,11 +608,11 @@ static unsigned char valueToByte(const Value* value) {
     if (!value) {
         return 0;
     }
-    switch (value->type) {
+    switch (VALUE_TYPE(*value)) {
         case TYPE_CHAR:
-            return (unsigned char)value->c_val;
+            return (unsigned char)AS_CHAR(*value);
         case TYPE_BOOLEAN:
-            return value->i_val ? 1u : 0u;
+            return VAL_INT(*value) ? 1u : 0u;
         default:
             if (IS_INTLIKE(*value)) {
                 return (unsigned char)AS_INTEGER(*value);
@@ -628,8 +628,8 @@ static bool writeBinaryElement(FILE* stream, const Value* rawValue, VarType elem
     }
 
     const Value* value = rawValue;
-    if (value->type == TYPE_POINTER && value->ptr_val) {
-        value = (const Value*)value->ptr_val;
+    if (VALUE_TYPE(*value) == TYPE_POINTER && AS_POINTER(*value)) {
+        value = (const Value*)AS_POINTER(*value);
     }
 
     unsigned char buffer[sizeof(long double)] = {0};
@@ -646,7 +646,7 @@ static bool writeBinaryElement(FILE* stream, const Value* rawValue, VarType elem
             break;
         case TYPE_INT16: {
             int16_t v = (int16_t)(IS_INTLIKE(*value) ? AS_INTEGER(*value)
-                                 : (isRealType(value->type) ? (long long)AS_REAL(*value) : 0));
+                                 : (isRealType(VALUE_TYPE(*value)) ? (long long)AS_REAL(*value) : 0));
             memcpy(buffer, &v, sizeof(v));
             bytes = sizeof(v);
             break;
@@ -654,14 +654,14 @@ static bool writeBinaryElement(FILE* stream, const Value* rawValue, VarType elem
         case TYPE_UINT16:
         case TYPE_WORD: {
             uint16_t v = (uint16_t)(IS_INTLIKE(*value) ? AS_INTEGER(*value)
-                                   : (isRealType(value->type) ? (long long)AS_REAL(*value) : 0));
+                                   : (isRealType(VALUE_TYPE(*value)) ? (long long)AS_REAL(*value) : 0));
             memcpy(buffer, &v, sizeof(v));
             bytes = sizeof(v);
             break;
         }
         case TYPE_INT32: {
             int32_t v = (int32_t)(IS_INTLIKE(*value) ? AS_INTEGER(*value)
-                                 : (isRealType(value->type) ? (long long)AS_REAL(*value) : 0));
+                                 : (isRealType(VALUE_TYPE(*value)) ? (long long)AS_REAL(*value) : 0));
             memcpy(buffer, &v, sizeof(v));
             bytes = sizeof(v);
             break;
@@ -669,41 +669,41 @@ static bool writeBinaryElement(FILE* stream, const Value* rawValue, VarType elem
         case TYPE_UINT32:
         case TYPE_ENUM: {
             uint32_t v = (uint32_t)(IS_INTLIKE(*value) ? AS_INTEGER(*value)
-                                     : (isRealType(value->type) ? (long long)AS_REAL(*value) : 0));
+                                     : (isRealType(VALUE_TYPE(*value)) ? (long long)AS_REAL(*value) : 0));
             memcpy(buffer, &v, sizeof(v));
             bytes = sizeof(v);
             break;
         }
         case TYPE_INT64: {
             int64_t v = (int64_t)(IS_INTLIKE(*value) ? AS_INTEGER(*value)
-                                 : (isRealType(value->type) ? (long long)AS_REAL(*value) : 0));
+                                 : (isRealType(VALUE_TYPE(*value)) ? (long long)AS_REAL(*value) : 0));
             memcpy(buffer, &v, sizeof(v));
             bytes = sizeof(v);
             break;
         }
         case TYPE_UINT64: {
             uint64_t v = (uint64_t)(IS_INTLIKE(*value) ? AS_INTEGER(*value)
-                                     : (isRealType(value->type) ? (unsigned long long)AS_REAL(*value) : 0u));
+                                     : (isRealType(VALUE_TYPE(*value)) ? (unsigned long long)AS_REAL(*value) : 0u));
             memcpy(buffer, &v, sizeof(v));
             bytes = sizeof(v);
             break;
         }
         case TYPE_FLOAT: {
-            float f = isRealType(value->type) ? (float)AS_REAL(*value)
+            float f = isRealType(VALUE_TYPE(*value)) ? (float)AS_REAL(*value)
                       : (IS_INTLIKE(*value) ? (float)AS_INTEGER(*value) : 0.0f);
             memcpy(buffer, &f, sizeof(f));
             bytes = sizeof(f);
             break;
         }
         case TYPE_DOUBLE: {
-            double d = isRealType(value->type) ? (double)AS_REAL(*value)
+            double d = isRealType(VALUE_TYPE(*value)) ? (double)AS_REAL(*value)
                         : (IS_INTLIKE(*value) ? (double)AS_INTEGER(*value) : 0.0);
             memcpy(buffer, &d, sizeof(d));
             bytes = sizeof(d);
             break;
         }
         case TYPE_LONG_DOUBLE: {
-            long double ld = isRealType(value->type) ? AS_REAL(*value)
+            long double ld = isRealType(VALUE_TYPE(*value)) ? AS_REAL(*value)
                                  : (IS_INTLIKE(*value) ? (long double)AS_INTEGER(*value) : 0.0L);
             memcpy(buffer, &ld, sizeof(ld));
             bytes = sizeof(ld);
@@ -753,11 +753,11 @@ static bool writeStructuredValue(FILE* stream, const Value* rawValue) {
     }
 
     const Value* value = rawValue;
-    if (value->type == TYPE_POINTER && value->ptr_val) {
-        value = (const Value*)value->ptr_val;
+    if (VALUE_TYPE(*value) == TYPE_POINTER && AS_POINTER(*value)) {
+        value = (const Value*)AS_POINTER(*value);
     }
 
-    switch (value->type) {
+    switch (VALUE_TYPE(*value)) {
         case TYPE_INT8:
         case TYPE_INT16:
         case TYPE_INT32:
@@ -776,18 +776,18 @@ static bool writeStructuredValue(FILE* stream, const Value* rawValue) {
         case TYPE_LONG_DOUBLE:
             return fprintf(stream, "%.17Lg ", (long double)AS_REAL(*value)) > 0;
         case TYPE_CHAR:
-            return fprintf(stream, "%u ", (unsigned int)(unsigned char)value->c_val) > 0;
+            return fprintf(stream, "%u ", (unsigned int)(unsigned char)AS_CHAR(*value)) > 0;
         case TYPE_STRING: {
-            const char* text = value->s_val ? value->s_val : "";
+            const char* text = AS_STRING(*value) ? AS_STRING(*value) : "";
             return fprintf(stream, "%s ", text) > 0;
         }
         case TYPE_ARRAY: {
             int total = calculateArrayTotalSize(value);
-            if (total < 0 || !value->array_val) {
+            if (total < 0 || !AS_ARRAY(*value)) {
                 return false;
             }
             for (int i = 0; i < total; ++i) {
-                if (!writeStructuredValue(stream, &value->array_val[i])) {
+                if (!writeStructuredValue(stream, &AS_ARRAY(*value)[i])) {
                     return false;
                 }
             }
@@ -796,7 +796,7 @@ static bool writeStructuredValue(FILE* stream, const Value* rawValue) {
         case TYPE_RECORD: {
             const Value* seen_storage[128];
             int seen_count = 0;
-            for (FieldValue* field = value->record_val; field; field = field->next) {
+            for (FieldValue* field = AS_RECORD(*value); field; field = field->next) {
                 const Value* fieldValue = fieldValueStorageConst(field);
                 bool already_seen = false;
                 for (int i = 0; i < seen_count; ++i) {
@@ -828,12 +828,12 @@ static bool readStructuredValue(FILE* stream, Value* rawValue) {
     }
 
     Value* value = rawValue;
-    if (value->type == TYPE_POINTER && value->ptr_val) {
-        value = (Value*)value->ptr_val;
+    if (VALUE_TYPE(*value) == TYPE_POINTER && AS_POINTER(*value)) {
+        value = (Value*)AS_POINTER(*value);
     }
 
     char token[1024];
-    switch (value->type) {
+    switch (VALUE_TYPE(*value)) {
         case TYPE_INT8:
         case TYPE_INT16:
         case TYPE_INT32:
@@ -871,30 +871,30 @@ static bool readStructuredValue(FILE* stream, Value* rawValue) {
             char* endp = NULL;
             long long parsed = strtoll(token, &endp, 10);
             if (endp != token && errno != ERANGE) {
-                value->c_val = (unsigned char)parsed;
-                SET_INT_VALUE(value, value->c_val);
+                SET_CHAR_VALUE(value, (unsigned char)parsed);
+                SET_INT_VALUE(value, AS_CHAR(*value));
                 return true;
             }
-            value->c_val = (unsigned char)token[0];
-            SET_INT_VALUE(value, value->c_val);
+            SET_CHAR_VALUE(value, (unsigned char)token[0]);
+            SET_INT_VALUE(value, AS_CHAR(*value));
             return true;
         }
         case TYPE_STRING: {
             if (!readToken(stream, token, sizeof(token))) return false;
-            if (value->s_val) {
-                free(value->s_val);
-                value->s_val = NULL;
+            if (AS_STRING(*value)) {
+                free(AS_STRING(*value));
+                AS_STRING(*value) = NULL;
             }
-            value->s_val = strdup(token);
-            return value->s_val != NULL;
+            AS_STRING(*value) = strdup(token);
+            return AS_STRING(*value) != NULL;
         }
         case TYPE_ARRAY: {
             int total = calculateArrayTotalSize(value);
-            if (total < 0 || !value->array_val) {
+            if (total < 0 || !AS_ARRAY(*value)) {
                 return false;
             }
             for (int i = 0; i < total; ++i) {
-                if (!readStructuredValue(stream, &value->array_val[i])) {
+                if (!readStructuredValue(stream, &AS_ARRAY(*value)[i])) {
                     return false;
                 }
             }
@@ -903,7 +903,7 @@ static bool readStructuredValue(FILE* stream, Value* rawValue) {
         case TYPE_RECORD: {
             Value* seen_storage[128];
             int seen_count = 0;
-            for (FieldValue* field = value->record_val; field; field = field->next) {
+            for (FieldValue* field = AS_RECORD(*value); field; field = field->next) {
                 Value* fieldValue = fieldValueStorage(field);
                 bool already_seen = false;
                 for (int i = 0; i < seen_count; ++i) {
@@ -933,10 +933,10 @@ static void assignByteToValue(Value* target, unsigned char byte) {
     if (!target) {
         return;
     }
-    switch (target->type) {
+    switch (VALUE_TYPE(*target)) {
         case TYPE_CHAR:
-            target->c_val = (unsigned char)byte;
-            SET_INT_VALUE(target, target->c_val);
+            SET_CHAR_VALUE(target, (unsigned char)byte);
+            SET_INT_VALUE(target, AS_CHAR(*target));
             break;
         case TYPE_BOOLEAN:
             SET_INT_VALUE(target, byte ? 1 : 0);
@@ -951,26 +951,26 @@ static void assignCountToResult(Value* slot, long long count) {
     if (!slot) {
         return;
     }
-    if (slot->type == TYPE_POINTER && slot->ptr_val) {
-        assignCountToResult((Value*)slot->ptr_val, count);
+    if (VALUE_TYPE(*slot) == TYPE_POINTER && AS_POINTER(*slot)) {
+        assignCountToResult((Value*)AS_POINTER(*slot), count);
         return;
     }
-    if (isRealType(slot->type)) {
+    if (isRealType(VALUE_TYPE(*slot))) {
         SET_REAL_VALUE(slot, (long double)count);
         return;
     }
-    if (slot->type == TYPE_CHAR) {
-        slot->c_val = (unsigned char)count;
-        SET_INT_VALUE(slot, slot->c_val);
+    if (VALUE_TYPE(*slot) == TYPE_CHAR) {
+        SET_CHAR_VALUE(slot, (unsigned char)count);
+        SET_INT_VALUE(slot, AS_CHAR(*slot));
         return;
     }
-    if (slot->type == TYPE_BOOLEAN) {
+    if (VALUE_TYPE(*slot) == TYPE_BOOLEAN) {
         SET_INT_VALUE(slot, count != 0 ? 1 : 0);
         return;
     }
     SET_INT_VALUE(slot, count);
-    if (slot->type == TYPE_VOID || slot->type == TYPE_UNKNOWN || slot->type == TYPE_NIL) {
-        slot->type = TYPE_INT32;
+    if (VALUE_TYPE(*slot) == TYPE_VOID || VALUE_TYPE(*slot) == TYPE_UNKNOWN || VALUE_TYPE(*slot) == TYPE_NIL) {
+        SET_VALUE_TYPE(slot, TYPE_INT32);
     }
 }
 
@@ -1093,7 +1093,7 @@ static bool computeValueSizeBytesInternal(const Value *value, long long *out_byt
         return false;
     }
 
-    switch (value->type) {
+    switch (VALUE_TYPE(*value)) {
         case TYPE_POINTER:
             /* Pascal SizeOf should treat any pointer value as pointer-sized. */
             *out_bytes = (long long)sizeof(void*);
@@ -1112,9 +1112,9 @@ static bool computeValueSizeBytesInternal(const Value *value, long long *out_byt
             }
             long long elem_size = 0;
             bool have_elem = false;
-            if (value->array_val && total > 0) {
+            if (AS_ARRAY(*value) && total > 0) {
                 for (int i = 0; i < total; ++i) {
-                    if (computeValueSizeBytesInternal(&value->array_val[i], &elem_size, depth + 1)) {
+                    if (computeValueSizeBytesInternal(&AS_ARRAY(*value)[i], &elem_size, depth + 1)) {
                         have_elem = true;
                         break;
                     }
@@ -1142,7 +1142,7 @@ static bool computeValueSizeBytesInternal(const Value *value, long long *out_byt
             long long total = 0;
             const Value* seen_storage[128];
             int seen_count = 0;
-            for (FieldValue *field = value->record_val; field; field = field->next) {
+            for (FieldValue *field = AS_RECORD(*value); field; field = field->next) {
                 const Value *fieldValue = fieldValueStorageConst(field);
                 bool already_counted = false;
                 for (int i = 0; i < seen_count; i++) {
@@ -1167,8 +1167,8 @@ static bool computeValueSizeBytesInternal(const Value *value, long long *out_byt
             return true;
         }
         case TYPE_SET:
-            if (value->set_val.set_size > 0) {
-                *out_bytes = (long long)value->set_val.set_size * (long long)sizeof(long long);
+            if (AS_SET(*value).set_size > 0) {
+                *out_bytes = (long long)AS_SET(*value).set_size * (long long)sizeof(long long);
             } else {
                 *out_bytes = 0;
             }
@@ -1177,7 +1177,7 @@ static bool computeValueSizeBytesInternal(const Value *value, long long *out_byt
             *out_bytes = (long long)sizeof(void*);
             return true;
         default:
-            if (builtinSizeForVarType(value->type, out_bytes)) {
+            if (builtinSizeForVarType(VALUE_TYPE(*value), out_bytes)) {
                 return true;
             }
             return false;
@@ -1544,15 +1544,15 @@ static Value vmBuiltinToInt(VM* vm, int arg_count, Value* args) {
     }
     Value v = args[0];
     long long i = 0;
-    if (isRealType(v.type)) {
+    if (isRealType(VALUE_TYPE(v))) {
         long double d = AS_REAL(v);
         i = (long long)d; // truncate toward zero like C cast
     } else if (IS_INTLIKE(v)) {
         i = AS_INTEGER(v);
-    } else if (v.type == TYPE_BOOLEAN) {
-        i = v.i_val ? 1 : 0;
-    } else if (v.type == TYPE_CHAR) {
-        i = v.c_val;
+    } else if (VALUE_TYPE(v) == TYPE_BOOLEAN) {
+        i = VAL_INT(v) ? 1 : 0;
+    } else if (VALUE_TYPE(v) == TYPE_CHAR) {
+        i = AS_CHAR(v);
     } else {
         i = 0;
     }
@@ -1566,14 +1566,14 @@ static Value vmBuiltinToDouble(VM* vm, int arg_count, Value* args) {
     }
     Value v = args[0];
     long double d = 0.0L;
-    if (isRealType(v.type)) {
+    if (isRealType(VALUE_TYPE(v))) {
         d = AS_REAL(v);
     } else if (IS_INTLIKE(v)) {
         d = (long double)AS_INTEGER(v);
-    } else if (v.type == TYPE_BOOLEAN) {
-        d = v.i_val ? 1.0L : 0.0L;
-    } else if (v.type == TYPE_CHAR) {
-        d = (long double)v.c_val;
+    } else if (VALUE_TYPE(v) == TYPE_BOOLEAN) {
+        d = VAL_INT(v) ? 1.0L : 0.0L;
+    } else if (VALUE_TYPE(v) == TYPE_CHAR) {
+        d = (long double)AS_CHAR(v);
     } else {
         d = 0.0L;
     }
@@ -1587,14 +1587,14 @@ static Value vmBuiltinToFloat(VM* vm, int arg_count, Value* args) {
     }
     Value v = args[0];
     float f = 0.0f;
-    if (isRealType(v.type)) {
+    if (isRealType(VALUE_TYPE(v))) {
         f = (float)AS_REAL(v);
     } else if (IS_INTLIKE(v)) {
         f = (float)AS_INTEGER(v);
-    } else if (v.type == TYPE_BOOLEAN) {
-        f = v.i_val ? 1.0f : 0.0f;
-    } else if (v.type == TYPE_CHAR) {
-        f = (float)v.c_val;
+    } else if (VALUE_TYPE(v) == TYPE_BOOLEAN) {
+        f = VAL_INT(v) ? 1.0f : 0.0f;
+    } else if (VALUE_TYPE(v) == TYPE_CHAR) {
+        f = (float)AS_CHAR(v);
     } else {
         f = 0.0f;
     }
@@ -1608,15 +1608,15 @@ static Value vmBuiltinToChar(VM* vm, int arg_count, Value* args) {
     }
     Value v = args[0];
     unsigned char c = 0;
-    if (isRealType(v.type)) {
+    if (isRealType(VALUE_TYPE(v))) {
         long double d = AS_REAL(v);
         c = (unsigned char)((long long)d); // truncate then narrow
     } else if (IS_INTLIKE(v)) {
         c = (unsigned char)AS_INTEGER(v);
-    } else if (v.type == TYPE_BOOLEAN) {
-        c = v.i_val ? 1 : 0;
-    } else if (v.type == TYPE_CHAR) {
-        c = (unsigned char)v.c_val;
+    } else if (VALUE_TYPE(v) == TYPE_BOOLEAN) {
+        c = VAL_INT(v) ? 1 : 0;
+    } else if (VALUE_TYPE(v) == TYPE_CHAR) {
+        c = (unsigned char)AS_CHAR(v);
     } else {
         c = 0;
     }
@@ -1630,15 +1630,15 @@ static Value vmBuiltinToByte(VM* vm, int arg_count, Value* args) {
     }
     Value v = args[0];
     unsigned char b = 0;
-    if (isRealType(v.type)) {
+    if (isRealType(VALUE_TYPE(v))) {
         long double d = AS_REAL(v);
         b = (unsigned char)((long long)d);
     } else if (IS_INTLIKE(v)) {
         b = (unsigned char)AS_INTEGER(v);
-    } else if (v.type == TYPE_BOOLEAN) {
-        b = v.i_val ? 1 : 0;
-    } else if (v.type == TYPE_CHAR) {
-        b = (unsigned char)v.c_val;
+    } else if (VALUE_TYPE(v) == TYPE_BOOLEAN) {
+        b = VAL_INT(v) ? 1 : 0;
+    } else if (VALUE_TYPE(v) == TYPE_CHAR) {
+        b = (unsigned char)AS_CHAR(v);
     } else {
         b = 0;
     }
@@ -1652,14 +1652,14 @@ static Value vmBuiltinToBool(VM* vm, int arg_count, Value* args) {
     }
     Value v = args[0];
     int truth = 0;
-    if (isRealType(v.type)) {
+    if (isRealType(VALUE_TYPE(v))) {
         truth = (AS_REAL(v) != 0.0L);
     } else if (IS_INTLIKE(v)) {
         truth = (AS_INTEGER(v) != 0);
-    } else if (v.type == TYPE_BOOLEAN) {
-        truth = v.i_val ? 1 : 0;
-    } else if (v.type == TYPE_CHAR) {
-        truth = (v.c_val != 0);
+    } else if (VALUE_TYPE(v) == TYPE_BOOLEAN) {
+        truth = VAL_INT(v) ? 1 : 0;
+    } else if (VALUE_TYPE(v) == TYPE_CHAR) {
+        truth = (AS_CHAR(v) != 0);
     } else {
         truth = 0;
     }
@@ -2405,11 +2405,11 @@ Value vmBuiltinSqr(VM* vm, int arg_count, Value* args) {
     if (IS_INTLIKE(arg)) {
         long long v = AS_INTEGER(arg);
         return makeInt(v * v);
-    } else if (isRealType(arg.type)) {
+    } else if (isRealType(VALUE_TYPE(arg))) {
         long double v = AS_REAL(arg);
         return makeReal(v * v);
     }
-    runtimeError(vm, "Sqr expects an Integer or Real argument. Got %s.", varTypeToString(arg.type));
+    runtimeError(vm, "Sqr expects an Integer or Real argument. Got %s.", varTypeToString(VALUE_TYPE(arg)));
     return makeInt(0);
 }
 
@@ -2435,32 +2435,32 @@ Value vmBuiltinSucc(VM* vm, int arg_count, Value* args) {
     if (IS_INTLIKE(arg)) {
         return makeInt(AS_INTEGER(arg) + 1);
     }
-    switch(arg.type) {
+    switch(VALUE_TYPE(arg)) {
         case TYPE_CHAR:
-            if (arg.c_val >= PASCAL_CHAR_MAX) {
+            if (AS_CHAR(arg) >= PASCAL_CHAR_MAX) {
                 runtimeError(vm, "Succ char overflow.");
                 return makeVoid();
             }
-            return makeChar(arg.c_val + 1);
+            return makeChar(AS_CHAR(arg) + 1);
         case TYPE_BOOLEAN: {
-            long long next_val = arg.i_val + 1;
+            long long next_val = VAL_INT(arg) + 1;
             int bool_result = next_val > 1 ? 1 : (next_val != 0);
             return makeBoolean(bool_result);
         }
         case TYPE_ENUM: {
-            int ordinal = arg.enum_val.ordinal;
+            int ordinal = AS_ENUM(arg).ordinal;
             if (arg.enum_meta && ordinal + 1 >= arg.enum_meta->member_count) {
                 runtimeError(vm, "Succ enum overflow.");
                 return makeVoid();
             }
-            Value result = makeEnum(arg.enum_val.enum_name, ordinal + 1);
+            Value result = makeEnum(AS_ENUM(arg).enum_name, ordinal + 1);
             result.enum_meta = arg.enum_meta;
             result.base_type_node = arg.base_type_node;
             return result;
         }
         default:
             runtimeError(vm, "Succ requires an ordinal type argument. Got %s.",
-                         varTypeToString(arg.type));
+                         varTypeToString(VALUE_TYPE(arg)));
             return makeVoid();
     }
 }
@@ -2473,8 +2473,8 @@ Value vmBuiltinUpcase(VM* vm, int arg_count, Value* args) {
 
     Value arg = args[0];
     int c;
-    if (arg.type == TYPE_CHAR || arg.type == TYPE_WIDECHAR) {
-        c = arg.c_val;
+    if (VALUE_TYPE(arg) == TYPE_CHAR || VALUE_TYPE(arg) == TYPE_WIDECHAR) {
+        c = AS_CHAR(arg);
     } else if (IS_INTLIKE(arg)) {
         c = (int)AS_INTEGER(arg);
     } else if (IS_REAL(arg)) {
@@ -2485,7 +2485,7 @@ Value vmBuiltinUpcase(VM* vm, int arg_count, Value* args) {
          * the value was widened to a real earlier in the pipeline.
          */
         c = (int)AS_REAL(arg);
-    } else if (isPascalStringType(arg.type)) {
+    } else if (isPascalStringType(VALUE_TYPE(arg))) {
         const char* s = AS_STRING(arg);
         if (s && s[0] != '\0') {
             uint32_t codepoint = 0;
@@ -2503,7 +2503,7 @@ Value vmBuiltinUpcase(VM* vm, int arg_count, Value* args) {
     } else {
         runtimeError(vm,
                      "Upcase expects a char, int, or non-empty string argument. Got %s.",
-                     varTypeToString(arg.type));
+                     varTypeToString(VALUE_TYPE(arg)));
         return makeChar('\0');
     }
     if (c >= 0 && c <= 255) {
@@ -2518,21 +2518,21 @@ Value vmBuiltinPos(VM* vm, int arg_count, Value* args) {
         return makeInt(0);
     }
     // Allow the first argument to be a char
-    if (!isPascalStringType(args[0].type) && !isPascalCharType(args[0].type)) {
+    if (!isPascalStringType(VALUE_TYPE(args[0])) && !isPascalCharType(VALUE_TYPE(args[0]))) {
         runtimeError(vm, "Pos first argument must be a string or char.");
         return makeInt(0);
     }
-    if (!isPascalStringType(args[1].type)) {
+    if (!isPascalStringType(VALUE_TYPE(args[1]))) {
         runtimeError(vm, "Pos second argument must be a string.");
         return makeInt(0);
     }
 
     const char* needle = NULL;
     char needle_buf[5] = {0};
-    if (args[0].type == TYPE_CHAR) {
+    if (VALUE_TYPE(args[0]) == TYPE_CHAR) {
         needle_buf[0] = AS_CHAR(args[0]);
         needle = needle_buf;
-    } else if (args[0].type == TYPE_WIDECHAR) {
+    } else if (VALUE_TYPE(args[0]) == TYPE_WIDECHAR) {
         encodeUtf8Codepoint((uint32_t)AS_CHAR(args[0]), needle_buf);
         needle = needle_buf;
     } else {
@@ -2545,7 +2545,7 @@ Value vmBuiltinPos(VM* vm, int arg_count, Value* args) {
     if (!found) {
         return makeInt(0);
     }
-    if (args[1].type == TYPE_UNICODE_STRING) {
+    if (VALUE_TYPE(args[1]) == TYPE_UNICODE_STRING) {
         size_t prefix_len = (size_t)(found - haystack);
         return makeInt((long long)utf8CodepointCount(haystack, prefix_len) + 1);
     }
@@ -2553,7 +2553,7 @@ Value vmBuiltinPos(VM* vm, int arg_count, Value* args) {
 }
 
 Value vmBuiltinPrintf(VM* vm, int arg_count, Value* args) {
-    if (arg_count < 1 || !isPascalStringType(args[0].type)) {
+    if (arg_count < 1 || !isPascalStringType(VALUE_TYPE(args[0]))) {
         runtimeError(vm, "printf expects a format string as the first argument.");
         return makeInt(0);
     }
@@ -2717,7 +2717,7 @@ Value vmBuiltinPrintf(VM* vm, int arg_count, Value* args) {
                         fputs(buf, stdout);
                         break;
                     case 'c': {
-                        char ch = (v.type == TYPE_CHAR) ? v.c_val : (char)asI64(v);
+                        char ch = (VALUE_TYPE(v) == TYPE_CHAR) ? AS_CHAR(v) : (char)asI64(v);
                         char safe_fmt[sizeof(fmtbuf)];
                         const char* format = fmtbuf;
                         if (has_wide_char_length) {
@@ -2737,13 +2737,13 @@ Value vmBuiltinPrintf(VM* vm, int arg_count, Value* args) {
                     case 's': {
                         char char_text[5] = {0};
                         const char* sv = "";
-                        if (isPascalStringType(v.type) && v.s_val) {
-                            sv = v.s_val;
-                        } else if (v.type == TYPE_CHAR) {
-                            char_text[0] = (char)v.c_val;
+                        if (isPascalStringType(VALUE_TYPE(v)) && AS_STRING(v)) {
+                            sv = AS_STRING(v);
+                        } else if (VALUE_TYPE(v) == TYPE_CHAR) {
+                            char_text[0] = (char)AS_CHAR(v);
                             sv = char_text;
-                        } else if (v.type == TYPE_WIDECHAR) {
-                            encodeUtf8Codepoint((uint32_t)v.c_val, char_text);
+                        } else if (VALUE_TYPE(v) == TYPE_WIDECHAR) {
+                            encodeUtf8Codepoint((uint32_t)AS_CHAR(v), char_text);
                             sv = char_text;
                         }
                         char safe_fmt[sizeof(fmtbuf)];
@@ -2792,14 +2792,14 @@ Value vmBuiltinFprintf(VM* vm, int arg_count, Value* args) {
     // Determine output FILE*
     FILE* output_stream = NULL;
     const Value* farg = &args[0];
-    if (farg->type == TYPE_POINTER && farg->ptr_val) farg = (const Value*)farg->ptr_val;
-    if (farg->type == TYPE_FILE && farg->f_val) {
-        output_stream = farg->f_val;
+    if (VALUE_TYPE(*farg) == TYPE_POINTER && AS_POINTER(*farg)) farg = (const Value*)AS_POINTER(*farg);
+    if (VALUE_TYPE(*farg) == TYPE_FILE && AS_FILE(*farg)) {
+        output_stream = AS_FILE(*farg);
     } else {
         runtimeError(vm, "fprintf first argument must be an open file.");
         return makeInt(0);
     }
-    if (!isPascalStringType(args[1].type) || !args[1].s_val) {
+    if (!isPascalStringType(VALUE_TYPE(args[1])) || !AS_STRING(args[1])) {
         runtimeError(vm, "fprintf expects a format string as the second argument.");
         return makeInt(0);
     }
@@ -2939,7 +2939,7 @@ Value vmBuiltinFprintf(VM* vm, int arg_count, Value* args) {
                         fputs(buf, output_stream);
                         break; }
                     case 'c': {
-                        char ch = (v.type == TYPE_CHAR) ? v.c_val : (char)asI64(v);
+                        char ch = (VALUE_TYPE(v) == TYPE_CHAR) ? AS_CHAR(v) : (char)asI64(v);
                         char safe_fmt[sizeof(fmtbuf)];
                         const char* format = fmtbuf;
                         if (has_wide_char_length) {
@@ -2958,13 +2958,13 @@ Value vmBuiltinFprintf(VM* vm, int arg_count, Value* args) {
                     case 's': {
                         char char_text[5] = {0};
                         const char* sv = "";
-                        if (isPascalStringType(v.type) && v.s_val) {
-                            sv = v.s_val;
-                        } else if (v.type == TYPE_CHAR) {
-                            char_text[0] = (char)v.c_val;
+                        if (isPascalStringType(VALUE_TYPE(v)) && AS_STRING(v)) {
+                            sv = AS_STRING(v);
+                        } else if (VALUE_TYPE(v) == TYPE_CHAR) {
+                            char_text[0] = (char)AS_CHAR(v);
                             sv = char_text;
-                        } else if (v.type == TYPE_WIDECHAR) {
-                            encodeUtf8Codepoint((uint32_t)v.c_val, char_text);
+                        } else if (VALUE_TYPE(v) == TYPE_WIDECHAR) {
+                            encodeUtf8Codepoint((uint32_t)AS_CHAR(v), char_text);
                             sv = char_text;
                         }
                         char safe_fmt[sizeof(fmtbuf)];
@@ -3014,20 +3014,20 @@ Value vmBuiltinFflush(VM* vm, int arg_count, Value* args) {
         return makeInt(0);
     }
     const Value* farg = &args[0];
-    if (farg->type == TYPE_POINTER && farg->ptr_val) {
-        farg = (const Value*)farg->ptr_val;
+    if (VALUE_TYPE(*farg) == TYPE_POINTER && AS_POINTER(*farg)) {
+        farg = (const Value*)AS_POINTER(*farg);
     }
-    if (farg->type != TYPE_FILE || !farg->f_val) {
+    if (VALUE_TYPE(*farg) != TYPE_FILE || !AS_FILE(*farg)) {
         runtimeError(vm, "fflush requires a valid file argument.");
         return makeInt(0);
     }
-    fflush(farg->f_val);
+    fflush(AS_FILE(*farg));
     return makeInt(0);
 }
 
 // fopen(path, mode) -> FILE
 Value vmBuiltinFopen(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 2 || !isPascalStringType(args[0].type) || !isPascalStringType(args[1].type)) {
+    if (arg_count != 2 || !isPascalStringType(VALUE_TYPE(args[0])) || !isPascalStringType(VALUE_TYPE(args[1]))) {
         runtimeError(vm, "fopen expects (path:string, mode:string).");
         return makeVoid();
     }
@@ -3039,8 +3039,8 @@ Value vmBuiltinFopen(VM* vm, int arg_count, Value* args) {
         return makeVoid();
     }
     Value v = makeVoid();
-    v.type = TYPE_FILE;
-    v.f_val = f;
+    SET_VALUE_TYPE(&v, TYPE_FILE);
+    AS_FILE(v) = f;
     v.filename = strdup(path);
     return v;
 }
@@ -3052,8 +3052,8 @@ Value vmBuiltinFclose(VM* vm, int arg_count, Value* args) {
         return makeVoid();
     }
     Value* farg = (Value*)&args[0];
-    if (farg->type == TYPE_POINTER && farg->ptr_val) farg = (Value*)farg->ptr_val;
-    if (farg->type != TYPE_FILE || !farg->f_val) {
+    if (VALUE_TYPE(*farg) == TYPE_POINTER && AS_POINTER(*farg)) farg = (Value*)AS_POINTER(*farg);
+    if (VALUE_TYPE(*farg) != TYPE_FILE || !AS_FILE(*farg)) {
         runtimeError(vm, "fclose requires a valid file argument.");
         return makeVoid();
     }
@@ -3063,16 +3063,16 @@ Value vmBuiltinFclose(VM* vm, int arg_count, Value* args) {
 
 Value vmBuiltinCopy(VM* vm, int arg_count, Value* args) {
     // Allow the first argument to be a char
-    if (arg_count != 3 || (!isPascalStringType(args[0].type) && !isPascalCharType(args[0].type)) || !IS_INTLIKE(args[1]) || !IS_INTLIKE(args[2])) {
+    if (arg_count != 3 || (!isPascalStringType(VALUE_TYPE(args[0])) && !isPascalCharType(VALUE_TYPE(args[0]))) || !IS_INTLIKE(args[1]) || !IS_INTLIKE(args[2])) {
         runtimeError(vm, "Copy expects (String/Char, Integer, Integer).");
         return makeString("");
     }
     const char* source = NULL;
     char source_buf[5] = {0};
-    if (args[0].type == TYPE_CHAR) {
+    if (VALUE_TYPE(args[0]) == TYPE_CHAR) {
         source_buf[0] = AS_CHAR(args[0]);
         source = source_buf;
-    } else if (args[0].type == TYPE_WIDECHAR) {
+    } else if (VALUE_TYPE(args[0]) == TYPE_WIDECHAR) {
         encodeUtf8Codepoint((uint32_t)AS_CHAR(args[0]), source_buf);
         source = source_buf;
     } else {
@@ -3082,11 +3082,11 @@ Value vmBuiltinCopy(VM* vm, int arg_count, Value* args) {
     long long count = AS_INTEGER(args[2]);
 
     if (!source || start_idx < 1 || count < 0) {
-        return (args[0].type == TYPE_UNICODE_STRING) ? makeUnicodeString("") : makeString("");
+        return (VALUE_TYPE(args[0]) == TYPE_UNICODE_STRING) ? makeUnicodeString("") : makeString("");
     }
 
     size_t source_len = strlen(source);
-    if (args[0].type == TYPE_UNICODE_STRING) {
+    if (VALUE_TYPE(args[0]) == TYPE_UNICODE_STRING) {
         size_t source_cp_len = utf8CodepointCount(source, source_len);
         if ((size_t)start_idx > source_cp_len) return makeUnicodeString("");
 
@@ -3156,22 +3156,22 @@ Value vmBuiltinStringOfChar(VM* vm, int arg_count, Value* args) {
     char encoded_fill[5] = {0};
     size_t encoded_fill_len = 0;
     bool unicode_fill = false;
-    if (args[0].type == TYPE_CHAR) {
+    if (VALUE_TYPE(args[0]) == TYPE_CHAR) {
         fill = (unsigned char)AS_CHAR(args[0]);
         encoded_fill[0] = (char)fill;
         encoded_fill[1] = '\0';
         encoded_fill_len = 1;
-    } else if (args[0].type == TYPE_WIDECHAR) {
+    } else if (VALUE_TYPE(args[0]) == TYPE_WIDECHAR) {
         fill = AS_CHAR(args[0]);
         encoded_fill_len = encodeUtf8Codepoint((uint32_t)fill, encoded_fill);
         unicode_fill = true;
-    } else if (args[0].type == TYPE_STRING) {
+    } else if (VALUE_TYPE(args[0]) == TYPE_STRING) {
         const char *source = AS_STRING(args[0]);
         fill = (source && source[0]) ? (unsigned char)source[0] : 0;
         encoded_fill[0] = (char)fill;
         encoded_fill[1] = '\0';
         encoded_fill_len = 1;
-    } else if (args[0].type == TYPE_UNICODE_STRING) {
+    } else if (VALUE_TYPE(args[0]) == TYPE_UNICODE_STRING) {
         const char *source = AS_STRING(args[0]);
         uint32_t codepoint = 0;
         size_t advance = 0;
@@ -3224,7 +3224,7 @@ static bool resizeDynamicArrayValue(VM* vm,
                                     Value* array_value,
                                     int dimension_count,
                                     const long long* lengths) {
-    if (!array_value || array_value->type != TYPE_ARRAY) {
+    if (!array_value || VALUE_TYPE(*array_value) != TYPE_ARRAY) {
         runtimeError(vm, "SetLength target is not an array.");
         return false;
     }
@@ -3295,8 +3295,8 @@ static bool resizeDynamicArrayValue(VM* vm,
     size_t old_total = 0;
     int* old_lower_bounds = array_value->lower_bounds;
     int* old_upper_bounds = array_value->upper_bounds;
-    Value* old_array_val = array_value->array_val;
-    unsigned char* old_array_raw = array_value->array_raw;
+    Value* old_array_val = AS_ARRAY(*array_value);
+    unsigned char* old_array_raw = AS_ARRAY_RAW(*array_value);
     bool old_array_is_packed = array_value->array_is_packed;
     bool old_array_is_dynamic = array_value->array_is_dynamic;
     uint32_t* old_array_refcount = array_value->array_refcount;
@@ -3340,8 +3340,8 @@ static bool resizeDynamicArrayValue(VM* vm,
 
         if (old_total > 0 && array_value->lower_bounds &&
             array_value->upper_bounds && array_value->dimensions == dimension_count &&
-            ((use_packed && (array_value->array_raw || array_value->array_val)) ||
-             (!use_packed && array_value->array_val))) {
+            ((use_packed && (AS_ARRAY_RAW(*array_value) || AS_ARRAY(*array_value))) ||
+             (!use_packed && AS_ARRAY(*array_value)))) {
             copy_lower = (int*)malloc(sizeof(int) * dimension_count);
             copy_upper = (int*)malloc(sizeof(int) * dimension_count);
             if (!copy_lower || !copy_upper) {
@@ -3373,7 +3373,7 @@ static bool resizeDynamicArrayValue(VM* vm,
                 Value old_array_stub = *array_value;
                 Value new_array_stub;
                 memset(&new_array_stub, 0, sizeof(Value));
-                new_array_stub.type = TYPE_ARRAY;
+                SET_VALUE_TYPE(&new_array_stub, TYPE_ARRAY);
                 new_array_stub.dimensions = dimension_count;
                 new_array_stub.lower_bounds = new_lower;
                 new_array_stub.upper_bounds = new_upper;
@@ -3387,15 +3387,15 @@ static bool resizeDynamicArrayValue(VM* vm,
                     int new_offset = computeFlatOffset(&new_array_stub, copy_indices);
                     if (use_packed) {
                         unsigned char byte = 0;
-                        if (array_value->array_is_packed && array_value->array_raw) {
-                            byte = array_value->array_raw[old_offset];
-                        } else if (array_value->array_val) {
-                            byte = valueToByte(&array_value->array_val[old_offset]);
+                        if (array_value->array_is_packed && AS_ARRAY_RAW(*array_value)) {
+                            byte = AS_ARRAY_RAW(*array_value)[old_offset];
+                        } else if (AS_ARRAY(*array_value)) {
+                            byte = valueToByte(&AS_ARRAY(*array_value)[old_offset]);
                         }
                         new_raw[new_offset] = byte;
                     } else {
                         freeValue(&new_elements[new_offset]);
-                        new_elements[new_offset] = makeCopyOfValue(&array_value->array_val[old_offset]);
+                        new_elements[new_offset] = makeCopyOfValue(&AS_ARRAY(*array_value)[old_offset]);
                     }
 
                     int dim = dimension_count - 1;
@@ -3473,8 +3473,8 @@ static bool resizeDynamicArrayValue(VM* vm,
 
     array_value->lower_bounds = new_lower;
     array_value->upper_bounds = new_upper;
-    array_value->array_val = new_elements;
-    array_value->array_raw = new_raw;
+    AS_ARRAY(*array_value) = new_elements;
+    AS_ARRAY_RAW(*array_value) = new_raw;
     array_value->array_is_packed = use_packed;
     array_value->array_refcount = new_refcount;
     array_value->dimensions = dimension_count;
@@ -3484,8 +3484,8 @@ static bool resizeDynamicArrayValue(VM* vm,
     array_value->element_type_def = element_type_def;
 
     if (new_total == 0) {
-        array_value->array_val = NULL;
-        array_value->array_raw = NULL;
+        AS_ARRAY(*array_value) = NULL;
+        AS_ARRAY_RAW(*array_value) = NULL;
     }
 
     return true;
@@ -3518,18 +3518,18 @@ setlength_cleanup_failure:
 }
 
 Value vmBuiltinSetlength(VM* vm, int arg_count, Value* args) {
-    if (arg_count < 2 || args[0].type != TYPE_POINTER) {
+    if (arg_count < 2 || VALUE_TYPE(args[0]) != TYPE_POINTER) {
         runtimeError(vm, "SetLength expects a pointer target followed by length arguments.");
         return makeVoid();
     }
 
-    Value* target = (Value*)args[0].ptr_val;
+    Value* target = (Value*)AS_POINTER(args[0]);
     if (!target) {
         runtimeError(vm, "SetLength received a nil pointer.");
         return makeVoid();
     }
 
-    if (target->type != TYPE_ARRAY) {
+    if (VALUE_TYPE(*target) != TYPE_ARRAY) {
         if (arg_count != 2 || !IS_INTLIKE(args[1])) {
             runtimeError(vm, "SetLength expects (var string, integer).");
             return makeVoid();
@@ -3538,17 +3538,17 @@ Value vmBuiltinSetlength(VM* vm, int arg_count, Value* args) {
         long long new_len = AS_INTEGER(args[1]);
         if (new_len < 0) new_len = 0;
 
-        if (!isPascalStringType(target->type)) {
+        if (!isPascalStringType(VALUE_TYPE(*target))) {
             runtimeError(vm, "SetLength expects a string or dynamic array target.");
             return makeVoid();
         }
 
         size_t alloc_len = (size_t)new_len;
         size_t copy_len = 0;
-        bool unicode_target = (target->type == TYPE_UNICODE_STRING);
+        bool unicode_target = (VALUE_TYPE(*target) == TYPE_UNICODE_STRING);
 
         if (unicode_target) {
-            const char *src = target->s_val ? target->s_val : "";
+            const char *src = AS_STRING(*target) ? AS_STRING(*target) : "";
             size_t src_len = strlen(src);
             size_t src_cp_len = utf8CodepointCount(src, src_len);
             size_t copy_cp_len = src_cp_len;
@@ -3565,13 +3565,13 @@ Value vmBuiltinSetlength(VM* vm, int arg_count, Value* args) {
             return makeVoid();
         }
 
-        if (target->s_val) {
+        if (AS_STRING(*target)) {
             if (!unicode_target) {
-                copy_len = strlen(target->s_val);
+                copy_len = strlen(AS_STRING(*target));
                 if (copy_len > (size_t)new_len) copy_len = (size_t)new_len;
             }
-            memcpy(new_buf, target->s_val, copy_len);
-            free(target->s_val);
+            memcpy(new_buf, AS_STRING(*target), copy_len);
+            free(AS_STRING(*target));
         }
 
         if ((size_t)new_len > (unicode_target ? utf8CodepointCount(new_buf, copy_len) : copy_len)) {
@@ -3583,7 +3583,7 @@ Value vmBuiltinSetlength(VM* vm, int arg_count, Value* args) {
         }
         new_buf[copy_len] = '\0';
 
-        target->s_val = new_buf;
+        AS_STRING(*target) = new_buf;
         target->max_length = -1;
         return makeVoid();
     }
@@ -3592,7 +3592,7 @@ Value vmBuiltinSetlength(VM* vm, int arg_count, Value* args) {
          target->element_type_def == NULL) &&
         args[0].base_type_node != NULL) {
         Value typed_template = makeValueForType(TYPE_ARRAY, args[0].base_type_node, NULL);
-        if (typed_template.type == TYPE_ARRAY) {
+        if (VALUE_TYPE(typed_template) == TYPE_ARRAY) {
             if (target->element_type == TYPE_UNKNOWN || target->element_type == TYPE_VOID) {
                 target->element_type = typed_template.element_type;
             }
@@ -3630,7 +3630,7 @@ Value vmBuiltinSetlength(VM* vm, int arg_count, Value* args) {
 }
 
 Value vmBuiltinRealtostr(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || !isRealType(args[0].type)) {
+    if (arg_count != 1 || !isRealType(VALUE_TYPE(args[0]))) {
         runtimeError(vm, "RealToStr expects 1 real argument.");
         return makeString("");
     }
@@ -3663,12 +3663,12 @@ static bool appendFormatResultChunk(char** buffer, size_t* length, size_t* capac
 }
 
 Value vmBuiltinFormat(VM* vm, int arg_count, Value* args) {
-    if (arg_count < 1 || !isPascalStringType(args[0].type)) {
+    if (arg_count < 1 || !isPascalStringType(VALUE_TYPE(args[0]))) {
         runtimeError(vm, "Format expects a format string followed by values.");
         return makeString("");
     }
 
-    const char* fmt = args[0].s_val ? args[0].s_val : "";
+    const char* fmt = AS_STRING(args[0]) ? AS_STRING(args[0]) : "";
     size_t flen = strlen(fmt);
     int arg_index = 1;
     char* result = NULL;
@@ -3772,7 +3772,7 @@ Value vmBuiltinFormat(VM* vm, int arg_count, Value* args) {
             case 'd': case 'i': case 'u': case 'o': case 'x': case 'X': {
                 unsigned long long u = 0ULL;
                 long long s = 0LL;
-                if (isIntlikeType(v.type) || v.type == TYPE_BOOLEAN || v.type == TYPE_CHAR || v.type == TYPE_ENUM) {
+                if (isIntlikeType(VALUE_TYPE(v)) || VALUE_TYPE(v) == TYPE_BOOLEAN || VALUE_TYPE(v) == TYPE_CHAR || VALUE_TYPE(v) == TYPE_ENUM) {
                     s = AS_INTEGER(v);
                     u = (unsigned long long)AS_INTEGER(v);
                 }
@@ -3793,7 +3793,7 @@ Value vmBuiltinFormat(VM* vm, int arg_count, Value* args) {
                 break;
             }
             case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A': {
-                long double rv = isRealType(v.type) ? AS_REAL(v) : (long double)AS_INTEGER(v);
+                long double rv = isRealType(VALUE_TYPE(v)) ? AS_REAL(v) : (long double)AS_INTEGER(v);
                 if (strcmp(lenmod, "L") == 0) snprintf(piece, sizeof(piece), fmtbuf, (long double)rv);
                 else snprintf(piece, sizeof(piece), fmtbuf, (double)rv);
                 break;
@@ -3801,7 +3801,7 @@ Value vmBuiltinFormat(VM* vm, int arg_count, Value* args) {
             case 'c': {
                 char safe_fmt[sizeof(fmtbuf)];
                 const char* active_fmt = fmtbuf;
-                char ch = (v.type == TYPE_CHAR) ? v.c_val : (char)AS_INTEGER(v);
+                char ch = (VALUE_TYPE(v) == TYPE_CHAR) ? AS_CHAR(v) : (char)AS_INTEGER(v);
                 if (expects_wide_char) {
                     strncpy(safe_fmt, fmtbuf, sizeof(safe_fmt));
                     safe_fmt[sizeof(safe_fmt) - 1] = '\0';
@@ -3818,13 +3818,13 @@ Value vmBuiltinFormat(VM* vm, int arg_count, Value* args) {
             case 's': {
                 char char_text[8] = {0};
                 const char* sv = "";
-                if (isPascalStringType(v.type) && v.s_val) {
-                    sv = v.s_val;
-                } else if (v.type == TYPE_CHAR) {
-                    char_text[0] = (char)v.c_val;
+                if (isPascalStringType(VALUE_TYPE(v)) && AS_STRING(v)) {
+                    sv = AS_STRING(v);
+                } else if (VALUE_TYPE(v) == TYPE_CHAR) {
+                    char_text[0] = (char)AS_CHAR(v);
                     sv = char_text;
-                } else if (v.type == TYPE_WIDECHAR) {
-                    encodeUtf8Codepoint((uint32_t)v.c_val, char_text);
+                } else if (VALUE_TYPE(v) == TYPE_WIDECHAR) {
+                    encodeUtf8Codepoint((uint32_t)AS_CHAR(v), char_text);
                     sv = char_text;
                 }
                 char safe_fmt[sizeof(fmtbuf)];
@@ -3873,7 +3873,7 @@ Value vmBuiltinFormatfloat(VM* vm, int arg_count, Value* args) {
         return makeString("");
     }
 
-    long double value = isRealType(args[0].type) ? AS_REAL(args[0]) : (long double)AS_INTEGER(args[0]);
+    long double value = isRealType(VALUE_TYPE(args[0])) ? AS_REAL(args[0]) : (long double)AS_INTEGER(args[0]);
 
     int precision = PASCAL_DEFAULT_FLOAT_PRECISION;
     if (arg_count == 2) {
@@ -5890,13 +5890,13 @@ Value vmBuiltinReadkey(VM* vm, int arg_count, Value* args) {
     }
 
     if (arg_count == 1) {
-        if (args[0].type != TYPE_POINTER || args[0].ptr_val == NULL) {
+        if (VALUE_TYPE(args[0]) != TYPE_POINTER || AS_POINTER(args[0]) == NULL) {
             runtimeError(vm, "ReadKey argument must be a VAR char.");
         } else {
-            Value* dst = (Value*)args[0].ptr_val;
-                if (dst->type == TYPE_CHAR) {
-                    dst->c_val = c;
-                    SET_INT_VALUE(dst, dst->c_val);
+            Value* dst = (Value*)AS_POINTER(args[0]);
+                if (VALUE_TYPE(*dst) == TYPE_CHAR) {
+                    SET_CHAR_VALUE(dst, c);
+                    SET_INT_VALUE(dst, AS_CHAR(*dst));
                 } else {
                     runtimeError(vm, "ReadKey argument must be of type CHAR.");
                 }
@@ -6302,13 +6302,13 @@ Value vmBuiltinRewrite(VM* vm, int arg_count, Value* args) {
         return makeVoid();
     }
 
-    if (args[0].type != TYPE_POINTER || !args[0].ptr_val) {
+    if (VALUE_TYPE(args[0]) != TYPE_POINTER || !AS_POINTER(args[0])) {
         runtimeError(vm, "Rewrite: Argument must be a VAR file parameter.");
         return makeVoid();
     }
-    Value* fileVarLValue = (Value*)args[0].ptr_val; // Dereference the pointer
+    Value* fileVarLValue = (Value*)AS_POINTER(args[0]); // Dereference the pointer
 
-    if (fileVarLValue->type != TYPE_FILE) { runtimeError(vm, "Argument to Rewrite must be a file variable."); return makeVoid(); }
+    if (VALUE_TYPE(*fileVarLValue) != TYPE_FILE) { runtimeError(vm, "Argument to Rewrite must be a file variable."); return makeVoid(); }
     if (fileVarLValue->filename == NULL) { runtimeError(vm, "File variable not assigned a name before Rewrite."); return makeVoid(); }
     vmMaybeCloseFileValue(fileVarLValue);
 
@@ -6342,7 +6342,7 @@ Value vmBuiltinRewrite(VM* vm, int arg_count, Value* args) {
     } else {
         last_io_error = 0;
     }
-    fileVarLValue->f_val = f;
+    AS_FILE(*fileVarLValue) = f;
     return makeVoid();
 }
 
@@ -6351,7 +6351,7 @@ Value vmBuiltinSqrt(VM* vm, int arg_count, Value* args) {
     Value arg = args[0];
     long double x = IS_INTLIKE(arg) ? (long double)AS_INTEGER(arg) : AS_REAL(arg);
     if (x < 0) { runtimeError(vm, "sqrt expects a non-negative argument."); return makeReal(0.0); }
-    if (arg.type == TYPE_LONG_DOUBLE) {
+    if (VALUE_TYPE(arg) == TYPE_LONG_DOUBLE) {
         return makeLongDouble(sqrtl(x));
     }
     return makeReal(sqrt((double)x));
@@ -6565,24 +6565,24 @@ Value vmBuiltinTrunc(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1) { runtimeError(vm, "trunc expects 1 argument."); return makeInt(0); }
     Value arg = args[0];
     if (IS_INTLIKE(arg)) return makeInt(AS_INTEGER(arg));
-    if (isRealType(arg.type)) return makeInt((long long)AS_REAL(arg));
+    if (isRealType(VALUE_TYPE(arg))) return makeInt((long long)AS_REAL(arg));
     runtimeError(vm, "trunc expects a numeric argument.");
     return makeInt(0);
 }
 
 static inline bool isOrdinalDelta(const Value* v) {
-    return isIntlikeType(v->type) || v->type == TYPE_CHAR /* || v->type == TYPE_BOOLEAN */;
+    return isIntlikeType(VALUE_TYPE(*v)) || VALUE_TYPE(*v) == TYPE_CHAR /* || v->type == TYPE_BOOLEAN */;
 }
 
 static inline long long coerceDeltaToI64(const Value* v) {
-    switch (v->type) {
+    switch (VALUE_TYPE(*v)) {
         case TYPE_INTEGER:
         case TYPE_WORD:
         case TYPE_BYTE:
         case TYPE_BOOLEAN:
-            return v->i_val;
+            return VAL_INT(*v);
         case TYPE_CHAR:
-            return v->c_val;
+            return AS_CHAR(*v);
         default:
             return 0;
     }
@@ -6591,17 +6591,17 @@ static inline long long coerceDeltaToI64(const Value* v) {
 Value vmBuiltinOrd(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1) { runtimeError(vm, "ord expects 1 argument."); return makeInt(0); }
     Value arg = args[0];
-    if (arg.type == TYPE_CHAR || arg.type == TYPE_WIDECHAR) return makeInt(arg.c_val);
-    if (isPascalStringType(arg.type) && arg.s_val) {
-        size_t len = strlen(arg.s_val);
+    if (VALUE_TYPE(arg) == TYPE_CHAR || VALUE_TYPE(arg) == TYPE_WIDECHAR) return makeInt(AS_CHAR(arg));
+    if (isPascalStringType(VALUE_TYPE(arg)) && AS_STRING(arg)) {
+        size_t len = strlen(AS_STRING(arg));
         uint32_t codepoint = 0;
         size_t advance = 0;
-        if (len > 1 && decodeUtf8Codepoint(arg.s_val, len, &codepoint, &advance) && advance == len) {
+        if (len > 1 && decodeUtf8Codepoint(AS_STRING(arg), len, &codepoint, &advance) && advance == len) {
             return makeInt((long long)codepoint);
         }
     }
-    if (arg.type == TYPE_BOOLEAN) return makeInt(arg.i_val);
-    if (arg.type == TYPE_ENUM) return makeInt(arg.enum_val.ordinal);
+    if (VALUE_TYPE(arg) == TYPE_BOOLEAN) return makeInt(VAL_INT(arg));
+    if (VALUE_TYPE(arg) == TYPE_ENUM) return makeInt(AS_ENUM(arg).ordinal);
     if (IS_INTLIKE(arg)) return makeInt(AS_INTEGER(arg));
     runtimeError(vm, "ord expects an ordinal type argument.");
     return makeInt(0);
@@ -6612,12 +6612,12 @@ Value vmBuiltinInc(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "Inc expects 1 or 2 arguments.");
         return makeVoid();
     }
-    if (args[0].type != TYPE_POINTER || args[0].ptr_val == NULL) {
+    if (VALUE_TYPE(args[0]) != TYPE_POINTER || AS_POINTER(args[0]) == NULL) {
         runtimeError(vm, "First argument to Inc must be a variable (pointer).");
         return makeVoid();
     }
 
-    Value* target = (Value*)args[0].ptr_val;
+    Value* target = (Value*)AS_POINTER(args[0]);
 
     long long delta = 1;
     if (arg_count == 2) {
@@ -6628,9 +6628,9 @@ Value vmBuiltinInc(VM* vm, int arg_count, Value* args) {
         delta = coerceDeltaToI64(&args[1]);
     }
 
-    switch (target->type) {
+    switch (VALUE_TYPE(*target)) {
         case TYPE_INT8: {
-            long long next = target->i_val + delta;
+            long long next = VAL_INT(*target) + delta;
             if (next < INT8_MIN || next > INT8_MAX) {
                 runtimeWarning(vm, "Warning: Range check error incrementing INT8 to %lld.", next);
             }
@@ -6639,7 +6639,7 @@ Value vmBuiltinInc(VM* vm, int arg_count, Value* args) {
         }
 
         case TYPE_UINT8: {
-            long long next = target->i_val + delta;
+            long long next = VAL_INT(*target) + delta;
             if (next < 0 || next > UINT8_MAX) {
                 runtimeWarning(vm, "Warning: Range check error incrementing UINT8 to %lld.", next);
             }
@@ -6648,7 +6648,7 @@ Value vmBuiltinInc(VM* vm, int arg_count, Value* args) {
         }
 
         case TYPE_INT16: {
-            long long next = target->i_val + delta;
+            long long next = VAL_INT(*target) + delta;
             if (next < INT16_MIN || next > INT16_MAX) {
                 runtimeWarning(vm, "Warning: Range check error incrementing INT16 to %lld.", next);
             }
@@ -6657,7 +6657,7 @@ Value vmBuiltinInc(VM* vm, int arg_count, Value* args) {
         }
 
         case TYPE_UINT16: {
-            long long next = target->i_val + delta;
+            long long next = VAL_INT(*target) + delta;
             if (next < 0 || next > UINT16_MAX) {
                 runtimeWarning(vm, "Warning: Range check error incrementing UINT16 to %lld.", next);
             }
@@ -6669,11 +6669,11 @@ Value vmBuiltinInc(VM* vm, int arg_count, Value* args) {
         case TYPE_UINT32:
         case TYPE_INT64:
         case TYPE_UINT64:
-            SET_INT_VALUE(target, target->i_val + delta);
+            SET_INT_VALUE(target, VAL_INT(*target) + delta);
             break;
 
         case TYPE_BYTE: {
-            long long next = target->i_val + delta;
+            long long next = VAL_INT(*target) + delta;
             if (next < 0 || next > 255) {
                 runtimeWarning(vm, "Warning: Range check error incrementing BYTE to %lld.", next);
             }
@@ -6682,7 +6682,7 @@ Value vmBuiltinInc(VM* vm, int arg_count, Value* args) {
         }
 
         case TYPE_WORD: {
-            long long next = target->i_val + delta;
+            long long next = VAL_INT(*target) + delta;
             if (next < 0 || next > 65535) {
                 runtimeWarning(vm, "Warning: Range check error incrementing WORD to %lld.", next);
             }
@@ -6691,17 +6691,17 @@ Value vmBuiltinInc(VM* vm, int arg_count, Value* args) {
         }
 
         case TYPE_CHAR: {
-            long long next = target->c_val + delta;
+            long long next = AS_CHAR(*target) + delta;
             if (next < 0 || next > PASCAL_CHAR_MAX) {
                 runtimeWarning(vm, "Warning: Range check error incrementing CHAR to %lld.", next);
             }
-            target->c_val = (int)next;
-            SET_INT_VALUE(target, target->c_val);
+            SET_CHAR_VALUE(target, (int)next);
+            SET_INT_VALUE(target, AS_CHAR(*target));
             break;
         }
 
         case TYPE_ENUM:
-            target->enum_val.ordinal += (int)delta;
+            AS_ENUM(*target).ordinal += (int)delta;
             break;
 
         default:
@@ -6717,12 +6717,12 @@ Value vmBuiltinDec(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "Dec expects 1 or 2 arguments.");
         return makeVoid();
     }
-    if (args[0].type != TYPE_POINTER || args[0].ptr_val == NULL) {
+    if (VALUE_TYPE(args[0]) != TYPE_POINTER || AS_POINTER(args[0]) == NULL) {
         runtimeError(vm, "First argument to Dec must be a variable (pointer).");
         return makeVoid();
     }
 
-    Value* target = (Value*)args[0].ptr_val;
+    Value* target = (Value*)AS_POINTER(args[0]);
 
     long long delta = 1;
     if (arg_count == 2) {
@@ -6733,9 +6733,9 @@ Value vmBuiltinDec(VM* vm, int arg_count, Value* args) {
         delta = coerceDeltaToI64(&args[1]);
     }
 
-    switch (target->type) {
+    switch (VALUE_TYPE(*target)) {
         case TYPE_INT8: {
-            long long next = target->i_val - delta;
+            long long next = VAL_INT(*target) - delta;
             if (next < INT8_MIN || next > INT8_MAX) {
                 runtimeWarning(vm, "Warning: Range check error decrementing INT8 to %lld.", next);
             }
@@ -6744,7 +6744,7 @@ Value vmBuiltinDec(VM* vm, int arg_count, Value* args) {
         }
 
         case TYPE_UINT8: {
-            long long next = target->i_val - delta;
+            long long next = VAL_INT(*target) - delta;
             if (next < 0 || next > UINT8_MAX) {
                 runtimeWarning(vm, "Warning: Range check error decrementing UINT8 to %lld.", next);
             }
@@ -6753,7 +6753,7 @@ Value vmBuiltinDec(VM* vm, int arg_count, Value* args) {
         }
 
         case TYPE_INT16: {
-            long long next = target->i_val - delta;
+            long long next = VAL_INT(*target) - delta;
             if (next < INT16_MIN || next > INT16_MAX) {
                 runtimeWarning(vm, "Warning: Range check error decrementing INT16 to %lld.", next);
             }
@@ -6762,7 +6762,7 @@ Value vmBuiltinDec(VM* vm, int arg_count, Value* args) {
         }
 
         case TYPE_UINT16: {
-            long long next = target->i_val - delta;
+            long long next = VAL_INT(*target) - delta;
             if (next < 0 || next > UINT16_MAX) {
                 runtimeWarning(vm, "Warning: Range check error decrementing UINT16 to %lld.", next);
             }
@@ -6774,11 +6774,11 @@ Value vmBuiltinDec(VM* vm, int arg_count, Value* args) {
         case TYPE_UINT32:
         case TYPE_INT64:
         case TYPE_UINT64:
-            SET_INT_VALUE(target, target->i_val - delta);
+            SET_INT_VALUE(target, VAL_INT(*target) - delta);
             break;
 
         case TYPE_BYTE: {
-            long long next = target->i_val - delta;
+            long long next = VAL_INT(*target) - delta;
             if (next < 0 || next > 255) {
                 runtimeWarning(vm, "Warning: Range check error decrementing BYTE to %lld.", next);
             }
@@ -6787,7 +6787,7 @@ Value vmBuiltinDec(VM* vm, int arg_count, Value* args) {
         }
 
         case TYPE_WORD: {
-            long long next = target->i_val - delta;
+            long long next = VAL_INT(*target) - delta;
             if (next < 0 || next > 65535) {
                 runtimeWarning(vm, "Warning: Range check error decrementing WORD to %lld.", next);
             }
@@ -6796,17 +6796,17 @@ Value vmBuiltinDec(VM* vm, int arg_count, Value* args) {
         }
 
         case TYPE_CHAR: {
-            long long next = target->c_val - delta;
+            long long next = AS_CHAR(*target) - delta;
             if (next < 0 || next > PASCAL_CHAR_MAX) {
                 runtimeWarning(vm, "Warning: Range check error decrementing CHAR to %lld.", next);
             }
-            target->c_val = (int)next;
-            SET_INT_VALUE(target, target->c_val);
+            SET_CHAR_VALUE(target, (int)next);
+            SET_INT_VALUE(target, AS_CHAR(*target));
             break;
         }
 
         case TYPE_ENUM:
-            target->enum_val.ordinal -= (int)delta;
+            AS_ENUM(*target).ordinal -= (int)delta;
             break;
 
         default:
@@ -6833,7 +6833,7 @@ static ArrayBoundsResult resolveFirstDimBounds(Value* arg) {
 
     Value* current = arg;
     for (int depth = 0; depth < 8 && current; ++depth) {
-        if (current->type == TYPE_ARRAY) {
+        if (VALUE_TYPE(*current) == TYPE_ARRAY) {
             int lower = 0;
             int upper = -1;
             if (current->dimensions > 0 && current->lower_bounds && current->upper_bounds) {
@@ -6849,16 +6849,16 @@ static ArrayBoundsResult resolveFirstDimBounds(Value* arg) {
             return result;
         }
 
-        if (current->type != TYPE_POINTER) {
+        if (VALUE_TYPE(*current) != TYPE_POINTER) {
             break;
         }
 
-        if (!current->ptr_val) {
+        if (!AS_POINTER(*current)) {
             result.hitNilPointer = true;
             return result;
         }
 
-        Value* next = (Value*)current->ptr_val;
+        Value* next = (Value*)AS_POINTER(*current);
         if (next == current) {
             break;
         }
@@ -6889,13 +6889,13 @@ Value vmBuiltinLow(VM* vm, int arg_count, Value* args) {
     }
 
     // Extract type name or type information from the argument
-    if (isPascalStringType(arg.type)) {
+    if (isPascalStringType(VALUE_TYPE(arg))) {
         typeName = AS_STRING(arg);
-    } else if (arg.type == TYPE_ENUM) {
-        typeName = arg.enum_val.enum_name;
+    } else if (VALUE_TYPE(arg) == TYPE_ENUM) {
+        typeName = AS_ENUM(arg).enum_name;
         t = TYPE_ENUM;
     } else {
-        t = arg.type;
+        t = VALUE_TYPE(arg);
     }
 
     // Map the provided name to a VarType if we haven't yet
@@ -6956,13 +6956,13 @@ Value vmBuiltinHigh(VM* vm, int arg_count, Value* args) {
         return makeInt(0);
     }
 
-    if (isPascalStringType(arg.type)) {
+    if (isPascalStringType(VALUE_TYPE(arg))) {
         typeName = AS_STRING(arg);
-    } else if (arg.type == TYPE_ENUM) {
-        typeName = arg.enum_val.enum_name;
+    } else if (VALUE_TYPE(arg) == TYPE_ENUM) {
+        typeName = AS_ENUM(arg).enum_name;
         t = TYPE_ENUM;
     } else {
-        t = arg.type;
+        t = VALUE_TYPE(arg);
     }
 
     if (t == TYPE_UNKNOWN && typeName) {
@@ -7003,19 +7003,19 @@ Value vmBuiltinHigh(VM* vm, int arg_count, Value* args) {
 }
 
 Value vmBuiltinNew(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || args[0].type != TYPE_POINTER) {
+    if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_POINTER) {
         runtimeError(vm, "new() expects a single pointer variable argument.");
         return makeVoid();
     }
     
     // The argument on the stack is a pointer TO the pointer variable's Value struct
-    Value* pointerVarValuePtr = (Value*)args[0].ptr_val;
+    Value* pointerVarValuePtr = (Value*)AS_POINTER(args[0]);
     if (!pointerVarValuePtr) {
         runtimeError(vm, "VM internal error: new() received a null LValue pointer.");
         return makeVoid();
     }
-    if (pointerVarValuePtr->type != TYPE_POINTER) {
-        runtimeError(vm, "Argument to new() must be of pointer type. Got %s.", varTypeToString(pointerVarValuePtr->type));
+    if (VALUE_TYPE(*pointerVarValuePtr) != TYPE_POINTER) {
+        runtimeError(vm, "Argument to new() must be of pointer type. Got %s.", varTypeToString(VALUE_TYPE(*pointerVarValuePtr)));
         return makeVoid();
     }
 
@@ -7063,8 +7063,8 @@ Value vmBuiltinNew(VM* vm, int arg_count, Value* args) {
     // (debug logging removed)
 
     // Update the pointer variable that was passed by reference
-    pointerVarValuePtr->ptr_val = allocated_memory;
-    pointerVarValuePtr->type = TYPE_POINTER;
+    AS_POINTER(*pointerVarValuePtr) = allocated_memory;
+    SET_VALUE_TYPE(pointerVarValuePtr, TYPE_POINTER);
 
     // Safety: if base type metadata is unknown, treat as integer for subsequent dereferences
     if (!pointerVarValuePtr->base_type_node) {
@@ -7081,11 +7081,11 @@ Value vmBuiltinNew(VM* vm, int arg_count, Value* args) {
 
 // newobj(typeName: string): pointer
 Value vmBuiltinNewObj(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || !isPascalStringType(args[0].type) || !args[0].s_val) {
+    if (arg_count != 1 || !isPascalStringType(VALUE_TYPE(args[0])) || !AS_STRING(args[0])) {
         runtimeError(vm, "newobj expects 1 string type name.");
         return makeNil();
     }
-    const char* typeName = args[0].s_val;
+    const char* typeName = AS_STRING(args[0]);
     AST* typeDef = lookupType(typeName);
     if (!typeDef) {
         runtimeError(vm, "newobj: unknown type '%s'", typeName ? typeName : "");
@@ -7096,8 +7096,8 @@ Value vmBuiltinNewObj(VM* vm, int arg_count, Value* args) {
     if (!allocated) { runtimeError(vm, "newobj: allocation failed"); return makeNil(); }
     *allocated = makeValueForType(vt, typeDef, NULL);
     Value ret = makeVoid();
-    ret.type = TYPE_POINTER;
-    ret.ptr_val = allocated;
+    SET_VALUE_TYPE(&ret, TYPE_POINTER);
+    AS_POINTER(ret) = allocated;
     ret.base_type_node = typeDef;
     return ret;
 }
@@ -7113,22 +7113,22 @@ Value vmBuiltinExit(VM* vm, int arg_count, Value* args) {
 }
 
 Value vmBuiltinDispose(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || args[0].type != TYPE_POINTER) {
+    if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_POINTER) {
         runtimeError(vm, "dispose() expects a single pointer variable argument.");
         return makeVoid();
     }
     
-    Value* pointerVarValuePtr = (Value*)args[0].ptr_val;
+    Value* pointerVarValuePtr = (Value*)AS_POINTER(args[0]);
     if (!pointerVarValuePtr) {
         runtimeError(vm, "VM internal error: dispose() received a null LValue pointer.");
         return makeVoid();
     }
-    if (pointerVarValuePtr->type != TYPE_POINTER) {
+    if (VALUE_TYPE(*pointerVarValuePtr) != TYPE_POINTER) {
         runtimeError(vm, "Argument to dispose() must be a pointer.");
         return makeVoid();
     }
 
-    Value* valueToDispose = pointerVarValuePtr->ptr_val;
+    Value* valueToDispose = AS_POINTER(*pointerVarValuePtr);
     if (valueToDispose == NULL) {
         // Disposing a nil pointer is a safe no-op.
         return makeVoid();
@@ -7142,7 +7142,7 @@ Value vmBuiltinDispose(VM* vm, int arg_count, Value* args) {
     free(valueToDispose);
     
     // Set the original pointer variable to nil
-    pointerVarValuePtr->ptr_val = NULL;
+    AS_POINTER(*pointerVarValuePtr) = NULL;
     
     // Call the new helper to find and nullify any dangling aliases
     vmNullifyAliases(vm, disposedAddrValue);
@@ -7161,18 +7161,18 @@ Value vmBuiltinAssign(VM* vm, int arg_count, Value* args) {
     Value fileVarPtr  = args[0];
     Value fileNameVal = args[1];
 
-    if (fileVarPtr.type != TYPE_POINTER || !fileVarPtr.ptr_val) {
+    if (VALUE_TYPE(fileVarPtr) != TYPE_POINTER || !AS_POINTER(fileVarPtr)) {
         runtimeError(vm, "Assign: First argument must be a VAR file parameter.");
         return makeVoid();
     }
-    Value* fileVarLValue = (Value*)fileVarPtr.ptr_val;
+    Value* fileVarLValue = (Value*)AS_POINTER(fileVarPtr);
 
-    if (fileVarLValue->type != TYPE_FILE) {
+    if (VALUE_TYPE(*fileVarLValue) != TYPE_FILE) {
         runtimeError(vm, "First arg to Assign must be a file variable.");
         return makeVoid();
     }
-    if (!isPascalStringType(fileNameVal.type)) {
-        runtimeError(vm, "Second arg to Assign must be a string. Got type %s.", varTypeToString(fileNameVal.type));
+    if (!isPascalStringType(VALUE_TYPE(fileNameVal))) {
+        runtimeError(vm, "Second arg to Assign must be a string. Got type %s.", varTypeToString(VALUE_TYPE(fileNameVal)));
         return makeVoid();
     }
 
@@ -7181,8 +7181,8 @@ Value vmBuiltinAssign(VM* vm, int arg_count, Value* args) {
     }
 
     // Use strdup to create a persistent copy of the filename
-    fileVarLValue->filename = fileNameVal.s_val ? strdup(fileNameVal.s_val) : NULL;
-    if (fileNameVal.s_val && !fileVarLValue->filename) {
+    fileVarLValue->filename = AS_STRING(fileNameVal) ? strdup(AS_STRING(fileNameVal)) : NULL;
+    if (AS_STRING(fileNameVal) && !fileVarLValue->filename) {
         runtimeError(vm, "Memory allocation failed for filename in assign.");
     }
 
@@ -7195,13 +7195,13 @@ Value vmBuiltinReset(VM* vm, int arg_count, Value* args) {
         return makeVoid();
     }
 
-    if (args[0].type != TYPE_POINTER || !args[0].ptr_val) {
+    if (VALUE_TYPE(args[0]) != TYPE_POINTER || !AS_POINTER(args[0])) {
         runtimeError(vm, "Reset: Argument must be a VAR file parameter.");
         return makeVoid();
     }
-    Value* fileVarLValue = (Value*)args[0].ptr_val; // Dereference the pointer
+    Value* fileVarLValue = (Value*)AS_POINTER(args[0]); // Dereference the pointer
 
-    if (fileVarLValue->type != TYPE_FILE) { runtimeError(vm, "Argument to Reset must be a file variable."); return makeVoid(); }
+    if (VALUE_TYPE(*fileVarLValue) != TYPE_FILE) { runtimeError(vm, "Argument to Reset must be a file variable."); return makeVoid(); }
     if (fileVarLValue->filename == NULL) { runtimeError(vm, "File variable not assigned a name before Reset."); return makeVoid(); }
     vmMaybeCloseFileValue(fileVarLValue);
 
@@ -7235,20 +7235,20 @@ Value vmBuiltinReset(VM* vm, int arg_count, Value* args) {
     } else {
         last_io_error = 0;
     }
-    fileVarLValue->f_val = f;
+    AS_FILE(*fileVarLValue) = f;
     return makeVoid();
 }
 
 Value vmBuiltinAppend(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1) { runtimeError(vm, "Append requires 1 argument."); return makeVoid(); }
 
-    if (args[0].type != TYPE_POINTER || !args[0].ptr_val) {
+    if (VALUE_TYPE(args[0]) != TYPE_POINTER || !AS_POINTER(args[0])) {
         runtimeError(vm, "Append: Argument must be a VAR file parameter.");
         return makeVoid();
     }
-    Value* fileVarLValue = (Value*)args[0].ptr_val;
+    Value* fileVarLValue = (Value*)AS_POINTER(args[0]);
 
-    if (fileVarLValue->type != TYPE_FILE) { runtimeError(vm, "Argument to Append must be a file variable."); return makeVoid(); }
+    if (VALUE_TYPE(*fileVarLValue) != TYPE_FILE) { runtimeError(vm, "Argument to Append must be a file variable."); return makeVoid(); }
     if (fileVarLValue->filename == NULL) { runtimeError(vm, "File variable not assigned a name before Append."); return makeVoid(); }
     vmMaybeCloseFileValue(fileVarLValue);
 
@@ -7258,20 +7258,20 @@ Value vmBuiltinAppend(VM* vm, int arg_count, Value* args) {
     } else {
         last_io_error = 0;
     }
-    fileVarLValue->f_val = f;
+    AS_FILE(*fileVarLValue) = f;
     return makeVoid();
 }
 
 Value vmBuiltinClose(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1) { runtimeError(vm, "Close requires 1 argument."); return makeVoid(); }
     
-    if (args[0].type != TYPE_POINTER || !args[0].ptr_val) {
+    if (VALUE_TYPE(args[0]) != TYPE_POINTER || !AS_POINTER(args[0])) {
         runtimeError(vm, "Close: Argument must be a VAR file parameter.");
         return makeVoid();
     }
-    Value* fileVarLValue = (Value*)args[0].ptr_val; // Dereference the pointer
+    Value* fileVarLValue = (Value*)AS_POINTER(args[0]); // Dereference the pointer
 
-    if (fileVarLValue->type != TYPE_FILE) { runtimeError(vm, "Argument to Close must be a file variable."); return makeVoid(); }
+    if (VALUE_TYPE(*fileVarLValue) != TYPE_FILE) { runtimeError(vm, "Argument to Close must be a file variable."); return makeVoid(); }
     vmMaybeCloseFileValue(fileVarLValue);
     // Standard Pascal does not de-assign the filename on Close.
     return makeVoid();
@@ -7280,25 +7280,25 @@ Value vmBuiltinClose(VM* vm, int arg_count, Value* args) {
 Value vmBuiltinRename(VM* vm, int arg_count, Value* args) {
     if (arg_count != 2) { runtimeError(vm, "Rename requires 2 arguments."); return makeVoid(); }
 
-    if (args[0].type != TYPE_POINTER || !args[0].ptr_val) {
+    if (VALUE_TYPE(args[0]) != TYPE_POINTER || !AS_POINTER(args[0])) {
         runtimeError(vm, "Rename: First argument must be a VAR file parameter.");
         return makeVoid();
     }
-    Value* fileVarLValue = (Value*)args[0].ptr_val;
+    Value* fileVarLValue = (Value*)AS_POINTER(args[0]);
 
-    if (fileVarLValue->type != TYPE_FILE) { runtimeError(vm, "First argument to Rename must be a file variable."); return makeVoid(); }
+    if (VALUE_TYPE(*fileVarLValue) != TYPE_FILE) { runtimeError(vm, "First argument to Rename must be a file variable."); return makeVoid(); }
     if (fileVarLValue->filename == NULL) { runtimeError(vm, "File variable not assigned a name before Rename."); return makeVoid(); }
-    if (!isPascalStringType(args[1].type)) { runtimeError(vm, "Second argument to Rename must be a string."); return makeVoid(); }
+    if (!isPascalStringType(VALUE_TYPE(args[1]))) { runtimeError(vm, "Second argument to Rename must be a string."); return makeVoid(); }
     vmMaybeCloseFileValue(fileVarLValue);
 
-    int res = rename(fileVarLValue->filename, args[1].s_val);
+    int res = rename(fileVarLValue->filename, AS_STRING(args[1]));
     if (res != 0) {
         last_io_error = errno ? errno : 1;
     } else {
         last_io_error = 0;
         free(fileVarLValue->filename);
-        fileVarLValue->filename = args[1].s_val ? strdup(args[1].s_val) : NULL;
-        if (args[1].s_val && !fileVarLValue->filename) {
+        fileVarLValue->filename = AS_STRING(args[1]) ? strdup(AS_STRING(args[1])) : NULL;
+        if (AS_STRING(args[1]) && !fileVarLValue->filename) {
             runtimeError(vm, "Memory allocation failed for filename in Rename.");
         }
     }
@@ -7308,13 +7308,13 @@ Value vmBuiltinRename(VM* vm, int arg_count, Value* args) {
 Value vmBuiltinErase(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1) { runtimeError(vm, "Erase requires 1 argument."); return makeVoid(); }
 
-    if (args[0].type != TYPE_POINTER || !args[0].ptr_val) {
+    if (VALUE_TYPE(args[0]) != TYPE_POINTER || !AS_POINTER(args[0])) {
         runtimeError(vm, "Erase: Argument must be a VAR file parameter.");
         return makeVoid();
     }
-    Value* fileVarLValue = (Value*)args[0].ptr_val;
+    Value* fileVarLValue = (Value*)AS_POINTER(args[0]);
 
-    if (fileVarLValue->type != TYPE_FILE) { runtimeError(vm, "Argument to Erase must be a file variable."); return makeVoid(); }
+    if (VALUE_TYPE(*fileVarLValue) != TYPE_FILE) { runtimeError(vm, "Argument to Erase must be a file variable."); return makeVoid(); }
     if (fileVarLValue->filename == NULL) { runtimeError(vm, "File variable not assigned a name before Erase."); return makeVoid(); }
     vmMaybeCloseFileValue(fileVarLValue);
 
@@ -7335,13 +7335,13 @@ Value vmBuiltinFilesize(VM* vm, int arg_count, Value* args) {
     }
 
     Value *fileValue = NULL;
-    if (args[0].type == TYPE_POINTER && args[0].ptr_val) {
-        fileValue = (Value*)args[0].ptr_val;
-    } else if (args[0].type == TYPE_FILE) {
+    if (VALUE_TYPE(args[0]) == TYPE_POINTER && AS_POINTER(args[0])) {
+        fileValue = (Value*)AS_POINTER(args[0]);
+    } else if (VALUE_TYPE(args[0]) == TYPE_FILE) {
         fileValue = (Value*)&args[0];
     }
 
-    if (!fileValue || fileValue->type != TYPE_FILE) {
+    if (!fileValue || VALUE_TYPE(*fileValue) != TYPE_FILE) {
         runtimeError(vm, "FileSize argument must be a file variable.");
         last_io_error = 1;
         return makeInt(0);
@@ -7349,8 +7349,8 @@ Value vmBuiltinFilesize(VM* vm, int arg_count, Value* args) {
 
     long long sizeBytes = -1;
 
-    if (fileValue->f_val) {
-        int fd = fileno(fileValue->f_val);
+    if (AS_FILE(*fileValue)) {
+        int fd = fileno(AS_FILE(*fileValue));
         if (fd >= 0) {
             struct stat st;
             if (fstat(fd, &st) == 0) {
@@ -7361,26 +7361,26 @@ Value vmBuiltinFilesize(VM* vm, int arg_count, Value* args) {
         if (sizeBytes < 0) {
             errno = 0;
 #ifdef _WIN32
-            long current = ftell(fileValue->f_val);
+            long current = ftell(AS_FILE(*fileValue));
             if (current >= 0L) {
-                if (fseek(fileValue->f_val, 0L, SEEK_END) == 0) {
-                    long end = ftell(fileValue->f_val);
+                if (fseek(AS_FILE(*fileValue), 0L, SEEK_END) == 0) {
+                    long end = ftell(AS_FILE(*fileValue));
                     if (end >= 0L) {
                         sizeBytes = (long long)end;
                     }
                 }
-                fseek(fileValue->f_val, current, SEEK_SET);
+                fseek(AS_FILE(*fileValue), current, SEEK_SET);
             }
 #else
-            off_t current = ftello(fileValue->f_val);
+            off_t current = ftello(AS_FILE(*fileValue));
             if (current >= (off_t)0) {
-                if (fseeko(fileValue->f_val, 0, SEEK_END) == 0) {
-                    off_t end = ftello(fileValue->f_val);
+                if (fseeko(AS_FILE(*fileValue), 0, SEEK_END) == 0) {
+                    off_t end = ftello(AS_FILE(*fileValue));
                     if (end >= (off_t)0) {
                         sizeBytes = (long long)end;
                     }
                 }
-                fseeko(fileValue->f_val, current, SEEK_SET);
+                fseeko(AS_FILE(*fileValue), current, SEEK_SET);
             }
 #endif
         }
@@ -7421,8 +7421,8 @@ Value vmBuiltinEof(VM* vm, int arg_count, Value* args) {
         if (vm->vmGlobalSymbols) {
             Symbol* inputSym = hashTableLookup(vm->vmGlobalSymbols, "input");
             if (inputSym && inputSym->value &&
-                inputSym->value->type == TYPE_FILE) {
-                stream = inputSym->value->f_val;
+                VALUE_TYPE(*inputSym->value) == TYPE_FILE) {
+                stream = AS_FILE(*inputSym->value);
             }
         }
         if (!stream) {
@@ -7430,19 +7430,19 @@ Value vmBuiltinEof(VM* vm, int arg_count, Value* args) {
             return makeBoolean(true);
         }
     } else if (arg_count == 1) {
-        if (args[0].type != TYPE_POINTER || !args[0].ptr_val) {
+        if (VALUE_TYPE(args[0]) != TYPE_POINTER || !AS_POINTER(args[0])) {
             runtimeError(vm, "Eof: Argument must be a VAR file parameter.");
             return makeBoolean(true);
         }
-        Value* fileVarLValue = (Value*)args[0].ptr_val; // Dereference the pointer
-        if (fileVarLValue->type != TYPE_FILE) {
+        Value* fileVarLValue = (Value*)AS_POINTER(args[0]); // Dereference the pointer
+        if (VALUE_TYPE(*fileVarLValue) != TYPE_FILE) {
             runtimeError(vm, "Argument to Eof must be a file variable.");
             return makeBoolean(true);
         }
-        if (!fileVarLValue->f_val) {
+        if (!AS_FILE(*fileVarLValue)) {
             return makeBoolean(true); // Closed file is treated as EOF
         }
-        stream = fileVarLValue->f_val;
+        stream = AS_FILE(*fileVarLValue);
     } else {
         runtimeError(vm, "Eof expects 0 or 1 arguments.");
         return makeBoolean(true);
@@ -7478,26 +7478,26 @@ Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
         goto cleanup;
     }
 
-    if (args[0].type != TYPE_POINTER || !args[0].ptr_val) {
+    if (VALUE_TYPE(args[0]) != TYPE_POINTER || !AS_POINTER(args[0])) {
         runtimeError(vm, "BlockRead: first argument must be a VAR file parameter.");
         last_io_error = 1;
         parameterError = true;
         goto cleanup;
     }
-    fileValue = (Value*)args[0].ptr_val;
-    if (!fileValue || fileValue->type != TYPE_FILE) {
+    fileValue = (Value*)AS_POINTER(args[0]);
+    if (!fileValue || VALUE_TYPE(*fileValue) != TYPE_FILE) {
         runtimeError(vm, "BlockRead: first argument must reference a file variable.");
         last_io_error = 1;
         parameterError = true;
         goto cleanup;
     }
-    if (!fileValue->f_val) {
+    if (!AS_FILE(*fileValue)) {
         runtimeError(vm, "BlockRead: file is not open.");
         last_io_error = 1;
         parameterError = true;
         goto cleanup;
     }
-    stream = fileValue->f_val;
+    stream = AS_FILE(*fileValue);
 
     if (!IS_INTLIKE(args[2])) {
         runtimeError(vm, "BlockRead: count must be an integer value.");
@@ -7511,16 +7511,16 @@ Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
     }
 
     if (arg_count == 4) {
-        if (args[3].type != TYPE_POINTER || !args[3].ptr_val) {
+        if (VALUE_TYPE(args[3]) != TYPE_POINTER || !AS_POINTER(args[3])) {
             runtimeError(vm, "BlockRead: result argument must be a VAR parameter.");
             last_io_error = 1;
             parameterError = true;
             goto cleanup;
         }
-        resultSlot = (Value*)args[3].ptr_val;
+        resultSlot = (Value*)AS_POINTER(args[3]);
     }
 
-    if (args[1].type != TYPE_POINTER || !args[1].ptr_val) {
+    if (VALUE_TYPE(args[1]) != TYPE_POINTER || !AS_POINTER(args[1])) {
         runtimeError(vm, "BlockRead: buffer must be passed by reference.");
         last_io_error = 1;
         parameterError = true;
@@ -7531,20 +7531,20 @@ Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
         args[1].base_type_node == SERIALIZED_CHAR_PTR_SENTINEL ||
         args[1].base_type_node == BYTE_ARRAY_PTR_SENTINEL) {
         bufferIsRawPointer = true;
-        rawPointer = (unsigned char*)args[1].ptr_val;
+        rawPointer = (unsigned char*)AS_POINTER(args[1]);
     } else {
-        bufferValue = (Value*)args[1].ptr_val;
-        if (bufferValue && bufferValue->type == TYPE_POINTER &&
+        bufferValue = (Value*)AS_POINTER(args[1]);
+        if (bufferValue && VALUE_TYPE(*bufferValue) == TYPE_POINTER &&
             (bufferValue->base_type_node == STRING_CHAR_PTR_SENTINEL ||
              bufferValue->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL ||
              bufferValue->base_type_node == BYTE_ARRAY_PTR_SENTINEL)) {
             bufferIsRawPointer = true;
-            rawPointer = (unsigned char*)bufferValue->ptr_val;
+            rawPointer = (unsigned char*)AS_POINTER(*bufferValue);
         }
     }
 
     if (!bufferIsRawPointer) {
-        if (!bufferValue || bufferValue->type != TYPE_ARRAY) {
+        if (!bufferValue || VALUE_TYPE(*bufferValue) != TYPE_ARRAY) {
             runtimeError(vm, "BlockRead: buffer must be an array of byte-sized elements or a character pointer.");
             last_io_error = 1;
             parameterError = true;
@@ -7604,8 +7604,8 @@ Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
                 bufferValue->element_type == TYPE_INT8 ||
                 bufferValue->element_type == TYPE_CHAR ||
                 bufferValue->element_type == TYPE_BOOLEAN;
-            if (!elementByteCompatible && bufferValue->array_val && available > 0) {
-                elementByteCompatible = valueIsByteCompatible(&bufferValue->array_val[0]);
+            if (!elementByteCompatible && AS_ARRAY(*bufferValue) && available > 0) {
+                elementByteCompatible = valueIsByteCompatible(&AS_ARRAY(*bufferValue)[0]);
             }
             if (!elementByteCompatible) {
                 runtimeError(vm, "BlockRead: buffer array must contain byte-sized elements.");
@@ -7614,7 +7614,7 @@ Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
                 goto cleanup;
             }
             if (bufferValue->array_is_packed && bufferValue->element_type == TYPE_BYTE) {
-                if (!bufferValue->array_raw && bytesToRead > 0) {
+                if (!AS_ARRAY_RAW(*bufferValue) && bytesToRead > 0) {
                     runtimeError(vm, "BlockRead: packed byte buffer is NULL.");
                     last_io_error = 1;
                     parameterError = true;
@@ -7622,7 +7622,7 @@ Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
                 }
                 errno = 0;
                 performedIO = true;
-                bytesProcessed = fread(bufferValue->array_raw, 1, bytesToRead, stream);
+                bytesProcessed = fread(AS_ARRAY_RAW(*bufferValue), 1, bytesToRead, stream);
                 if (bytesProcessed < bytesToRead && ferror(stream)) {
                     last_io_error = errno ? errno : 1;
                 }
@@ -7640,8 +7640,8 @@ Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
                 if (bytesProcessed < bytesToRead && ferror(stream)) {
                     last_io_error = errno ? errno : 1;
                 }
-                for (size_t i = 0; i < bytesProcessed && bufferValue->array_val; ++i) {
-                    assignByteToValue(&bufferValue->array_val[i], tempBuffer[i]);
+                for (size_t i = 0; i < bytesProcessed && AS_ARRAY(*bufferValue); ++i) {
+                    assignByteToValue(&AS_ARRAY(*bufferValue)[i], tempBuffer[i]);
                 }
             }
         } else {
@@ -7698,26 +7698,26 @@ Value vmBuiltinBlockwrite(VM* vm, int arg_count, Value* args) {
         goto cleanup;
     }
 
-    if (args[0].type != TYPE_POINTER || !args[0].ptr_val) {
+    if (VALUE_TYPE(args[0]) != TYPE_POINTER || !AS_POINTER(args[0])) {
         runtimeError(vm, "BlockWrite: first argument must be a VAR file parameter.");
         last_io_error = 1;
         parameterError = true;
         goto cleanup;
     }
-    fileValue = (Value*)args[0].ptr_val;
-    if (!fileValue || fileValue->type != TYPE_FILE) {
+    fileValue = (Value*)AS_POINTER(args[0]);
+    if (!fileValue || VALUE_TYPE(*fileValue) != TYPE_FILE) {
         runtimeError(vm, "BlockWrite: first argument must reference a file variable.");
         last_io_error = 1;
         parameterError = true;
         goto cleanup;
     }
-    if (!fileValue->f_val) {
+    if (!AS_FILE(*fileValue)) {
         runtimeError(vm, "BlockWrite: file is not open.");
         last_io_error = 1;
         parameterError = true;
         goto cleanup;
     }
-    stream = fileValue->f_val;
+    stream = AS_FILE(*fileValue);
 
     if (!IS_INTLIKE(args[2])) {
         runtimeError(vm, "BlockWrite: count must be an integer value.");
@@ -7731,16 +7731,16 @@ Value vmBuiltinBlockwrite(VM* vm, int arg_count, Value* args) {
     }
 
     if (arg_count == 4) {
-        if (args[3].type != TYPE_POINTER || !args[3].ptr_val) {
+        if (VALUE_TYPE(args[3]) != TYPE_POINTER || !AS_POINTER(args[3])) {
             runtimeError(vm, "BlockWrite: result argument must be a VAR parameter.");
             last_io_error = 1;
             parameterError = true;
             goto cleanup;
         }
-        resultSlot = (Value*)args[3].ptr_val;
+        resultSlot = (Value*)AS_POINTER(args[3]);
     }
 
-    if (args[1].type != TYPE_POINTER || !args[1].ptr_val) {
+    if (VALUE_TYPE(args[1]) != TYPE_POINTER || !AS_POINTER(args[1])) {
         runtimeError(vm, "BlockWrite: buffer must be passed by reference.");
         last_io_error = 1;
         parameterError = true;
@@ -7751,20 +7751,20 @@ Value vmBuiltinBlockwrite(VM* vm, int arg_count, Value* args) {
         args[1].base_type_node == SERIALIZED_CHAR_PTR_SENTINEL ||
         args[1].base_type_node == BYTE_ARRAY_PTR_SENTINEL) {
         bufferIsRawPointer = true;
-        rawPointer = (unsigned char*)args[1].ptr_val;
+        rawPointer = (unsigned char*)AS_POINTER(args[1]);
     } else {
-        bufferValue = (Value*)args[1].ptr_val;
-        if (bufferValue && bufferValue->type == TYPE_POINTER &&
+        bufferValue = (Value*)AS_POINTER(args[1]);
+        if (bufferValue && VALUE_TYPE(*bufferValue) == TYPE_POINTER &&
             (bufferValue->base_type_node == STRING_CHAR_PTR_SENTINEL ||
              bufferValue->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL ||
              bufferValue->base_type_node == BYTE_ARRAY_PTR_SENTINEL)) {
             bufferIsRawPointer = true;
-            rawPointer = (unsigned char*)bufferValue->ptr_val;
+            rawPointer = (unsigned char*)AS_POINTER(*bufferValue);
         }
     }
 
     if (!bufferIsRawPointer) {
-        if (!bufferValue || bufferValue->type != TYPE_ARRAY) {
+        if (!bufferValue || VALUE_TYPE(*bufferValue) != TYPE_ARRAY) {
             runtimeError(vm, "BlockWrite: buffer must be an array of byte-sized elements or a character pointer.");
             last_io_error = 1;
             parameterError = true;
@@ -7824,8 +7824,8 @@ Value vmBuiltinBlockwrite(VM* vm, int arg_count, Value* args) {
                 bufferValue->element_type == TYPE_INT8 ||
                 bufferValue->element_type == TYPE_CHAR ||
                 bufferValue->element_type == TYPE_BOOLEAN;
-            if (!elementByteCompatible && bufferValue->array_val && available > 0) {
-                elementByteCompatible = valueIsByteCompatible(&bufferValue->array_val[0]);
+            if (!elementByteCompatible && AS_ARRAY(*bufferValue) && available > 0) {
+                elementByteCompatible = valueIsByteCompatible(&AS_ARRAY(*bufferValue)[0]);
             }
             if (!elementByteCompatible) {
                 runtimeError(vm, "BlockWrite: buffer array must contain byte-sized elements.");
@@ -7834,7 +7834,7 @@ Value vmBuiltinBlockwrite(VM* vm, int arg_count, Value* args) {
                 goto cleanup;
             }
             if (bufferValue->array_is_packed && bufferValue->element_type == TYPE_BYTE) {
-                if (!bufferValue->array_raw && bytesToWrite > 0) {
+                if (!AS_ARRAY_RAW(*bufferValue) && bytesToWrite > 0) {
                     runtimeError(vm, "BlockWrite: packed byte buffer is NULL.");
                     last_io_error = 1;
                     parameterError = true;
@@ -7842,7 +7842,7 @@ Value vmBuiltinBlockwrite(VM* vm, int arg_count, Value* args) {
                 }
                 errno = 0;
                 performedIO = true;
-                bytesProcessed = fwrite(bufferValue->array_raw, 1, bytesToWrite, stream);
+                bytesProcessed = fwrite(AS_ARRAY_RAW(*bufferValue), 1, bytesToWrite, stream);
                 if (bytesProcessed < bytesToWrite && ferror(stream)) {
                     last_io_error = errno ? errno : 1;
                 }
@@ -7854,8 +7854,8 @@ Value vmBuiltinBlockwrite(VM* vm, int arg_count, Value* args) {
                     parameterError = true;
                     goto cleanup;
                 }
-                for (size_t i = 0; i < bytesToWrite && bufferValue->array_val; ++i) {
-                    tempBuffer[i] = valueToByte(&bufferValue->array_val[i]);
+                for (size_t i = 0; i < bytesToWrite && AS_ARRAY(*bufferValue); ++i) {
+                    tempBuffer[i] = valueToByte(&AS_ARRAY(*bufferValue)[i]);
                 }
                 errno = 0;
                 performedIO = true;
@@ -7905,17 +7905,17 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
     // Determine input stream: allow FILE or ^FILE
     if (arg_count > 0) {
         const Value* a0 = &args[0];
-        if (a0->type == TYPE_POINTER && a0->ptr_val) a0 = (const Value*)a0->ptr_val;
-        if (a0->type == TYPE_FILE) {
-            if (!a0->f_val) {
+        if (VALUE_TYPE(*a0) == TYPE_POINTER && AS_POINTER(*a0)) a0 = (const Value*)AS_POINTER(*a0);
+        if (VALUE_TYPE(*a0) == TYPE_FILE) {
+            if (!AS_FILE(*a0)) {
                 runtimeError(vm, "File not open for Read.");
                 io_error = 1;
                 vmCommitLastIoError(io_error);
                 return makeVoid();
             }
-            input_stream = a0->f_val;
+            input_stream = AS_FILE(*a0);
             var_start_index = 1;
-            if (args[0].type == TYPE_FILE) first_arg_is_file_by_value = true;
+            if (VALUE_TYPE(args[0]) == TYPE_FILE) first_arg_is_file_by_value = true;
         }
     }
 
@@ -7924,21 +7924,21 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
     }
 
     for (int i = var_start_index; i < arg_count; i++) {
-        if (args[i].type != TYPE_POINTER || !args[i].ptr_val) {
+        if (VALUE_TYPE(args[i]) != TYPE_POINTER || !AS_POINTER(args[i])) {
             runtimeError(vm, "Read requires VAR parameters to read into.");
             io_error = 1;
             break;
         }
-        Value* dst = (Value*)args[i].ptr_val;
+        Value* dst = (Value*)AS_POINTER(args[i]);
 
-        if (dst->type == TYPE_CHAR) {
+        if (VALUE_TYPE(*dst) == TYPE_CHAR) {
             int ch = fgetc(input_stream);
             if (ch == EOF) { io_error = feof(input_stream) ? 0 : 1; break; }
-            dst->c_val = ch;
-            SET_INT_VALUE(dst, dst->c_val);
+            SET_CHAR_VALUE(dst, ch);
+            SET_INT_VALUE(dst, AS_CHAR(*dst));
             continue;
         }
-        if (dst->type == TYPE_RECORD || dst->type == TYPE_ARRAY) {
+        if (VALUE_TYPE(*dst) == TYPE_RECORD || VALUE_TYPE(*dst) == TYPE_ARRAY) {
             if (!readStructuredValue(input_stream, dst)) {
                 io_error = 1;
                 break;
@@ -7952,7 +7952,7 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
             break;
         }
 
-        switch (dst->type) {
+        switch (VALUE_TYPE(*dst)) {
             case TYPE_INTEGER:
             case TYPE_WORD:
             case TYPE_BYTE: {
@@ -7989,14 +7989,14 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
             }
             case TYPE_STRING:
             case TYPE_NIL: {
-                dst->type = TYPE_STRING;
-                if (dst->s_val) { free(dst->s_val); }
-                dst->s_val = strdup(buffer);
-                if (!dst->s_val) { io_error = 1; }
+                SET_VALUE_TYPE(dst, TYPE_STRING);
+                if (AS_STRING(*dst)) { free(AS_STRING(*dst)); }
+                AS_STRING(*dst) = strdup(buffer);
+                if (!AS_STRING(*dst)) { io_error = 1; }
                 break;
             }
             default:
-                runtimeError(vm, "Cannot Read into a variable of type %s.", varTypeToString(dst->type));
+                runtimeError(vm, "Cannot Read into a variable of type %s.", varTypeToString(VALUE_TYPE(*dst)));
                 io_error = 1;
                 i = arg_count;
                 break;
@@ -8006,7 +8006,7 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
     if (!io_error && ferror(input_stream)) io_error = 1;
     else if (io_error != 1) io_error = 0;
 
-    if (first_arg_is_file_by_value) { args[0].type = TYPE_NIL; args[0].f_val = NULL; }
+    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); AS_FILE(args[0]) = NULL; }
 
     if (input_stream == stdin) {
         vmEnableRawMode();
@@ -8028,20 +8028,20 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
     // 1) Determine input stream: allow FILE or ^FILE
     if (arg_count > 0) {
         const Value* a0 = &args[0];
-        if (a0->type == TYPE_POINTER && a0->ptr_val) a0 = (const Value*)a0->ptr_val;
-        if (a0->type == TYPE_FILE) {
-            if (!a0->f_val) {
+        if (VALUE_TYPE(*a0) == TYPE_POINTER && AS_POINTER(*a0)) a0 = (const Value*)AS_POINTER(*a0);
+        if (VALUE_TYPE(*a0) == TYPE_FILE) {
+            if (!AS_FILE(*a0)) {
                 runtimeError(vm, "File not open for Readln.");
                 io_error = 1;
                 vmCommitLastIoError(io_error);
                 return makeVoid();
             }
-            input_stream = a0->f_val;
+            input_stream = AS_FILE(*a0);
             var_start_index = 1;
             // If the actual arg0 on the stack is a FILE by value (not a pointer),
             // the VM will free it after we return, which would fclose() the stream.
             // Prevent that by neutering the stack value before we return.
-            if (args[0].type == TYPE_FILE) first_arg_is_file_by_value = true;   // ***NEW***
+            if (VALUE_TYPE(args[0]) == TYPE_FILE) first_arg_is_file_by_value = true;   // ***NEW***
         }
     }
 
@@ -8062,7 +8062,7 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
                     vm ? (int)vm->suspend_unwind_requested : -1);
         }
         // ***NEW***: prevent VM cleanup from closing the stream we used
-        if (first_arg_is_file_by_value) { args[0].type = TYPE_NIL; args[0].f_val = NULL; }  // ***NEW***
+        if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); AS_FILE(args[0]) = NULL; }  // ***NEW***
         if (input_stream == stdin) vmEnableRawMode();
         vmCommitLastIoError(io_error);
         return makeVoid();
@@ -8072,12 +8072,12 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
     // 3) Parse vars from buffer
     const char* p = line_buffer;
     for (int i = var_start_index; i < arg_count; i++) {
-        if (args[i].type != TYPE_POINTER || !args[i].ptr_val) {
+        if (VALUE_TYPE(args[i]) != TYPE_POINTER || !AS_POINTER(args[i])) {
             runtimeError(vm, "Readln requires VAR parameters to read into.");
             io_error = 1;
             break;
         }
-        Value* dst = (Value*)args[i].ptr_val;
+        Value* dst = (Value*)AS_POINTER(args[i]);
 
         while (isspace((unsigned char)*p)) p++;
 
@@ -8086,12 +8086,12 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
         // strings start out with the TYPE_NIL tag which caused the builtin to
         // reject them.  Treating TYPE_NIL as a string matches Pascal's
         // semantics where uninitialised strings can be read into directly.
-        if (dst->type == TYPE_NIL) {
-            dst->type = TYPE_STRING;
-            dst->s_val = NULL;
+        if (VALUE_TYPE(*dst) == TYPE_NIL) {
+            SET_VALUE_TYPE(dst, TYPE_STRING);
+            AS_STRING(*dst) = NULL;
         }
 
-        switch (dst->type) {
+        switch (VALUE_TYPE(*dst)) {
             case TYPE_INT8:
             case TYPE_INT16:
             case TYPE_INT32: /* TYPE_INTEGER */
@@ -8148,10 +8148,10 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
             }
             case TYPE_CHAR: {
                 if (*p) {
-                dst->c_val = (unsigned char)*p++;
-                SET_INT_VALUE(dst, dst->c_val);
+                SET_CHAR_VALUE(dst, (unsigned char)*p++);
+                SET_INT_VALUE(dst, AS_CHAR(*dst));
                 } else {
-                    dst->c_val = '\0';
+                    SET_CHAR_VALUE(dst, '\0');
                     SET_INT_VALUE(dst, 0);
                     io_error = 1;
                 }
@@ -8166,17 +8166,17 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
                     io_error = 1;
                     break;
                 }
-                if (isPascalStringType(dst->type) && dst->s_val) {
-                    free(dst->s_val);
+                if (isPascalStringType(VALUE_TYPE(*dst)) && AS_STRING(*dst)) {
+                    free(AS_STRING(*dst));
                 }
-                dst->type = (dst->type == TYPE_UNICODE_STRING) ? TYPE_UNICODE_STRING : TYPE_STRING;
-                dst->s_val = tmp;
+                SET_VALUE_TYPE(dst, (VALUE_TYPE(*dst) == TYPE_UNICODE_STRING) ? TYPE_UNICODE_STRING : TYPE_STRING);
+                AS_STRING(*dst) = tmp;
                 i = arg_count; // consume the line; ignore trailing params
                 break;
             }
 
             default:
-                runtimeError(vm, "Cannot Readln into a variable of type %s.", varTypeToString(dst->type));
+                runtimeError(vm, "Cannot Readln into a variable of type %s.", varTypeToString(VALUE_TYPE(*dst)));
                 io_error = 1;
                 i = arg_count;
                 break;
@@ -8187,7 +8187,7 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
     else if (io_error != 1) io_error = 0;
 
     // ***NEW***: neuter FILE-by-value arg so VM cleanup won’t fclose()
-    if (first_arg_is_file_by_value) { args[0].type = TYPE_NIL; args[0].f_val = NULL; }  // ***NEW***
+    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); AS_FILE(args[0]) = NULL; }  // ***NEW***
 
     if (input_stream == stdin) {
         vmEnableRawMode();
@@ -8214,13 +8214,13 @@ static void vmTraceDescribeValue(const Value *val) {
         fprintf(stderr, "  [TRACE stdout] <null value>\n");
         return;
     }
-    switch (val->type) {
+    switch (VALUE_TYPE(*val)) {
         case TYPE_STRING:
             fprintf(stderr, "  [TRACE stdout] string: \"%.*s\"\n",
-                    80, val->s_val ? val->s_val : "");
+                    80, AS_STRING(*val) ? AS_STRING(*val) : "");
             break;
         case TYPE_CHAR:
-            fprintf(stderr, "  [TRACE stdout] char: %d\n", val->c_val);
+            fprintf(stderr, "  [TRACE stdout] char: %d\n", AS_CHAR(*val));
             break;
         case TYPE_BOOLEAN:
         case TYPE_INT8:
@@ -8236,7 +8236,7 @@ static void vmTraceDescribeValue(const Value *val) {
             fprintf(stderr, "  [TRACE stdout] real: %Lf\n", (long double)AS_REAL(*val));
             break;
         default:
-            fprintf(stderr, "  [TRACE stdout] value type %d\n", val->type);
+            fprintf(stderr, "  [TRACE stdout] value type %d\n", VALUE_TYPE(*val));
             break;
     }
 }
@@ -8252,17 +8252,17 @@ Value vmBuiltinWrite(VM* vm, int arg_count, Value* args) {
     bool suppress_spacing_flag = false;
     last_io_error = 0;
     Value flag = args[0];
-    if (isRealType(flag.type)) {
+    if (isRealType(VALUE_TYPE(flag))) {
         newline = (AS_REAL(flag) != 0.0);
     } else if (IS_INTLIKE(flag)) {
         long long raw = AS_INTEGER(flag);
         newline = (raw & VM_WRITE_FLAG_NEWLINE) != 0;
         suppress_spacing_flag = ((raw & VM_WRITE_FLAG_SUPPRESS_SPACING) != 0);
         suppress_spacing = suppress_spacing || suppress_spacing_flag;
-    } else if (flag.type == TYPE_BOOLEAN) {
-        newline = flag.i_val != 0;
-    } else if (flag.type == TYPE_CHAR) {
-        newline = flag.c_val != 0;
+    } else if (VALUE_TYPE(flag) == TYPE_BOOLEAN) {
+        newline = VAL_INT(flag) != 0;
+    } else if (VALUE_TYPE(flag) == TYPE_CHAR) {
+        newline = AS_CHAR(flag) != 0;
     }
 
     FILE* output_stream = stdout;
@@ -8275,15 +8275,15 @@ Value vmBuiltinWrite(VM* vm, int arg_count, Value* args) {
 
     if (arg_count > 1) {
         const Value* first = &args[1];
-        if (first->type == TYPE_POINTER && first->ptr_val) first = (const Value*)first->ptr_val;
-        if (first->type == TYPE_FILE) {
-            if (!first->f_val) {
+        if (VALUE_TYPE(*first) == TYPE_POINTER && AS_POINTER(*first)) first = (const Value*)AS_POINTER(*first);
+        if (VALUE_TYPE(*first) == TYPE_FILE) {
+            if (!AS_FILE(*first)) {
                 runtimeError(vm, "File not open for writing.");
                 return makeVoid();
             }
-            output_stream = first->f_val;
+            output_stream = AS_FILE(*first);
             start_index = 2;
-            if (args[1].type == TYPE_FILE) first_arg_is_file_by_value = true;
+            if (VALUE_TYPE(args[1]) == TYPE_FILE) first_arg_is_file_by_value = true;
             file_value = first;
             if (file_value->element_type != TYPE_VOID && file_value->element_type != TYPE_UNKNOWN) {
                 bool has_typed_metadata = file_value->record_size_explicit || file_value->element_type_def != NULL;
@@ -8339,32 +8339,32 @@ Value vmBuiltinWrite(VM* vm, int arg_count, Value* args) {
         if (!suppress_spacing && has_prev) {
             bool add_space = true;
             const char *no_space_after = "=,.;:?!-)]}>)\"'";
-            if (prev.type == TYPE_STRING && prev.s_val) {
-                size_t len = strlen(prev.s_val);
+            if (VALUE_TYPE(prev) == TYPE_STRING && AS_STRING(prev)) {
+                size_t len = strlen(AS_STRING(prev));
                 if (len == 0) {
                     add_space = false;
                 } else {
-                    char last = prev.s_val[len - 1];
+                    char last = AS_STRING(prev)[len - 1];
                     if (isspace((unsigned char)last) || strchr(no_space_after, last)) {
                         add_space = false;
                     }
                 }
-            } else if (prev.type == TYPE_CHAR) {
-                char last = (char)prev.c_val;
+            } else if (VALUE_TYPE(prev) == TYPE_CHAR) {
+                char last = (char)AS_CHAR(prev);
                 if (isspace((unsigned char)last) || strchr(no_space_after, last)) {
                     add_space = false;
                 }
             }
-            if (val.type == TYPE_STRING && val.s_val) {
-                size_t len_cur = strlen(val.s_val);
+            if (VALUE_TYPE(val) == TYPE_STRING && AS_STRING(val)) {
+                size_t len_cur = strlen(AS_STRING(val));
                 if (len_cur > 0) {
-                    char first = val.s_val[0];
+                    char first = AS_STRING(val)[0];
                     if (isspace((unsigned char)first) || strchr(",.;:)]}!?)", first)) {
                         add_space = false;
                     }
                 }
-            } else if (val.type == TYPE_CHAR) {
-                char first = (char)val.c_val;
+            } else if (VALUE_TYPE(val) == TYPE_CHAR) {
+                char first = (char)AS_CHAR(val);
                 if (isspace((unsigned char)first) || strchr(",.;:)]}!?", first)) {
                     add_space = false;
                 }
@@ -8376,16 +8376,16 @@ Value vmBuiltinWrite(VM* vm, int arg_count, Value* args) {
         if (trace_stdout) {
             vmTraceDescribeValue(&val);
         }
-        if (suppress_spacing_flag && val.type == TYPE_BOOLEAN) {
-            fputs(val.i_val ? "1" : "0", output_stream);
-        } else if (val.type == TYPE_STRING) {
-            const char *text = val.s_val ? val.s_val : "";
+        if (suppress_spacing_flag && VALUE_TYPE(val) == TYPE_BOOLEAN) {
+            fputs(VAL_INT(val) ? "1" : "0", output_stream);
+        } else if (VALUE_TYPE(val) == TYPE_STRING) {
+            const char *text = AS_STRING(val) ? AS_STRING(val) : "";
             writePascalText(output_stream, text, strlen(text));
-        } else if (val.type == TYPE_CHAR) {
+        } else if (VALUE_TYPE(val) == TYPE_CHAR) {
             char utf8[5];
-            size_t utf8_len = encodePascalCharUtf8(val.c_val, utf8);
+            size_t utf8_len = encodePascalCharUtf8(AS_CHAR(val), utf8);
             fwrite(utf8, 1, utf8_len, output_stream);
-        } else if (output_stream != stdout && (val.type == TYPE_RECORD || val.type == TYPE_ARRAY)) {
+        } else if (output_stream != stdout && (VALUE_TYPE(val) == TYPE_RECORD || VALUE_TYPE(val) == TYPE_ARRAY)) {
             if (!writeStructuredValue(output_stream, &val)) {
                 runtimeError(vm, "Cannot write structured value to file.");
                 last_io_error = 1;
@@ -8409,7 +8409,7 @@ Value vmBuiltinWrite(VM* vm, int arg_count, Value* args) {
     if (output_stream != stdout) {
         fflush(output_stream);
     }
-    if (first_arg_is_file_by_value) { args[1].type = TYPE_NIL; args[1].f_val = NULL; }
+    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[1], TYPE_NIL); AS_FILE(args[1]) = NULL; }
 
     return makeVoid();
 }
@@ -8446,7 +8446,7 @@ Value vmBuiltinRandom(VM* vm, int arg_count, Value* args) {
 // --- VM BUILT-IN IMPLEMENTATIONS: DOS/OS ---
 
 Value vmBuiltinDosGetenv(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || !isPascalStringType(args[0].type)) {
+    if (arg_count != 1 || !isPascalStringType(VALUE_TYPE(args[0]))) {
         runtimeError(vm, "dosGetenv expects 1 string argument.");
         return makeString("");
     }
@@ -8457,7 +8457,7 @@ Value vmBuiltinDosGetenv(VM* vm, int arg_count, Value* args) {
 
 // Expose getenv without the DOS_ prefix for portability
 Value vmBuiltinGetenv(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || !isPascalStringType(args[0].type)) {
+    if (arg_count != 1 || !isPascalStringType(VALUE_TYPE(args[0]))) {
         runtimeError(vm, "getenv expects 1 string argument.");
         return makeString("");
     }
@@ -8467,7 +8467,7 @@ Value vmBuiltinGetenv(VM* vm, int arg_count, Value* args) {
 }
 
 Value vmBuiltinGetenvint(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 2 || !isPascalStringType(args[0].type) ||
+    if (arg_count != 2 || !isPascalStringType(VALUE_TYPE(args[0])) ||
         !IS_INTLIKE(args[1])) {
         runtimeError(vm, "getEnvInt expects (string, integer).");
         return makeInt(0);
@@ -8492,18 +8492,18 @@ Value vmBuiltinVal(VM* vm, int arg_count, Value* args) {
     Value src = args[0];
     Value dstPtr = args[1];
     Value codePtr = args[2];
-    if (!isPascalStringType(src.type) || dstPtr.type != TYPE_POINTER || codePtr.type != TYPE_POINTER) {
+    if (!isPascalStringType(VALUE_TYPE(src)) || VALUE_TYPE(dstPtr) != TYPE_POINTER || VALUE_TYPE(codePtr) != TYPE_POINTER) {
         runtimeError(vm, "Val expects (string, var numeric, var integer).");
         return makeVoid();
     }
 
-    Value* dst = (Value*)dstPtr.ptr_val;
-    Value* code = (Value*)codePtr.ptr_val;
-    const char* s = src.s_val ? src.s_val : "";
+    Value* dst = (Value*)AS_POINTER(dstPtr);
+    Value* code = (Value*)AS_POINTER(codePtr);
+    const char* s = AS_STRING(src) ? AS_STRING(src) : "";
 
     char* endptr = NULL;
     errno = 0;
-    if (dst->type == TYPE_REAL || dst->type == TYPE_FLOAT) {
+    if (VALUE_TYPE(*dst) == TYPE_REAL || VALUE_TYPE(*dst) == TYPE_FLOAT) {
         double r = strtod(s, &endptr);
         if (errno != 0 || (endptr && *endptr != '\0')) {
             *code = makeInt((int)((endptr ? endptr : s) - s) + 1);
@@ -8539,7 +8539,7 @@ Value vmBuiltinBytecodeVersion(VM* vm, int arg_count, Value* args) {
 }
 
 Value vmBuiltinDosExec(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 2 || !isPascalStringType(args[0].type) || !isPascalStringType(args[1].type)) {
+    if (arg_count != 2 || !isPascalStringType(VALUE_TYPE(args[0])) || !isPascalStringType(VALUE_TYPE(args[1]))) {
         runtimeError(vm, "dosExec expects 2 string arguments.");
         return makeInt(-1);
     }
@@ -8645,7 +8645,7 @@ Value vmBuiltinDosMkdir(VM* vm, int arg_count, Value* args) {
         return makeInt(EINVAL);
     }
     /* Accept optional flags like -p, ignoring others for now. */
-    if (isPascalStringType(args[0].type) && AS_STRING(args[0])[0] == '-') {
+    if (isPascalStringType(VALUE_TYPE(args[0])) && AS_STRING(args[0])[0] == '-') {
         const char *opt = AS_STRING(args[0]);
         if (strcmp(opt, "-p") == 0) {
             parents = true;
@@ -8658,7 +8658,7 @@ Value vmBuiltinDosMkdir(VM* vm, int arg_count, Value* args) {
     int last_err = 0;
     bool any = false;
     for (int i = first_path_idx; i < arg_count; i++) {
-        if (!isPascalStringType(args[i].type)) {
+        if (!isPascalStringType(VALUE_TYPE(args[i]))) {
             runtimeError(vm, "dosMkdir: path %d is not a string", i - first_path_idx + 1);
             return makeInt(EINVAL);
         }
@@ -8686,7 +8686,7 @@ Value vmBuiltinDosMkdir(VM* vm, int arg_count, Value* args) {
 }
 
 Value vmBuiltinDosRmdir(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || !isPascalStringType(args[0].type)) {
+    if (arg_count != 1 || !isPascalStringType(VALUE_TYPE(args[0]))) {
         runtimeError(vm, "dosRmdir expects 1 string argument.");
         return makeInt(errno);
     }
@@ -8700,7 +8700,7 @@ Value vmBuiltinDosRmdir(VM* vm, int arg_count, Value* args) {
 }
 
 Value vmBuiltinDosFindfirst(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || !isPascalStringType(args[0].type)) {
+    if (arg_count != 1 || !isPascalStringType(VALUE_TYPE(args[0]))) {
         runtimeError(vm, "dosFindfirst expects 1 string argument.");
         return makeString("");
     }
@@ -8734,7 +8734,7 @@ Value vmBuiltinDosFindnext(VM* vm, int arg_count, Value* args) {
 }
 
 Value vmBuiltinDosGetfattr(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || !isPascalStringType(args[0].type)) {
+    if (arg_count != 1 || !isPascalStringType(VALUE_TYPE(args[0]))) {
         runtimeError(vm, "dosGetfattr expects 1 string argument.");
         return makeInt(0);
     }
@@ -8763,14 +8763,14 @@ Value vmBuiltinDosGetdate(VM* vm, int arg_count, Value* args) {
         if (tmp) tm_info = *tmp; else memset(&tm_info, 0, sizeof(tm_info));
     }
 #endif
-    Value* year = (Value*)args[0].ptr_val;
-    Value* month = (Value*)args[1].ptr_val;
-    Value* day = (Value*)args[2].ptr_val;
-    Value* dow = (Value*)args[3].ptr_val;
-    if (year) { year->type = TYPE_WORD; SET_INT_VALUE(year, tm_info.tm_year + 1900); }
-    if (month) { month->type = TYPE_WORD; SET_INT_VALUE(month, tm_info.tm_mon + 1); }
-    if (day) { day->type = TYPE_WORD; SET_INT_VALUE(day, tm_info.tm_mday); }
-    if (dow) { dow->type = TYPE_WORD; SET_INT_VALUE(dow, tm_info.tm_wday); }
+    Value* year = (Value*)AS_POINTER(args[0]);
+    Value* month = (Value*)AS_POINTER(args[1]);
+    Value* day = (Value*)AS_POINTER(args[2]);
+    Value* dow = (Value*)AS_POINTER(args[3]);
+    if (year) { SET_VALUE_TYPE(year, TYPE_WORD); SET_INT_VALUE(year, tm_info.tm_year + 1900); }
+    if (month) { SET_VALUE_TYPE(month, TYPE_WORD); SET_INT_VALUE(month, tm_info.tm_mon + 1); }
+    if (day) { SET_VALUE_TYPE(day, TYPE_WORD); SET_INT_VALUE(day, tm_info.tm_mday); }
+    if (dow) { SET_VALUE_TYPE(dow, TYPE_WORD); SET_INT_VALUE(dow, tm_info.tm_wday); }
     return makeVoid();
 }
 
@@ -8790,14 +8790,14 @@ Value vmBuiltinDosGettime(VM* vm, int arg_count, Value* args) {
         if (tmp) tm_info = *tmp; else memset(&tm_info, 0, sizeof(tm_info));
     }
 #endif
-    Value* hour = (Value*)args[0].ptr_val;
-    Value* min = (Value*)args[1].ptr_val;
-    Value* sec = (Value*)args[2].ptr_val;
-    Value* sec100 = (Value*)args[3].ptr_val;
-    if (hour) { hour->type = TYPE_WORD; SET_INT_VALUE(hour, tm_info.tm_hour); }
-    if (min) { min->type = TYPE_WORD; SET_INT_VALUE(min, tm_info.tm_min); }
-    if (sec) { sec->type = TYPE_WORD; SET_INT_VALUE(sec, tm_info.tm_sec); }
-    if (sec100) { sec100->type = TYPE_WORD; SET_INT_VALUE(sec100, (int)(tv.tv_usec / 10000)); }
+    Value* hour = (Value*)AS_POINTER(args[0]);
+    Value* min = (Value*)AS_POINTER(args[1]);
+    Value* sec = (Value*)AS_POINTER(args[2]);
+    Value* sec100 = (Value*)AS_POINTER(args[3]);
+    if (hour) { SET_VALUE_TYPE(hour, TYPE_WORD); SET_INT_VALUE(hour, tm_info.tm_hour); }
+    if (min) { SET_VALUE_TYPE(min, TYPE_WORD); SET_INT_VALUE(min, tm_info.tm_min); }
+    if (sec) { SET_VALUE_TYPE(sec, TYPE_WORD); SET_INT_VALUE(sec, tm_info.tm_sec); }
+    if (sec100) { SET_VALUE_TYPE(sec100, TYPE_WORD); SET_INT_VALUE(sec100, (int)(tv.tv_usec / 10000)); }
     return makeVoid();
 }
 
@@ -8846,27 +8846,27 @@ Value vmBuiltinMstreamloadfromfile(VM* vm, int arg_count, Value* args) {
     }
 
     // Argument 0 is pointer to the Value holding the MStream*
-    if (args[0].type != TYPE_POINTER) {
+    if (VALUE_TYPE(args[0]) != TYPE_POINTER) {
         runtimeError(vm, "MStreamLoadFromFile: First argument must be a VAR MStream.");
         return makeBoolean(0);
     }
-    Value* ms_value_ptr = (Value*)args[0].ptr_val;
-    if (!ms_value_ptr || ms_value_ptr->type != TYPE_MEMORYSTREAM) {
+    Value* ms_value_ptr = (Value*)AS_POINTER(args[0]);
+    if (!ms_value_ptr || VALUE_TYPE(*ms_value_ptr) != TYPE_MEMORYSTREAM) {
         runtimeError(vm, "MStreamLoadFromFile: First argument is not a valid MStream variable.");
         return makeBoolean(0);
     }
-    MStream* ms = ms_value_ptr->mstream;
+    MStream* ms = AS_MSTREAM(*ms_value_ptr);
     if (!ms) {
         runtimeError(vm, "MStreamLoadFromFile: MStream variable not initialized.");
         return makeBoolean(0);
     }
 
     // Argument 1 is the filename string
-    if (!isPascalStringType(args[1].type) || args[1].s_val == NULL) {
+    if (!isPascalStringType(VALUE_TYPE(args[1])) || AS_STRING(args[1]) == NULL) {
         runtimeError(vm, "MStreamLoadFromFile: Second argument must be a string filename.");
         return makeBoolean(0); // No need to free args[1] here, vm stack manages
     }
-    const char* filename = args[1].s_val;
+    const char* filename = AS_STRING(args[1]);
 
     FILE* f = fopen(filename, "rb");
     if (!f) {
@@ -8911,27 +8911,27 @@ Value vmBuiltinMstreamsavetofile(VM* vm, int arg_count, Value* args) {
     }
 
     // Argument 0 is pointer to the Value holding the MStream*
-    if (args[0].type != TYPE_POINTER) {
+    if (VALUE_TYPE(args[0]) != TYPE_POINTER) {
         runtimeError(vm, "MStreamSaveToFile: First argument must be a VAR MStream.");
         return makeVoid();
     }
-    Value* ms_value_ptr = (Value*)args[0].ptr_val;
-    if (!ms_value_ptr || ms_value_ptr->type != TYPE_MEMORYSTREAM) {
+    Value* ms_value_ptr = (Value*)AS_POINTER(args[0]);
+    if (!ms_value_ptr || VALUE_TYPE(*ms_value_ptr) != TYPE_MEMORYSTREAM) {
         runtimeError(vm, "MStreamSaveToFile: First argument is not a valid MStream variable.");
         return makeVoid();
     }
-    MStream* ms = ms_value_ptr->mstream;
+    MStream* ms = AS_MSTREAM(*ms_value_ptr);
     if (!ms) {
         runtimeError(vm, "MStreamSaveToFile: MStream variable not initialized.");
         return makeVoid();
     }
 
     // Argument 1 is the filename string
-    if (!isPascalStringType(args[1].type) || args[1].s_val == NULL) {
+    if (!isPascalStringType(VALUE_TYPE(args[1])) || AS_STRING(args[1]) == NULL) {
         runtimeError(vm, "MStreamSaveToFile: Second argument must be a string filename.");
         return makeVoid();
     }
-    const char* filename = args[1].s_val;
+    const char* filename = AS_STRING(args[1]);
 
     FILE* f = fopen(filename, "wb");
     if (!f) {
@@ -8954,20 +8954,20 @@ Value vmBuiltinMstreamfree(VM* vm, int arg_count, Value* args) {
     }
 
     // Argument 0 is pointer to the Value holding the MStream*
-    if (args[0].type != TYPE_POINTER) {
+    if (VALUE_TYPE(args[0]) != TYPE_POINTER) {
         runtimeError(vm, "MStreamFree: First argument must be a VAR MStream.");
         return makeVoid();
     }
-    Value* ms_value_ptr = (Value*)args[0].ptr_val;
-    if (!ms_value_ptr || ms_value_ptr->type != TYPE_MEMORYSTREAM) {
+    Value* ms_value_ptr = (Value*)AS_POINTER(args[0]);
+    if (!ms_value_ptr || VALUE_TYPE(*ms_value_ptr) != TYPE_MEMORYSTREAM) {
         runtimeError(vm, "MStreamFree: First argument is not a valid MStream variable.");
         return makeVoid();
     }
-    MStream* ms = ms_value_ptr->mstream;
+    MStream* ms = AS_MSTREAM(*ms_value_ptr);
 
     if (ms) { // Only free if MStream struct itself exists
         releaseMStream(ms);
-        ms_value_ptr->mstream = NULL; // Crucial: Set the MStream pointer in the variable's Value struct to NULL
+        AS_MSTREAM(*ms_value_ptr) = NULL; // Crucial: Set the MStream pointer in the variable's Value struct to NULL
     }
     // If ms was NULL, it's a no-op, which is fine.
 
@@ -8979,11 +8979,11 @@ Value vmBuiltinMstreambuffer(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "MStreamBuffer expects 1 argument (MStream).");
         return makeVoid();
     }
-    if (args[0].type != TYPE_MEMORYSTREAM || args[0].mstream == NULL) {
+    if (VALUE_TYPE(args[0]) != TYPE_MEMORYSTREAM || AS_MSTREAM(args[0]) == NULL) {
         runtimeError(vm, "MStreamBuffer: Argument is not a valid MStream.");
         return makeVoid();
     }
-    MStream* mstream = args[0].mstream;
+    MStream* mstream = AS_MSTREAM(args[0]);
     const char* buffer_content = mstream->buffer ? (char*)mstream->buffer : "";
     return makeString(buffer_content);
 }
@@ -9037,7 +9037,7 @@ Value vmBuiltinMstreamAppendByte(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "MStreamAppendByte expects (mstream, byte).");
         return makeVoid();
     }
-    if (args[0].type != TYPE_MEMORYSTREAM || args[0].mstream == NULL) {
+    if (VALUE_TYPE(args[0]) != TYPE_MEMORYSTREAM || AS_MSTREAM(args[0]) == NULL) {
         runtimeError(vm, "MStreamAppendByte: first argument must be a valid mstream.");
         return makeVoid();
     }
@@ -9048,7 +9048,7 @@ Value vmBuiltinMstreamAppendByte(VM* vm, int arg_count, Value* args) {
     }
     byte = AS_INTEGER(args[1]) & 0xFF;
 
-    MStream* ms = args[0].mstream;
+    MStream* ms = AS_MSTREAM(args[0]);
     /* Ensure capacity */
     if (ms->capacity < ms->size + 2) { /* +1 for new byte, +1 for terminator */
         int newcap = (ms->capacity > 0) ? ms->capacity * 2 : 64;
@@ -9076,13 +9076,13 @@ Value vmBuiltinReal(VM* vm, int arg_count, Value* args) {
     if (IS_INTLIKE(arg)) {
         return makeReal((double)AS_INTEGER(arg));
     }
-    if (arg.type == TYPE_CHAR) {
-        return makeReal((double)arg.c_val);
+    if (VALUE_TYPE(arg) == TYPE_CHAR) {
+        return makeReal((double)AS_CHAR(arg));
     }
-    if (isRealType(arg.type)) {
+    if (isRealType(VALUE_TYPE(arg))) {
         return makeReal(AS_REAL(arg));
     }
-    runtimeError(vm, "Real() argument must be an Integer, Ordinal, or Real type. Got %s.", varTypeToString(arg.type));
+    runtimeError(vm, "Real() argument must be an Integer, Ordinal, or Real type. Got %s.", varTypeToString(VALUE_TYPE(arg)));
     return makeReal(0.0);
 }
 
@@ -9093,8 +9093,8 @@ Value vmBuiltinInttostr(VM* vm, int arg_count, Value* args) {
     long long value_to_convert = 0;
     if (IS_INTLIKE(arg)) {
         value_to_convert = AS_INTEGER(arg);
-    } else if (arg.type == TYPE_CHAR) {
-        value_to_convert = (long long)arg.c_val;
+    } else if (VALUE_TYPE(arg) == TYPE_CHAR) {
+        value_to_convert = (long long)AS_CHAR(arg);
     } else {
         runtimeError(vm, "IntToStr requires an integer-compatible argument."); return makeString("");
     }
@@ -9104,40 +9104,40 @@ Value vmBuiltinInttostr(VM* vm, int arg_count, Value* args) {
 }
 
 Value vmBuiltinStr(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 2 || args[1].type != TYPE_POINTER) {
+    if (arg_count != 2 || VALUE_TYPE(args[1]) != TYPE_POINTER) {
         runtimeError(vm, "Str expects (value, var string).");
         return makeVoid();
     }
     Value val = args[0];
-    Value* dest = (Value*)args[1].ptr_val;
+    Value* dest = (Value*)AS_POINTER(args[1]);
     if (!dest) {
         runtimeError(vm, "Str received a nil pointer.");
         return makeVoid();
     }
 
     char* new_buf = NULL;
-    if (isPascalStringType(val.type)) {
-        const char* src = val.s_val ? val.s_val : "";
+    if (isPascalStringType(VALUE_TYPE(val))) {
+        const char* src = AS_STRING(val) ? AS_STRING(val) : "";
         new_buf = strdup(src);
     } else {
         char buffer[64];
-        switch (val.type) {
+        switch (VALUE_TYPE(val)) {
             case TYPE_CHAR:
-                snprintf(buffer, sizeof(buffer), "%c", val.c_val);
+                snprintf(buffer, sizeof(buffer), "%c", AS_CHAR(val));
                 break;
             case TYPE_WIDECHAR: {
                 char utf8[5];
-                encodeUtf8Codepoint((uint32_t)val.c_val, utf8);
+                encodeUtf8Codepoint((uint32_t)AS_CHAR(val), utf8);
                 snprintf(buffer, sizeof(buffer), "%s", utf8);
                 break;
             }
             case TYPE_BOOLEAN:
-                snprintf(buffer, sizeof(buffer), "%s", val.i_val ? "TRUE" : "FALSE");
+                snprintf(buffer, sizeof(buffer), "%s", VAL_INT(val) ? "TRUE" : "FALSE");
                 break;
             default:
                 if (IS_INTLIKE(val)) {
                     snprintf(buffer, sizeof(buffer), "%lld", AS_INTEGER(val));
-                } else if (isRealType(val.type)) {
+                } else if (isRealType(VALUE_TYPE(val))) {
                     snprintf(buffer, sizeof(buffer), "%Lf", AS_REAL(val));
                 } else {
                     runtimeError(vm, "Str expects a numeric, char, or formatted string argument.");
@@ -9151,10 +9151,10 @@ Value vmBuiltinStr(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "Str: memory allocation failed.");
         return makeVoid();
     }
-    VarType dest_type = isPascalStringType(dest->type) ? dest->type : TYPE_STRING;
+    VarType dest_type = isPascalStringType(VALUE_TYPE(*dest)) ? VALUE_TYPE(*dest) : TYPE_STRING;
     freeValue(dest);
-    dest->type = dest_type;
-    dest->s_val = new_buf;
+    SET_VALUE_TYPE(dest, dest_type);
+    AS_STRING(*dest) = new_buf;
     dest->max_length = -1;
     return makeVoid();
 }
@@ -9167,31 +9167,31 @@ Value vmBuiltinLength(VM* vm, int arg_count, Value* args) {
 
     Value arg = args[0];
 
-    if (arg.type == TYPE_POINTER) {
-        if (!arg.ptr_val) {
+    if (VALUE_TYPE(arg) == TYPE_POINTER) {
+        if (!AS_POINTER(arg)) {
             runtimeError(vm, "Length() cannot dereference a nil pointer argument.");
             return makeInt(0);
         }
-        Value* pointed = (Value*)arg.ptr_val;
-        if (isPascalStringType(pointed->type)) {
-            if (pointed->type == TYPE_UNICODE_STRING) {
-                size_t len = pointed->s_val ? strlen(pointed->s_val) : 0;
-                return makeInt((long long)utf8CodepointCount(pointed->s_val, len));
+        Value* pointed = (Value*)AS_POINTER(arg);
+        if (isPascalStringType(VALUE_TYPE(*pointed))) {
+            if (VALUE_TYPE(*pointed) == TYPE_UNICODE_STRING) {
+                size_t len = AS_STRING(*pointed) ? strlen(AS_STRING(*pointed)) : 0;
+                return makeInt((long long)utf8CodepointCount(AS_STRING(*pointed), len));
             }
-            return makeInt(pointed->s_val ? (long long)strlen(pointed->s_val) : 0);
+            return makeInt(AS_STRING(*pointed) ? (long long)strlen(AS_STRING(*pointed)) : 0);
         }
     }
 
-    if (arg.type == TYPE_UNICODE_STRING) {
-        size_t len = arg.s_val ? strlen(arg.s_val) : 0;
-        return makeInt((long long)utf8CodepointCount(arg.s_val, len));
+    if (VALUE_TYPE(arg) == TYPE_UNICODE_STRING) {
+        size_t len = AS_STRING(arg) ? strlen(AS_STRING(arg)) : 0;
+        return makeInt((long long)utf8CodepointCount(AS_STRING(arg), len));
     }
 
-    if (arg.type == TYPE_STRING) {
-        return makeInt(arg.s_val ? (long long)strlen(arg.s_val) : 0);
+    if (VALUE_TYPE(arg) == TYPE_STRING) {
+        return makeInt(AS_STRING(arg) ? (long long)strlen(AS_STRING(arg)) : 0);
     }
 
-    if (arg.type == TYPE_CHAR || arg.type == TYPE_WIDECHAR) {
+    if (VALUE_TYPE(arg) == TYPE_CHAR || VALUE_TYPE(arg) == TYPE_WIDECHAR) {
         return makeInt(1);
     }
 
@@ -9239,7 +9239,7 @@ Value vmBuiltinSizeof(VM* vm, int arg_count, Value* args) {
         return makeInt64(bytes);
     }
 
-    runtimeError(vm, "SizeOf unsupported for type '%s'.", varTypeToString(arg.type));
+    runtimeError(vm, "SizeOf unsupported for type '%s'.", varTypeToString(VALUE_TYPE(arg)));
     return makeInt64(0);
 }
 
@@ -9247,14 +9247,14 @@ Value vmBuiltinSizeof(VM* vm, int arg_count, Value* args) {
 Value vmBuiltinAbs(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1) { runtimeError(vm, "abs expects 1 argument."); return makeInt(0); }
     if (IS_INTLIKE(args[0])) return makeInt(llabs(AS_INTEGER(args[0])));
-    if (isRealType(args[0].type)) return makeReal(fabsl(AS_REAL(args[0])));
+    if (isRealType(VALUE_TYPE(args[0]))) return makeReal(fabsl(AS_REAL(args[0])));
     runtimeError(vm, "abs expects a numeric argument.");
     return makeInt(0);
 }
 
 Value vmBuiltinRound(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1) { runtimeError(vm, "Round expects 1 argument."); return makeInt(0); }
-    if (isRealType(args[0].type)) return makeInt((long long)llround(AS_REAL(args[0])));
+    if (isRealType(VALUE_TYPE(args[0]))) return makeInt((long long)llround(AS_REAL(args[0])));
     if (IS_INTLIKE(args[0])) return makeInt(AS_INTEGER(args[0]));
     runtimeError(vm, "Round expects a numeric argument.");
     return makeInt(0);
@@ -9332,7 +9332,7 @@ static bool parseThreadIdValue(const Value* value, int* outId) {
     if (!value || !outId) {
         return false;
     }
-    if (value->type == TYPE_THREAD || IS_INTLIKE(*value)) {
+    if (VALUE_TYPE(*value) == TYPE_THREAD || IS_INTLIKE(*value)) {
         long long raw = asI64(*value);
         if (raw <= 0 || raw >= VM_MAX_THREADS) {
             return false;
@@ -9347,8 +9347,8 @@ static bool parseBooleanValue(const Value* value, bool* outBool) {
     if (!value || !outBool) {
         return false;
     }
-    if (value->type == TYPE_BOOLEAN) {
-        *outBool = value->i_val != 0;
+    if (VALUE_TYPE(*value) == TYPE_BOOLEAN) {
+        *outBool = VAL_INT(*value) != 0;
         return true;
     }
     if (IS_INTLIKE(*value)) {
@@ -9372,11 +9372,11 @@ static void initThreadRequestOptions(ThreadRequestOptions* options) {
 }
 
 static bool parseThreadRequestOptionsValue(const Value* value, ThreadRequestOptions* options) {
-    if (!value || !options || value->type != TYPE_RECORD) {
+    if (!value || !options || VALUE_TYPE(*value) != TYPE_RECORD) {
         return false;
     }
     bool recognized = false;
-    for (FieldValue* field = value->record_val; field; field = field->next) {
+    for (FieldValue* field = AS_RECORD(*value); field; field = field->next) {
         if (!field->name) {
             continue;
         }
@@ -9422,7 +9422,7 @@ static bool appendThreadField(FieldValue** head, FieldValue** tail, const char* 
     field->value = value;
     field->storage = &field->value;
     field->type_def = NULL;
-    field->declared_type = value.type;
+    field->declared_type = VALUE_TYPE(value);
     field->slot_index = (*tail) ? ((*tail)->slot_index + 1) : 0;
     field->owns_storage = true;
     field->next = NULL;
@@ -9680,15 +9680,15 @@ static bool jsonAppendArrayRecursive(JsonBuffer *buffer, const Value *array,
         if (dimension + 1 >= array->dimensions) {
             int offset = computeFlatOffset((Value *)array, indices);
             if (arrayUsesPackedBytes(array)) {
-                if (!array->array_raw) {
+                if (!AS_ARRAY_RAW(*array)) {
                     return false;
                 }
-                Value temp = makeByte(array->array_raw[offset]);
+                Value temp = makeByte(AS_ARRAY_RAW(*array)[offset]);
                 if (!jsonAppendValue(buffer, &temp)) {
                     return false;
                 }
             } else {
-                if (!jsonAppendValue(buffer, &array->array_val[offset])) {
+                if (!jsonAppendValue(buffer, &AS_ARRAY(*array)[offset])) {
                     return false;
                 }
             }
@@ -9703,7 +9703,7 @@ static bool jsonAppendArrayRecursive(JsonBuffer *buffer, const Value *array,
 
 static bool jsonAppendArray(JsonBuffer *buffer, const Value *array) {
     if (!array || array->dimensions <= 0 ||
-        (!array->array_val && !arrayUsesPackedBytes(array)) ||
+        (!AS_ARRAY(*array) && !arrayUsesPackedBytes(array)) ||
         !array->lower_bounds || !array->upper_bounds) {
         return jsonBufferAppendFormat(buffer, "[]");
     }
@@ -9744,37 +9744,37 @@ static bool jsonAppendValue(JsonBuffer *buffer, const Value *value) {
     if (!value) {
         return jsonBufferAppendFormat(buffer, "null");
     }
-    switch (value->type) {
+    switch (VALUE_TYPE(*value)) {
         case TYPE_BOOLEAN:
             return jsonBufferAppendFormat(buffer, "%s",
-                                         value->i_val ? "true" : "false");
+                                         VAL_INT(*value) ? "true" : "false");
         case TYPE_INT8:
         case TYPE_INT16:
         case TYPE_INT32:
         case TYPE_INT64:
-            return jsonBufferAppendFormat(buffer, "%lld", value->i_val);
+            return jsonBufferAppendFormat(buffer, "%lld", VAL_INT(*value));
         case TYPE_UINT8:
         case TYPE_UINT16:
         case TYPE_UINT32:
         case TYPE_UINT64:
-            return jsonBufferAppendFormat(buffer, "%llu", value->u_val);
+            return jsonBufferAppendFormat(buffer, "%llu", VAL_UINT(*value));
         case TYPE_FLOAT:
-            return jsonBufferAppendFormat(buffer, "%g", value->real.f32_val);
+            return jsonBufferAppendFormat(buffer, "%g", VAL_REAL32(*value));
         case TYPE_DOUBLE:
-            return jsonBufferAppendFormat(buffer, "%g", value->real.d_val);
+            return jsonBufferAppendFormat(buffer, "%g", VAL_REAL64(*value));
         case TYPE_LONG_DOUBLE:
-            return jsonBufferAppendFormat(buffer, "%Lg", value->real.r_val);
+            return jsonBufferAppendFormat(buffer, "%Lg", VAL_REAL_LD(*value));
         case TYPE_STRING:
-            return jsonAppendEscapedString(buffer, value->s_val ? value->s_val : "");
+            return jsonAppendEscapedString(buffer, AS_STRING(*value) ? AS_STRING(*value) : "");
         case TYPE_RECORD:
-            return jsonAppendRecord(buffer, value->record_val);
+            return jsonAppendRecord(buffer, AS_RECORD(*value));
         case TYPE_ARRAY:
             return jsonAppendArray(buffer, value);
         case TYPE_NIL:
         case TYPE_VOID:
             return jsonBufferAppendFormat(buffer, "null");
         default:
-            return jsonAppendEscapedString(buffer, varTypeToString(value->type));
+            return jsonAppendEscapedString(buffer, varTypeToString(VALUE_TYPE(*value)));
     }
 }
 
@@ -9800,7 +9800,7 @@ static Value threadSpawnOrSubmitCommon(VM* vm, int arg_count, Value* args, bool 
     Value target = args[0];
     int builtin_id = -1;
     const char* builtin_name = NULL;
-    if (isPascalStringType(target.type) || target.type == TYPE_POINTER) {
+    if (isPascalStringType(VALUE_TYPE(target)) || VALUE_TYPE(target) == TYPE_POINTER) {
         const char* source_name = builtinValueToCString(&target);
         if (!source_name || !*source_name) {
             runtimeError(vm, "%s requires a builtin name or id.", opName);
@@ -9846,7 +9846,7 @@ static Value threadSpawnOrSubmitCommon(VM* vm, int arg_count, Value* args, bool 
     }
     if (arg_count > 1) {
         const Value* maybe_options = &args[arg_count - 1];
-        if (maybe_options->type == TYPE_RECORD) {
+        if (VALUE_TYPE(*maybe_options) == TYPE_RECORD) {
             ThreadRequestOptions parsed = options;
             if (parseThreadRequestOptionsValue(maybe_options, &parsed)) {
                 options_index = arg_count - 1;
@@ -9881,7 +9881,7 @@ static Value threadSpawnOrSubmitCommon(VM* vm, int arg_count, Value* args, bool 
     }
 
     Value thread_value = makeInt(thread_id);
-    thread_value.type = TYPE_THREAD;
+    SET_VALUE_TYPE(&thread_value, TYPE_THREAD);
     return thread_value;
 }
 
@@ -9895,7 +9895,7 @@ Value vmBuiltinWaitForThread(VM* vm, int arg_count, Value* args) {
     }
 
     Value tidVal = args[0];
-    if (!(tidVal.type == TYPE_THREAD || IS_INTLIKE(tidVal))) {
+    if (!(VALUE_TYPE(tidVal) == TYPE_THREAD || IS_INTLIKE(tidVal))) {
         runtimeError(vm, "WaitForThread argument must be a thread id.");
         return makeInt(-1);
     }
@@ -10182,7 +10182,7 @@ Value vmBuiltinThreadLookup(VM* vm, int arg_count, Value* args) {
         return makeInt(-1);
     }
     Value result = makeInt(thread_id);
-    result.type = TYPE_THREAD;
+    SET_VALUE_TYPE(&result, TYPE_THREAD);
     return result;
 }
 
@@ -10258,8 +10258,8 @@ Value vmBuiltinThreadStats(VM* vm, int arg_count, Value* args) {
             continue;
         }
         Value entry = makeThreadStateRecord(i, thread);
-        freeValue(&result.array_val[index]);
-        result.array_val[index] = entry;
+        freeValue(&AS_ARRAY(result)[index]);
+        AS_ARRAY(result)[index] = entry;
         index++;
     }
     pthread_mutex_unlock(&thread_vm->threadRegistryLock);

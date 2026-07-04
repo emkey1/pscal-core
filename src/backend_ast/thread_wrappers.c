@@ -31,7 +31,7 @@ static bool appendField(FieldValue** head, FieldValue** tail, const char* name, 
     node->value = value;
     node->storage = &node->value;
     node->type_def = NULL;
-    node->declared_type = value.type;
+    node->declared_type = VALUE_TYPE(value);
     node->slot_index = *tail ? ((*tail)->slot_index + 1) : 0;
     node->owns_storage = true;
     node->next = NULL;
@@ -84,7 +84,7 @@ static Value threadSpawnOrSubmitCommon(VM* vm, int arg_count, Value* args, bool 
     const Value* target = &args[0];
     const Value* name_arg = &args[1];
 
-    if (!(isPascalStringType(target->type) || IS_INTLIKE(*target))) {
+    if (!(isPascalStringType(VALUE_TYPE(*target)) || IS_INTLIKE(*target))) {
         runtimeError(vm, "%s target must be a string or integer id.",
                      submit_only ? "thread_pool_submit" : "thread_spawn_named");
         return makeInt(-1);
@@ -92,10 +92,10 @@ static Value threadSpawnOrSubmitCommon(VM* vm, int arg_count, Value* args, bool 
 
     const char* requested_name = "";
     bool include_name = false;
-    if (isPascalStringType(name_arg->type)) {
+    if (isPascalStringType(VALUE_TYPE(*name_arg))) {
         include_name = true;
-        requested_name = name_arg->s_val ? name_arg->s_val : "";
-    } else if (name_arg->type == TYPE_NIL) {
+        requested_name = AS_STRING(*name_arg) ? AS_STRING(*name_arg) : "";
+    } else if (VALUE_TYPE(*name_arg) == TYPE_NIL) {
         include_name = false;
         requested_name = "";
     } else {
@@ -119,7 +119,7 @@ static Value threadSpawnOrSubmitCommon(VM* vm, int arg_count, Value* args, bool 
     }
 
     Value options = makeThreadOptionsValue(requested_name, include_name, submit_only);
-    if (options.type != TYPE_RECORD) {
+    if (VALUE_TYPE(options) != TYPE_RECORD) {
         ok = false;
     }
     call_args[total_args] = options;

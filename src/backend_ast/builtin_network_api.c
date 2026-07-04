@@ -88,17 +88,17 @@ static Value makeLocalhostFallbackResult(void) {
 static const Value* resolveStringPointer(const Value* value) {
     const Value* current = value;
     int depth = 0;
-    while (current && current->type == TYPE_POINTER &&
+    while (current && VALUE_TYPE(*current) == TYPE_POINTER &&
            current->base_type_node != STRING_CHAR_PTR_SENTINEL &&
            current->base_type_node != SERIALIZED_CHAR_PTR_SENTINEL &&
            current->base_type_node != STRING_LENGTH_SENTINEL &&
            current->base_type_node != BYTE_ARRAY_PTR_SENTINEL &&
            current->base_type_node != SHELL_FUNCTION_PTR_SENTINEL &&
            current->base_type_node != OPAQUE_POINTER_SENTINEL) {
-        if (!current->ptr_val) {
+        if (!AS_POINTER(*current)) {
             return NULL;
         }
-        current = (const Value*)current->ptr_val;
+        current = (const Value*)AS_POINTER(*current);
         if (++depth > 16) {
             return NULL;
         }
@@ -108,14 +108,14 @@ static const Value* resolveStringPointer(const Value* value) {
 
 static int valueIsStringLike(const Value* value) {
     if (!value) return 0;
-    if (isPascalStringType(value->type)) return 1;
-    if (value->type == TYPE_POINTER) {
+    if (isPascalStringType(VALUE_TYPE(*value))) return 1;
+    if (VALUE_TYPE(*value) == TYPE_POINTER) {
         if (value->base_type_node == STRING_CHAR_PTR_SENTINEL ||
             value->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) return 1;
         const Value* resolved = resolveStringPointer(value);
         if (!resolved) return 0;
-        if (isPascalStringType(resolved->type)) return 1;
-        if (resolved->type == TYPE_POINTER &&
+        if (isPascalStringType(VALUE_TYPE(*resolved))) return 1;
+        if (VALUE_TYPE(*resolved) == TYPE_POINTER &&
             (resolved->base_type_node == STRING_CHAR_PTR_SENTINEL ||
              resolved->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL)) {
             return 1;
@@ -126,31 +126,31 @@ static int valueIsStringLike(const Value* value) {
 
 static const char* valueToCStringLike(const Value* value) {
     if (!value) return NULL;
-    if (isPascalStringType(value->type)) return value->s_val ? value->s_val : "";
-    if (value->type == TYPE_POINTER) {
+    if (isPascalStringType(VALUE_TYPE(*value))) return AS_STRING(*value) ? AS_STRING(*value) : "";
+    if (VALUE_TYPE(*value) == TYPE_POINTER) {
         if (value->base_type_node == STRING_CHAR_PTR_SENTINEL ||
             value->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
-            return (const char*)value->ptr_val;
+            return (const char*)AS_POINTER(*value);
         }
         const Value* resolved = resolveStringPointer(value);
         if (!resolved) return NULL;
-        if (isPascalStringType(resolved->type)) {
-            return resolved->s_val ? resolved->s_val : "";
+        if (isPascalStringType(VALUE_TYPE(*resolved))) {
+            return AS_STRING(*resolved) ? AS_STRING(*resolved) : "";
         }
-        if (resolved->type == TYPE_POINTER &&
+        if (VALUE_TYPE(*resolved) == TYPE_POINTER &&
             (resolved->base_type_node == STRING_CHAR_PTR_SENTINEL ||
              resolved->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL)) {
-            return (const char*)resolved->ptr_val;
+            return (const char*)AS_POINTER(*resolved);
         }
     }
     return NULL;
 }
 
 static int valueIsNullCharPointer(const Value* value) {
-    return value && value->type == TYPE_POINTER &&
+    return value && VALUE_TYPE(*value) == TYPE_POINTER &&
            (value->base_type_node == STRING_CHAR_PTR_SENTINEL ||
             value->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) &&
-           value->ptr_val == NULL;
+           AS_POINTER(*value) == NULL;
 }
 
 static void registerSocketInfo(int fd, int family, int socktype) {
@@ -895,16 +895,16 @@ Value vmBuiltinHttpClose(VM* vm, int arg_count, Value* args) {
 // httpSetHeader(session, name, value): void
 Value vmBuiltinHttpSetHeader(VM* vm, int arg_count, Value* args) {
     if (arg_count != 3 || !IS_INTLIKE(args[0]) ||
-        !isPascalStringType(args[1].type) || !isPascalStringType(args[2].type)) {
+        !isPascalStringType(VALUE_TYPE(args[1])) || !isPascalStringType(VALUE_TYPE(args[2]))) {
         runtimeError(vm, "httpSetHeader expects (session:int, name:string, value:string).");
         return makeVoid();
     }
     HttpSession* s = httpGet((int)AS_INTEGER(args[0]));
     if (!s) { runtimeError(vm, "httpSetHeader: invalid session id."); return makeVoid(); }
-    size_t line_len = strlen(args[1].s_val) + 2 + strlen(args[2].s_val) + 1;
+    size_t line_len = strlen(AS_STRING(args[1])) + 2 + strlen(AS_STRING(args[2])) + 1;
     char* line = (char*)malloc(line_len);
     if (!line) { runtimeError(vm, "httpSetHeader: malloc failed."); return makeVoid(); }
-    snprintf(line, line_len, "%s: %s", args[1].s_val, args[2].s_val);
+    snprintf(line, line_len, "%s: %s", AS_STRING(args[1]), AS_STRING(args[2]));
     s->headers = curl_slist_append(s->headers, line);
     free(line);
     return makeVoid();
@@ -924,37 +924,37 @@ Value vmBuiltinHttpClearHeaders(VM* vm, int arg_count, Value* args) {
 
 // httpSetOption(session, key, value): void (value can be int or string)
 Value vmBuiltinHttpSetOption(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 3 || !IS_INTLIKE(args[0]) || !isPascalStringType(args[1].type)) {
+    if (arg_count != 3 || !IS_INTLIKE(args[0]) || !isPascalStringType(VALUE_TYPE(args[1]))) {
         runtimeError(vm, "httpSetOption expects (session:int, key:string, value:int|string).");
         return makeVoid();
     }
     HttpSession* s = httpGet((int)AS_INTEGER(args[0]));
     if (!s) { runtimeError(vm, "httpSetOption: invalid session id."); return makeVoid(); }
-    const char* key = args[1].s_val;
+    const char* key = AS_STRING(args[1]);
     if (strcasecmp(key, "timeout_ms") == 0 && IS_INTLIKE(args[2])) {
         s->timeout_ms = (long)AS_INTEGER(args[2]);
     } else if (strcasecmp(key, "follow_redirects") == 0 && IS_INTLIKE(args[2])) {
         s->follow_redirects = (long)AS_INTEGER(args[2]) ? 1L : 0L;
-    } else if (strcasecmp(key, "user_agent") == 0 && isPascalStringType(args[2].type)) {
+    } else if (strcasecmp(key, "user_agent") == 0 && isPascalStringType(VALUE_TYPE(args[2]))) {
         if (s->user_agent) free(s->user_agent);
-        s->user_agent = strdup(args[2].s_val ? args[2].s_val : "");
-    } else if (strcasecmp(key, "ca_path") == 0 && isPascalStringType(args[2].type)) {
+        s->user_agent = strdup(AS_STRING(args[2]) ? AS_STRING(args[2]) : "");
+    } else if (strcasecmp(key, "ca_path") == 0 && isPascalStringType(VALUE_TYPE(args[2]))) {
         if (s->ca_path) free(s->ca_path);
-        s->ca_path = strdup(args[2].s_val ? args[2].s_val : "");
-    } else if (strcasecmp(key, "client_cert") == 0 && isPascalStringType(args[2].type)) {
+        s->ca_path = strdup(AS_STRING(args[2]) ? AS_STRING(args[2]) : "");
+    } else if (strcasecmp(key, "client_cert") == 0 && isPascalStringType(VALUE_TYPE(args[2]))) {
         if (s->client_cert) free(s->client_cert);
-        s->client_cert = strdup(args[2].s_val ? args[2].s_val : "");
-    } else if (strcasecmp(key, "client_key") == 0 && isPascalStringType(args[2].type)) {
+        s->client_cert = strdup(AS_STRING(args[2]) ? AS_STRING(args[2]) : "");
+    } else if (strcasecmp(key, "client_key") == 0 && isPascalStringType(VALUE_TYPE(args[2]))) {
         if (s->client_key) free(s->client_key);
-        s->client_key = strdup(args[2].s_val ? args[2].s_val : "");
-    } else if (strcasecmp(key, "proxy") == 0 && isPascalStringType(args[2].type)) {
+        s->client_key = strdup(AS_STRING(args[2]) ? AS_STRING(args[2]) : "");
+    } else if (strcasecmp(key, "proxy") == 0 && isPascalStringType(VALUE_TYPE(args[2]))) {
         if (s->proxy) free(s->proxy);
-        s->proxy = strdup(args[2].s_val ? args[2].s_val : "");
-    } else if (strcasecmp(key, "proxy_userpwd") == 0 && isPascalStringType(args[2].type)) {
+        s->proxy = strdup(AS_STRING(args[2]) ? AS_STRING(args[2]) : "");
+    } else if (strcasecmp(key, "proxy_userpwd") == 0 && isPascalStringType(VALUE_TYPE(args[2]))) {
         if (s->proxy_userpwd) free(s->proxy_userpwd);
-        s->proxy_userpwd = strdup(args[2].s_val ? args[2].s_val : "");
-    } else if (strcasecmp(key, "proxy_type") == 0 && isPascalStringType(args[2].type)) {
-        const char* v = args[2].s_val ? args[2].s_val : "";
+        s->proxy_userpwd = strdup(AS_STRING(args[2]) ? AS_STRING(args[2]) : "");
+    } else if (strcasecmp(key, "proxy_type") == 0 && isPascalStringType(VALUE_TYPE(args[2]))) {
+        const char* v = AS_STRING(args[2]) ? AS_STRING(args[2]) : "";
         if (strcasecmp(v, "http") == 0) s->proxy_type = (long)CURLPROXY_HTTP;
 #ifdef CURLPROXY_HTTPS
         else if (strcasecmp(v, "https") == 0) s->proxy_type = (long)CURLPROXY_HTTPS;
@@ -965,16 +965,16 @@ Value vmBuiltinHttpSetOption(VM* vm, int arg_count, Value* args) {
         s->tls_min = (long)AS_INTEGER(args[2]);
     } else if (strcasecmp(key, "tls_max") == 0 && IS_INTLIKE(args[2])) {
         s->tls_max = (long)AS_INTEGER(args[2]);
-    } else if (strcasecmp(key, "ciphers") == 0 && isPascalStringType(args[2].type)) {
+    } else if (strcasecmp(key, "ciphers") == 0 && isPascalStringType(VALUE_TYPE(args[2]))) {
         if (s->ciphers) free(s->ciphers);
-        s->ciphers = strdup(args[2].s_val ? args[2].s_val : "");
+        s->ciphers = strdup(AS_STRING(args[2]) ? AS_STRING(args[2]) : "");
     } else if (strcasecmp(key, "alpn") == 0 && IS_INTLIKE(args[2])) {
         s->alpn = (long)AS_INTEGER(args[2]) ? 1L : 0L;
-    } else if (strcasecmp(key, "pin_sha256") == 0 && isPascalStringType(args[2].type)) {
+    } else if (strcasecmp(key, "pin_sha256") == 0 && isPascalStringType(VALUE_TYPE(args[2]))) {
         if (s->pinned_pubkey) free(s->pinned_pubkey);
-        s->pinned_pubkey = strdup(args[2].s_val ? args[2].s_val : "");
-    } else if (strcasecmp(key, "resolve_add") == 0 && isPascalStringType(args[2].type)) {
-        s->resolve = curl_slist_append(s->resolve, args[2].s_val ? args[2].s_val : "");
+        s->pinned_pubkey = strdup(AS_STRING(args[2]) ? AS_STRING(args[2]) : "");
+    } else if (strcasecmp(key, "resolve_add") == 0 && isPascalStringType(VALUE_TYPE(args[2]))) {
+        s->resolve = curl_slist_append(s->resolve, AS_STRING(args[2]) ? AS_STRING(args[2]) : "");
     } else if (strcasecmp(key, "resolve_clear") == 0) {
         if (s->resolve) { curl_slist_free_all(s->resolve); s->resolve = NULL; }
     } else if (strcasecmp(key, "verify_peer") == 0 && IS_INTLIKE(args[2])) {
@@ -983,12 +983,12 @@ Value vmBuiltinHttpSetOption(VM* vm, int arg_count, Value* args) {
         s->verify_host = (long)AS_INTEGER(args[2]) ? 1L : 0L;
     } else if (strcasecmp(key, "http2") == 0 && IS_INTLIKE(args[2])) {
         s->force_http2 = (long)AS_INTEGER(args[2]) ? 1L : 0L;
-    } else if (strcasecmp(key, "basic_auth") == 0 && isPascalStringType(args[2].type)) {
+    } else if (strcasecmp(key, "basic_auth") == 0 && isPascalStringType(VALUE_TYPE(args[2]))) {
         if (s->basic_auth) free(s->basic_auth);
-        s->basic_auth = strdup(args[2].s_val ? args[2].s_val : "");
-    } else if (strcasecmp(key, "out_file") == 0 && isPascalStringType(args[2].type)) {
+        s->basic_auth = strdup(AS_STRING(args[2]) ? AS_STRING(args[2]) : "");
+    } else if (strcasecmp(key, "out_file") == 0 && isPascalStringType(VALUE_TYPE(args[2]))) {
         if (s->out_file) free(s->out_file);
-        s->out_file = strdup(args[2].s_val ? args[2].s_val : "");
+        s->out_file = strdup(AS_STRING(args[2]) ? AS_STRING(args[2]) : "");
     } else if (strcasecmp(key, "accept_encoding") == 0) {
         /* Always clear the curl handle so callers can disable compression
            even after a request has set the default empty string. */
@@ -997,20 +997,20 @@ Value vmBuiltinHttpSetOption(VM* vm, int arg_count, Value* args) {
             free(s->accept_encoding);
             s->accept_encoding = NULL;
         }
-        if (isPascalStringType(args[2].type)) {
-            s->accept_encoding = strdup(args[2].s_val ? args[2].s_val : "");
+        if (isPascalStringType(VALUE_TYPE(args[2]))) {
+            s->accept_encoding = strdup(AS_STRING(args[2]) ? AS_STRING(args[2]) : "");
             s->accept_encoding_disabled = 0;
         } else if (IS_INTLIKE(args[2])) {
             s->accept_encoding_disabled = 1;
         } else {
             runtimeError(vm, "httpSetOption: accept_encoding expects string or int.");
         }
-    } else if (strcasecmp(key, "cookie_file") == 0 && isPascalStringType(args[2].type)) {
+    } else if (strcasecmp(key, "cookie_file") == 0 && isPascalStringType(VALUE_TYPE(args[2]))) {
         if (s->cookie_file) free(s->cookie_file);
-        s->cookie_file = strdup(args[2].s_val ? args[2].s_val : "");
-    } else if (strcasecmp(key, "cookie_jar") == 0 && isPascalStringType(args[2].type)) {
+        s->cookie_file = strdup(AS_STRING(args[2]) ? AS_STRING(args[2]) : "");
+    } else if (strcasecmp(key, "cookie_jar") == 0 && isPascalStringType(VALUE_TYPE(args[2]))) {
         if (s->cookie_jar) free(s->cookie_jar);
-        s->cookie_jar = strdup(args[2].s_val ? args[2].s_val : "");
+        s->cookie_jar = strdup(AS_STRING(args[2]) ? AS_STRING(args[2]) : "");
     } else if (strcasecmp(key, "retry_max") == 0 && IS_INTLIKE(args[2])) {
         s->max_retries = (long)AS_INTEGER(args[2]);
     } else if (strcasecmp(key, "retry_delay_ms") == 0 && IS_INTLIKE(args[2])) {
@@ -1019,9 +1019,9 @@ Value vmBuiltinHttpSetOption(VM* vm, int arg_count, Value* args) {
         s->max_recv_speed = (curl_off_t)AS_INTEGER(args[2]);
     } else if (strcasecmp(key, "max_send_speed") == 0 && IS_INTLIKE(args[2])) {
         s->max_send_speed = (curl_off_t)AS_INTEGER(args[2]);
-    } else if (strcasecmp(key, "upload_file") == 0 && isPascalStringType(args[2].type)) {
+    } else if (strcasecmp(key, "upload_file") == 0 && isPascalStringType(VALUE_TYPE(args[2]))) {
         if (s->upload_file) free(s->upload_file);
-        s->upload_file = strdup(args[2].s_val ? args[2].s_val : "");
+        s->upload_file = strdup(AS_STRING(args[2]) ? AS_STRING(args[2]) : "");
     } else {
         runtimeError(vm, "httpSetOption: unsupported option or value type for '%s'.", key);
     }
@@ -1031,28 +1031,28 @@ Value vmBuiltinHttpSetOption(VM* vm, int arg_count, Value* args) {
 // httpRequest(session, method, url, bodyStrOrMStreamOrNil, outMStream): Integer (status)
 Value vmBuiltinHttpRequest(VM* vm, int arg_count, Value* args) {
     if (arg_count != 5 || !IS_INTLIKE(args[0]) ||
-        !isPascalStringType(args[1].type) || !isPascalStringType(args[2].type)) {
+        !isPascalStringType(VALUE_TYPE(args[1])) || !isPascalStringType(VALUE_TYPE(args[2]))) {
         runtimeError(vm, "httpRequest expects (session:int, method:string, url:string, body:string|mstream|nil, out:mstream).");
         return makeInt(-1);
     }
     HttpSession* s = httpGet((int)AS_INTEGER(args[0]));
     if (!s) { runtimeError(vm, "httpRequest: invalid session id."); return makeInt(-1); }
 
-    const char* method = args[1].s_val ? args[1].s_val : "GET";
-    const char* url = args[2].s_val;
+    const char* method = AS_STRING(args[1]) ? AS_STRING(args[1]) : "GET";
+    const char* url = AS_STRING(args[2]);
     const char* body_ptr = NULL;
     size_t body_len = 0;
-    if (isPascalStringType(args[3].type) && args[3].s_val) {
-        body_ptr = args[3].s_val; body_len = strlen(args[3].s_val);
-    } else if (args[3].type == TYPE_MEMORYSTREAM && args[3].mstream) {
-        body_ptr = (const char*)args[3].mstream->buffer; body_len = (size_t)args[3].mstream->size;
-    } else if (args[3].type == TYPE_NIL) {
+    if (isPascalStringType(VALUE_TYPE(args[3])) && AS_STRING(args[3])) {
+        body_ptr = AS_STRING(args[3]); body_len = strlen(AS_STRING(args[3]));
+    } else if (VALUE_TYPE(args[3]) == TYPE_MEMORYSTREAM && AS_MSTREAM(args[3])) {
+        body_ptr = (const char*)AS_MSTREAM(args[3])->buffer; body_len = (size_t)AS_MSTREAM(args[3])->size;
+    } else if (VALUE_TYPE(args[3]) == TYPE_NIL) {
         // ok, no body
     } else {
         runtimeError(vm, "httpRequest: body must be string, mstream or nil.");
         return makeInt(-1);
     }
-    if (args[4].type != TYPE_MEMORYSTREAM || !args[4].mstream) {
+    if (VALUE_TYPE(args[4]) != TYPE_MEMORYSTREAM || !AS_MSTREAM(args[4])) {
         runtimeError(vm, "httpRequest: out must be a valid mstream.");
         return makeInt(-1);
     }
@@ -1065,9 +1065,9 @@ Value vmBuiltinHttpRequest(VM* vm, int arg_count, Value* args) {
         s->last_error_code = 0;
         const char* path = url + 7; // e.g. file:///Users/... -> "/Users/..."
         // Clear output mstream before writing
-        args[4].mstream->size = 0;
-        if (args[4].mstream->buffer && args[4].mstream->capacity > 0) {
-            args[4].mstream->buffer[0] = '\0';
+        AS_MSTREAM(args[4])->size = 0;
+        if (AS_MSTREAM(args[4])->buffer && AS_MSTREAM(args[4])->capacity > 0) {
+            AS_MSTREAM(args[4])->buffer[0] = '\0';
         }
 
         FILE* f = fopen(path, "rb");
@@ -1081,32 +1081,32 @@ Value vmBuiltinHttpRequest(VM* vm, int arg_count, Value* args) {
         unsigned char buf[8192];
         size_t n;
         while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
-            if (args[4].mstream->capacity < args[4].mstream->size + (int)n + 1) {
-                int newcap = args[4].mstream->size + (int)n + 1;
-                unsigned char* newbuf = (unsigned char*)realloc(args[4].mstream->buffer, (size_t)newcap);
+            if (AS_MSTREAM(args[4])->capacity < AS_MSTREAM(args[4])->size + (int)n + 1) {
+                int newcap = AS_MSTREAM(args[4])->size + (int)n + 1;
+                unsigned char* newbuf = (unsigned char*)realloc(AS_MSTREAM(args[4])->buffer, (size_t)newcap);
                 if (!newbuf) { fclose(f); runtimeError(vm, "httpRequest: out-of-memory reading file '%s'", path); return makeInt(-1); }
-                args[4].mstream->buffer = newbuf;
-                args[4].mstream->capacity = newcap;
+                AS_MSTREAM(args[4])->buffer = newbuf;
+                AS_MSTREAM(args[4])->capacity = newcap;
             }
-            memcpy(args[4].mstream->buffer + args[4].mstream->size, buf, n);
-            args[4].mstream->size += (int)n;
+            memcpy(AS_MSTREAM(args[4])->buffer + AS_MSTREAM(args[4])->size, buf, n);
+            AS_MSTREAM(args[4])->size += (int)n;
         }
         fclose(f);
-        size_t nread = (size_t)args[4].mstream->size;
-        while (nread > 0 && (args[4].mstream->buffer[nread-1] == '\n' || args[4].mstream->buffer[nread-1] == '\r')) nread--;
-        args[4].mstream->size = (int)nread;
-        if (args[4].mstream->capacity < (int)nread + 1) {
-            unsigned char* newbuf = (unsigned char*)realloc(args[4].mstream->buffer, nread + 1);
+        size_t nread = (size_t)AS_MSTREAM(args[4])->size;
+        while (nread > 0 && (AS_MSTREAM(args[4])->buffer[nread-1] == '\n' || AS_MSTREAM(args[4])->buffer[nread-1] == '\r')) nread--;
+        AS_MSTREAM(args[4])->size = (int)nread;
+        if (AS_MSTREAM(args[4])->capacity < (int)nread + 1) {
+            unsigned char* newbuf = (unsigned char*)realloc(AS_MSTREAM(args[4])->buffer, nread + 1);
             if (!newbuf) { runtimeError(vm, "httpRequest: out-of-memory reading file '%s'", path); return makeInt(-1); }
-            args[4].mstream->buffer = newbuf;
-            args[4].mstream->capacity = (int)nread + 1;
+            AS_MSTREAM(args[4])->buffer = newbuf;
+            AS_MSTREAM(args[4])->capacity = (int)nread + 1;
         }
-        args[4].mstream->buffer[nread] = '\0';
+        AS_MSTREAM(args[4])->buffer[nread] = '\0';
         // If an out_file is configured, mirror content to that file
-        if (s->out_file && s->out_file[0] && args[4].mstream && args[4].mstream->buffer) {
+        if (s->out_file && s->out_file[0] && AS_MSTREAM(args[4]) && AS_MSTREAM(args[4])->buffer) {
             FILE* of = fopen(s->out_file, "wb");
             if (of) {
-                fwrite(args[4].mstream->buffer, 1, (size_t)args[4].mstream->size, of);
+                fwrite(AS_MSTREAM(args[4])->buffer, 1, (size_t)AS_MSTREAM(args[4])->size, of);
                 fclose(of);
             } else {
                 if (s->last_error_msg) free(s->last_error_msg);
@@ -1157,8 +1157,8 @@ Value vmBuiltinHttpRequest(VM* vm, int arg_count, Value* args) {
 
         size_t required = payload.length + 1;
         if (required == 0) required = 1;
-        if (args[4].mstream->capacity < (int)required || !args[4].mstream->buffer) {
-            unsigned char* newbuf = (unsigned char*)realloc(args[4].mstream->buffer, required);
+        if (AS_MSTREAM(args[4])->capacity < (int)required || !AS_MSTREAM(args[4])->buffer) {
+            unsigned char* newbuf = (unsigned char*)realloc(AS_MSTREAM(args[4])->buffer, required);
             if (!newbuf) {
                 dataUrlPayloadFree(&payload);
                 if (err_msg) free(err_msg);
@@ -1167,10 +1167,10 @@ Value vmBuiltinHttpRequest(VM* vm, int arg_count, Value* args) {
                 runtimeError(vm, "httpRequest: out of memory handling data URL");
                 return makeInt(-1);
             }
-            args[4].mstream->buffer = newbuf;
-            args[4].mstream->capacity = (int)required;
+            AS_MSTREAM(args[4])->buffer = newbuf;
+            AS_MSTREAM(args[4])->capacity = (int)required;
         }
-        if (!args[4].mstream->buffer) {
+        if (!AS_MSTREAM(args[4])->buffer) {
             dataUrlPayloadFree(&payload);
             if (err_msg) free(err_msg);
             s->last_error_code = 2;
@@ -1180,10 +1180,10 @@ Value vmBuiltinHttpRequest(VM* vm, int arg_count, Value* args) {
         }
 
         if (payload.length > 0) {
-            memcpy(args[4].mstream->buffer, payload.data, payload.length);
+            memcpy(AS_MSTREAM(args[4])->buffer, payload.data, payload.length);
         }
-        args[4].mstream->size = (int)payload.length;
-        args[4].mstream->buffer[payload.length] = '\0';
+        AS_MSTREAM(args[4])->size = (int)payload.length;
+        AS_MSTREAM(args[4])->buffer[payload.length] = '\0';
 
         if (s->out_file && s->out_file[0]) {
             FILE* of = fopen(s->out_file, "wb");
@@ -1236,12 +1236,12 @@ Value vmBuiltinHttpRequest(VM* vm, int arg_count, Value* args) {
             return makeInt(-1);
         }
         dual.f = tmp_out_file;
-        dual.ms = args[4].mstream;
+        dual.ms = AS_MSTREAM(args[4]);
         curl_easy_setopt(s->curl, CURLOPT_WRITEFUNCTION, dualWriteCallback);
         curl_easy_setopt(s->curl, CURLOPT_WRITEDATA, &dual);
     } else {
         curl_easy_setopt(s->curl, CURLOPT_WRITEFUNCTION, writeCallback);
-        curl_easy_setopt(s->curl, CURLOPT_WRITEDATA, args[4].mstream);
+        curl_easy_setopt(s->curl, CURLOPT_WRITEDATA, AS_MSTREAM(args[4]));
     }
     curl_easy_setopt(s->curl, CURLOPT_TIMEOUT_MS, s->timeout_ms);
     curl_easy_setopt(s->curl, CURLOPT_FOLLOWLOCATION, s->follow_redirects);
@@ -1384,9 +1384,9 @@ Value vmBuiltinHttpRequest(VM* vm, int arg_count, Value* args) {
 #endif
 
     // Clear out buffer of output mstream before writing
-    args[4].mstream->size = 0;
-    if (args[4].mstream->buffer && args[4].mstream->capacity > 0) {
-        args[4].mstream->buffer[0] = '\0';
+    AS_MSTREAM(args[4])->size = 0;
+    if (AS_MSTREAM(args[4])->buffer && AS_MSTREAM(args[4])->capacity > 0) {
+        AS_MSTREAM(args[4])->buffer[0] = '\0';
     }
 
     long http_code = 0;
@@ -1403,8 +1403,8 @@ Value vmBuiltinHttpRequest(VM* vm, int arg_count, Value* args) {
         attempt++;
         if (s->last_headers) { free(s->last_headers); s->last_headers = NULL; }
         if (s->last_error_msg) { free(s->last_error_msg); s->last_error_msg = NULL; }
-        args[4].mstream->size = 0;
-        if (args[4].mstream->buffer && args[4].mstream->capacity > 0) args[4].mstream->buffer[0] = '\0';
+        AS_MSTREAM(args[4])->size = 0;
+        if (AS_MSTREAM(args[4])->buffer && AS_MSTREAM(args[4])->capacity > 0) AS_MSTREAM(args[4])->buffer[0] = '\0';
         if (tmp_out_file) {
             fclose(tmp_out_file);
             tmp_out_file = fopen(s->out_file, "wb");
@@ -1472,32 +1472,32 @@ Value vmBuiltinHttpRequest(VM* vm, int arg_count, Value* args) {
 // httpRequestToFile(session, method, url, bodyStrOrMStreamOrNil, outFilename): Integer (status)
 Value vmBuiltinHttpRequestToFile(VM* vm, int arg_count, Value* args) {
     if (arg_count != 5 || !IS_INTLIKE(args[0]) ||
-        !isPascalStringType(args[1].type) || !isPascalStringType(args[2].type)) {
+        !isPascalStringType(VALUE_TYPE(args[1])) || !isPascalStringType(VALUE_TYPE(args[2]))) {
         runtimeError(vm, "httpRequestToFile expects (session:int, method:string, url:string, body:string|mstream|nil, out:string).");
         return makeInt(-1);
     }
     HttpSession* s = httpGet((int)AS_INTEGER(args[0]));
     if (!s) { runtimeError(vm, "httpRequestToFile: invalid session id."); return makeInt(-1); }
 
-    const char* method = args[1].s_val ? args[1].s_val : "GET";
-    const char* url = args[2].s_val;
+    const char* method = AS_STRING(args[1]) ? AS_STRING(args[1]) : "GET";
+    const char* url = AS_STRING(args[2]);
     const char* body_ptr = NULL;
     size_t body_len = 0;
-    if (isPascalStringType(args[3].type) && args[3].s_val) {
-        body_ptr = args[3].s_val; body_len = strlen(args[3].s_val);
-    } else if (args[3].type == TYPE_MEMORYSTREAM && args[3].mstream) {
-        body_ptr = (const char*)args[3].mstream->buffer; body_len = (size_t)args[3].mstream->size;
-    } else if (args[3].type == TYPE_NIL) {
+    if (isPascalStringType(VALUE_TYPE(args[3])) && AS_STRING(args[3])) {
+        body_ptr = AS_STRING(args[3]); body_len = strlen(AS_STRING(args[3]));
+    } else if (VALUE_TYPE(args[3]) == TYPE_MEMORYSTREAM && AS_MSTREAM(args[3])) {
+        body_ptr = (const char*)AS_MSTREAM(args[3])->buffer; body_len = (size_t)AS_MSTREAM(args[3])->size;
+    } else if (VALUE_TYPE(args[3]) == TYPE_NIL) {
         // ok, no body
     } else {
         runtimeError(vm, "httpRequestToFile: body must be string, mstream or nil.");
         return makeInt(-1);
     }
-    if (!isPascalStringType(args[4].type) || !args[4].s_val) {
+    if (!isPascalStringType(VALUE_TYPE(args[4])) || !AS_STRING(args[4])) {
         runtimeError(vm, "httpRequestToFile: out must be a filename string.");
         return makeInt(-1);
     }
-    const char* out_path = args[4].s_val;
+    const char* out_path = AS_STRING(args[4]);
 
     // Reset last headers and errors
     if (s->last_headers) { free(s->last_headers); s->last_headers = NULL; }
@@ -1815,21 +1815,21 @@ Value vmBuiltinApiSend(VM* vm, int arg_count, Value* args) {
     }
 
     // Arg 0: URL (String)
-    if (!isPascalStringType(args[0].type) || args[0].s_val == NULL) {
+    if (!isPascalStringType(VALUE_TYPE(args[0])) || AS_STRING(args[0]) == NULL) {
         runtimeError(vm, "apiSend: URL argument must be a non-null string.");
         return makeVoid();
     }
-    const char* url = args[0].s_val;
+    const char* url = AS_STRING(args[0]);
 
     // Arg 1: RequestBody (String or MStream)
     const char* request_body_content = NULL;
     size_t request_body_length = 0;
-    if (isPascalStringType(args[1].type)) {
-        request_body_content = args[1].s_val ? args[1].s_val : "";
+    if (isPascalStringType(VALUE_TYPE(args[1]))) {
+        request_body_content = AS_STRING(args[1]) ? AS_STRING(args[1]) : "";
         request_body_length = strlen(request_body_content);
-    } else if (args[1].type == TYPE_MEMORYSTREAM && args[1].mstream != NULL) {
-        request_body_content = (const char*)args[1].mstream->buffer;
-        request_body_length = args[1].mstream->size;
+    } else if (VALUE_TYPE(args[1]) == TYPE_MEMORYSTREAM && AS_MSTREAM(args[1]) != NULL) {
+        request_body_content = (const char*)AS_MSTREAM(args[1])->buffer;
+        request_body_length = AS_MSTREAM(args[1])->size;
     } else {
         runtimeError(vm, "apiSend: Request body must be a string or memory stream.");
         return makeVoid();
@@ -1912,11 +1912,11 @@ Value vmBuiltinApiReceive(VM* vm, int arg_count, Value* args) {
     }
 
     // Arg 0: MStream
-    if (args[0].type != TYPE_MEMORYSTREAM || args[0].mstream == NULL) {
+    if (VALUE_TYPE(args[0]) != TYPE_MEMORYSTREAM || AS_MSTREAM(args[0]) == NULL) {
         runtimeError(vm, "apiReceive: Argument must be a valid MStream.");
         return makeString("");
     }
-    MStream* mstream = args[0].mstream;
+    MStream* mstream = AS_MSTREAM(args[0]);
 
     // Ensure buffer is not NULL before creating string, even if size is 0
     const char* buffer_content = mstream->buffer ? (char*)mstream->buffer : "";
@@ -2385,9 +2385,9 @@ Value vmBuiltinSocketSend(VM* vm, int arg_count, Value* args) {
         }
         data = valueToCStringLike(&args[1]);
         len = data ? strlen(data) : 0;
-    } else if (args[1].type == TYPE_MEMORYSTREAM && args[1].mstream) {
-        data = (const char*)args[1].mstream->buffer;
-        len = args[1].mstream->size;
+    } else if (VALUE_TYPE(args[1]) == TYPE_MEMORYSTREAM && AS_MSTREAM(args[1])) {
+        data = (const char*)AS_MSTREAM(args[1])->buffer;
+        len = AS_MSTREAM(args[1])->size;
     } else {
         runtimeError(vm, "socketSend data must be string or mstream.");
         return makeInt(-1);
@@ -2461,12 +2461,12 @@ Value vmBuiltinSocketReceive(VM* vm, int arg_count, Value* args) {
 }
 
 Value vmBuiltinSocketSetBlocking(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 2 || !IS_INTLIKE(args[0]) || args[1].type != TYPE_BOOLEAN) {
+    if (arg_count != 2 || !IS_INTLIKE(args[0]) || VALUE_TYPE(args[1]) != TYPE_BOOLEAN) {
         runtimeError(vm, "socketSetBlocking expects (socket, boolean).");
         return makeInt(-1);
     }
     int s = (int)AS_INTEGER(args[0]);
-    int blocking = args[1].i_val != 0;
+    int blocking = VAL_INT(args[1]) != 0;
 #ifdef _WIN32
     u_long mode = blocking ? 0 : 1;
     int r = ioctlsocket(s, FIONBIO, &mode);
@@ -2525,11 +2525,11 @@ static void markDnsLookupFailure(VM* vm) {
 }
 
 Value vmBuiltinDnsLookup(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || !isPascalStringType(args[0].type)) {
+    if (arg_count != 1 || !isPascalStringType(VALUE_TYPE(args[0]))) {
         runtimeError(vm, "dnsLookup expects (hostname).");
         return makeString("");
     }
-    const char* host = args[0].s_val;
+    const char* host = AS_STRING(args[0]);
 #ifdef _WIN32
     ensure_winsock();
 #endif
@@ -3153,7 +3153,7 @@ static void* httpAsyncThread(void* arg) {
 // HttpRequestAsync(session, method, url, bodyStrOrMStreamOrNil): Integer (async id)
 Value vmBuiltinHttpRequestAsync(VM* vm, int arg_count, Value* args) {
     if (arg_count != 4 || !IS_INTLIKE(args[0]) ||
-        !isPascalStringType(args[1].type) || !isPascalStringType(args[2].type)) {
+        !isPascalStringType(VALUE_TYPE(args[1])) || !isPascalStringType(VALUE_TYPE(args[2]))) {
         runtimeError(vm, "httpRequestAsync expects (session:int, method:string, url:string, body:string|mstream|nil).");
         return makeInt(-1);
     }
@@ -3161,17 +3161,17 @@ Value vmBuiltinHttpRequestAsync(VM* vm, int arg_count, Value* args) {
     if (id < 0) { runtimeError(vm, "httpRequestAsync: no free slots."); return makeInt(-1); }
     HttpAsyncJob* job = &g_http_async[id]; /* g_http_async_mutex is locked */
     job->session = (int)AS_INTEGER(args[0]);
-    job->method = strdup(args[1].s_val ? args[1].s_val : "GET");
-    job->url = strdup(args[2].s_val ? args[2].s_val : "");
-    if (isPascalStringType(args[3].type) && args[3].s_val) {
-        job->body_len = strlen(args[3].s_val);
+    job->method = strdup(AS_STRING(args[1]) ? AS_STRING(args[1]) : "GET");
+    job->url = strdup(AS_STRING(args[2]) ? AS_STRING(args[2]) : "");
+    if (isPascalStringType(VALUE_TYPE(args[3])) && AS_STRING(args[3])) {
+        job->body_len = strlen(AS_STRING(args[3]));
         job->body = (char*)malloc(job->body_len + 1);
-        if (job->body) { memcpy(job->body, args[3].s_val, job->body_len + 1); }
-    } else if (args[3].type == TYPE_MEMORYSTREAM && args[3].mstream) {
-        job->body_len = (size_t)args[3].mstream->size;
+        if (job->body) { memcpy(job->body, AS_STRING(args[3]), job->body_len + 1); }
+    } else if (VALUE_TYPE(args[3]) == TYPE_MEMORYSTREAM && AS_MSTREAM(args[3])) {
+        job->body_len = (size_t)AS_MSTREAM(args[3])->size;
         job->body = (char*)malloc(job->body_len + 1);
-        if (job->body && args[3].mstream->buffer) {
-            memcpy(job->body, args[3].mstream->buffer, job->body_len);
+        if (job->body && AS_MSTREAM(args[3])->buffer) {
+            memcpy(job->body, AS_MSTREAM(args[3])->buffer, job->body_len);
             job->body[job->body_len] = '\0';
         }
     }
@@ -3252,7 +3252,7 @@ Value vmBuiltinHttpRequestAsync(VM* vm, int arg_count, Value* args) {
 // HttpRequestAsyncToFile(session, method, url, bodyStrOrMStreamOrNil, outPath): Integer (async id)
 Value vmBuiltinHttpRequestAsyncToFile(VM* vm, int arg_count, Value* args) {
     if (arg_count != 5 || !IS_INTLIKE(args[0]) ||
-        !isPascalStringType(args[1].type) || !isPascalStringType(args[2].type)) {
+        !isPascalStringType(VALUE_TYPE(args[1])) || !isPascalStringType(VALUE_TYPE(args[2]))) {
         runtimeError(vm, "httpRequestAsyncToFile expects (session:int, method:string, url:string, body:string|mstream|nil, out:string).");
         return makeInt(-1);
     }
@@ -3260,21 +3260,21 @@ Value vmBuiltinHttpRequestAsyncToFile(VM* vm, int arg_count, Value* args) {
     if (id < 0) { runtimeError(vm, "httpRequestAsyncToFile: no free slots."); return makeInt(-1); }
     HttpAsyncJob* job = &g_http_async[id]; /* g_http_async_mutex is locked */
     job->session = (int)AS_INTEGER(args[0]);
-    job->method = strdup(args[1].s_val ? args[1].s_val : "GET");
-    job->url = strdup(args[2].s_val ? args[2].s_val : "");
-    if (isPascalStringType(args[3].type) && args[3].s_val) {
-        job->body_len = strlen(args[3].s_val);
+    job->method = strdup(AS_STRING(args[1]) ? AS_STRING(args[1]) : "GET");
+    job->url = strdup(AS_STRING(args[2]) ? AS_STRING(args[2]) : "");
+    if (isPascalStringType(VALUE_TYPE(args[3])) && AS_STRING(args[3])) {
+        job->body_len = strlen(AS_STRING(args[3]));
         job->body = (char*)malloc(job->body_len + 1);
-        if (job->body) { memcpy(job->body, args[3].s_val, job->body_len + 1); }
-    } else if (args[3].type == TYPE_MEMORYSTREAM && args[3].mstream) {
-        job->body_len = (size_t)args[3].mstream->size;
+        if (job->body) { memcpy(job->body, AS_STRING(args[3]), job->body_len + 1); }
+    } else if (VALUE_TYPE(args[3]) == TYPE_MEMORYSTREAM && AS_MSTREAM(args[3])) {
+        job->body_len = (size_t)AS_MSTREAM(args[3])->size;
         job->body = (char*)malloc(job->body_len + 1);
-        if (job->body && args[3].mstream->buffer) {
-            memcpy(job->body, args[3].mstream->buffer, job->body_len);
+        if (job->body && AS_MSTREAM(args[3])->buffer) {
+            memcpy(job->body, AS_MSTREAM(args[3])->buffer, job->body_len);
             job->body[job->body_len] = '\0';
         }
     }
-    if (!isPascalStringType(args[4].type) || !args[4].s_val) {
+    if (!isPascalStringType(VALUE_TYPE(args[4])) || !AS_STRING(args[4])) {
         runtimeError(vm, "httpRequestAsyncToFile: out must be a filename string.");
         // free partial
         if (job->method) free(job->method);
@@ -3284,7 +3284,7 @@ Value vmBuiltinHttpRequestAsyncToFile(VM* vm, int arg_count, Value* args) {
         pthread_mutex_unlock(&g_http_async_mutex);
         return makeInt(-1);
     }
-    job->out_file = strdup(args[4].s_val);
+    job->out_file = strdup(AS_STRING(args[4]));
     // Snapshot session options for thread safety
     HttpSession* s = httpGet(job->session);
     if (s) {
@@ -3340,7 +3340,7 @@ Value vmBuiltinHttpRequestAsyncToFile(VM* vm, int arg_count, Value* args) {
 
 // HttpAwait(asyncId, out:mstream): Integer (status)
 Value vmBuiltinHttpAwait(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 2 || !IS_INTLIKE(args[0]) || args[1].type != TYPE_MEMORYSTREAM || !args[1].mstream) {
+    if (arg_count != 2 || !IS_INTLIKE(args[0]) || VALUE_TYPE(args[1]) != TYPE_MEMORYSTREAM || !AS_MSTREAM(args[1])) {
         runtimeError(vm, "httpAwait expects (id:int, out:mstream).");
         return makeInt(-1);
     }
@@ -3355,7 +3355,7 @@ Value vmBuiltinHttpAwait(VM* vm, int arg_count, Value* args) {
     int status = (int)job->status;
     // Copy result into provided mstream
     if (job->result && job->result->buffer) {
-        MStream* out = args[1].mstream;
+        MStream* out = AS_MSTREAM(args[1]);
         // ensure capacity
         if ((size_t)out->capacity < job->result->size + 1) {
             unsigned char* nb = realloc(out->buffer, job->result->size + 1);
@@ -3406,7 +3406,7 @@ Value vmBuiltinHttpAwait(VM* vm, int arg_count, Value* args) {
 
 // HttpTryAwait(asyncId, out:mstream): Integer (-2: pending; otherwise status)
 Value vmBuiltinHttpTryAwait(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 2 || !IS_INTLIKE(args[0]) || args[1].type != TYPE_MEMORYSTREAM || !args[1].mstream) {
+    if (arg_count != 2 || !IS_INTLIKE(args[0]) || VALUE_TYPE(args[1]) != TYPE_MEMORYSTREAM || !AS_MSTREAM(args[1])) {
         runtimeError(vm, "httpTryAwait expects (id:int, out:mstream).");
         return makeInt(-1);
     }
@@ -3422,7 +3422,7 @@ Value vmBuiltinHttpTryAwait(VM* vm, int arg_count, Value* args) {
     pthread_mutex_lock(&g_http_async_mutex);
     int status = (int)job->status;
     if (job->result && job->result->buffer) {
-        MStream* out = args[1].mstream;
+        MStream* out = AS_MSTREAM(args[1]);
         if ((size_t)out->capacity < job->result->size + 1) {
             unsigned char* nb = realloc(out->buffer, job->result->size + 1);
             if (nb) { out->buffer = nb; out->capacity = (int)(job->result->size + 1); }
@@ -3565,13 +3565,13 @@ Value vmBuiltinHttpErrorCode(VM* vm, int arg_count, Value* args) {
 
 // HttpGetHeader(session, name): String (value from last response headers; empty if not found)
 Value vmBuiltinHttpGetHeader(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 2 || !IS_INTLIKE(args[0]) || !isPascalStringType(args[1].type)) {
+    if (arg_count != 2 || !IS_INTLIKE(args[0]) || !isPascalStringType(VALUE_TYPE(args[1]))) {
         runtimeError(vm, "httpGetHeader expects (session:int, name:string).");
         return makeString("");
     }
     HttpSession* s = httpGet((int)AS_INTEGER(args[0]));
     if (!s || !s->last_headers) return makeString("");
-    const char* name = args[1].s_val ? args[1].s_val : "";
+    const char* name = AS_STRING(args[1]) ? AS_STRING(args[1]) : "";
     size_t name_len = strlen(name);
     if (name_len == 0) return makeString("");
 
@@ -3631,12 +3631,12 @@ Value vmBuiltinHttpGetHeader(VM* vm, int arg_count, Value* args) {
 // -------------------- Minimal JSON helper --------------------
 // JsonGet(jsonStr, key) -> returns value as string for flat JSON (string/number/bool)
 Value vmBuiltinJsonGet(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 2 || !isPascalStringType(args[0].type) || !isPascalStringType(args[1].type)) {
+    if (arg_count != 2 || !isPascalStringType(VALUE_TYPE(args[0])) || !isPascalStringType(VALUE_TYPE(args[1]))) {
         runtimeError(vm, "JsonGet expects (json:string, key:string).");
         return makeString("");
     }
-    const char* json = args[0].s_val ? args[0].s_val : "";
-    const char* key = args[1].s_val ? args[1].s_val : "";
+    const char* json = AS_STRING(args[0]) ? AS_STRING(args[0]) : "";
+    const char* key = AS_STRING(args[1]) ? AS_STRING(args[1]) : "";
     char pat[256]; snprintf(pat, sizeof(pat), "\"%s\"", key);
     const char* p = strstr(json, pat);
     if (!p) return makeString("");

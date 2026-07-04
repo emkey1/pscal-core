@@ -322,7 +322,7 @@ Symbol *lookupSymbol(const char *name) {
 #endif
         EXIT_FAILURE_HANDLER();
     }
-    DEBUG_PRINT("[DEBUG SYMBOL] lookupSymbol: '%s' found, type=%s\n", name, varTypeToString(sym->type));
+    DEBUG_PRINT("[DEBUG SYMBOL] lookupSymbol: '%s' found, type=%s\n", name, varTypeToString(VALUE_TYPE(*sym)));
     return sym;
 }
 
@@ -410,11 +410,11 @@ void insertGlobalSymbol(const char *name, VarType type, AST *type_def) {
             def = def->right;
         }
         if (def && def->type == AST_ENUM_TYPE && def->token && def->token->value) {
-            if (new_symbol->value->enum_val.enum_name) {
-                free(new_symbol->value->enum_val.enum_name);
+            if (AS_ENUM(*new_symbol->value).enum_name) {
+                free(AS_ENUM(*new_symbol->value).enum_name);
             }
-            new_symbol->value->enum_val.enum_name = strdup(def->token->value);
-            new_symbol->value->enum_val.ordinal = 0;
+            AS_ENUM(*new_symbol->value).enum_name = strdup(def->token->value);
+            AS_ENUM(*new_symbol->value).ordinal = 0;
             new_symbol->value->base_type_node = def;
         }
     }
@@ -523,7 +523,7 @@ void insertStandardStreamSymbols(void) {
                 EXIT_FAILURE_HANDLER();
             }
             *(sym->value) = makeValueForType(TYPE_FILE, NULL, sym);
-        } else if (sym->value->type != TYPE_FILE) {
+        } else if (VALUE_TYPE(*sym->value) != TYPE_FILE) {
             freeValue(sym->value);
             *(sym->value) = makeValueForType(TYPE_FILE, NULL, sym);
         }
@@ -963,12 +963,12 @@ void nullifyPointerAliasesByAddrValue(HashTable* table, uintptr_t disposedAddrVa
         while (current) {
             // Compare the stored pointer address (cast to integer) with the disposed address value
             if (current->value && current->type == TYPE_POINTER &&
-                ((uintptr_t)current->value->ptr_val) == disposedAddrValue) {
+                ((uintptr_t)AS_POINTER(*current->value)) == disposedAddrValue) {
                 #ifdef DEBUG
                 fprintf(stderr, "[DEBUG DISPOSE] Nullifying alias '%s' in bucket %d which pointed to disposed memory address 0x%lx.\n",
                         current->name ? current->name : "?", i, disposedAddrValue);
                 #endif
-                current->value->ptr_val = NULL; // Set the alias pointer to nil
+                AS_POINTER(*current->value) = NULL; // Set the alias pointer to nil
             }
             current = current->next;
         }
@@ -993,12 +993,12 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
     fprintf(stderr,
             "[DEBUG updateSymbol] Attempting to update symbol '%s' (Type: %s, Value @ %p, is_const: %d, is_alias: %d, is_local_var: %d). Incoming value type: %s\n",
             name ? name : (sym && sym->name ? sym->name : "<unnamed>"),
-            sym ? varTypeToString(sym->type) : "<?>",
+            sym ? varTypeToString(VALUE_TYPE(*sym)) : "<?>",
             (void*)(sym ? sym->value : NULL),
             sym ? sym->is_const : -1,
             sym ? sym->is_alias : -1,
             sym ? sym->is_local_var : -1,
-            varTypeToString(val.type));
+            varTypeToString(VALUE_TYPE(val)));
     fflush(stderr);
 #endif
     if (!sym) {
@@ -1021,47 +1021,47 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
 
     // --- Type Compatibility Check ---
     bool types_compatible = false;
-    if (sym->type == val.type) {
+    if (sym->type == VALUE_TYPE(val)) {
         types_compatible = true; // Exact type match
     } else {
         // Handle specific allowed coercions and promotions.
-        if (isRealType(sym->type) && (isRealType(val.type) || isIntlikeType(val.type))) types_compatible = true;
-        else if (sym->type == TYPE_INTEGER && isRealType(val.type)) { types_compatible = false; } // No implicit Real to Integer
-        else if (isIntlikeType(sym->type) && isIntlikeType(val.type)) types_compatible = true;
-        else if (isPascalStringType(sym->type) && isPascalStringType(val.type)) types_compatible = true;
-        else if (isPascalStringType(sym->type) && isPascalCharType(val.type)) types_compatible = true;
-        else if (sym->type == TYPE_CHAR && isPascalStringType(val.type) && val.s_val && strlen(val.s_val) == 1) types_compatible = true;
-        else if (sym->type == TYPE_WIDECHAR && isPascalStringType(val.type) && val.s_val) {
+        if (isRealType(sym->type) && (isRealType(VALUE_TYPE(val)) || isIntlikeType(VALUE_TYPE(val)))) types_compatible = true;
+        else if (sym->type == TYPE_INTEGER && isRealType(VALUE_TYPE(val))) { types_compatible = false; } // No implicit Real to Integer
+        else if (isIntlikeType(sym->type) && isIntlikeType(VALUE_TYPE(val))) types_compatible = true;
+        else if (isPascalStringType(sym->type) && isPascalStringType(VALUE_TYPE(val))) types_compatible = true;
+        else if (isPascalStringType(sym->type) && isPascalCharType(VALUE_TYPE(val))) types_compatible = true;
+        else if (sym->type == TYPE_CHAR && isPascalStringType(VALUE_TYPE(val)) && AS_STRING(val) && strlen(AS_STRING(val)) == 1) types_compatible = true;
+        else if (sym->type == TYPE_WIDECHAR && isPascalStringType(VALUE_TYPE(val)) && AS_STRING(val)) {
             uint32_t codepoint = 0;
             size_t advance = 0;
-            size_t len = strlen(val.s_val);
-            types_compatible = decodeUtf8Codepoint(val.s_val, len, &codepoint, &advance) &&
+            size_t len = strlen(AS_STRING(val));
+            types_compatible = decodeUtf8Codepoint(AS_STRING(val), len, &codepoint, &advance) &&
                                advance == len;
         }
-        else if (sym->type == TYPE_ENUM && val.type == TYPE_ENUM) {
-             if ((sym->value->enum_val.enum_name == NULL && val.enum_val.enum_name == NULL) ||
-                 (sym->value->enum_val.enum_name != NULL && val.enum_val.enum_name != NULL &&
-                  strcmp(sym->value->enum_val.enum_name, val.enum_val.enum_name) == 0)) {
+        else if (sym->type == TYPE_ENUM && VALUE_TYPE(val) == TYPE_ENUM) {
+             if ((AS_ENUM(*sym->value).enum_name == NULL && AS_ENUM(val).enum_name == NULL) ||
+                 (AS_ENUM(*sym->value).enum_name != NULL && AS_ENUM(val).enum_name != NULL &&
+                  strcmp(AS_ENUM(*sym->value).enum_name, AS_ENUM(val).enum_name) == 0)) {
                  types_compatible = true;
              } else {
                  #ifdef DEBUG
                  fprintf(stderr, "[DEBUG updateSymbol] Enum type mismatch: Cannot assign enum '%s' to enum '%s'.\n",
-                         val.enum_val.enum_name ? val.enum_val.enum_name : "?",
-                         sym->value->enum_val.enum_name ? sym->value->enum_val.enum_name : "?");
+                         AS_ENUM(val).enum_name ? AS_ENUM(val).enum_name : "?",
+                         AS_ENUM(*sym->value).enum_name ? AS_ENUM(*sym->value).enum_name : "?");
                  #endif
                  types_compatible = false;
              }
         }
-        else if (sym->type == TYPE_ENUM && isIntlikeType(val.type)) types_compatible = true;
-        else if (sym->type == TYPE_POINTER && (val.type == TYPE_POINTER || val.type == TYPE_NIL)) types_compatible = true;
-        else if (sym->type == TYPE_SET && val.type == TYPE_SET) types_compatible = true;
-        else if (sym->type == TYPE_MEMORYSTREAM && val.type == TYPE_MEMORYSTREAM) types_compatible = true;
-        else if (sym->type == TYPE_FILE && val.type == TYPE_FILE) types_compatible = true;
+        else if (sym->type == TYPE_ENUM && isIntlikeType(VALUE_TYPE(val))) types_compatible = true;
+        else if (sym->type == TYPE_POINTER && (VALUE_TYPE(val) == TYPE_POINTER || VALUE_TYPE(val) == TYPE_NIL)) types_compatible = true;
+        else if (sym->type == TYPE_SET && VALUE_TYPE(val) == TYPE_SET) types_compatible = true;
+        else if (sym->type == TYPE_MEMORYSTREAM && VALUE_TYPE(val) == TYPE_MEMORYSTREAM) types_compatible = true;
+        else if (sym->type == TYPE_FILE && VALUE_TYPE(val) == TYPE_FILE) types_compatible = true;
     }
 
     if (!types_compatible) {
                 fprintf(stderr, "Runtime error: Type mismatch. Cannot assign %s to %s for symbol '%s'.\n",
-                        varTypeToString(val.type), varTypeToString(sym->type),
+                        varTypeToString(VALUE_TYPE(val)), varTypeToString(sym->type),
                         name ? name : (sym->name ? sym->name : "<unnamed>"));
                 freeValue(&val);
                 EXIT_FAILURE_HANDLER();
@@ -1082,7 +1082,7 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
     }
     if (isTextAttrSymbol && !gTextAttrInitialized) {
         gTextAttrInitialized = true;
-        if (isIntlikeType(val.type) && asI64(val) == 0) {
+        if (isIntlikeType(VALUE_TYPE(val)) && asI64(val) == 0) {
             freeValue(sym->value);
             SET_INT_VALUE(sym->value, 7);
             setCurrentTextAttrFromByte(7);
@@ -1104,41 +1104,41 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
     // Use a switch on the TARGET symbol's type to handle assignments correctly.
     switch (sym->type) {
         case TYPE_INTEGER:
-            if (isIntlikeType(val.type)) {
+            if (isIntlikeType(VALUE_TYPE(val))) {
                 SET_INT_VALUE(sym->value, asI64(val));
-            } else if (isRealType(val.type)) {
+            } else if (isRealType(VALUE_TYPE(val))) {
                 SET_INT_VALUE(sym->value, (long long)AS_REAL(val)); // Implicit Truncation
             }
             break;
 
         case TYPE_INT64:
-            if (isIntlikeType(val.type)) {
+            if (isIntlikeType(VALUE_TYPE(val))) {
                 SET_INT_VALUE(sym->value, asI64(val));
-            } else if (isRealType(val.type)) {
+            } else if (isRealType(VALUE_TYPE(val))) {
                 SET_INT_VALUE(sym->value, (long long)AS_REAL(val));
             }
             break;
 
         case TYPE_REAL:
-            if (isRealType(val.type) || isIntlikeType(val.type)) {
+            if (isRealType(VALUE_TYPE(val)) || isIntlikeType(VALUE_TYPE(val))) {
                 SET_REAL_VALUE(sym->value, asLd(val));
             }
             break;
 
         case TYPE_FLOAT:
-            if (isRealType(val.type) || isIntlikeType(val.type)) {
+            if (isRealType(VALUE_TYPE(val)) || isIntlikeType(VALUE_TYPE(val))) {
                 SET_REAL_VALUE(sym->value, asLd(val));
             }
             break;
 
         case TYPE_LONG_DOUBLE:
-            if (isRealType(val.type) || isIntlikeType(val.type)) {
+            if (isRealType(VALUE_TYPE(val)) || isIntlikeType(VALUE_TYPE(val))) {
                 SET_REAL_VALUE(sym->value, asLd(val));
             }
             break;
 
         case TYPE_BYTE: {
-            if (isIntlikeType(val.type)) {
+            if (isIntlikeType(VALUE_TYPE(val))) {
                 long long tmp = asI64(val);
                 if (tmp < 0 || tmp > 255) {
                     fprintf(stderr, "Runtime warning: Assignment to BYTE variable '%s' out of range (0-255). Value %lld will be truncated.\n", name, tmp);
@@ -1149,10 +1149,10 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
         }
 
         case TYPE_UINT8: {
-            if (isIntlikeType(val.type)) {
-                bool srcUnsigned = symbolTypeIsUnsignedInt(val.type);
+            if (isIntlikeType(VALUE_TYPE(val))) {
+                bool srcUnsigned = symbolTypeIsUnsignedInt(VALUE_TYPE(val));
                 long long signedTmp = asI64(val);
-                unsigned long long raw = srcUnsigned ? val.u_val : (unsigned long long)signedTmp;
+                unsigned long long raw = srcUnsigned ? VAL_UINT(val) : (unsigned long long)signedTmp;
                 if (!srcUnsigned && signedTmp < 0) {
                     fprintf(stderr, "Runtime warning: Assignment to UINT8 variable '%s' with negative value %lld will wrap.\n", name, signedTmp);
                 } else if (raw > UINT8_MAX) {
@@ -1165,7 +1165,7 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
         }
 
         case TYPE_WORD: {
-            if (isIntlikeType(val.type)) {
+            if (isIntlikeType(VALUE_TYPE(val))) {
                 long long tmp = asI64(val);
                 if (tmp < 0 || tmp > 65535) {
                     fprintf(stderr, "Runtime warning: Assignment to WORD variable '%s' out of range (0-65535). Value %lld will be truncated.\n", name, tmp);
@@ -1176,10 +1176,10 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
         }
 
         case TYPE_UINT16: {
-            if (isIntlikeType(val.type)) {
-                bool srcUnsigned = symbolTypeIsUnsignedInt(val.type);
+            if (isIntlikeType(VALUE_TYPE(val))) {
+                bool srcUnsigned = symbolTypeIsUnsignedInt(VALUE_TYPE(val));
                 long long signedTmp = asI64(val);
-                unsigned long long raw = srcUnsigned ? val.u_val : (unsigned long long)signedTmp;
+                unsigned long long raw = srcUnsigned ? VAL_UINT(val) : (unsigned long long)signedTmp;
                 if (!srcUnsigned && signedTmp < 0) {
                     fprintf(stderr, "Runtime warning: Assignment to UINT16 variable '%s' with negative value %lld will wrap.\n", name, signedTmp);
                 } else if (raw > UINT16_MAX) {
@@ -1192,10 +1192,10 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
         }
 
         case TYPE_UINT32: {
-            if (isIntlikeType(val.type)) {
-                bool srcUnsigned = symbolTypeIsUnsignedInt(val.type);
+            if (isIntlikeType(VALUE_TYPE(val))) {
+                bool srcUnsigned = symbolTypeIsUnsignedInt(VALUE_TYPE(val));
                 long long signedTmp = asI64(val);
-                unsigned long long raw = srcUnsigned ? val.u_val : (unsigned long long)signedTmp;
+                unsigned long long raw = srcUnsigned ? VAL_UINT(val) : (unsigned long long)signedTmp;
                 if (!srcUnsigned && signedTmp < 0) {
                     fprintf(stderr, "Runtime warning: Assignment to UINT32 variable '%s' with negative value %lld will wrap.\n", name, signedTmp);
                 } else if (raw > UINT32_MAX) {
@@ -1208,10 +1208,10 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
         }
 
         case TYPE_UINT64: {
-            if (isIntlikeType(val.type)) {
-                bool srcUnsigned = symbolTypeIsUnsignedInt(val.type);
+            if (isIntlikeType(VALUE_TYPE(val))) {
+                bool srcUnsigned = symbolTypeIsUnsignedInt(VALUE_TYPE(val));
                 long long signedTmp = asI64(val);
-                unsigned long long raw = srcUnsigned ? val.u_val : (unsigned long long)signedTmp;
+                unsigned long long raw = srcUnsigned ? VAL_UINT(val) : (unsigned long long)signedTmp;
                 if (!srcUnsigned && signedTmp < 0) {
                     fprintf(stderr, "Runtime warning: Assignment to UINT64 variable '%s' with negative value %lld will wrap.\n", name, signedTmp);
                 }
@@ -1225,32 +1225,32 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
             const char* source_str = NULL;
             char char_buf[5] = {0};
 
-            if (isPascalStringType(val.type)) {
-                source_str = val.s_val;
-            } else if (val.type == TYPE_CHAR) {
-                char_buf[0] = (char)val.c_val;
+            if (isPascalStringType(VALUE_TYPE(val))) {
+                source_str = AS_STRING(val);
+            } else if (VALUE_TYPE(val) == TYPE_CHAR) {
+                char_buf[0] = (char)AS_CHAR(val);
                 char_buf[1] = '\0';
                 source_str = char_buf;
-            } else if (val.type == TYPE_WIDECHAR) {
-                encodeUtf8Codepoint((uint32_t)val.c_val, char_buf);
+            } else if (VALUE_TYPE(val) == TYPE_WIDECHAR) {
+                encodeUtf8Codepoint((uint32_t)AS_CHAR(val), char_buf);
                 source_str = char_buf;
             }
             if (!source_str) source_str = "";
 
             if (sym->value->max_length > 0) { // Target is a fixed-length string.
-                strncpy(sym->value->s_val, source_str, sym->value->max_length);
-                sym->value->s_val[sym->value->max_length] = '\0';
+                strncpy(AS_STRING(*sym->value), source_str, sym->value->max_length);
+                AS_STRING(*sym->value)[sym->value->max_length] = '\0';
             } else { // Target is a dynamic string.
-                if (sym->value->s_val) {
-                    free(sym->value->s_val);
+                if (AS_STRING(*sym->value)) {
+                    free(AS_STRING(*sym->value));
                 }
-                sym->value->s_val = strdup(source_str);
-                if (!sym->value->s_val) {
+                AS_STRING(*sym->value) = strdup(source_str);
+                if (!AS_STRING(*sym->value)) {
                     fprintf(stderr, "FATAL: Memory allocation failed for dynamic string assignment to '%s'.\n", name);
                     EXIT_FAILURE_HANDLER();
                 }
             }
-            sym->value->type = sym->type;
+            SET_VALUE_TYPE(sym->value, sym->type);
             break;
         }
 
@@ -1261,45 +1261,45 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
             break;
 
         case TYPE_FILE:
-            if (val.type == TYPE_FILE) {
-                if (sym->value->f_val) {
-                    if (!pscalRuntimeVmIsSharedFileStream(sym->value->f_val)) {
-                        fclose(sym->value->f_val);
+            if (VALUE_TYPE(val) == TYPE_FILE) {
+                if (AS_FILE(*sym->value)) {
+                    if (!pscalRuntimeVmIsSharedFileStream(AS_FILE(*sym->value))) {
+                        fclose(AS_FILE(*sym->value));
                     } else {
-                        fflush(sym->value->f_val);
+                        fflush(AS_FILE(*sym->value));
                     }
                 }
-                sym->value->f_val = val.f_val;
+                AS_FILE(*sym->value) = AS_FILE(val);
                 if (sym->value->filename) free(sym->value->filename);
                 sym->value->filename = val.filename ? strdup(val.filename) : NULL;
-                val.f_val = NULL;
+                AS_FILE(val) = NULL;
                 val.filename = NULL;
             }
             break;
 
         case TYPE_BOOLEAN:
-            if (isIntlikeType(val.type)) SET_INT_VALUE(sym->value, asI64(val) != 0 ? 1 : 0);
+            if (isIntlikeType(VALUE_TYPE(val))) SET_INT_VALUE(sym->value, asI64(val) != 0 ? 1 : 0);
             break;
 
         case TYPE_CHAR:
-            if (isIntlikeType(val.type)) {
-                sym->value->c_val = (int)asI64(val);
-            } else if (isPascalStringType(val.type) && val.s_val && strlen(val.s_val) == 1) {
-                sym->value->c_val = val.s_val[0];
+            if (isIntlikeType(VALUE_TYPE(val))) {
+                SET_CHAR_VALUE(sym->value, (int)asI64(val));
+            } else if (isPascalStringType(VALUE_TYPE(val)) && AS_STRING(val) && strlen(AS_STRING(val)) == 1) {
+                SET_CHAR_VALUE(sym->value, AS_STRING(val)[0]);
             }
             break;
 
         case TYPE_WIDECHAR:
-            if (val.type == TYPE_WIDECHAR || val.type == TYPE_CHAR || isIntlikeType(val.type)) {
-                sym->value->c_val = (int)asI64(val);
-            } else if (isPascalStringType(val.type) && val.s_val) {
-                size_t len = strlen(val.s_val);
+            if (VALUE_TYPE(val) == TYPE_WIDECHAR || VALUE_TYPE(val) == TYPE_CHAR || isIntlikeType(VALUE_TYPE(val))) {
+                SET_CHAR_VALUE(sym->value, (int)asI64(val));
+            } else if (isPascalStringType(VALUE_TYPE(val)) && AS_STRING(val)) {
+                size_t len = strlen(AS_STRING(val));
                 uint32_t codepoint = 0;
                 size_t advance = 0;
                 if (len == 0) {
-                    sym->value->c_val = 0;
-                } else if (decodeUtf8Codepoint(val.s_val, len, &codepoint, &advance) && advance == len) {
-                    sym->value->c_val = (int)codepoint;
+                    SET_CHAR_VALUE(sym->value, 0);
+                } else if (decodeUtf8Codepoint(AS_STRING(val), len, &codepoint, &advance) && advance == len) {
+                    SET_CHAR_VALUE(sym->value, (int)codepoint);
                 }
             }
             break;
@@ -1309,11 +1309,11 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
             break;
 
         case TYPE_ENUM:
-            if (val.type == TYPE_ENUM) {
-                if(sym->value->enum_val.enum_name) free(sym->value->enum_val.enum_name);
-                sym->value->enum_val.enum_name = val.enum_val.enum_name ? strdup(val.enum_val.enum_name) : NULL;
-                sym->value->enum_val.ordinal = val.enum_val.ordinal;
-            } else if (isIntlikeType(val.type)) {
+            if (VALUE_TYPE(val) == TYPE_ENUM) {
+                if(AS_ENUM(*sym->value).enum_name) free(AS_ENUM(*sym->value).enum_name);
+                AS_ENUM(*sym->value).enum_name = AS_ENUM(val).enum_name ? strdup(AS_ENUM(val).enum_name) : NULL;
+                AS_ENUM(*sym->value).ordinal = AS_ENUM(val).ordinal;
+            } else if (isIntlikeType(VALUE_TYPE(val))) {
                 AST* typeDef = sym->type_def;
                 if (typeDef && typeDef->type == AST_TYPE_REFERENCE) typeDef = typeDef->right;
                 long long maxOrdinal = -1;
@@ -1323,12 +1323,12 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
                 if (maxOrdinal != -1 && (v < 0 || v > maxOrdinal)) {
                     fprintf(stderr, "Runtime warning: Assignment to ENUM variable '%s' out of range (0..%lld). Value %lld is invalid.\n", name, maxOrdinal, v);
                 }
-                sym->value->enum_val.ordinal = (int)v;
+                AS_ENUM(*sym->value).ordinal = (int)v;
             }
             break;
 
         case TYPE_POINTER:
-            sym->value->ptr_val = val.ptr_val;
+            AS_POINTER(*sym->value) = AS_POINTER(val);
             // The `base_type_node` of the variable itself does not change on assignment.
             break;
 
@@ -1345,7 +1345,7 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
     }
 
     if (isTextAttrSymbol) {
-        uint8_t attr_byte = (uint8_t)(sym->value->i_val & 0xFF);
+        uint8_t attr_byte = (uint8_t)(VAL_INT(*sym->value) & 0xFF);
         setCurrentTextAttrFromByte(attr_byte);
     }
 
@@ -1355,7 +1355,7 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
     #ifdef DEBUG
     fprintf(stderr, "[DEBUG updateSymbol] Assignment to '%s' successful. Final value type: %s\n",
             name ? name : (sym->name ? sym->name : "<unnamed>"),
-            varTypeToString(sym->value->type));
+            varTypeToString(VALUE_TYPE(*sym->value)));
     #endif
 }
 
