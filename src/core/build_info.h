@@ -7,7 +7,18 @@
 #define PSCAL_STRINGIFY_IMPL(x) #x
 #define PSCAL_STRINGIFY(x) PSCAL_STRINGIFY_IMPL(x)
 
-#ifdef PROGRAM_VERSION
+// PSCAL_PROGRAM_VERSION_OVERRIDE lets a frontend that tracks its own
+// meaningful version scheme (e.g. Aether's language-version VERSION file)
+// take priority over the generic build-timestamp PROGRAM_VERSION that the
+// umbrella build defines at directory scope for every frontend. It has to be
+// a distinct macro name, not a redefinition of PROGRAM_VERSION itself: umbrella
+// builds set PROGRAM_VERSION as a directory-wide compile definition, which in
+// CMake's compile-definition ordering always wins over a same-named target-level
+// override added later in the same directory scope, so a frontend-specific
+// target_compile_definitions(... PROGRAM_VERSION=...) silently loses.
+#ifdef PSCAL_PROGRAM_VERSION_OVERRIDE
+#define PSCAL_PROGRAM_VERSION_RAW PSCAL_STRINGIFY(PSCAL_PROGRAM_VERSION_OVERRIDE)
+#elif defined(PROGRAM_VERSION)
 #define PSCAL_PROGRAM_VERSION_RAW PSCAL_STRINGIFY(PROGRAM_VERSION)
 #else
 #define PSCAL_PROGRAM_VERSION_RAW PSCAL_STRINGIFY("undefined.version_DEV")
