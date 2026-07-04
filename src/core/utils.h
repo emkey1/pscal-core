@@ -36,18 +36,18 @@
 #define PASCAL_CHAR_MAX 255
 // Bytecode related stuff
 // Make sure Value and VarType are defined before these.
-#define IS_BOOLEAN(value) ((value).type == TYPE_BOOLEAN)
-#define AS_BOOLEAN(value) ((value).i_val != 0) // Assumes i_val stores 0 for false, 1 for true
+#define IS_BOOLEAN(value) (VALUE_TYPE(value) == TYPE_BOOLEAN)
+#define AS_BOOLEAN(value) (VAL_INT(value) != 0) // Assumes i_val stores 0 for false, 1 for true
 
 // Also useful:
-#define IS_INTEGER(value) (isIntlikeType((value).type))
+#define IS_INTEGER(value) (isIntlikeType(VALUE_TYPE(value)))
 #define AS_INTEGER(value) (asI64(value))
-#define IS_REAL(value)    (isRealType((value).type))
+#define IS_REAL(value)    (isRealType(VALUE_TYPE(value)))
 #define AS_REAL(value)    (asLd(value))
-#define IS_STRING(value)  (isPascalStringType((value).type))
-#define AS_STRING(value)  ((value).s_val)
-#define IS_CHAR(value)    (isPascalCharType((value).type))
-#define AS_CHAR(value)    ((value).c_val)
+#define IS_STRING(value)  (isPascalStringType(VALUE_TYPE(value)))
+#define AS_STRING(value)  PSCAL_VALUE_FIELD(value, s_val)
+#define IS_CHAR(value)    (isPascalCharType(VALUE_TYPE(value)))
+#define AS_CHAR(value)    PSCAL_VALUE_FIELD(value, c_val)
 
 static inline bool isPascalStringType(VarType t) {
     return t == TYPE_STRING || t == TYPE_UNICODE_STRING;
@@ -174,7 +174,7 @@ static inline long long coerceToI64(const Value* v, VM* vm, const char* who) {
     return 0;
 }
 
-#define IS_INTLIKE(v) (isIntlikeType((v).type))
+#define IS_INTLIKE(v) (isIntlikeType(VALUE_TYPE(v)))
 #define IS_NUMERIC(v) (IS_INTLIKE(v) || isRealType((v).type))
 
 VarType lookupBuiltinPascalTypeName(const char *name);

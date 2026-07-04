@@ -171,6 +171,54 @@ typedef struct ValueStruct {
 #define SET_REAL_VALUE(dest, val) \
     do { (dest)->real.r_val = (long double)(val); (dest)->real.d_val = (double)(dest)->real.r_val; \
          (dest)->real.f32_val = (float)(dest)->real.r_val; } while(0)
+#define SET_CHAR_VALUE(dest, val) \
+    do { PSCAL_VALUE_FIELD(*(dest), c_val) = (val); } while(0)
+#define SET_VALUE_TYPE(dest, t) \
+    do { PSCAL_VALUE_FIELD(*(dest), type) = (t); } while(0)
+
+/*
+ * Value tag and payload accessors (VM 2.0 Phase 0 accessor sweep; see
+ * Docs/pscal_vm2_plan.md section 4).  Each macro is an exact alias for the
+ * underlying field today; Phase 4 re-representation redefines these instead
+ * of rewriting call sites.  Where available, C11 _Generic pins the receiver
+ * to Value so that accidentally applying a macro to a Symbol/AST/Token
+ * (which also carry a `type` member) is a compile error, not a silent
+ * semantic change.
+ *
+ * Reads and pointer-payload writes go through these accessors; writes to
+ * immediate payloads (integers, reals, chars, the type tag) go through the
+ * SET_*_VALUE helpers above so that Phase 4 can re-encode on store.
+ * The representation layer itself (Value constructors, freeValue,
+ * makeCopyOfValue, the bytecode-cache serializer) intentionally keeps raw
+ * field access.
+ */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__cplusplus)
+#define PSCAL_VALUE_FIELD(v, f) (_Generic((v), Value: (v), const Value: (v)).f)
+#else
+#define PSCAL_VALUE_FIELD(v, f) ((v).f)
+#endif
+
+#define VALUE_TYPE(v)    PSCAL_VALUE_FIELD(v, type)
+
+/* Exact immediate-payload accessors (no coercion; contrast AS_INTEGER /
+ * AS_REAL in core/utils.h which coerce across the numeric families). */
+#define VAL_INT(v)       PSCAL_VALUE_FIELD(v, i_val)
+#define VAL_UINT(v)      PSCAL_VALUE_FIELD(v, u_val)
+#define VAL_REAL32(v)    PSCAL_VALUE_FIELD(v, real.f32_val)
+#define VAL_REAL64(v)    PSCAL_VALUE_FIELD(v, real.d_val)
+#define VAL_REAL_LD(v)   PSCAL_VALUE_FIELD(v, real.r_val)
+
+/* Heap/pointer payload accessors (lvalue-capable). */
+#define AS_RECORD(v)     PSCAL_VALUE_FIELD(v, record_val)
+#define AS_ARRAY(v)      PSCAL_VALUE_FIELD(v, array_val)
+#define AS_FILE(v)       PSCAL_VALUE_FIELD(v, f_val)
+#define AS_MSTREAM(v)    PSCAL_VALUE_FIELD(v, mstream)
+#define AS_POINTER(v)    PSCAL_VALUE_FIELD(v, ptr_val)
+#define AS_ENUM(v)       PSCAL_VALUE_FIELD(v, enum_val)
+#define AS_CLOSURE(v)    PSCAL_VALUE_FIELD(v, closure)
+#define AS_INTERFACE(v)  PSCAL_VALUE_FIELD(v, interface)
+#define AS_SET(v)        PSCAL_VALUE_FIELD(v, set_val)
+#define AS_ARRAY_RAW(v)  PSCAL_VALUE_FIELD(v, array_raw)
 
 typedef struct FieldValue {
     char *name;

@@ -15,6 +15,12 @@ endif()
 if(CMAKE_C_COMPILER_ID STREQUAL "AppleClang")
     add_compile_options(-Wno-nullability-completeness)
 endif()
+if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    # PSCAL_VALUE_FIELD (core/types.h) keeps a `const Value` _Generic branch
+    # for compilers that do not drop qualifiers during lvalue conversion;
+    # clang does drop them and warns the branch is unreachable.
+    add_compile_options(-Wno-unreachable-code-generic-assoc)
+endif()
 
 option(PSCAL_SDL "Enable the SDL graphics/audio backend (sdl/gl/audio + 3D)" OFF)
 
