@@ -61,7 +61,7 @@ static bool ensureGlContext(VM* vm, const char* name) {
 }
 
 static bool valueToFloat(Value v, float* out) {
-    if (isRealType(v.type)) {
+    if (isRealType(VALUE_TYPE(v))) {
         *out = (float)AS_REAL(v);
         return true;
     }
@@ -73,7 +73,7 @@ static bool valueToFloat(Value v, float* out) {
 }
 
 static bool valueToDouble(Value v, double* out) {
-    if (isRealType(v.type)) {
+    if (isRealType(VALUE_TYPE(v))) {
         *out = (double)AS_REAL(v);
         return true;
     }
@@ -89,16 +89,16 @@ static bool parseMatrixMode(Value arg, GLenum* mode) {
         *mode = (GLenum)AS_INTEGER(arg);
         return true;
     }
-    if (isPascalStringType(arg.type) && arg.s_val) {
-        if (strcasecmp(arg.s_val, "modelview") == 0) {
+    if (isPascalStringType(VALUE_TYPE(arg)) && AS_STRING(arg)) {
+        if (strcasecmp(AS_STRING(arg), "modelview") == 0) {
             *mode = GL_MODELVIEW;
             return true;
         }
-        if (strcasecmp(arg.s_val, "projection") == 0) {
+        if (strcasecmp(AS_STRING(arg), "projection") == 0) {
             *mode = GL_PROJECTION;
             return true;
         }
-        if (strcasecmp(arg.s_val, "texture") == 0) {
+        if (strcasecmp(AS_STRING(arg), "texture") == 0) {
             *mode = GL_TEXTURE;
             return true;
         }
@@ -111,49 +111,49 @@ static bool parsePrimitive(Value arg, GLenum* primitive) {
         *primitive = (GLenum)AS_INTEGER(arg);
         return true;
     }
-    if (isPascalStringType(arg.type) && arg.s_val) {
-        if (strcasecmp(arg.s_val, "points") == 0) {
+    if (isPascalStringType(VALUE_TYPE(arg)) && AS_STRING(arg)) {
+        if (strcasecmp(AS_STRING(arg), "points") == 0) {
             *primitive = GL_POINTS;
             return true;
         }
-        if (strcasecmp(arg.s_val, "lines") == 0) {
+        if (strcasecmp(AS_STRING(arg), "lines") == 0) {
             *primitive = GL_LINES;
             return true;
         }
-        if (strcasecmp(arg.s_val, "line_strip") == 0 || strcasecmp(arg.s_val, "linestrip") == 0) {
+        if (strcasecmp(AS_STRING(arg), "line_strip") == 0 || strcasecmp(AS_STRING(arg), "linestrip") == 0) {
             *primitive = GL_LINE_STRIP;
             return true;
         }
-        if (strcasecmp(arg.s_val, "line_loop") == 0 || strcasecmp(arg.s_val, "lineloop") == 0) {
+        if (strcasecmp(AS_STRING(arg), "line_loop") == 0 || strcasecmp(AS_STRING(arg), "lineloop") == 0) {
             *primitive = GL_LINE_LOOP;
             return true;
         }
-        if (strcasecmp(arg.s_val, "triangles") == 0) {
+        if (strcasecmp(AS_STRING(arg), "triangles") == 0) {
             *primitive = GL_TRIANGLES;
             return true;
         }
-        if (strcasecmp(arg.s_val, "triangle_strip") == 0 || strcasecmp(arg.s_val, "trianglestrip") == 0) {
+        if (strcasecmp(AS_STRING(arg), "triangle_strip") == 0 || strcasecmp(AS_STRING(arg), "trianglestrip") == 0) {
             *primitive = GL_TRIANGLE_STRIP;
             return true;
         }
-        if (strcasecmp(arg.s_val, "triangle_fan") == 0 || strcasecmp(arg.s_val, "trianglefan") == 0) {
+        if (strcasecmp(AS_STRING(arg), "triangle_fan") == 0 || strcasecmp(AS_STRING(arg), "trianglefan") == 0) {
             *primitive = GL_TRIANGLE_FAN;
             return true;
         }
 #ifdef GL_QUADS
-        if (strcasecmp(arg.s_val, "quads") == 0) {
+        if (strcasecmp(AS_STRING(arg), "quads") == 0) {
             *primitive = GL_QUADS;
             return true;
         }
 #endif
 #ifdef GL_QUAD_STRIP
-        if (strcasecmp(arg.s_val, "quad_strip") == 0 || strcasecmp(arg.s_val, "quadstrip") == 0) {
+        if (strcasecmp(AS_STRING(arg), "quad_strip") == 0 || strcasecmp(AS_STRING(arg), "quadstrip") == 0) {
             *primitive = GL_QUAD_STRIP;
             return true;
         }
 #endif
 #ifdef GL_POLYGON
-        if (strcasecmp(arg.s_val, "polygon") == 0) {
+        if (strcasecmp(AS_STRING(arg), "polygon") == 0) {
             *primitive = GL_POLYGON;
             return true;
         }
@@ -167,105 +167,105 @@ static bool parseCapability(Value arg, GLenum* cap) {
         *cap = (GLenum)AS_INTEGER(arg);
         return true;
     }
-    if (isPascalStringType(arg.type) && arg.s_val) {
+    if (isPascalStringType(VALUE_TYPE(arg)) && AS_STRING(arg)) {
 #ifdef GL_CULL_FACE
-        if (strcasecmp(arg.s_val, "cull_face") == 0 || strcasecmp(arg.s_val, "cullface") == 0) {
+        if (strcasecmp(AS_STRING(arg), "cull_face") == 0 || strcasecmp(AS_STRING(arg), "cullface") == 0) {
             *cap = GL_CULL_FACE;
             return true;
         }
 #endif
 #ifdef GL_LIGHTING
-        if (strcasecmp(arg.s_val, "lighting") == 0) {
+        if (strcasecmp(AS_STRING(arg), "lighting") == 0) {
             *cap = GL_LIGHTING;
             return true;
         }
 #endif
 #ifdef GL_LIGHT0
-        if (strcasecmp(arg.s_val, "light0") == 0) {
+        if (strcasecmp(AS_STRING(arg), "light0") == 0) {
             *cap = GL_LIGHT0;
             return true;
         }
 #endif
 #ifdef GL_LIGHT1
-        if (strcasecmp(arg.s_val, "light1") == 0) {
+        if (strcasecmp(AS_STRING(arg), "light1") == 0) {
             *cap = GL_LIGHT1;
             return true;
         }
 #endif
 #ifdef GL_LIGHT2
-        if (strcasecmp(arg.s_val, "light2") == 0) {
+        if (strcasecmp(AS_STRING(arg), "light2") == 0) {
             *cap = GL_LIGHT2;
             return true;
         }
 #endif
 #ifdef GL_LIGHT3
-        if (strcasecmp(arg.s_val, "light3") == 0) {
+        if (strcasecmp(AS_STRING(arg), "light3") == 0) {
             *cap = GL_LIGHT3;
             return true;
         }
 #endif
 #ifdef GL_LIGHT4
-        if (strcasecmp(arg.s_val, "light4") == 0) {
+        if (strcasecmp(AS_STRING(arg), "light4") == 0) {
             *cap = GL_LIGHT4;
             return true;
         }
 #endif
 #ifdef GL_LIGHT5
-        if (strcasecmp(arg.s_val, "light5") == 0) {
+        if (strcasecmp(AS_STRING(arg), "light5") == 0) {
             *cap = GL_LIGHT5;
             return true;
         }
 #endif
 #ifdef GL_LIGHT6
-        if (strcasecmp(arg.s_val, "light6") == 0) {
+        if (strcasecmp(AS_STRING(arg), "light6") == 0) {
             *cap = GL_LIGHT6;
             return true;
         }
 #endif
 #ifdef GL_LIGHT7
-        if (strcasecmp(arg.s_val, "light7") == 0) {
+        if (strcasecmp(AS_STRING(arg), "light7") == 0) {
             *cap = GL_LIGHT7;
             return true;
         }
 #endif
 #ifdef GL_COLOR_MATERIAL
-        if (strcasecmp(arg.s_val, "color_material") == 0) {
+        if (strcasecmp(AS_STRING(arg), "color_material") == 0) {
             *cap = GL_COLOR_MATERIAL;
             return true;
         }
 #endif
 #ifdef GL_NORMALIZE
-        if (strcasecmp(arg.s_val, "normalize") == 0) {
+        if (strcasecmp(AS_STRING(arg), "normalize") == 0) {
             *cap = GL_NORMALIZE;
             return true;
         }
 #endif
-        if (strcasecmp(arg.s_val, "blend") == 0) {
+        if (strcasecmp(AS_STRING(arg), "blend") == 0) {
             *cap = GL_BLEND;
             return true;
         }
-        if (strcasecmp(arg.s_val, "cull_face") == 0 ||
-            strcasecmp(arg.s_val, "cullface") == 0) {
+        if (strcasecmp(AS_STRING(arg), "cull_face") == 0 ||
+            strcasecmp(AS_STRING(arg), "cullface") == 0) {
             *cap = GL_CULL_FACE;
             return true;
         }
-        if (strcasecmp(arg.s_val, "depth_test") == 0 ||
-            strcasecmp(arg.s_val, "depthtest") == 0) {
+        if (strcasecmp(AS_STRING(arg), "depth_test") == 0 ||
+            strcasecmp(AS_STRING(arg), "depthtest") == 0) {
             *cap = GL_DEPTH_TEST;
             return true;
         }
 #ifdef GL_FOG
-        if (strcasecmp(arg.s_val, "fog") == 0) {
+        if (strcasecmp(AS_STRING(arg), "fog") == 0) {
             *cap = GL_FOG;
             return true;
         }
 #endif
-        if (strcasecmp(arg.s_val, "scissor_test") == 0 ||
-            strcasecmp(arg.s_val, "scissortest") == 0) {
+        if (strcasecmp(AS_STRING(arg), "scissor_test") == 0 ||
+            strcasecmp(AS_STRING(arg), "scissortest") == 0) {
             *cap = GL_SCISSOR_TEST;
             return true;
         }
-        if (strcasecmp(arg.s_val, "texture_2d") == 0) {
+        if (strcasecmp(AS_STRING(arg), "texture_2d") == 0) {
             *cap = GL_TEXTURE_2D;
             return true;
         }
@@ -278,18 +278,18 @@ static bool parseCullFaceMode(Value arg, GLenum* mode) {
         *mode = (GLenum)AS_INTEGER(arg);
         return true;
     }
-    if (isPascalStringType(arg.type) && arg.s_val) {
-        if (strcasecmp(arg.s_val, "front") == 0) {
+    if (isPascalStringType(VALUE_TYPE(arg)) && AS_STRING(arg)) {
+        if (strcasecmp(AS_STRING(arg), "front") == 0) {
             *mode = GL_FRONT;
             return true;
         }
-        if (strcasecmp(arg.s_val, "back") == 0) {
+        if (strcasecmp(AS_STRING(arg), "back") == 0) {
             *mode = GL_BACK;
             return true;
         }
-        if (strcasecmp(arg.s_val, "front_and_back") == 0 ||
-            strcasecmp(arg.s_val, "frontandback") == 0 ||
-            strcasecmp(arg.s_val, "front-and-back") == 0) {
+        if (strcasecmp(AS_STRING(arg), "front_and_back") == 0 ||
+            strcasecmp(AS_STRING(arg), "frontandback") == 0 ||
+            strcasecmp(AS_STRING(arg), "front-and-back") == 0) {
             *mode = GL_FRONT_AND_BACK;
             return true;
         }
@@ -302,42 +302,42 @@ static bool parseDepthFunc(Value arg, GLenum* func) {
         *func = (GLenum)AS_INTEGER(arg);
         return true;
     }
-    if (isPascalStringType(arg.type) && arg.s_val) {
-        if (strcasecmp(arg.s_val, "never") == 0) {
+    if (isPascalStringType(VALUE_TYPE(arg)) && AS_STRING(arg)) {
+        if (strcasecmp(AS_STRING(arg), "never") == 0) {
             *func = GL_NEVER;
             return true;
         }
-        if (strcasecmp(arg.s_val, "less") == 0) {
+        if (strcasecmp(AS_STRING(arg), "less") == 0) {
             *func = GL_LESS;
             return true;
         }
-        if (strcasecmp(arg.s_val, "equal") == 0) {
+        if (strcasecmp(AS_STRING(arg), "equal") == 0) {
             *func = GL_EQUAL;
             return true;
         }
-        if (strcasecmp(arg.s_val, "lequal") == 0 ||
-            strcasecmp(arg.s_val, "less_equal") == 0 ||
-            strcasecmp(arg.s_val, "less-equal") == 0) {
+        if (strcasecmp(AS_STRING(arg), "lequal") == 0 ||
+            strcasecmp(AS_STRING(arg), "less_equal") == 0 ||
+            strcasecmp(AS_STRING(arg), "less-equal") == 0) {
             *func = GL_LEQUAL;
             return true;
         }
-        if (strcasecmp(arg.s_val, "greater") == 0) {
+        if (strcasecmp(AS_STRING(arg), "greater") == 0) {
             *func = GL_GREATER;
             return true;
         }
-        if (strcasecmp(arg.s_val, "notequal") == 0 ||
-            strcasecmp(arg.s_val, "not_equal") == 0 ||
-            strcasecmp(arg.s_val, "not-equal") == 0) {
+        if (strcasecmp(AS_STRING(arg), "notequal") == 0 ||
+            strcasecmp(AS_STRING(arg), "not_equal") == 0 ||
+            strcasecmp(AS_STRING(arg), "not-equal") == 0) {
             *func = GL_NOTEQUAL;
             return true;
         }
-        if (strcasecmp(arg.s_val, "gequal") == 0 ||
-            strcasecmp(arg.s_val, "greater_equal") == 0 ||
-            strcasecmp(arg.s_val, "greater-equal") == 0) {
+        if (strcasecmp(AS_STRING(arg), "gequal") == 0 ||
+            strcasecmp(AS_STRING(arg), "greater_equal") == 0 ||
+            strcasecmp(AS_STRING(arg), "greater-equal") == 0) {
             *func = GL_GEQUAL;
             return true;
         }
-        if (strcasecmp(arg.s_val, "always") == 0) {
+        if (strcasecmp(AS_STRING(arg), "always") == 0) {
             *func = GL_ALWAYS;
             return true;
         }
@@ -350,12 +350,12 @@ static bool parseShadeModel(Value arg, GLenum* mode) {
         *mode = (GLenum)AS_INTEGER(arg);
         return true;
     }
-    if (isPascalStringType(arg.type) && arg.s_val) {
-        if (strcasecmp(arg.s_val, "smooth") == 0) {
+    if (isPascalStringType(VALUE_TYPE(arg)) && AS_STRING(arg)) {
+        if (strcasecmp(AS_STRING(arg), "smooth") == 0) {
             *mode = GL_SMOOTH;
             return true;
         }
-        if (strcasecmp(arg.s_val, "flat") == 0) {
+        if (strcasecmp(AS_STRING(arg), "flat") == 0) {
             *mode = GL_FLAT;
             return true;
         }
@@ -368,51 +368,51 @@ static bool parseLight(Value arg, GLenum* light) {
         *light = (GLenum)AS_INTEGER(arg);
         return true;
     }
-    if (isPascalStringType(arg.type) && arg.s_val) {
+    if (isPascalStringType(VALUE_TYPE(arg)) && AS_STRING(arg)) {
 #ifdef GL_LIGHT0
-        if (strcasecmp(arg.s_val, "light0") == 0) {
+        if (strcasecmp(AS_STRING(arg), "light0") == 0) {
             *light = GL_LIGHT0;
             return true;
         }
 #endif
 #ifdef GL_LIGHT1
-        if (strcasecmp(arg.s_val, "light1") == 0) {
+        if (strcasecmp(AS_STRING(arg), "light1") == 0) {
             *light = GL_LIGHT1;
             return true;
         }
 #endif
 #ifdef GL_LIGHT2
-        if (strcasecmp(arg.s_val, "light2") == 0) {
+        if (strcasecmp(AS_STRING(arg), "light2") == 0) {
             *light = GL_LIGHT2;
             return true;
         }
 #endif
 #ifdef GL_LIGHT3
-        if (strcasecmp(arg.s_val, "light3") == 0) {
+        if (strcasecmp(AS_STRING(arg), "light3") == 0) {
             *light = GL_LIGHT3;
             return true;
         }
 #endif
 #ifdef GL_LIGHT4
-        if (strcasecmp(arg.s_val, "light4") == 0) {
+        if (strcasecmp(AS_STRING(arg), "light4") == 0) {
             *light = GL_LIGHT4;
             return true;
         }
 #endif
 #ifdef GL_LIGHT5
-        if (strcasecmp(arg.s_val, "light5") == 0) {
+        if (strcasecmp(AS_STRING(arg), "light5") == 0) {
             *light = GL_LIGHT5;
             return true;
         }
 #endif
 #ifdef GL_LIGHT6
-        if (strcasecmp(arg.s_val, "light6") == 0) {
+        if (strcasecmp(AS_STRING(arg), "light6") == 0) {
             *light = GL_LIGHT6;
             return true;
         }
 #endif
 #ifdef GL_LIGHT7
-        if (strcasecmp(arg.s_val, "light7") == 0) {
+        if (strcasecmp(AS_STRING(arg), "light7") == 0) {
             *light = GL_LIGHT7;
             return true;
         }
@@ -426,20 +426,20 @@ static bool parseLightParam(Value arg, GLenum* pname) {
         *pname = (GLenum)AS_INTEGER(arg);
         return true;
     }
-    if (isPascalStringType(arg.type) && arg.s_val) {
-        if (strcasecmp(arg.s_val, "position") == 0) {
+    if (isPascalStringType(VALUE_TYPE(arg)) && AS_STRING(arg)) {
+        if (strcasecmp(AS_STRING(arg), "position") == 0) {
             *pname = GL_POSITION;
             return true;
         }
-        if (strcasecmp(arg.s_val, "diffuse") == 0) {
+        if (strcasecmp(AS_STRING(arg), "diffuse") == 0) {
             *pname = GL_DIFFUSE;
             return true;
         }
-        if (strcasecmp(arg.s_val, "specular") == 0) {
+        if (strcasecmp(AS_STRING(arg), "specular") == 0) {
             *pname = GL_SPECULAR;
             return true;
         }
-        if (strcasecmp(arg.s_val, "ambient") == 0) {
+        if (strcasecmp(AS_STRING(arg), "ambient") == 0) {
             *pname = GL_AMBIENT;
             return true;
         }
@@ -452,17 +452,17 @@ static bool parseMaterialFace(Value arg, GLenum* face) {
         *face = (GLenum)AS_INTEGER(arg);
         return true;
     }
-    if (isPascalStringType(arg.type) && arg.s_val) {
-        if (strcasecmp(arg.s_val, "front") == 0) {
+    if (isPascalStringType(VALUE_TYPE(arg)) && AS_STRING(arg)) {
+        if (strcasecmp(AS_STRING(arg), "front") == 0) {
             *face = GL_FRONT;
             return true;
         }
-        if (strcasecmp(arg.s_val, "back") == 0) {
+        if (strcasecmp(AS_STRING(arg), "back") == 0) {
             *face = GL_BACK;
             return true;
         }
-        if (strcasecmp(arg.s_val, "front_and_back") == 0 ||
-            strcasecmp(arg.s_val, "frontandback") == 0) {
+        if (strcasecmp(AS_STRING(arg), "front_and_back") == 0 ||
+            strcasecmp(AS_STRING(arg), "frontandback") == 0) {
             *face = GL_FRONT_AND_BACK;
             return true;
         }
@@ -475,29 +475,29 @@ static bool parseMaterialParam(Value arg, GLenum* pname) {
         *pname = (GLenum)AS_INTEGER(arg);
         return true;
     }
-    if (isPascalStringType(arg.type) && arg.s_val) {
-        if (strcasecmp(arg.s_val, "ambient") == 0) {
+    if (isPascalStringType(VALUE_TYPE(arg)) && AS_STRING(arg)) {
+        if (strcasecmp(AS_STRING(arg), "ambient") == 0) {
             *pname = GL_AMBIENT;
             return true;
         }
-        if (strcasecmp(arg.s_val, "diffuse") == 0) {
+        if (strcasecmp(AS_STRING(arg), "diffuse") == 0) {
             *pname = GL_DIFFUSE;
             return true;
         }
-        if (strcasecmp(arg.s_val, "specular") == 0) {
+        if (strcasecmp(AS_STRING(arg), "specular") == 0) {
             *pname = GL_SPECULAR;
             return true;
         }
-        if (strcasecmp(arg.s_val, "emission") == 0) {
+        if (strcasecmp(AS_STRING(arg), "emission") == 0) {
             *pname = GL_EMISSION;
             return true;
         }
-        if (strcasecmp(arg.s_val, "ambient_and_diffuse") == 0 ||
-            strcasecmp(arg.s_val, "ambientdiffuse") == 0) {
+        if (strcasecmp(AS_STRING(arg), "ambient_and_diffuse") == 0 ||
+            strcasecmp(AS_STRING(arg), "ambientdiffuse") == 0) {
             *pname = GL_AMBIENT_AND_DIFFUSE;
             return true;
         }
-        if (strcasecmp(arg.s_val, "shininess") == 0) {
+        if (strcasecmp(AS_STRING(arg), "shininess") == 0) {
             *pname = GL_SHININESS;
             return true;
         }
@@ -510,25 +510,25 @@ static bool parseColorMaterialMode(Value arg, GLenum* mode) {
         *mode = (GLenum)AS_INTEGER(arg);
         return true;
     }
-    if (isPascalStringType(arg.type) && arg.s_val) {
-        if (strcasecmp(arg.s_val, "ambient") == 0) {
+    if (isPascalStringType(VALUE_TYPE(arg)) && AS_STRING(arg)) {
+        if (strcasecmp(AS_STRING(arg), "ambient") == 0) {
             *mode = GL_AMBIENT;
             return true;
         }
-        if (strcasecmp(arg.s_val, "diffuse") == 0) {
+        if (strcasecmp(AS_STRING(arg), "diffuse") == 0) {
             *mode = GL_DIFFUSE;
             return true;
         }
-        if (strcasecmp(arg.s_val, "ambient_and_diffuse") == 0 ||
-            strcasecmp(arg.s_val, "ambientdiffuse") == 0) {
+        if (strcasecmp(AS_STRING(arg), "ambient_and_diffuse") == 0 ||
+            strcasecmp(AS_STRING(arg), "ambientdiffuse") == 0) {
             *mode = GL_AMBIENT_AND_DIFFUSE;
             return true;
         }
-        if (strcasecmp(arg.s_val, "specular") == 0) {
+        if (strcasecmp(AS_STRING(arg), "specular") == 0) {
             *mode = GL_SPECULAR;
             return true;
         }
-        if (strcasecmp(arg.s_val, "emission") == 0) {
+        if (strcasecmp(AS_STRING(arg), "emission") == 0) {
             *mode = GL_EMISSION;
             return true;
         }
@@ -541,52 +541,52 @@ static bool parseBlendFactor(Value arg, GLenum* factor) {
         *factor = (GLenum)AS_INTEGER(arg);
         return true;
     }
-    if (isPascalStringType(arg.type) && arg.s_val) {
-        if (strcasecmp(arg.s_val, "zero") == 0) {
+    if (isPascalStringType(VALUE_TYPE(arg)) && AS_STRING(arg)) {
+        if (strcasecmp(AS_STRING(arg), "zero") == 0) {
             *factor = GL_ZERO;
             return true;
         }
-        if (strcasecmp(arg.s_val, "one") == 0) {
+        if (strcasecmp(AS_STRING(arg), "one") == 0) {
             *factor = GL_ONE;
             return true;
         }
-        if (strcasecmp(arg.s_val, "src_color") == 0 ||
-            strcasecmp(arg.s_val, "srccolor") == 0) {
+        if (strcasecmp(AS_STRING(arg), "src_color") == 0 ||
+            strcasecmp(AS_STRING(arg), "srccolor") == 0) {
             *factor = GL_SRC_COLOR;
             return true;
         }
-        if (strcasecmp(arg.s_val, "one_minus_src_color") == 0 ||
-            strcasecmp(arg.s_val, "oneminussrccolor") == 0) {
+        if (strcasecmp(AS_STRING(arg), "one_minus_src_color") == 0 ||
+            strcasecmp(AS_STRING(arg), "oneminussrccolor") == 0) {
             *factor = GL_ONE_MINUS_SRC_COLOR;
             return true;
         }
-        if (strcasecmp(arg.s_val, "dst_color") == 0 ||
-            strcasecmp(arg.s_val, "dstcolor") == 0) {
+        if (strcasecmp(AS_STRING(arg), "dst_color") == 0 ||
+            strcasecmp(AS_STRING(arg), "dstcolor") == 0) {
             *factor = GL_DST_COLOR;
             return true;
         }
-        if (strcasecmp(arg.s_val, "one_minus_dst_color") == 0 ||
-            strcasecmp(arg.s_val, "oneminusdstcolor") == 0) {
+        if (strcasecmp(AS_STRING(arg), "one_minus_dst_color") == 0 ||
+            strcasecmp(AS_STRING(arg), "oneminusdstcolor") == 0) {
             *factor = GL_ONE_MINUS_DST_COLOR;
             return true;
         }
-        if (strcasecmp(arg.s_val, "src_alpha") == 0 ||
-            strcasecmp(arg.s_val, "srcalpha") == 0) {
+        if (strcasecmp(AS_STRING(arg), "src_alpha") == 0 ||
+            strcasecmp(AS_STRING(arg), "srcalpha") == 0) {
             *factor = GL_SRC_ALPHA;
             return true;
         }
-        if (strcasecmp(arg.s_val, "one_minus_src_alpha") == 0 ||
-            strcasecmp(arg.s_val, "oneminussrcalpha") == 0) {
+        if (strcasecmp(AS_STRING(arg), "one_minus_src_alpha") == 0 ||
+            strcasecmp(AS_STRING(arg), "oneminussrcalpha") == 0) {
             *factor = GL_ONE_MINUS_SRC_ALPHA;
             return true;
         }
-        if (strcasecmp(arg.s_val, "dst_alpha") == 0 ||
-            strcasecmp(arg.s_val, "dstalpha") == 0) {
+        if (strcasecmp(AS_STRING(arg), "dst_alpha") == 0 ||
+            strcasecmp(AS_STRING(arg), "dstalpha") == 0) {
             *factor = GL_DST_ALPHA;
             return true;
         }
-        if (strcasecmp(arg.s_val, "one_minus_dst_alpha") == 0 ||
-            strcasecmp(arg.s_val, "oneminusdstalpha") == 0) {
+        if (strcasecmp(AS_STRING(arg), "one_minus_dst_alpha") == 0 ||
+            strcasecmp(AS_STRING(arg), "oneminusdstalpha") == 0) {
             *factor = GL_ONE_MINUS_DST_ALPHA;
             return true;
         }
@@ -1167,11 +1167,11 @@ PSCAL_DEFINE_IOS_GL_BUILTIN(vmBuiltinGldepthtest) {
     if (!ensureGlContext(vm, "GLDepthTest")) return makeVoid();
 
     bool enable;
-    if (args[0].type == TYPE_BOOLEAN) {
+    if (VALUE_TYPE(args[0]) == TYPE_BOOLEAN) {
         enable = AS_BOOLEAN(args[0]);
     } else if (IS_INTLIKE(args[0])) {
         enable = AS_INTEGER(args[0]) != 0;
-    } else if (isRealType(args[0].type)) {
+    } else if (isRealType(VALUE_TYPE(args[0]))) {
         enable = AS_REAL(args[0]) != 0.0;
     } else {
         runtimeError(vm, "GLDepthTest argument must be boolean or numeric.");
@@ -1194,11 +1194,11 @@ PSCAL_DEFINE_IOS_GL_BUILTIN(vmBuiltinGldepthmask) {
     if (!ensureGlContext(vm, "GLDepthMask")) return makeVoid();
 
     bool enable;
-    if (args[0].type == TYPE_BOOLEAN) {
+    if (VALUE_TYPE(args[0]) == TYPE_BOOLEAN) {
         enable = AS_BOOLEAN(args[0]);
     } else if (IS_INTLIKE(args[0])) {
         enable = AS_INTEGER(args[0]) != 0;
-    } else if (isRealType(args[0].type)) {
+    } else if (isRealType(VALUE_TYPE(args[0]))) {
         enable = AS_REAL(args[0]) != 0.0;
     } else {
         runtimeError(vm, "GLDepthMask argument must be boolean or numeric.");
@@ -1289,19 +1289,19 @@ PSCAL_DEFINE_IOS_GL_BUILTIN(vmBuiltinGlsaveframebufferpng) {
     if (!ensureGlContext(vm, name)) {
         return makeBoolean(false);
     }
-    if (!isPascalStringType(args[0].type) || !args[0].s_val) {
+    if (!isPascalStringType(VALUE_TYPE(args[0])) || !AS_STRING(args[0])) {
         runtimeError(vm, "%s expects the first argument to be a file path string.", name);
         return makeBoolean(false);
     }
 
-    const char* path = args[0].s_val;
+    const char* path = AS_STRING(args[0]);
     bool flipVertical = true;
     if (arg_count == 2) {
-        if (args[1].type == TYPE_BOOLEAN) {
+        if (VALUE_TYPE(args[1]) == TYPE_BOOLEAN) {
             flipVertical = AS_BOOLEAN(args[1]);
         } else if (IS_INTLIKE(args[1])) {
             flipVertical = AS_INTEGER(args[1]) != 0;
-        } else if (isRealType(args[1].type)) {
+        } else if (isRealType(VALUE_TYPE(args[1]))) {
             flipVertical = AS_REAL(args[1]) != 0.0;
         } else {
             runtimeError(vm, "%s expects a boolean flipVertical flag as the second argument.", name);

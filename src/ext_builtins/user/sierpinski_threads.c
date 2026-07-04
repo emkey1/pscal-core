@@ -126,14 +126,14 @@ static char coerceDrawChar(const Value *value) {
     if (!value) {
         return '+';
     }
-    if (value->type == TYPE_CHAR) {
-        return (char)value->c_val;
+    if (VALUE_TYPE(*value) == TYPE_CHAR) {
+        return (char)AS_CHAR(*value);
     }
     if (IS_INTLIKE(*value)) {
         return (char)AS_INTEGER(*value);
     }
-    if (value->type == TYPE_STRING && value->s_val && value->s_val[0] != '\0') {
-        return value->s_val[0];
+    if (VALUE_TYPE(*value) == TYPE_STRING && AS_STRING(*value) && AS_STRING(*value)[0] != '\0') {
+        return AS_STRING(*value)[0];
     }
     return '+';
 }

@@ -6,9 +6,9 @@ static Value vmBuiltinMandelbrotRow(struct VM_s* vm, int arg_count, Value* args)
         runtimeError(vm, "MandelbrotRow expects 6 arguments.");
         return makeVoid();
     }
-    if (!isRealType(args[0].type) || !isRealType(args[1].type) || !isRealType(args[2].type) ||
+    if (!isRealType(VALUE_TYPE(args[0])) || !isRealType(VALUE_TYPE(args[1])) || !isRealType(VALUE_TYPE(args[2])) ||
         !IS_INTLIKE(args[3]) || !IS_INTLIKE(args[4]) ||
-        (args[5].type != TYPE_POINTER && args[5].type != TYPE_ARRAY)) {
+        (VALUE_TYPE(args[5]) != TYPE_POINTER && VALUE_TYPE(args[5]) != TYPE_ARRAY)) {
         runtimeError(vm, "MandelbrotRow argument types are (Real, Real, Real, Integer, Integer, VAR array).");
         return makeVoid();
     }
@@ -21,12 +21,12 @@ static Value vmBuiltinMandelbrotRow(struct VM_s* vm, int arg_count, Value* args)
 
     // Resolve the output array and validate its size and bounds.
     Value* arrVal = NULL;
-    if (args[5].type == TYPE_POINTER) {
-        arrVal = (Value*)args[5].ptr_val;
+    if (VALUE_TYPE(args[5]) == TYPE_POINTER) {
+        arrVal = (Value*)AS_POINTER(args[5]);
     } else {
         arrVal = &args[5];
     }
-    if (!arrVal || arrVal->type != TYPE_ARRAY) {
+    if (!arrVal || VALUE_TYPE(*arrVal) != TYPE_ARRAY) {
         runtimeError(vm, "MandelbrotRow expected VAR array parameter.");
         return makeVoid();
     }
@@ -48,7 +48,7 @@ static Value vmBuiltinMandelbrotRow(struct VM_s* vm, int arg_count, Value* args)
         runtimeError(vm, "MandelbrotRow output array too small for max X of %d.", maxX);
         return makeVoid();
     }
-    Value* outArr = arrVal->array_val;
+    Value* outArr = AS_ARRAY(*arrVal);
     if (!outArr) {
         runtimeError(vm, "MandelbrotRow received a NIL pointer for output array.");
         return makeVoid();
@@ -72,7 +72,7 @@ static Value vmBuiltinMandelbrotRow(struct VM_s* vm, int arg_count, Value* args)
         }
         Value* outPtr = &outArr[x];
         // Directly assign the iteration count without freeing uninitialized memory
-        outPtr->type = TYPE_INTEGER;
+        SET_VALUE_TYPE(outPtr, TYPE_INTEGER);
         SET_INT_VALUE(outPtr, n);
     }
 

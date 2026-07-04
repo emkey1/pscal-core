@@ -6,19 +6,19 @@ static Value vmBuiltinSwap(struct VM_s* vm, int arg_count, Value* args) {
         runtimeError(vm, "Swap expects exactly 2 arguments.");
         return makeVoid();
     }
-    if (args[0].type != TYPE_POINTER || args[1].type != TYPE_POINTER) {
+    if (VALUE_TYPE(args[0]) != TYPE_POINTER || VALUE_TYPE(args[1]) != TYPE_POINTER) {
         runtimeError(vm, "Arguments to Swap must be variables (VAR parameters).");
         return makeVoid();
     }
-    Value* varA = (Value*)args[0].ptr_val;
-    Value* varB = (Value*)args[1].ptr_val;
+    Value* varA = (Value*)AS_POINTER(args[0]);
+    Value* varB = (Value*)AS_POINTER(args[1]);
     if (!varA || !varB) {
         runtimeError(vm, "Swap received a NIL pointer for a VAR parameter.");
         return makeVoid();
     }
-    if (varA->type != varB->type) {
+    if (VALUE_TYPE(*varA) != VALUE_TYPE(*varB)) {
         runtimeError(vm, "Cannot swap variables of different types (%s and %s).",
-                     varTypeToString(varA->type), varTypeToString(varB->type));
+                     varTypeToString(VALUE_TYPE(*varA)), varTypeToString(VALUE_TYPE(*varB)));
         return makeVoid();
     }
     Value temp = *varA;

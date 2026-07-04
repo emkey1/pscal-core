@@ -16,9 +16,9 @@
 // (e.g. the "," separator) arrives as TYPE_CHAR, so materialize it into the
 // caller-provided 2-byte scratch buffer. Returns NULL for non-text values.
 static const char* string_arg(Value* v, char* scratch2) {
-    if (v->type == TYPE_STRING || v->type == TYPE_UNICODE_STRING) return v->s_val;
-    if (v->type == TYPE_CHAR) {
-        scratch2[0] = (char)v->c_val;
+    if (VALUE_TYPE(*v) == TYPE_STRING || VALUE_TYPE(*v) == TYPE_UNICODE_STRING) return AS_STRING(*v);
+    if (VALUE_TYPE(*v) == TYPE_CHAR) {
+        scratch2[0] = (char)AS_CHAR(*v);
         scratch2[1] = '\0';
         return scratch2;
     }
@@ -89,9 +89,9 @@ static Value vmBuiltinSplit(struct VM_s* vm, int arg_count, Value* args) {
     if (!sep || sep[0] == '\0') {
         int lo = 0, hi = 0;
         Value arr = makeArrayND(1, &lo, &hi, TYPE_STRING, NULL);
-        if (arr.array_val) {
-            freeValue(&arr.array_val[0]);
-            arr.array_val[0] = makeString(s);
+        if (AS_ARRAY(arr)) {
+            freeValue(&AS_ARRAY(arr)[0]);
+            AS_ARRAY(arr)[0] = makeString(s);
         }
         return arr;
     }
@@ -102,19 +102,19 @@ static Value vmBuiltinSplit(struct VM_s* vm, int arg_count, Value* args) {
 
     int lo = 0, hi = count - 1;
     Value arr = makeArrayND(1, &lo, &hi, TYPE_STRING, NULL);
-    if (!arr.array_val) return arr;
+    if (!AS_ARRAY(arr)) return arr;
 
     int idx = 0;
     const char* start = s;
     const char* hit;
     while ((hit = strstr(start, sep)) != NULL) {
-        freeValue(&arr.array_val[idx]);
-        arr.array_val[idx] = makeStringLen(start, (size_t)(hit - start));
+        freeValue(&AS_ARRAY(arr)[idx]);
+        AS_ARRAY(arr)[idx] = makeStringLen(start, (size_t)(hit - start));
         idx++;
         start = hit + seplen;
     }
-    freeValue(&arr.array_val[idx]);
-    arr.array_val[idx] = makeString(start);
+    freeValue(&AS_ARRAY(arr)[idx]);
+    AS_ARRAY(arr)[idx] = makeString(start);
     return arr;
 }
 

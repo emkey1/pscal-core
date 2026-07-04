@@ -8,7 +8,7 @@ static Value networkBuiltinUnavailable(struct VM_s* vm, const char *name) {
                  name);
     Value result;
     memset(&result, 0, sizeof(result));
-    result.type = TYPE_NIL;
+    SET_VALUE_TYPE(&result, TYPE_NIL);
     return result;
 }
 

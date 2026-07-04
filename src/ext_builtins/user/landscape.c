@@ -32,17 +32,17 @@ typedef struct ArrayArg {
 static const Value* landscapeResolveStringPointer(const Value* value) {
     const Value* current = value;
     int depth = 0;
-    while (current && current->type == TYPE_POINTER &&
+    while (current && VALUE_TYPE(*current) == TYPE_POINTER &&
            current->base_type_node != STRING_CHAR_PTR_SENTINEL &&
            current->base_type_node != SERIALIZED_CHAR_PTR_SENTINEL &&
            current->base_type_node != STRING_LENGTH_SENTINEL &&
            current->base_type_node != BYTE_ARRAY_PTR_SENTINEL &&
            current->base_type_node != SHELL_FUNCTION_PTR_SENTINEL &&
            current->base_type_node != OPAQUE_POINTER_SENTINEL) {
-        if (!current->ptr_val) {
+        if (!AS_POINTER(*current)) {
             return NULL;
         }
-        current = (const Value*)current->ptr_val;
+        current = (const Value*)AS_POINTER(*current);
         if (++depth > 16) {
             return NULL;
         }
@@ -52,23 +52,23 @@ static const Value* landscapeResolveStringPointer(const Value* value) {
 
 static const char* landscapeValueToCString(const Value* value) {
     if (!value) return NULL;
-    if (value->type == TYPE_STRING) {
-        return value->s_val ? value->s_val : "";
+    if (VALUE_TYPE(*value) == TYPE_STRING) {
+        return AS_STRING(*value) ? AS_STRING(*value) : "";
     }
-    if (value->type == TYPE_POINTER) {
+    if (VALUE_TYPE(*value) == TYPE_POINTER) {
         if (value->base_type_node == STRING_CHAR_PTR_SENTINEL ||
             value->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
-            return (const char*)value->ptr_val;
+            return (const char*)AS_POINTER(*value);
         }
         const Value* resolved = landscapeResolveStringPointer(value);
         if (!resolved) return NULL;
-        if (resolved->type == TYPE_STRING) {
-            return resolved->s_val ? resolved->s_val : "";
+        if (VALUE_TYPE(*resolved) == TYPE_STRING) {
+            return AS_STRING(*resolved) ? AS_STRING(*resolved) : "";
         }
-        if (resolved->type == TYPE_POINTER &&
+        if (VALUE_TYPE(*resolved) == TYPE_POINTER &&
             (resolved->base_type_node == STRING_CHAR_PTR_SENTINEL ||
              resolved->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL)) {
-            return (const char*)resolved->ptr_val;
+            return (const char*)AS_POINTER(*resolved);
         }
     }
     return NULL;
@@ -144,8 +144,8 @@ static bool sanityCheckMonotonic(VM* vm, const ArrayArg* array, int count, const
 static ArrayArg resolveArrayArg(VM* vm, Value* arg, const char* name, int* lower, int* upper) {
     ArrayArg result = {0};
     Value* arrVal = NULL;
-    if (arg->type == TYPE_POINTER) {
-        arrVal = (Value*)arg->ptr_val;
+    if (VALUE_TYPE(*arg) == TYPE_POINTER) {
+        arrVal = (Value*)AS_POINTER(*arg);
         if (!arrVal) {
             runtimeError(vm, "%s received a NIL pointer.", name);
             return result;
@@ -155,7 +155,7 @@ static ArrayArg resolveArrayArg(VM* vm, Value* arg, const char* name, int* lower
         arrVal = arg;
     }
 
-    if (!arrVal || arrVal->type != TYPE_ARRAY) {
+    if (!arrVal || VALUE_TYPE(*arrVal) != TYPE_ARRAY) {
         runtimeError(vm, "%s expects VAR array arguments.", name);
         return result;
     }
@@ -173,25 +173,25 @@ static ArrayArg resolveArrayArg(VM* vm, Value* arg, const char* name, int* lower
     if (lower) *lower = l;
     if (upper) *upper = u;
 
-    if (!arrVal->array_val) {
+    if (!AS_ARRAY(*arrVal)) {
         runtimeError(vm, "%s received an array with NIL storage.", name);
         return result;
     }
-    result.values = arrVal->array_val;
+    result.values = AS_ARRAY(*arrVal);
     return result;
 }
 
 static inline void assignFloatValue(Value* target, double value) {
     if (!target) return;
-    target->type = TYPE_DOUBLE;
+    SET_VALUE_TYPE(target, TYPE_DOUBLE);
     SET_REAL_VALUE(target, value);
 }
 
 static bool fetchNumericVarRef(VM* vm, Value* arg, const char* name, const char* paramDesc,
                                NumericVarRef* out) {
     if (!out) return false;
-    if (arg->type == TYPE_POINTER) {
-        Value* slot = (Value*)arg->ptr_val;
+    if (VALUE_TYPE(*arg) == TYPE_POINTER) {
+        Value* slot = (Value*)AS_POINTER(*arg);
         if (!slot) {
             runtimeError(vm, "%s received NIL storage for %s.", name, paramDesc);
             return false;
@@ -241,7 +241,7 @@ static float saturatef(float value) {
 
 static bool valueToBool(Value v, bool* out) {
     if (out == NULL) return false;
-    if (v.type == TYPE_BOOLEAN) {
+    if (VALUE_TYPE(v) == TYPE_BOOLEAN) {
         *out = AS_BOOLEAN(v);
         return true;
     }
@@ -249,7 +249,7 @@ static bool valueToBool(Value v, bool* out) {
         *out = AS_INTEGER(v) != 0;
         return true;
     }
-    if (isRealType(v.type)) {
+    if (isRealType(VALUE_TYPE(v))) {
         *out = fabs((double)asLd(v)) > 1e-6;
         return true;
     }
@@ -258,7 +258,7 @@ static bool valueToBool(Value v, bool* out) {
 
 static bool valueToFloat32(Value v, float* out) {
     if (!out) return false;
-    if (isRealType(v.type)) {
+    if (isRealType(VALUE_TYPE(v))) {
         *out = (float)asLd(v);
         return true;
     }
@@ -532,7 +532,7 @@ static Value vmBuiltinLandscapePrecomputeWorldCoords(VM* vm, int arg_count, Valu
     }
     if (worldZ.upper < coordUpper) coordUpper = worldZ.upper;
 
-    if (!isRealType(args[2].type) && !IS_INTLIKE(args[2])) {
+    if (!isRealType(VALUE_TYPE(args[2])) && !IS_INTLIKE(args[2])) {
         runtimeError(vm, "LandscapePrecomputeWorldCoords expects numeric tile scale argument.");
         return makeVoid();
     }
@@ -563,14 +563,14 @@ static Value vmBuiltinLandscapePrecomputeWorldCoords(VM* vm, int arg_count, Valu
         assignFloatValue(&worldZ.values[i], world);
     }
 
-    if (worldX.owner && worldX.owner->array_val != worldX.values) {
+    if (worldX.owner && AS_ARRAY(*worldX.owner) != worldX.values) {
         for (int i = 0; i <= coordUpper; ++i) {
-            worldX.owner->array_val[i] = worldX.values[i];
+            AS_ARRAY(*worldX.owner)[i] = worldX.values[i];
         }
     }
-    if (worldZ.owner && worldZ.owner->array_val != worldZ.values) {
+    if (worldZ.owner && AS_ARRAY(*worldZ.owner) != worldZ.values) {
         for (int i = 0; i <= coordUpper; ++i) {
-            worldZ.owner->array_val[i] = worldZ.values[i];
+            AS_ARRAY(*worldZ.owner)[i] = worldZ.values[i];
         }
     }
 
@@ -654,19 +654,19 @@ static Value vmBuiltinLandscapePrecomputeWaterOffsets(VM* vm, int arg_count, Val
         }
     }
 
-    if (waterPhase.owner && waterPhase.owner->array_val != waterPhase.values) {
+    if (waterPhase.owner && AS_ARRAY(*waterPhase.owner) != waterPhase.values) {
         for (int i = 0; i < vertexCount; ++i) {
-            waterPhase.owner->array_val[i] = waterPhase.values[i];
+            AS_ARRAY(*waterPhase.owner)[i] = waterPhase.values[i];
         }
     }
-    if (waterSecondary.owner && waterSecondary.owner->array_val != waterSecondary.values) {
+    if (waterSecondary.owner && AS_ARRAY(*waterSecondary.owner) != waterSecondary.values) {
         for (int i = 0; i < vertexCount; ++i) {
-            waterSecondary.owner->array_val[i] = waterSecondary.values[i];
+            AS_ARRAY(*waterSecondary.owner)[i] = waterSecondary.values[i];
         }
     }
-    if (waterSparkle.owner && waterSparkle.owner->array_val != waterSparkle.values) {
+    if (waterSparkle.owner && AS_ARRAY(*waterSparkle.owner) != waterSparkle.values) {
         for (int i = 0; i < vertexCount; ++i) {
-            waterSparkle.owner->array_val[i] = waterSparkle.values[i];
+            AS_ARRAY(*waterSparkle.owner)[i] = waterSparkle.values[i];
         }
     }
 
@@ -713,7 +713,7 @@ static Value vmBuiltinLandscapeBuildHeightField(VM* vm, int arg_count, Value* ar
         runtimeError(vm, "%s expects integer terrain parameters.", name);
         return makeVoid();
     }
-    if (!isRealType(args[4].type) && !IS_INTLIKE(args[4])) {
+    if (!isRealType(VALUE_TYPE(args[4])) && !IS_INTLIKE(args[4])) {
         runtimeError(vm, "%s expects numeric height scale.", name);
         return makeVoid();
     }
@@ -766,9 +766,9 @@ static Value vmBuiltinLandscapeBuildHeightField(VM* vm, int arg_count, Value* ar
     }
 
     int vertexCount = vertexStride * vertexStride;
-    if (heightArray.owner && heightArray.owner->array_val != heightArray.values) {
+    if (heightArray.owner && AS_ARRAY(*heightArray.owner) != heightArray.values) {
         for (int i = 0; i < vertexCount; ++i) {
-            heightArray.owner->array_val[i] = heightArray.values[i];
+            AS_ARRAY(*heightArray.owner)[i] = heightArray.values[i];
         }
     }
 
@@ -807,13 +807,13 @@ static Value vmBuiltinLandscapeConfigureProcedural(VM* vm, int arg_count, Value*
         return makeVoid();
     }
     if (!IS_INTLIKE(args[0]) ||
-        (!isRealType(args[1].type) && !IS_INTLIKE(args[1])) ||
-        (!isRealType(args[2].type) && !IS_INTLIKE(args[2])) ||
+        (!isRealType(VALUE_TYPE(args[1])) && !IS_INTLIKE(args[1])) ||
+        (!isRealType(VALUE_TYPE(args[2])) && !IS_INTLIKE(args[2])) ||
         !IS_INTLIKE(args[3]) ||
-        (!isRealType(args[4].type) && !IS_INTLIKE(args[4])) ||
-        (!isRealType(args[5].type) && !IS_INTLIKE(args[5])) ||
-        (!isRealType(args[6].type) && !IS_INTLIKE(args[6])) ||
-        (!isRealType(args[7].type) && !IS_INTLIKE(args[7]))) {
+        (!isRealType(VALUE_TYPE(args[4])) && !IS_INTLIKE(args[4])) ||
+        (!isRealType(VALUE_TYPE(args[5])) && !IS_INTLIKE(args[5])) ||
+        (!isRealType(VALUE_TYPE(args[6])) && !IS_INTLIKE(args[6])) ||
+        (!isRealType(VALUE_TYPE(args[7])) && !IS_INTLIKE(args[7]))) {
         runtimeError(vm, "%s received invalid parameter types.", name);
         return makeVoid();
     }
@@ -908,11 +908,11 @@ static Value vmBuiltinLandscapeBakeVertexData(VM* vm, int arg_count, Value* args
     if (!fetchNumericVarRef(vm, &args[8], name, "water height", &waterHeightRef))
         return makeVoid();
 
-    if ((!isRealType(args[9].type) && !IS_INTLIKE(args[9])) ||
-        (!isRealType(args[10].type) && !IS_INTLIKE(args[10])) ||
-        (!isRealType(args[11].type) && !IS_INTLIKE(args[11])) ||
-        (!isRealType(args[12].type) && !IS_INTLIKE(args[12])) ||
-        (!isRealType(args[13].type) && !IS_INTLIKE(args[13]))) {
+    if ((!isRealType(VALUE_TYPE(args[9])) && !IS_INTLIKE(args[9])) ||
+        (!isRealType(VALUE_TYPE(args[10])) && !IS_INTLIKE(args[10])) ||
+        (!isRealType(VALUE_TYPE(args[11])) && !IS_INTLIKE(args[11])) ||
+        (!isRealType(VALUE_TYPE(args[12])) && !IS_INTLIKE(args[12])) ||
+        (!isRealType(VALUE_TYPE(args[13])) && !IS_INTLIKE(args[13]))) {
         runtimeError(vm, "%s expects numeric parameters for height bounds, normalization, water level, and tile scale.",
                      name);
         return makeVoid();
@@ -1040,44 +1040,44 @@ static Value vmBuiltinLandscapeBakeVertexData(VM* vm, int arg_count, Value* args
         }
     }
 
-    if (sourceHeights.owner && sourceHeights.owner->array_val != sourceHeights.values) {
+    if (sourceHeights.owner && AS_ARRAY(*sourceHeights.owner) != sourceHeights.values) {
         for (int i = 0; i < vertexCount; ++i) {
-            sourceHeights.owner->array_val[i] = sourceHeights.values[i];
+            AS_ARRAY(*sourceHeights.owner)[i] = sourceHeights.values[i];
         }
     }
-    if (vertexHeights.owner && vertexHeights.owner->array_val != vertexHeights.values) {
+    if (vertexHeights.owner && AS_ARRAY(*vertexHeights.owner) != vertexHeights.values) {
         for (int i = 0; i < vertexCount; ++i) {
-            vertexHeights.owner->array_val[i] = vertexHeights.values[i];
+            AS_ARRAY(*vertexHeights.owner)[i] = vertexHeights.values[i];
         }
     }
-    if (vertexNormalX.owner && vertexNormalX.owner->array_val != vertexNormalX.values) {
+    if (vertexNormalX.owner && AS_ARRAY(*vertexNormalX.owner) != vertexNormalX.values) {
         for (int i = 0; i < vertexCount; ++i) {
-            vertexNormalX.owner->array_val[i] = vertexNormalX.values[i];
+            AS_ARRAY(*vertexNormalX.owner)[i] = vertexNormalX.values[i];
         }
     }
-    if (vertexNormalY.owner && vertexNormalY.owner->array_val != vertexNormalY.values) {
+    if (vertexNormalY.owner && AS_ARRAY(*vertexNormalY.owner) != vertexNormalY.values) {
         for (int i = 0; i < vertexCount; ++i) {
-            vertexNormalY.owner->array_val[i] = vertexNormalY.values[i];
+            AS_ARRAY(*vertexNormalY.owner)[i] = vertexNormalY.values[i];
         }
     }
-    if (vertexNormalZ.owner && vertexNormalZ.owner->array_val != vertexNormalZ.values) {
+    if (vertexNormalZ.owner && AS_ARRAY(*vertexNormalZ.owner) != vertexNormalZ.values) {
         for (int i = 0; i < vertexCount; ++i) {
-            vertexNormalZ.owner->array_val[i] = vertexNormalZ.values[i];
+            AS_ARRAY(*vertexNormalZ.owner)[i] = vertexNormalZ.values[i];
         }
     }
-    if (vertexColorR.owner && vertexColorR.owner->array_val != vertexColorR.values) {
+    if (vertexColorR.owner && AS_ARRAY(*vertexColorR.owner) != vertexColorR.values) {
         for (int i = 0; i < vertexCount; ++i) {
-            vertexColorR.owner->array_val[i] = vertexColorR.values[i];
+            AS_ARRAY(*vertexColorR.owner)[i] = vertexColorR.values[i];
         }
     }
-    if (vertexColorG.owner && vertexColorG.owner->array_val != vertexColorG.values) {
+    if (vertexColorG.owner && AS_ARRAY(*vertexColorG.owner) != vertexColorG.values) {
         for (int i = 0; i < vertexCount; ++i) {
-            vertexColorG.owner->array_val[i] = vertexColorG.values[i];
+            AS_ARRAY(*vertexColorG.owner)[i] = vertexColorG.values[i];
         }
     }
-    if (vertexColorB.owner && vertexColorB.owner->array_val != vertexColorB.values) {
+    if (vertexColorB.owner && AS_ARRAY(*vertexColorB.owner) != vertexColorB.values) {
         for (int i = 0; i < vertexCount; ++i) {
-            vertexColorB.owner->array_val[i] = vertexColorB.values[i];
+            AS_ARRAY(*vertexColorB.owner)[i] = vertexColorB.values[i];
         }
     }
 
@@ -1125,7 +1125,7 @@ static bool parsePalettePresetValue(VM* vm,
                                     TerrainPalettePreset* preset,
                                     const char* name) {
     if (!value || !preset) return false;
-    if (IS_INTLIKE(*value) || value->type == TYPE_BOOLEAN) {
+    if (IS_INTLIKE(*value) || VALUE_TYPE(*value) == TYPE_BOOLEAN) {
         long long idx = asI64(*value);
         if (idx < 0 || idx >= (long long)terrainShaderPalettePresetCount()) {
             char options[128];
@@ -1140,7 +1140,7 @@ static bool parsePalettePresetValue(VM* vm,
         *preset = (TerrainPalettePreset)idx;
         return true;
     }
-    if (isRealType(value->type)) {
+    if (isRealType(VALUE_TYPE(*value))) {
         long long idx = (long long)asLd(*value);
         if (idx < 0 || idx >= (long long)terrainShaderPalettePresetCount()) {
             char options[128];
@@ -1179,7 +1179,7 @@ static bool parseLightingPresetValue(VM* vm,
                                      TerrainLightingPreset* preset,
                                      const char* name) {
     if (!value || !preset) return false;
-    if (IS_INTLIKE(*value) || value->type == TYPE_BOOLEAN) {
+    if (IS_INTLIKE(*value) || VALUE_TYPE(*value) == TYPE_BOOLEAN) {
         long long idx = asI64(*value);
         if (idx < 0 || idx >= (long long)terrainShaderLightingPresetCount()) {
             char options[128];
@@ -1194,7 +1194,7 @@ static bool parseLightingPresetValue(VM* vm,
         *preset = (TerrainLightingPreset)idx;
         return true;
     }
-    if (isRealType(value->type)) {
+    if (isRealType(VALUE_TYPE(*value))) {
         long long idx = (long long)asLd(*value);
         if (idx < 0 || idx >= (long long)terrainShaderLightingPresetCount()) {
             char options[128];
@@ -1445,11 +1445,11 @@ static Value vmBuiltinLandscapeDrawWater(VM* vm, int arg_count, Value* args) {
     if (!waterSparkleOffset.values) return makeVoid();
     if (waterSparkleOffset.upper < phaseUpper) phaseUpper = waterSparkleOffset.upper;
 
-    if (!isRealType(args[6].type) && !IS_INTLIKE(args[6])) {
+    if (!isRealType(VALUE_TYPE(args[6])) && !IS_INTLIKE(args[6])) {
         runtimeError(vm, "%s expects numeric water height.", name);
         return makeVoid();
     }
-    if (!isRealType(args[7].type) && !IS_INTLIKE(args[7])) {
+    if (!isRealType(VALUE_TYPE(args[7])) && !IS_INTLIKE(args[7])) {
         runtimeError(vm, "%s expects numeric time parameter.", name);
         return makeVoid();
     }

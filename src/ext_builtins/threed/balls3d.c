@@ -17,14 +17,14 @@
 static Value* resolveArrayArg(VM* vm, Value* arg, const char* name, int* lower,
                               int* upper) {
     Value* arrVal = arg;
-    if (arg->type == TYPE_POINTER) {
-        arrVal = (Value*)arg->ptr_val;
+    if (VALUE_TYPE(*arg) == TYPE_POINTER) {
+        arrVal = (Value*)AS_POINTER(*arg);
         if (!arrVal) {
             runtimeError(vm, "%s received a NIL pointer.", name);
             return NULL;
         }
     }
-    if (!arrVal || arrVal->type != TYPE_ARRAY) {
+    if (!arrVal || VALUE_TYPE(*arrVal) != TYPE_ARRAY) {
         runtimeError(vm, "%s expects VAR array arguments.", name);
         return NULL;
     }
@@ -38,16 +38,16 @@ static Value* resolveArrayArg(VM* vm, Value* arg, const char* name, int* lower,
                                                              : arrVal->upper_bound;
     if (lower) *lower = l;
     if (upper) *upper = u;
-    if (!arrVal->array_val) {
+    if (!AS_ARRAY(*arrVal)) {
         runtimeError(vm, "%s received an array with NIL storage.", name);
         return NULL;
     }
-    return arrVal->array_val;
+    return AS_ARRAY(*arrVal);
 }
 
 static inline void assignFloatValue(Value* target, double value) {
     if (!target) return;
-    target->type = TYPE_DOUBLE;
+    SET_VALUE_TYPE(target, TYPE_DOUBLE);
     SET_REAL_VALUE(target, value);
 }
 
@@ -200,12 +200,12 @@ typedef struct NumericVarRef {
 static bool fetchNumericVarRef(VM* vm, Value* arg, const char* name,
                                const char* paramDesc, NumericVarRef* out) {
     if (!out) return false;
-    if (arg->type != TYPE_POINTER) {
+    if (VALUE_TYPE(*arg) != TYPE_POINTER) {
         runtimeError(vm, "%s expects VAR parameter for %s.", name, paramDesc);
         return false;
     }
 
-    Value* slot = (Value*)arg->ptr_val;
+    Value* slot = (Value*)AS_POINTER(*arg);
     if (!slot) {
         runtimeError(vm, "%s received NIL storage for %s.", name, paramDesc);
         return false;

@@ -145,12 +145,12 @@ Value vmBuiltinLoadsound(VM* vm, int arg_count, Value* args) {
         return makeInt(-1);
     }
     Value fileNameVal = args[0];
-    if (!isPascalStringType(fileNameVal.type) || fileNameVal.s_val == NULL) {
-        runtimeError(vm, "LoadSound argument must be a valid String. Got %s.", varTypeToString(fileNameVal.type));
+    if (!isPascalStringType(VALUE_TYPE(fileNameVal)) || AS_STRING(fileNameVal) == NULL) {
+        runtimeError(vm, "LoadSound argument must be a valid String. Got %s.", varTypeToString(VALUE_TYPE(fileNameVal)));
         return makeInt(-1);
     }
 
-    int soundID = audioLoadSound(fileNameVal.s_val);
+    int soundID = audioLoadSound(AS_STRING(fileNameVal));
     return makeInt(soundID);
 }
 

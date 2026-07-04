@@ -110,11 +110,11 @@ static Value vmSqliteOpen(struct VM_s *vm, int arg_count, Value *args) {
         runtimeError(vm, "SqliteOpen expects exactly 1 argument.");
         return makeInt(-1);
     }
-    if (!isPascalStringType(args[0].type)) {
+    if (!isPascalStringType(VALUE_TYPE(args[0]))) {
         runtimeError(vm, "SqliteOpen argument must be a string path.");
         return makeInt(-1);
     }
-    const char *path = args[0].s_val ? args[0].s_val : ":memory:";
+    const char *path = AS_STRING(args[0]) ? AS_STRING(args[0]) : ":memory:";
     sqlite3 *db = NULL;
     int rc = sqlite3_open(path, &db);
     if (rc != SQLITE_OK) {
@@ -194,12 +194,12 @@ static Value vmSqliteExec(struct VM_s *vm, int arg_count, Value *args) {
         runtimeError(vm, "SqliteExec expects (db_handle:int, sql:string).");
         return makeInt(-1);
     }
-    if (!IS_INTLIKE(args[0]) || !isPascalStringType(args[1].type)) {
+    if (!IS_INTLIKE(args[0]) || !isPascalStringType(VALUE_TYPE(args[1]))) {
         runtimeError(vm, "SqliteExec argument types are (int, string).");
         return makeInt(-1);
     }
     int handle = (int)asI64(args[0]);
-    const char *sql = args[1].s_val;
+    const char *sql = AS_STRING(args[1]);
     if (!sql) {
         runtimeError(vm, "SqliteExec received NIL SQL string.");
         return makeInt(-1);
@@ -231,12 +231,12 @@ static Value vmSqlitePrepare(struct VM_s *vm, int arg_count, Value *args) {
         runtimeError(vm, "SqlitePrepare expects (db_handle:int, sql:string).");
         return makeInt(-1);
     }
-    if (!IS_INTLIKE(args[0]) || !isPascalStringType(args[1].type)) {
+    if (!IS_INTLIKE(args[0]) || !isPascalStringType(VALUE_TYPE(args[1]))) {
         runtimeError(vm, "SqlitePrepare argument types are (int, string).");
         return makeInt(-1);
     }
     int handle = (int)asI64(args[0]);
-    const char *sql = args[1].s_val;
+    const char *sql = AS_STRING(args[1]);
     if (!sql) {
         runtimeError(vm, "SqlitePrepare received NIL SQL string.");
         return makeInt(-1);
@@ -513,7 +513,7 @@ static Value vmSqliteBindText(struct VM_s *vm, int arg_count, Value *args) {
         runtimeError(vm, "SqliteBindText index must be integer.");
         return makeInt(-1);
     }
-    if (!isPascalStringType(args[2].type)) {
+    if (!isPascalStringType(VALUE_TYPE(args[2]))) {
         runtimeError(vm, "SqliteBindText value must be string.");
         return makeInt(-1);
     }
@@ -522,7 +522,7 @@ static Value vmSqliteBindText(struct VM_s *vm, int arg_count, Value *args) {
         runtimeError(vm, "SqliteBindText parameter index must be >= 1.");
         return makeInt(-1);
     }
-    const char *text = args[2].s_val ? args[2].s_val : "";
+    const char *text = AS_STRING(args[2]) ? AS_STRING(args[2]) : "";
     int rc = sqlite3_bind_text(stmt, index, text, -1, SQLITE_TRANSIENT);
     if (rc != SQLITE_OK) {
         runtimeError(vm, "SqliteBindText failed (%d).", rc);

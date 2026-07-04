@@ -313,11 +313,11 @@ static const char *jsonFindSuggestedArrayField(yyjson_val *val) {
 }
 
 static Value vmBuiltinYyjsonRead(struct VM_s *vm, int arg_count, Value *args) {
-    if (arg_count != 1 || !isPascalStringType(args[0].type)) {
+    if (arg_count != 1 || !isPascalStringType(VALUE_TYPE(args[0]))) {
         runtimeError(vm, "YyjsonRead expects a single string argument.");
         return makeInt(YYJSON_UNUSED_HANDLE);
     }
-    const char *json = args[0].s_val ? args[0].s_val : "";
+    const char *json = AS_STRING(args[0]) ? AS_STRING(args[0]) : "";
     yyjson_read_err err;
     yyjson_doc *doc = yyjson_read_opts((char *)json, strlen(json), 0, NULL, &err);
     if (!doc) {
@@ -334,11 +334,11 @@ static Value vmBuiltinYyjsonRead(struct VM_s *vm, int arg_count, Value *args) {
 }
 
 static Value vmBuiltinYyjsonReadFile(struct VM_s *vm, int arg_count, Value *args) {
-    if (arg_count != 1 || !isPascalStringType(args[0].type)) {
+    if (arg_count != 1 || !isPascalStringType(VALUE_TYPE(args[0]))) {
         runtimeError(vm, "YyjsonReadFile expects a single string argument.");
         return makeInt(YYJSON_UNUSED_HANDLE);
     }
-    const char *path = args[0].s_val ? args[0].s_val : "";
+    const char *path = AS_STRING(args[0]) ? AS_STRING(args[0]) : "";
     yyjson_read_err err;
     yyjson_doc *doc = yyjson_read_file(path, 0, NULL, &err);
     if (!doc) {
@@ -414,7 +414,7 @@ cleanup:
 }
 
 static Value vmBuiltinYyjsonGetKey(struct VM_s *vm, int arg_count, Value *args) {
-    if (arg_count != 2 || !IS_INTLIKE(args[0]) || !isPascalStringType(args[1].type)) {
+    if (arg_count != 2 || !IS_INTLIKE(args[0]) || !isPascalStringType(VALUE_TYPE(args[1]))) {
         runtimeError(vm, "YyjsonGetKey expects (value_handle:int, key:string).");
         return makeInt(YYJSON_UNUSED_HANDLE);
     }
@@ -426,7 +426,7 @@ static Value vmBuiltinYyjsonGetKey(struct VM_s *vm, int arg_count, Value *args) 
     }
 
     Value result = makeInt(YYJSON_UNUSED_HANDLE);
-    const char *key = args[1].s_val ? args[1].s_val : "";
+    const char *key = AS_STRING(args[1]) ? AS_STRING(args[1]) : "";
     /* Dotted paths ("meta.code") walk nested objects. A missing key, an empty
      * key, or a non-object anywhere along the path yields an absent (invalid)
      * handle that downstream accessors degrade on -- so deep reads need no
@@ -519,7 +519,7 @@ cleanup:
 }
 
 static Value vmBuiltinYyjsonHasKey(struct VM_s *vm, int arg_count, Value *args) {
-    if (arg_count != 2 || !IS_INTLIKE(args[0]) || !isPascalStringType(args[1].type)) {
+    if (arg_count != 2 || !IS_INTLIKE(args[0]) || !isPascalStringType(VALUE_TYPE(args[1]))) {
         runtimeError(vm, "YyjsonHasKey expects (value_handle:int, key:string).");
         return makeInt(0);
     }
@@ -532,7 +532,7 @@ static Value vmBuiltinYyjsonHasKey(struct VM_s *vm, int arg_count, Value *args) 
 
     Value result = makeInt(0);
     {
-        const char *key = args[1].s_val ? args[1].s_val : "";
+        const char *key = AS_STRING(args[1]) ? AS_STRING(args[1]) : "";
         yyjson_val *child = val;
         if (strchr(key, '.') != NULL) {
             char *path = strdup(key);

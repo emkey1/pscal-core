@@ -103,7 +103,7 @@ static void sdlDumpEvent(const char *label, const SDL_Event *event) {
     if (!label || !event) {
         return;
     }
-    SDL_DEBUG_LOG("%s: %s (%u)", label, sdlDescribeEventType(event->type), event->type);
+    SDL_DEBUG_LOG("%s: %s (%u)", label, sdlDescribeEventType(VALUE_TYPE(*event)), VALUE_TYPE(*event));
 }
 #else
 #define sdlDumpEvent(label, event) ((void)0)
@@ -114,7 +114,7 @@ static void sdlLogEvent(const char *label, const SDL_Event *event) {
     if (!label || !event) {
         return;
     }
-    SDL_DEBUG_LOG("%s: %s (%u)", label, sdlDescribeEventType(event->type), event->type);
+    SDL_DEBUG_LOG("%s: %s (%u)", label, sdlDescribeEventType(VALUE_TYPE(*event)), VALUE_TYPE(*event));
 }
 #else
 static void sdlLogEvent(const char *label, const SDL_Event *event) {
@@ -282,7 +282,7 @@ static const int kTextureAccessInvalid = -1;
 
 #if defined(PSCALI_SDL3)
 static bool isWindowCloseEvent(const SDL_Event* event) {
-    return event && event->type == SDL_EVENT_WINDOW_CLOSE_REQUESTED;
+    return event && VALUE_TYPE(*event) == SDL_EVENT_WINDOW_CLOSE_REQUESTED;
 }
 #else
 static bool isWindowCloseEvent(const SDL_Event* event) {
@@ -467,7 +467,7 @@ static void enqueueUtf8Text(const char* text) {
 #if PSCALI_HAS_SYSWM
 static void handleSysWmEvent(const SDL_Event* event) {
 #ifdef SDL_VIDEO_DRIVER_X11
-    if (!event || event->type != SDL_SYSWMEVENT) {
+    if (!event || VALUE_TYPE(*event) != SDL_SYSWMEVENT) {
         return;
     }
 
@@ -477,7 +477,7 @@ static void handleSysWmEvent(const SDL_Event* event) {
     }
 
     XEvent* xevent = &msg->msg.x11.event;
-    if (!xevent || xevent->type != ClientMessage) {
+    if (!xevent || VALUE_TYPE(*xevent) != ClientMessage) {
         return;
     }
 
@@ -661,8 +661,8 @@ static SDL_Scancode resolveScancodeFromValue(Value arg, bool* out_ok) {
         *out_ok = false;
     }
 
-    if (isPascalStringType(arg.type) && arg.s_val != NULL) {
-        SDL_Scancode sc = resolveScancodeFromName(arg.s_val);
+    if (isPascalStringType(VALUE_TYPE(arg)) && AS_STRING(arg) != NULL) {
+        SDL_Scancode sc = resolveScancodeFromName(AS_STRING(arg));
         if (sc != SDL_SCANCODE_UNKNOWN && out_ok) {
             *out_ok = true;
         }
@@ -876,7 +876,7 @@ void sdlCleanupAtExit(void) {
 
 
 PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinInitgraph) {
-    if (arg_count != 3 || !IS_INTLIKE(args[0]) || !IS_INTLIKE(args[1]) || !isPascalStringType(args[2].type)) {
+    if (arg_count != 3 || !IS_INTLIKE(args[0]) || !IS_INTLIKE(args[1]) || !isPascalStringType(VALUE_TYPE(args[2]))) {
         runtimeError(vm, "VM Error: InitGraph expects (Integer, Integer, String)");
         return makeVoid();
     }
@@ -925,7 +925,7 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinInitgraph) {
 
     int width = (int)AS_INTEGER(args[0]);
     int height = (int)AS_INTEGER(args[1]);
-    const char* title = args[2].s_val ? args[2].s_val : "Pscal Graphics";
+    const char* title = AS_STRING(args[2]) ? AS_STRING(args[2]) : "Pscal Graphics";
 
     if (width <= 0 || height <= 0) {
         runtimeError(vm, "Runtime error: InitGraph width and height must be positive.");
@@ -1104,7 +1104,7 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinUpdatetexture) {
     Value idVal = args[0];
     Value pixelDataVal = args[1];
 
-    if (!isIntlikeType(idVal.type) || pixelDataVal.type != TYPE_ARRAY) {
+    if (!isIntlikeType(VALUE_TYPE(idVal)) || VALUE_TYPE(pixelDataVal) != TYPE_ARRAY) {
         runtimeError(vm, "UpdateTexture argument type mismatch.");
         return makeVoid();
     }
@@ -1138,15 +1138,15 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinUpdatetexture) {
     }
 
     if (arrayUsesPackedBytes(&pixelDataVal)) {
-        if (!pixelDataVal.array_raw) {
+        if (!AS_ARRAY_RAW(pixelDataVal)) {
             free(c_pixel_buffer);
             runtimeError(vm, "UpdateTexture PixelData buffer is NULL.");
             return makeVoid();
         }
-        memcpy(c_pixel_buffer, pixelDataVal.array_raw, (size_t)expectedPscalArraySize);
+        memcpy(c_pixel_buffer, AS_ARRAY_RAW(pixelDataVal), (size_t)expectedPscalArraySize);
     } else {
         for (int i = 0; i < expectedPscalArraySize; ++i) {
-            c_pixel_buffer[i] = (unsigned char)AS_INTEGER(pixelDataVal.array_val[i]);
+            c_pixel_buffer[i] = (unsigned char)AS_INTEGER(AS_ARRAY(pixelDataVal)[i]);
         }
     }
 
@@ -1205,13 +1205,13 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinGetscreensize) {
         runtimeError(vm, "GetScreenSize expects 2 arguments.");
         return makeBoolean(false);
     }
-    if (args[0].type != TYPE_POINTER || args[1].type != TYPE_POINTER) {
+    if (VALUE_TYPE(args[0]) != TYPE_POINTER || VALUE_TYPE(args[1]) != TYPE_POINTER) {
         runtimeError(vm, "GetScreenSize requires VAR parameters, but a non-pointer type was received.");
         return makeBoolean(false);
     }
 
-    Value* width_ptr = (Value*)args[0].ptr_val;
-    Value* height_ptr = (Value*)args[1].ptr_val;
+    Value* width_ptr = (Value*)AS_POINTER(args[0]);
+    Value* height_ptr = (Value*)AS_POINTER(args[1]);
 
     if (!width_ptr || !height_ptr) {
         runtimeError(vm, "GetScreenSize received a NIL pointer for a VAR parameter.");
@@ -1334,8 +1334,8 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinGettextsize) {
     if (!gSdlFont) { runtimeError(vm, "Font not initialized for GetTextSize."); return makeVoid(); }
     
     const char* text = AS_STRING(args[0]);
-    Value* width_ptr = (Value*)args[1].ptr_val;
-    Value* height_ptr = (Value*)args[2].ptr_val;
+    Value* width_ptr = (Value*)AS_POINTER(args[1]);
+    Value* height_ptr = (Value*)AS_POINTER(args[2]);
     
     int w, h;
     TTF_SizeUTF8(gSdlFont, text, &w, &h);
@@ -1353,22 +1353,22 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinGetmousestate) {
     }
 
     // --- ADD SAFETY CHECKS ---
-    if (args[0].type != TYPE_POINTER || args[1].type != TYPE_POINTER || args[2].type != TYPE_POINTER) {
+    if (VALUE_TYPE(args[0]) != TYPE_POINTER || VALUE_TYPE(args[1]) != TYPE_POINTER || VALUE_TYPE(args[2]) != TYPE_POINTER) {
         runtimeError(vm, "GetMouseState requires VAR parameters, but a non-pointer type was received.");
         return makeVoid();
     }
 
-    Value* x_ptr = (Value*)args[0].ptr_val;
-    Value* y_ptr = (Value*)args[1].ptr_val;
-    Value* buttons_ptr = (Value*)args[2].ptr_val;
+    Value* x_ptr = (Value*)AS_POINTER(args[0]);
+    Value* y_ptr = (Value*)AS_POINTER(args[1]);
+    Value* buttons_ptr = (Value*)AS_POINTER(args[2]);
     Value* inside_ptr = NULL;
 
     if (arg_count == 4) {
-        if (args[3].type != TYPE_POINTER) {
+        if (VALUE_TYPE(args[3]) != TYPE_POINTER) {
             runtimeError(vm, "GetMouseState requires VAR parameters, but a non-pointer type was received.");
             return makeVoid();
         }
-        inside_ptr = (Value*)args[3].ptr_val;
+        inside_ptr = (Value*)AS_POINTER(args[3]);
         if (!inside_ptr) {
             runtimeError(vm, "GetMouseState received a NIL pointer for a VAR parameter.");
             return makeVoid();
@@ -1528,7 +1528,7 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinRendercopyrect) {
 }
 
 PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinSetalphablend) {
-    if (arg_count != 1 || args[0].type != TYPE_BOOLEAN) { runtimeError(vm, "SetAlphaBlend expects 1 boolean argument."); return makeVoid(); }
+    if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_BOOLEAN) { runtimeError(vm, "SetAlphaBlend expects 1 boolean argument."); return makeVoid(); }
     SDL_BlendMode mode = AS_BOOLEAN(args[0]) ? SDL_BLENDMODE_BLEND : SDL_BLENDMODE_NONE;
     if (gSdlRenderer) SDL_SetRenderDrawBlendMode(gSdlRenderer, mode);
     return makeVoid();
@@ -1845,12 +1845,12 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinInittextsystem) {
     Value fontNameVal = args[0];
     Value fontSizeVal = args[1];
 
-    if (!isPascalStringType(fontNameVal.type) || !isIntlikeType(fontSizeVal.type)) {
+    if (!isPascalStringType(VALUE_TYPE(fontNameVal)) || !isIntlikeType(VALUE_TYPE(fontSizeVal))) {
         runtimeError(vm, "InitTextSystem argument type mismatch. Expected (String, Integer).");
         return makeVoid(); // Don't free args, they are on the VM stack
     }
 
-    const char* font_path = fontNameVal.s_val;
+    const char* font_path = AS_STRING(fontNameVal);
     int font_size = (int)AS_INTEGER(fontSizeVal);
 
     // Close previous font if one was loaded
@@ -1987,7 +1987,7 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinDrawpolygon) {
     if (arg_count != 2) { runtimeError(vm, "DrawPolygon expects 2 arguments (PointsArray, NumPoints)."); return makeVoid(); }
     if (!gSdlInitialized || !gSdlRenderer) { runtimeError(vm, "Graphics not initialized for DrawPolygon."); return makeVoid(); }
 
-    if (args[0].type != TYPE_ARRAY || !IS_INTLIKE(args[1])) { runtimeError(vm, "DrawPolygon argument type mismatch."); return makeVoid(); }
+    if (VALUE_TYPE(args[0]) != TYPE_ARRAY || !IS_INTLIKE(args[1])) { runtimeError(vm, "DrawPolygon argument type mismatch."); return makeVoid(); }
     if (args[0].element_type != TYPE_RECORD) { runtimeError(vm, "DrawPolygon Points argument must be an ARRAY OF PointRecord."); return makeVoid(); }
 
     int numPoints = (int)AS_INTEGER(args[1]);
@@ -2001,15 +2001,15 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinDrawpolygon) {
     if (!sdlPoints) { runtimeError(vm, "Memory allocation failed for SDL_Point array in DrawPolygon."); return makeVoid(); }
 
     for (int i = 0; i < numPoints; i++) {
-        Value recordValue = args[0].array_val[i];
-        if (recordValue.type != TYPE_RECORD || !recordValue.record_val) { runtimeError(vm, "Element in PointsArray is not a valid PointRecord."); free(sdlPoints); return makeVoid(); }
-        FieldValue* fieldX = recordValue.record_val;
+        Value recordValue = AS_ARRAY(args[0])[i];
+        if (VALUE_TYPE(recordValue) != TYPE_RECORD || !AS_RECORD(recordValue)) { runtimeError(vm, "Element in PointsArray is not a valid PointRecord."); free(sdlPoints); return makeVoid(); }
+        FieldValue* fieldX = AS_RECORD(recordValue);
         FieldValue* fieldY = fieldX ? fieldX->next : NULL;
 
         const Value *xVal = fieldValueStorageConst(fieldX);
         const Value *yVal = fieldValueStorageConst(fieldY);
-        if (fieldX && strcasecmp(fieldX->name, "x") == 0 && xVal && isIntlikeType(xVal->type) &&
-            fieldY && strcasecmp(fieldY->name, "y") == 0 && yVal && isIntlikeType(yVal->type)) {
+        if (fieldX && strcasecmp(fieldX->name, "x") == 0 && xVal && isIntlikeType(VALUE_TYPE(*xVal)) &&
+            fieldY && strcasecmp(fieldY->name, "y") == 0 && yVal && isIntlikeType(VALUE_TYPE(*yVal))) {
             sdlPoints[i].x = (int)AS_INTEGER(*xVal);
             sdlPoints[i].y = (int)AS_INTEGER(*yVal);
         } else { runtimeError(vm, "PointRecord does not have correct X,Y integer fields."); free(sdlPoints); return makeVoid(); }
@@ -2053,16 +2053,16 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinGetpixelcolor) {
 
     if (!IS_INTLIKE(args[0]) || !IS_INTLIKE(args[1])) { runtimeError(vm, "GetPixelColor X,Y coordinates must be integers."); return makeVoid(); }
 
-    if (args[2].type != TYPE_POINTER || args[3].type != TYPE_POINTER ||
-        args[4].type != TYPE_POINTER || args[5].type != TYPE_POINTER) { runtimeError(vm, "GetPixelColor R,G,B,A parameters must be VAR Byte."); return makeVoid(); }
+    if (VALUE_TYPE(args[2]) != TYPE_POINTER || VALUE_TYPE(args[3]) != TYPE_POINTER ||
+        VALUE_TYPE(args[4]) != TYPE_POINTER || VALUE_TYPE(args[5]) != TYPE_POINTER) { runtimeError(vm, "GetPixelColor R,G,B,A parameters must be VAR Byte."); return makeVoid(); }
 
     int x = (int)AS_INTEGER(args[0]);
     int y = (int)AS_INTEGER(args[1]);
 
-    Value* r_ptr = (Value*)args[2].ptr_val;
-    Value* g_ptr = (Value*)args[3].ptr_val;
-    Value* b_ptr = (Value*)args[4].ptr_val;
-    Value* a_ptr = (Value*)args[5].ptr_val;
+    Value* r_ptr = (Value*)AS_POINTER(args[2]);
+    Value* g_ptr = (Value*)AS_POINTER(args[3]);
+    Value* b_ptr = (Value*)AS_POINTER(args[4]);
+    Value* a_ptr = (Value*)AS_POINTER(args[5]);
 
     if (!r_ptr || !g_ptr || !b_ptr || !a_ptr) { runtimeError(vm, "Null pointer for RGBA output in GetPixelColor."); return makeVoid(); }
 
@@ -2103,7 +2103,7 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinGetpixelcolor) {
 }
 
 PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinLoadimagetotexture) {
-    if (arg_count != 1 || !isPascalStringType(args[0].type)) { runtimeError(vm, "LoadImageToTexture expects 1 argument (FilePath: String)."); return makeInt(-1); }
+    if (arg_count != 1 || !isPascalStringType(VALUE_TYPE(args[0]))) { runtimeError(vm, "LoadImageToTexture expects 1 argument (FilePath: String)."); return makeInt(-1); }
     if (!gSdlInitialized || !gSdlRenderer) { runtimeError(vm, "Graphics system not initialized before LoadImageToTexture."); return makeInt(-1); }
 
     if (!gSdlImageInitialized) {
@@ -2112,7 +2112,7 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinLoadimagetotexture) {
         gSdlImageInitialized = true;
     }
 
-    const char* filePath = args[0].s_val;
+    const char* filePath = AS_STRING(args[0]);
     int free_slot = findFreeTextureID();
     if (free_slot == -1) { runtimeError(vm, "No free texture slots available for LoadImageToTexture."); return makeInt(-1); }
 
@@ -2143,11 +2143,11 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinOuttextxy) {
     if (!gSdlInitialized || !gSdlRenderer) { runtimeError(vm, "Graphics system not initialized before OutTextXY."); return makeVoid(); }
     if (!gSdlTtfInitialized || !gSdlFont) { runtimeError(vm, "Text system or font not initialized before OutTextXY."); return makeVoid(); }
 
-    if (!IS_INTLIKE(args[0]) || !IS_INTLIKE(args[1]) || !isPascalStringType(args[2].type)) { runtimeError(vm, "OutTextXY argument type mismatch."); return makeVoid(); }
+    if (!IS_INTLIKE(args[0]) || !IS_INTLIKE(args[1]) || !isPascalStringType(VALUE_TYPE(args[2]))) { runtimeError(vm, "OutTextXY argument type mismatch."); return makeVoid(); }
 
     int x = (int)AS_INTEGER(args[0]);
     int y = (int)AS_INTEGER(args[1]);
-    const char* text_to_render = args[2].s_val ? args[2].s_val : "";
+    const char* text_to_render = AS_STRING(args[2]) ? AS_STRING(args[2]) : "";
 
     SDL_Surface* textSurface = TTF_RenderUTF8_Solid(gSdlFont, text_to_render, gSdlCurrentColor);
     if (!textSurface) { runtimeError(vm, "TTF_RenderUTF8_Solid failed in OutTextXY: %s", TTF_GetError()); return makeVoid(); }
@@ -2196,7 +2196,7 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinRendercopyex) {
     if (!IS_INTLIKE(args[0]) || !IS_INTLIKE(args[1]) || !IS_INTLIKE(args[2]) ||
         !IS_INTLIKE(args[3]) || !IS_INTLIKE(args[4]) || !IS_INTLIKE(args[5]) ||
         !IS_INTLIKE(args[6]) || !IS_INTLIKE(args[7]) || !IS_INTLIKE(args[8]) ||
-        !isRealType(args[9].type) || !IS_INTLIKE(args[10]) || !IS_INTLIKE(args[11]) ||
+        !isRealType(VALUE_TYPE(args[9])) || !IS_INTLIKE(args[10]) || !IS_INTLIKE(args[11]) ||
         !IS_INTLIKE(args[12])) {
         fprintf(stderr, "Runtime error: RenderCopyEx argument type mismatch. Expected (Int,Int,Int,Int,Int,Int,Int,Int,Int,Real,Int,Int,Int).\n");
         return makeVoid();
@@ -2238,7 +2238,7 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinRendercopyex) {
 }
 
 PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinSetcolor) {
-    if (arg_count != 1 || (!IS_INTLIKE(args[0]) && args[0].type != TYPE_BYTE)) {
+    if (arg_count != 1 || (!IS_INTLIKE(args[0]) && VALUE_TYPE(args[0]) != TYPE_BYTE)) {
         runtimeError(vm, "SetColor expects 1 argument (color index 0-255).");
         return makeVoid();
     }
@@ -2422,11 +2422,11 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinWaitkeyevent) {
 #endif
 
 #if defined(PSCAL_TARGET_IOS)
-            if (event.type == SDL_QUIT) {
+            if (VALUE_TYPE(event) == SDL_QUIT) {
                 continue;
             } else if (isWindowCloseEvent(&event)) {
                 continue;
-            } else if (event.type == SDL_KEYDOWN) {
+            } else if (VALUE_TYPE(event) == SDL_KEYDOWN) {
                 SDL_Keycode sym = event.key.keysym.sym;
                 if (sym == SDLK_q) {
                     SDL_DEBUG_SET_BREAK_REQUESTED(1, "WaitKey(iOS) SDL_KEYDOWN q");
@@ -2437,7 +2437,7 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinWaitkeyevent) {
                     enqueuePendingKeycode(sym);
                     waiting = 0;
                 }
-            } else if (event.type == SDL_TEXTINPUT) {
+            } else if (VALUE_TYPE(event) == SDL_TEXTINPUT) {
                 enqueueUtf8Text(event.text.text);
                 waiting = 0;
             }
@@ -2489,7 +2489,7 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinFillcircle) {
     int centerX, centerY, radius;
     if (IS_INTLIKE(args[0])) {
         centerX = (int)AS_INTEGER(args[0]);
-    } else if (isRealType(args[0].type)) {
+    } else if (isRealType(VALUE_TYPE(args[0]))) {
         centerX = (int)AS_REAL(args[0]);
     } else {
         runtimeError(vm, "FillCircle argument 1 must be numeric.");
@@ -2498,7 +2498,7 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinFillcircle) {
 
     if (IS_INTLIKE(args[1])) {
         centerY = (int)AS_INTEGER(args[1]);
-    } else if (isRealType(args[1].type)) {
+    } else if (isRealType(VALUE_TYPE(args[1]))) {
         centerY = (int)AS_REAL(args[1]);
     } else {
         runtimeError(vm, "FillCircle argument 2 must be numeric.");
@@ -2507,7 +2507,7 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinFillcircle) {
 
     if (IS_INTLIKE(args[2])) {
         radius = (int)AS_INTEGER(args[2]);
-    } else if (isRealType(args[2].type)) {
+    } else if (isRealType(VALUE_TYPE(args[2]))) {
         radius = (int)AS_REAL(args[2]);
     } else {
         runtimeError(vm, "FillCircle argument 3 must be numeric.");
@@ -2551,9 +2551,9 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinGraphloop) {
         return makeVoid();
     }
     long long ms;
-    if (IS_INTLIKE(args[0]) || args[0].type == TYPE_WORD || args[0].type == TYPE_BYTE) {
+    if (IS_INTLIKE(args[0]) || VALUE_TYPE(args[0]) == TYPE_WORD || VALUE_TYPE(args[0]) == TYPE_BYTE) {
         ms = AS_INTEGER(args[0]);
-    } else if (isRealType(args[0].type)) {
+    } else if (isRealType(VALUE_TYPE(args[0]))) {
         double delay = AS_REAL(args[0]);
         if (!isfinite(delay)) {
             runtimeError(vm, "GraphLoop delay must be finite.");
