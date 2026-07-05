@@ -1,0 +1,168 @@
+// src/compiler/opcodes.def
+//
+// Single source of truth for the PSCAL VM opcode page (VM 2.0 plan, Phase 0
+// item 4).  The OpCode enum (compiler/bytecode.h), the interpreter dispatch
+// table and kOpcodeNames (vm/vm.c), the operand-length/decoding table used by
+// the disassembler (compiler/bytecode.c), and the pscald/pscalasm mnemonic
+// table (src/disassembler/opcode_meta.c in the umbrella repo) all generate
+// from this file.  The manual's Chapter 3 tables (Docs/pscal_vm_manual/
+// pscal_vm_manual_ch3.md) are checkable against it.
+//
+// Usage: #define OP(name, value, operands, stack_in, stack_out) ... then
+// #include this file.  No include guard by design (classic X-macro).
+//
+// Columns:
+//   name      enum identifier / mnemonic
+//   value     published ordinal.  NEVER renumber an existing opcode: ordinals
+//             are pinned by _Static_asserts in bytecode.h and are part of the
+//             on-disk bytecode-cache format.  The published page is 0x00-0x63.
+//             Planned reserved ranges (plan §5.1): 0x64-0x7F core,
+//             0x80-0x9F concurrency, 0xA0-0xBF reserved, 0xC0-0xFE
+//             experimental, 0xFF escape prefix.
+//   operands  operand encoding spec, one char per operand in encoding order
+//             (multi-byte operands are big-endian):
+//               'b'  u8   raw byte (slot, arg count, dims, field/host id, width)
+//               'i'  i8   signed immediate byte
+//               'k'  u8   constant-pool index
+//               'K'  u16  constant-pool index
+//               'w'  u16  raw word (code address, entry offset, wide count/index)
+//               'j'  i16  signed jump displacement (relative to next instruction)
+//               'f'  u32  flat element offset
+//               'C'  inline-cache slot (GLOBAL_INLINE_CACHE_SLOT_SIZE bytes)
+//               "?"  (whole spec) variable-length payload; bespoke decode logic
+//                    in getInstructionLength()/disassembleInstruction()
+//   stack_in  values popped (-1 = variable / operand-dependent)
+//   stack_out values pushed (-1 = variable / operand-dependent)
+//
+// Stack effects are informational until the Phase 1e verifier consumes them;
+// keep them honest when adding opcodes.
+
+// --- Constants & immediates ---
+OP(RETURN,                     0x00, "",     1,  0)
+OP(CONSTANT,                   0x01, "k",    0,  1)
+OP(CONSTANT16,                 0x02, "K",    0,  1)
+OP(CONST_0,                    0x03, "",     0,  1)
+OP(CONST_1,                    0x04, "",     0,  1)
+OP(CONST_TRUE,                 0x05, "",     0,  1)
+OP(CONST_FALSE,                0x06, "",     0,  1)
+OP(PUSH_IMMEDIATE_INT8,        0x07, "i",    0,  1)
+
+// --- Arithmetic / logic / comparison ---
+OP(ADD,                        0x08, "",     2,  1)
+OP(SUBTRACT,                   0x09, "",     2,  1)
+OP(MULTIPLY,                   0x0A, "",     2,  1)
+OP(DIVIDE,                     0x0B, "",     2,  1)
+OP(NEGATE,                     0x0C, "",     1,  1)
+OP(NOT,                        0x0D, "",     1,  1)
+OP(TO_BOOL,                    0x0E, "",     1,  1)
+OP(EQUAL,                      0x0F, "",     2,  1)
+OP(NOT_EQUAL,                  0x10, "",     2,  1)
+OP(GREATER,                    0x11, "",     2,  1)
+OP(GREATER_EQUAL,              0x12, "",     2,  1)
+OP(LESS,                       0x13, "",     2,  1)
+OP(LESS_EQUAL,                 0x14, "",     2,  1)
+OP(INT_DIV,                    0x15, "",     2,  1)
+OP(MOD,                        0x16, "",     2,  1)
+OP(AND,                        0x17, "",     2,  1)
+OP(OR,                         0x18, "",     2,  1)
+OP(XOR,                        0x19, "",     2,  1)
+OP(SHL,                        0x1A, "",     2,  1)
+OP(SHR,                        0x1B, "",     2,  1)
+
+// --- Control flow / stack shuffling ---
+OP(JUMP_IF_FALSE,              0x1C, "j",    1,  0)
+OP(JUMP,                       0x1D, "j",    0,  0)
+OP(SWAP,                       0x1E, "",     2,  2)
+OP(DUP,                        0x1F, "",     1,  2)
+
+// --- Globals ---
+// DEFINE_GLOBAL[16] payload (bespoke decode):
+//   [name:k|K][var_type:b]
+//   TYPE_ARRAY:  [dims:b] { [lo:K][hi:K] }*dims [elem_type:b][elem_name:K]
+//   TYPE_STRING: [type_name:K][len:K]  (len const 0 = dynamic length)
+//   TYPE_FILE:   [type_name:K][elem_type:b][elem_name:K]
+//   else:        [type_name:K]
+OP(DEFINE_GLOBAL,              0x20, "?",    1,  0)
+OP(DEFINE_GLOBAL16,            0x21, "?",    1,  0)
+OP(GET_GLOBAL,                 0x22, "kC",   0,  1)
+OP(SET_GLOBAL,                 0x23, "kC",   1,  0)
+OP(GET_GLOBAL_ADDRESS,         0x24, "k",    0,  1)
+OP(GET_GLOBAL16,               0x25, "KC",   0,  1)
+OP(SET_GLOBAL16,               0x26, "KC",   1,  0)
+OP(GET_GLOBAL_ADDRESS16,       0x27, "K",    0,  1)
+OP(GET_GLOBAL_CACHED,          0x28, "kC",   0,  1)
+OP(SET_GLOBAL_CACHED,          0x29, "kC",   1,  0)
+OP(GET_GLOBAL16_CACHED,        0x2A, "KC",   0,  1)
+OP(SET_GLOBAL16_CACHED,        0x2B, "KC",   1,  0)
+
+// --- Locals & upvalues ---
+OP(GET_LOCAL,                  0x2C, "b",    0,  1)
+OP(SET_LOCAL,                  0x2D, "b",    1,  0)
+OP(INC_LOCAL,                  0x2E, "b",    0,  0)
+OP(DEC_LOCAL,                  0x2F, "b",    0,  0)
+// INIT_LOCAL_ARRAY payload (bespoke decode):
+//   [slot:b][dims:b] { [lo:K][hi:K] }*dims [elem_type:b][elem_name:K]
+OP(INIT_LOCAL_ARRAY,           0x30, "?",    0,  0)
+OP(INIT_LOCAL_FILE,            0x31, "bbK",  0,  0)
+OP(INIT_LOCAL_POINTER,         0x32, "bK",   0,  0)
+OP(INIT_LOCAL_STRING,          0x33, "bb",   0,  0)
+// INIT_FIELD_ARRAY payload: like INIT_LOCAL_ARRAY with a field index in
+// place of the slot; targets the object on top of the stack.
+OP(INIT_FIELD_ARRAY,           0x34, "?",    1,  1)
+OP(GET_LOCAL_ADDRESS,          0x35, "b",    0,  1)
+OP(GET_UPVALUE,                0x36, "b",    0,  1)
+OP(SET_UPVALUE,                0x37, "b",    1,  0)
+OP(GET_UPVALUE_ADDRESS,        0x38, "b",    0,  1)
+
+// --- Fields & elements (by name / by index) ---
+OP(GET_FIELD_ADDRESS,          0x39, "k",    1,  1)
+OP(GET_FIELD_ADDRESS16,        0x3A, "K",    1,  1)
+OP(GET_FIELD_ADDRESS_KEEP,     0x3B, "k",    1,  2)
+OP(GET_FIELD_ADDRESS_KEEP16,   0x3C, "K",    1,  2)
+OP(LOAD_FIELD_VALUE_BY_NAME,   0x3D, "k",    1,  1)
+OP(LOAD_FIELD_VALUE_BY_NAME16, 0x3E, "K",    1,  1)
+OP(GET_ELEMENT_ADDRESS,        0x3F, "b",   -1,  1)
+OP(GET_ELEMENT_ADDRESS_CONST,  0x40, "f",    1,  1)
+OP(LOAD_ELEMENT_VALUE,         0x41, "b",   -1,  1)
+OP(LOAD_ELEMENT_VALUE_CONST,   0x42, "f",    1,  1)
+OP(GET_CHAR_ADDRESS,           0x43, "",     2,  1)
+OP(SET_INDIRECT,               0x44, "",     2,  0)
+OP(GET_INDIRECT,               0x45, "",     1,  1)
+
+// --- Sets & strings ---
+OP(IN,                         0x46, "",     2,  1)
+OP(MAKE_SET_SINGLETON,         0x47, "",     1,  1)
+OP(MAKE_SET_RANGE,             0x48, "",     2,  1)
+OP(GET_CHAR_FROM_STRING,       0x49, "",     2,  1)
+
+// --- Object support ---
+OP(ALLOC_OBJECT,               0x4A, "b",    0,  1)
+OP(ALLOC_OBJECT16,             0x4B, "w",    0,  1)
+OP(GET_FIELD_OFFSET,           0x4C, "b",    1,  1)
+OP(GET_FIELD_OFFSET16,         0x4D, "w",    1,  1)
+OP(LOAD_FIELD_VALUE,           0x4E, "b",    1,  1)
+OP(LOAD_FIELD_VALUE16,         0x4F, "w",    1,  1)
+
+// --- Calls ---
+OP(CALL_BUILTIN,               0x50, "Kb",  -1,  1)
+OP(CALL_BUILTIN_PROC,          0x51, "wKb", -1,  0)
+OP(CALL_USER_PROC,             0x52, "Kb",  -1, -1)
+OP(CALL_HOST,                  0x53, "b",   -1,  1)
+OP(POP,                        0x54, "",     1,  0)
+OP(CALL,                       0x55, "Kwb", -1, -1)
+OP(CALL_INDIRECT,              0x56, "b",   -1, -1)
+OP(CALL_METHOD,                0x57, "bb",  -1, -1)
+OP(PROC_CALL_INDIRECT,         0x58, "b",   -1,  0)
+OP(HALT,                       0x59, "",     0,  0)
+OP(EXIT,                       0x5A, "",     0,  0)
+OP(FORMAT_VALUE,               0x5B, "bi",   1,  1)
+
+// --- Threads & mutexes ---
+OP(THREAD_CREATE,              0x5C, "w",    0,  1)
+OP(THREAD_JOIN,                0x5D, "",     1,  1)
+OP(MUTEX_CREATE,               0x5E, "",     0,  1)
+OP(RCMUTEX_CREATE,             0x5F, "",     0,  1)
+OP(MUTEX_LOCK,                 0x60, "",     1,  0)
+OP(MUTEX_UNLOCK,               0x61, "",     1,  0)
+OP(MUTEX_DESTROY,              0x62, "",     1,  0)
+OP(RESET_LOCAL,                0x63, "b",    0,  0)
