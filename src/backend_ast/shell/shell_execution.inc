@@ -624,33 +624,33 @@ static bool shellBuildCommand(VM *vm, int arg_count, Value *args, ShellCommand *
         return false;
     }
     Value meta = args[0];
-    if (meta.type != TYPE_STRING || !meta.s_val) {
+    if (VALUE_TYPE(meta) != TYPE_STRING || !AS_STRING(meta)) {
         runtimeError(vm, "shell exec: metadata must be a string");
         return false;
     }
-    shellParseMetadata(meta.s_val, out_cmd);
+    shellParseMetadata(AS_STRING(meta), out_cmd);
     bool saw_command_word = false;
     if (redir_dbg) {
-        fprintf(stderr, "[redir-build] arg_count=%d meta=%s\n", arg_count, meta.s_val);
+        fprintf(stderr, "[redir-build] arg_count=%d meta=%s\n", arg_count, AS_STRING(meta));
     }
     for (int i = 1; i < arg_count; ++i) {
         Value v = args[i];
-        if (v.type != TYPE_STRING || !v.s_val) {
+        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
             runtimeError(vm, "shell exec: arguments must be strings");
             shellFreeCommand(out_cmd);
             return false;
         }
         if (redir_dbg) {
-            fprintf(stderr, "[redir-build]   arg[%d]=%s\n", i, v.s_val);
+            fprintf(stderr, "[redir-build]   arg[%d]=%s\n", i, AS_STRING(v));
         }
-        if (strncmp(v.s_val, "redir:", 6) == 0) {
-            if (!shellAddRedirection(out_cmd, v.s_val)) {
-                runtimeError(vm, "shell exec: invalid redirection '%s'", v.s_val);
+        if (strncmp(AS_STRING(v), "redir:", 6) == 0) {
+            if (!shellAddRedirection(out_cmd, AS_STRING(v))) {
+                runtimeError(vm, "shell exec: invalid redirection '%s'", AS_STRING(v));
                 shellFreeCommand(out_cmd);
                 return false;
             }
         } else {
-            if (!shellAddArg(out_cmd, v.s_val, &saw_command_word)) {
+            if (!shellAddArg(out_cmd, AS_STRING(v), &saw_command_word)) {
                 runtimeError(vm, "shell exec: unable to add argument");
                 shellFreeCommand(out_cmd);
                 return false;

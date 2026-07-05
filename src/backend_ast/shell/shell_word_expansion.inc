@@ -3505,8 +3505,8 @@ static bool shellFindJobIndexByPid(pid_t pid, size_t *out_index) {
 }
 
 static bool shellParseJobSpecifier(VM *vm, const char *name, Value spec, size_t *out_index) {
-    if (spec.type == TYPE_STRING && spec.s_val) {
-        const char *text = spec.s_val;
+    if (VALUE_TYPE(spec) == TYPE_STRING && AS_STRING(spec)) {
+        const char *text = AS_STRING(spec);
         if (text[0] == '%') {
             text++;
         }
@@ -3517,7 +3517,7 @@ static bool shellParseJobSpecifier(VM *vm, const char *name, Value spec, size_t 
         char *end = NULL;
         long index = strtol(text, &end, 10);
         if (*end != '\0' || index <= 0) {
-            runtimeError(vm, "%s: invalid job '%s'", name, spec.s_val);
+            runtimeError(vm, "%s: invalid job '%s'", name, AS_STRING(spec));
             return false;
         }
         size_t pid_index = 0;
@@ -3526,7 +3526,7 @@ static bool shellParseJobSpecifier(VM *vm, const char *name, Value spec, size_t 
             return true;
         }
         if (!shellJobFindVisibleIndex((size_t)index, out_index)) {
-            runtimeError(vm, "%s: invalid job '%s'", name, spec.s_val);
+            runtimeError(vm, "%s: invalid job '%s'", name, AS_STRING(spec));
             return false;
         }
         return true;

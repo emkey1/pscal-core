@@ -316,14 +316,14 @@ Value vmBuiltinShellPipeline(VM *vm, int arg_count, Value *args) {
     VM *previous_vm = shellSwapCurrentVm(vm);
     Value result = makeVoid();
     char *merge_pattern = NULL;
-    if (arg_count != 1 || args[0].type != TYPE_STRING || !args[0].s_val) {
+    if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0])) {
         runtimeError(vm, "shell pipeline: expected metadata string");
         goto cleanup;
     }
     if (shellLoopSkipActive()) {
         goto cleanup;
     }
-    const char *meta = args[0].s_val;
+    const char *meta = AS_STRING(args[0]);
     size_t stages = 0;
     bool negated = false;
     char *copy = strdup(meta);
@@ -757,14 +757,14 @@ Value vmBuiltinShellArithmetic(VM *vm, int arg_count, Value *args) {
     VM *previous_vm = shellSwapCurrentVm(vm);
     Value result = makeVoid();
 
-    bool dispatch_mode = (arg_count >= 2 && args[0].type == TYPE_STRING);
+    bool dispatch_mode = (arg_count >= 2 && VALUE_TYPE(args[0]) == TYPE_STRING);
 
     if (dispatch_mode) {
         shellCollectJobs();
         ShellCommand cmd;
         memset(&cmd, 0, sizeof(cmd));
 
-        const char *meta = args[0].s_val;
+        const char *meta = AS_STRING(args[0]);
         if (!meta) {
             runtimeError(vm, "((: expected metadata");
             shellUpdateStatus(1);
@@ -773,13 +773,13 @@ Value vmBuiltinShellArithmetic(VM *vm, int arg_count, Value *args) {
 
         shellParseMetadata(meta, &cmd);
 
-        if (args[1].type != TYPE_STRING) {
+        if (VALUE_TYPE(args[1]) != TYPE_STRING) {
             runtimeError(vm, "((: expected expression");
             shellUpdateStatus(1);
             goto dispatch_cleanup;
         }
 
-        const char *expression = args[1].s_val ? args[1].s_val : "";
+        const char *expression = AS_STRING(args[1]) ? AS_STRING(args[1]) : "";
 
         char *name_copy = strdup("__shell_arithmetic");
         if (!name_copy) {
@@ -807,12 +807,12 @@ Value vmBuiltinShellArithmetic(VM *vm, int arg_count, Value *args) {
 
         for (int i = 2; i < arg_count; ++i) {
             Value entry = args[i];
-            if (entry.type != TYPE_STRING || !entry.s_val) {
+            if (VALUE_TYPE(entry) != TYPE_STRING || !AS_STRING(entry)) {
                 runtimeError(vm, "((: invalid redirection");
                 shellUpdateStatus(1);
                 goto dispatch_cleanup;
             }
-            if (!shellAddRedirection(&cmd, entry.s_val)) {
+            if (!shellAddRedirection(&cmd, AS_STRING(entry))) {
                 runtimeError(vm, "((: invalid redirection");
                 shellUpdateStatus(1);
                 goto dispatch_cleanup;
@@ -833,13 +833,13 @@ dispatch_cleanup:
         goto cleanup;
     }
 
-    if (args[0].type != TYPE_STRING) {
+    if (VALUE_TYPE(args[0]) != TYPE_STRING) {
         runtimeError(vm, "((: expected expression");
         shellUpdateStatus(1);
         goto cleanup;
     }
 
-    const char *expression = args[0].s_val ? args[0].s_val : "";
+    const char *expression = AS_STRING(args[0]) ? AS_STRING(args[0]) : "";
 
     long long expr_value = 0;
     if (!shellArithmeticCommandEvaluateExpression(expression, &expr_value)) {
@@ -915,7 +915,7 @@ static ShellSubshellFrame shellSubshellStackPop(void) {
 
 Value vmBuiltinShellSubshell(VM *vm, int arg_count, Value *args) {
     VM *previous_vm = shellSwapCurrentVm(vm);
-    const char *meta = (arg_count > 0 && args[0].type == TYPE_STRING) ? args[0].s_val : "";
+    const char *meta = (arg_count > 0 && VALUE_TYPE(args[0]) == TYPE_STRING) ? AS_STRING(args[0]) : "";
     bool leave = (meta && strstr(meta, "mode=leave") != NULL);
     if (leave) {
         ShellSubshellFrame frame = shellSubshellStackPop();
@@ -934,11 +934,11 @@ Value vmBuiltinShellSubshell(VM *vm, int arg_count, Value *args) {
     size_t backup_count = 0;
     for (int i = 1; i < arg_count; ++i) {
         Value entry = args[i];
-        if (entry.type != TYPE_STRING || !entry.s_val) {
+        if (VALUE_TYPE(entry) != TYPE_STRING || !AS_STRING(entry)) {
             ok = false;
             break;
         }
-        if (!shellAddRedirection(&cmd, entry.s_val)) {
+        if (!shellAddRedirection(&cmd, AS_STRING(entry))) {
             ok = false;
             break;
         }
@@ -1119,8 +1119,8 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
     VM *previous_vm = shellSwapCurrentVm(vm);
     Value result = makeVoid();
     const char *meta = NULL;
-    if (arg_count > 0 && args[0].type == TYPE_STRING && args[0].s_val) {
-        meta = args[0].s_val;
+    if (arg_count > 0 && VALUE_TYPE(args[0]) == TYPE_STRING && AS_STRING(args[0])) {
+        meta = AS_STRING(args[0]);
     }
 
     ShellLoopKind kind = SHELL_LOOP_KIND_WHILE;
@@ -1305,11 +1305,11 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
 
     if (kind == SHELL_LOOP_KIND_FOR) {
         if (payload_without_redirs < 1 || payload_cursor >= redir_start_index ||
-            args[payload_cursor].type != TYPE_STRING || !args[payload_cursor].s_val) {
+            VALUE_TYPE(args[payload_cursor]) != TYPE_STRING || !AS_STRING(args[payload_cursor])) {
             runtimeError(vm, "shell loop: expected iterator name");
             ok = false;
         } else {
-            const char *spec = args[payload_cursor].s_val;
+            const char *spec = AS_STRING(args[payload_cursor]);
             const char *text = spec;
             const char *word_meta = NULL;
             size_t word_meta_len = 0;
@@ -1334,7 +1334,7 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
         if (ok && value_count > 0) {
             for (size_t offset = 0; offset < value_count; ++offset) {
                 Value *val = &args[value_start_index + offset];
-                if (val->type != TYPE_STRING || !val->s_val) {
+                if (VALUE_TYPE(*val) != TYPE_STRING || !AS_STRING(*val)) {
                     char *empty = strdup("");
                     if (!empty || !shellLoopFrameAppendValue(frame, &values_capacity, empty)) {
                         free(empty);
@@ -1343,7 +1343,7 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
                     }
                     continue;
                 }
-                const char *spec = val->s_val;
+                const char *spec = AS_STRING(*val);
                 const char *text = spec;
                 const char *word_meta = NULL;
                 size_t word_meta_len = 0;
@@ -1486,9 +1486,9 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
                 const Value *init_val = &args[payload_cursor];
                 const Value *cond_val = &args[payload_cursor + 1];
                 const Value *update_val = &args[payload_cursor + 2];
-                const char *init_text = (init_val->type == TYPE_STRING && init_val->s_val) ? init_val->s_val : "";
-                const char *cond_text = (cond_val->type == TYPE_STRING && cond_val->s_val) ? cond_val->s_val : "";
-                const char *update_text = (update_val->type == TYPE_STRING && update_val->s_val) ? update_val->s_val : "";
+                const char *init_text = (VALUE_TYPE(*init_val) == TYPE_STRING && AS_STRING(*init_val)) ? AS_STRING(*init_val) : "";
+                const char *cond_text = (VALUE_TYPE(*cond_val) == TYPE_STRING && AS_STRING(*cond_val)) ? AS_STRING(*cond_val) : "";
+                const char *update_text = (VALUE_TYPE(*update_val) == TYPE_STRING && AS_STRING(*update_val)) ? AS_STRING(*update_val) : "";
                 frame->cfor_init = strdup(init_text);
                 frame->cfor_condition = strdup(cond_text);
                 frame->cfor_update = strdup(update_text);
@@ -1507,7 +1507,7 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
             } else {
                 if (frame->cond_kind == SHELL_LOOP_CONDITION_ARITH) {
                     const Value *entry = &args[condition_start_index];
-                    const char *expr = (entry->type == TYPE_STRING && entry->s_val) ? entry->s_val : "";
+                    const char *expr = (VALUE_TYPE(*entry) == TYPE_STRING && AS_STRING(*entry)) ? AS_STRING(*entry) : "";
                     frame->cond_arith_expression = strdup(expr);
                     if (!frame->cond_arith_expression) {
                         ok = false;
@@ -1522,7 +1522,7 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
                     } else {
                         for (size_t i = 0; i < condition_payload_count; ++i) {
                             const Value *entry = &args[condition_start_index + i];
-                            const char *spec = (entry->type == TYPE_STRING && entry->s_val) ? entry->s_val : "";
+                            const char *spec = (VALUE_TYPE(*entry) == TYPE_STRING && AS_STRING(*entry)) ? AS_STRING(*entry) : "";
                             frame->cond_words[i] = strdup(spec);
                             if (!frame->cond_words[i]) {
                                 ok = false;
@@ -1551,7 +1551,7 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
                         frame->body_kind = SHELL_LOOP_BODY_KIND_NONE;
                     } else {
                         const Value *entry = &args[body_expression_index];
-                        const char *expr = (entry->type == TYPE_STRING && entry->s_val) ? entry->s_val : "";
+                        const char *expr = (VALUE_TYPE(*entry) == TYPE_STRING && AS_STRING(*entry)) ? AS_STRING(*entry) : "";
                         frame->body_arith_expression = strdup(expr);
                         if (!frame->body_arith_expression) {
                             ok = false;
@@ -1577,7 +1577,7 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
                     frame->body_word_count = body_payload_count;
                     for (size_t i = 0; i < body_payload_count; ++i) {
                         const Value *entry = &args[body_start_index + (int)i];
-                        const char *spec = (entry->type == TYPE_STRING && entry->s_val) ? entry->s_val : "";
+                        const char *spec = (VALUE_TYPE(*entry) == TYPE_STRING && AS_STRING(*entry)) ? AS_STRING(*entry) : "";
                         frame->body_words[i] = strdup(spec);
                         if (!frame->body_words[i]) {
                             ok = false;
@@ -1601,7 +1601,7 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
                             break;
                         }
                         const Value *entry = &args[body_expression_index];
-                        const char *expr = (entry->type == TYPE_STRING && entry->s_val) ? entry->s_val : "";
+                        const char *expr = (VALUE_TYPE(*entry) == TYPE_STRING && AS_STRING(*entry)) ? AS_STRING(*entry) : "";
                         frame->body_arith_expression = strdup(expr);
                         if (!frame->body_arith_expression) {
                             ok = false;
@@ -1642,12 +1642,12 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
                 break;
             }
             Value entry = args[arg_index];
-            if (entry.type != TYPE_STRING || !entry.s_val) {
+            if (VALUE_TYPE(entry) != TYPE_STRING || !AS_STRING(entry)) {
                 runtimeError(vm, "shell loop: invalid redirection argument");
                 ok = false;
                 break;
             }
-            if (!shellAddRedirection(&redir_cmd, entry.s_val)) {
+            if (!shellAddRedirection(&redir_cmd, AS_STRING(entry))) {
                 runtimeError(vm, "shell loop: failed to parse redirection");
                 ok = false;
                 break;
@@ -1769,12 +1769,12 @@ Value vmBuiltinShellIf(VM *vm, int arg_count, Value *args) {
 Value vmBuiltinShellCase(VM *vm, int arg_count, Value *args) {
     VM *previous_vm = shellSwapCurrentVm(vm);
     Value result = makeVoid();
-    if (arg_count != 2 || args[1].type != TYPE_STRING || !args[1].s_val) {
+    if (arg_count != 2 || VALUE_TYPE(args[1]) != TYPE_STRING || !AS_STRING(args[1])) {
         runtimeError(vm, "shell case: expected metadata and subject word");
         shellUpdateStatus(1);
         goto cleanup;
     }
-    const char *subject_spec = args[1].s_val;
+    const char *subject_spec = AS_STRING(args[1]);
     const char *subject_text = subject_spec;
     const char *subject_meta = NULL;
     size_t subject_meta_len = 0;
@@ -1813,7 +1813,7 @@ Value vmBuiltinShellCaseClause(VM *vm, int arg_count, Value *args) {
     VM *previous_vm = shellSwapCurrentVm(vm);
     Value result = makeVoid();
     shellRuntimeEnterCondition();
-    if (arg_count < 1 || args[0].type != TYPE_STRING) {
+    if (arg_count < 1 || VALUE_TYPE(args[0]) != TYPE_STRING) {
         runtimeError(vm, "shell case clause: expected metadata");
         shellUpdateStatus(1);
         goto cleanup;
@@ -1831,10 +1831,10 @@ Value vmBuiltinShellCaseClause(VM *vm, int arg_count, Value *args) {
     const char *subject = ctx->subject ? ctx->subject : "";
     bool matched = false;
     for (int i = 1; i < arg_count; ++i) {
-        if (args[i].type != TYPE_STRING || !args[i].s_val) {
+        if (VALUE_TYPE(args[i]) != TYPE_STRING || !AS_STRING(args[i])) {
             continue;
         }
-        const char *pattern_spec = args[i].s_val;
+        const char *pattern_spec = AS_STRING(args[i]);
         const char *pattern_text = pattern_spec;
         const char *pattern_meta = NULL;
         size_t pattern_meta_len = 0;
@@ -2278,8 +2278,8 @@ Value vmBuiltinShellTest(VM *vm, int arg_count, Value *args) {
             return makeVoid();
         }
         for (int i = 0; i < arg_count; ++i) {
-            if (args[i].type == TYPE_STRING && args[i].s_val) {
-                argv[i] = args[i].s_val;
+            if (VALUE_TYPE(args[i]) == TYPE_STRING && AS_STRING(args[i])) {
+                argv[i] = AS_STRING(args[i]);
             } else {
                 argv[i] = "";
             }
@@ -2350,34 +2350,34 @@ Value vmBuiltinShellDefineFunction(VM *vm, int arg_count, Value *args) {
         shellUpdateStatus(1);
         goto cleanup;
     }
-    if (args[0].type != TYPE_STRING || !args[0].s_val || args[0].s_val[0] == '\0') {
+    if (VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0]) || AS_STRING(args[0])[0] == '\0') {
         runtimeError(vm, "shell define function: name must be a non-empty string");
         shellUpdateStatus(1);
         goto cleanup;
     }
-    if (args[1].type != TYPE_STRING && args[1].type != TYPE_VOID && args[1].type != TYPE_NIL) {
+    if (VALUE_TYPE(args[1]) != TYPE_STRING && VALUE_TYPE(args[1]) != TYPE_VOID && VALUE_TYPE(args[1]) != TYPE_NIL) {
         runtimeError(vm, "shell define function: parameter metadata must be a string");
         shellUpdateStatus(1);
         goto cleanup;
     }
-    if (args[2].type != TYPE_POINTER || !args[2].ptr_val) {
+    if (VALUE_TYPE(args[2]) != TYPE_POINTER || !AS_POINTER(args[2])) {
         runtimeError(vm, "shell define function: missing compiled body");
         shellUpdateStatus(1);
         goto cleanup;
     }
-    const char *name = args[0].s_val;
+    const char *name = AS_STRING(args[0]);
     const char *param_meta = NULL;
-    if (args[1].type == TYPE_STRING && args[1].s_val) {
-        param_meta = args[1].s_val;
+    if (VALUE_TYPE(args[1]) == TYPE_STRING && AS_STRING(args[1])) {
+        param_meta = AS_STRING(args[1]);
     }
-    ShellCompiledFunction *compiled = (ShellCompiledFunction *)args[2].ptr_val;
+    ShellCompiledFunction *compiled = (ShellCompiledFunction *)AS_POINTER(args[2]);
     if (!shellStoreFunction(name, param_meta, compiled)) {
         shellDisposeCompiledFunction(compiled);
         runtimeError(vm, "shell define function: failed to store '%s'", name);
         shellUpdateStatus(1);
         goto cleanup;
     }
-    args[2].ptr_val = NULL;
+    AS_POINTER(args[2]) = NULL;
     shellUpdateStatus(0);
 
 cleanup:
@@ -2663,7 +2663,7 @@ Value vmBuiltinShellDoubleBracket(VM *vm, int arg_count, Value *args) {
      * the rewrite step failed and left a trailing "]]" argument. */
     while (arg_count > 0) {
         const Value *last = &args[arg_count - 1];
-        const char *text = (last->type == TYPE_STRING && last->s_val) ? last->s_val : "";
+        const char *text = (VALUE_TYPE(*last) == TYPE_STRING && AS_STRING(*last)) ? AS_STRING(*last) : "";
         if (strcmp(text, "]]") != 0) {
             break;
         }
@@ -2673,7 +2673,7 @@ Value vmBuiltinShellDoubleBracket(VM *vm, int arg_count, Value *args) {
     int index = 0;
     while (index < arg_count) {
         const Value *value = &args[index];
-        const char *text = (value->type == TYPE_STRING && value->s_val) ? value->s_val : "";
+        const char *text = (VALUE_TYPE(*value) == TYPE_STRING && AS_STRING(*value)) ? AS_STRING(*value) : "";
         if (strcmp(text, "!") != 0) {
             break;
         }
@@ -2687,15 +2687,15 @@ Value vmBuiltinShellDoubleBracket(VM *vm, int arg_count, Value *args) {
         goto done;
     }
 
-    const char *first = (args[index].type == TYPE_STRING && args[index].s_val) ? args[index].s_val : "";
+    const char *first = (VALUE_TYPE(args[index]) == TYPE_STRING && AS_STRING(args[index])) ? AS_STRING(args[index]) : "";
     if (remaining == 1) {
         result = (first[0] != '\0');
         goto done;
     }
 
     if (remaining == 2) {
-        const char *operand = (args[index + 1].type == TYPE_STRING && args[index + 1].s_val)
-                                  ? args[index + 1].s_val
+        const char *operand = (VALUE_TYPE(args[index + 1]) == TYPE_STRING && AS_STRING(args[index + 1]))
+                                  ? AS_STRING(args[index + 1])
                                   : "";
         bool evaluated = false;
         if (strcmp(first, "-z") == 0) {
@@ -2721,11 +2721,11 @@ Value vmBuiltinShellDoubleBracket(VM *vm, int arg_count, Value *args) {
 
     if (remaining >= 3) {
         const char *left = first;
-        const char *op = (args[index + 1].type == TYPE_STRING && args[index + 1].s_val)
-                             ? args[index + 1].s_val
+        const char *op = (VALUE_TYPE(args[index + 1]) == TYPE_STRING && AS_STRING(args[index + 1]))
+                             ? AS_STRING(args[index + 1])
                              : "";
-        const char *right = (args[index + 2].type == TYPE_STRING && args[index + 2].s_val)
-                                ? args[index + 2].s_val
+        const char *right = (VALUE_TYPE(args[index + 2]) == TYPE_STRING && AS_STRING(args[index + 2]))
+                                ? AS_STRING(args[index + 2])
                                 : "";
 
         bool compared = false;
@@ -2776,8 +2776,8 @@ Value vmBuiltinShellCd(VM *vm, int arg_count, Value *args) {
     const char *path = NULL;
     int arg_index = 0;
 
-    if (arg_count > 0 && args[0].type == TYPE_STRING && args[0].s_val &&
-        strcmp(args[0].s_val, "--") == 0) {
+    if (arg_count > 0 && VALUE_TYPE(args[0]) == TYPE_STRING && AS_STRING(args[0]) &&
+        strcmp(AS_STRING(args[0]), "--") == 0) {
         arg_index = 1;
     }
 
@@ -2792,13 +2792,13 @@ Value vmBuiltinShellCd(VM *vm, int arg_count, Value *args) {
             shellUpdateStatus(1);
             return makeVoid();
         }
-    } else if (args[arg_index].type == TYPE_STRING && args[arg_index].s_val) {
+    } else if (VALUE_TYPE(args[arg_index]) == TYPE_STRING && AS_STRING(args[arg_index])) {
         if (remaining > 1) {
             runtimeError(vm, "cd: too many arguments");
             shellUpdateStatus(1);
             return makeVoid();
         }
-        path = args[arg_index].s_val;
+        path = AS_STRING(args[arg_index]);
     } else {
         runtimeError(vm, "cd: expected directory path");
         shellUpdateStatus(1);
@@ -2954,10 +2954,10 @@ Value vmBuiltinShellCat(VM *vm, int arg_count, Value *args) {
 
     while (index < arg_count) {
         const Value *arg = &args[index];
-        if (arg->type != TYPE_STRING || !arg->s_val || arg->s_val[0] != '-') {
+        if (VALUE_TYPE(*arg) != TYPE_STRING || !AS_STRING(*arg) || AS_STRING(*arg)[0] != '-') {
             break;
         }
-        const char *opt = arg->s_val + 1;
+        const char *opt = AS_STRING(*arg) + 1;
         if (*opt == '\0') {
             break;
         }
@@ -2984,12 +2984,12 @@ Value vmBuiltinShellCat(VM *vm, int arg_count, Value *args) {
     } else {
         for (int i = index; i < arg_count; ++i) {
             const Value *arg = &args[i];
-            if (arg->type != TYPE_STRING || !arg->s_val) {
+            if (VALUE_TYPE(*arg) != TYPE_STRING || !AS_STRING(*arg)) {
                 runtimeError(vm, "cat: expected string arguments");
                 status = 1;
                 break;
             }
-            int rc = shellCatPath(arg->s_val, show_nonprinting);
+            int rc = shellCatPath(AS_STRING(*arg), show_nonprinting);
             if (rc != 0 && status == 0) status = rc;
         }
     }
@@ -3004,29 +3004,29 @@ Value vmBuiltinShellChmod(VM *vm, int arg_count, Value *args) {
         shellUpdateStatus(1);
         return makeVoid();
     }
-    if (args[0].type != TYPE_STRING || !args[0].s_val || args[0].s_val[0] == '\0') {
+    if (VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0]) || AS_STRING(args[0])[0] == '\0') {
         runtimeError(vm, "chmod: invalid mode");
         shellUpdateStatus(1);
         return makeVoid();
     }
     char *endptr = NULL;
     errno = 0;
-    long parsed = strtol(args[0].s_val, &endptr, 8);
+    long parsed = strtol(AS_STRING(args[0]), &endptr, 8);
     if (errno != 0 || !endptr || *endptr != '\0' || parsed < 0 || parsed > 07777) {
-        runtimeError(vm, "chmod: %s: invalid mode", args[0].s_val);
+        runtimeError(vm, "chmod: %s: invalid mode", AS_STRING(args[0]));
         shellUpdateStatus(1);
         return makeVoid();
     }
     mode_t mode = (mode_t)parsed;
     int final_status = 0;
     for (int i = 1; i < arg_count; ++i) {
-        if (args[i].type != TYPE_STRING || !args[i].s_val || args[i].s_val[0] == '\0') {
+        if (VALUE_TYPE(args[i]) != TYPE_STRING || !AS_STRING(args[i]) || AS_STRING(args[i])[0] == '\0') {
             runtimeError(vm, "chmod: expected file paths");
             shellUpdateStatus(1);
             return makeVoid();
         }
-        if (chmod(args[i].s_val, mode) != 0) {
-            fprintf(stderr, "chmod: %s: %s\n", args[i].s_val, strerror(errno));
+        if (chmod(AS_STRING(args[i]), mode) != 0) {
+            fprintf(stderr, "chmod: %s: %s\n", AS_STRING(args[i]), strerror(errno));
             if (final_status == 0) {
                 final_status = errno ? errno : 1;
             }
@@ -3063,8 +3063,8 @@ Value vmBuiltinShellClear(VM *vm, int arg_count, Value *args) {
 Value vmBuiltinShellStdioInfo(VM *vm, int arg_count, Value *args) {
     (void)args;
     if (arg_count > 0) {
-        if (arg_count == 1 && args[0].type == TYPE_STRING && args[0].s_val &&
-            (strcmp(args[0].s_val, "--help") == 0 || strcmp(args[0].s_val, "-h") == 0)) {
+        if (arg_count == 1 && VALUE_TYPE(args[0]) == TYPE_STRING && AS_STRING(args[0]) &&
+            (strcmp(AS_STRING(args[0]), "--help") == 0 || strcmp(AS_STRING(args[0]), "-h") == 0)) {
             printf("stdioinfo\n");
             printf("  Show shell stdio and session routing details.\n");
             shellUpdateStatus(0);
@@ -3128,13 +3128,13 @@ Value vmBuiltinShellStdioInfo(VM *vm, int arg_count, Value *args) {
 }
 
 Value vmBuiltinShellTabName(VM *vm, int arg_count, Value *args) {
-    if (arg_count != 1 || args[0].type != TYPE_STRING || !args[0].s_val) {
+    if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0])) {
         runtimeError(vm, "tabname: expected a single title string");
         shellUpdateStatus(1);
         return makeVoid();
     }
 #if defined(PSCAL_TAB_TITLE_SUPPORT)
-    const char *title = args[0].s_val;
+    const char *title = AS_STRING(args[0]);
     int rc = PSCALRuntimeSetTabTitle(title);
     if (rc != 0) {
         runtimeError(vm, "tabname: unable to update tab title");
@@ -3151,13 +3151,13 @@ Value vmBuiltinShellTabName(VM *vm, int arg_count, Value *args) {
 }
 
 Value vmBuiltinShellTabStartupCommand(VM *vm, int arg_count, Value *args) {
-    if (arg_count != 1 || args[0].type != TYPE_STRING || !args[0].s_val) {
+    if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0])) {
         runtimeError(vm, "tscommand: expected a single command string");
         shellUpdateStatus(1);
         return makeVoid();
     }
 #if defined(PSCAL_TAB_TITLE_SUPPORT)
-    const char *command = args[0].s_val;
+    const char *command = AS_STRING(args[0]);
     int rc = PSCALRuntimeSetTabStartupCommand(command);
     if (rc != 0) {
         runtimeError(vm, "tscommand: unable to update tab startup command");
@@ -3250,13 +3250,13 @@ Value vmBuiltinShellGwin(VM *vm, int arg_count, Value *args) {
 
     const char *message = piped_message ? piped_message : "gwin for the win";
     if (arg_count > 0) {
-        if (args[0].type != TYPE_STRING || !args[0].s_val) {
+        if (VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0])) {
             runtimeError(vm, "gwin: expected an optional message string");
             shellUpdateStatus(1);
             free(piped_message);
             return makeVoid();
         }
-        message = args[0].s_val;
+        message = AS_STRING(args[0]);
     }
     pscalShowGwinMessage(message);
     shellUpdateStatus(0);
@@ -4191,7 +4191,7 @@ static Value shellRunToolBuiltin(VM *vm,
         argv[0] = strdup("exsh");
         for (int i = 0; i < arg_count; ++i) {
             const Value *v = &args[i];
-            const char *s = (v->type == TYPE_STRING && v->s_val) ? v->s_val : "";
+            const char *s = (VALUE_TYPE(*v) == TYPE_STRING && AS_STRING(*v)) ? AS_STRING(*v) : "";
             argv[i + 1] = strdup(s);
         }
         int status = entry(argc, argv);
@@ -4245,12 +4245,12 @@ static Value shellRunToolBuiltin(VM *vm,
 
     for (int i = 0; ok && i < arg_count; ++i) {
         const Value *arg = &args[i];
-        if (arg->type != TYPE_STRING) {
+        if (VALUE_TYPE(*arg) != TYPE_STRING) {
             runtimeError(vm, "%s: expected string arguments", tool_name);
             ok = false;
             break;
         }
-        const char *src = arg->s_val ? arg->s_val : "";
+        const char *src = AS_STRING(*arg) ? AS_STRING(*arg) : "";
         argv[i + 1] = strdup(src);
         if (!argv[i + 1]) {
             runtimeError(vm, "%s: out of memory", tool_name);
@@ -4474,10 +4474,10 @@ Value vmBuiltinShellLs(VM *vm, int arg_count, Value *args) {
     bool show_almost_all = false;
     int index = 0;
     while (index < arg_count) {
-        if (args[index].type != TYPE_STRING || !args[index].s_val) {
+        if (VALUE_TYPE(args[index]) != TYPE_STRING || !AS_STRING(args[index])) {
             break;
         }
-        const char *word = args[index].s_val;
+        const char *word = AS_STRING(args[index]);
         if (word[0] != '-') {
             break;
         }
@@ -4517,13 +4517,13 @@ Value vmBuiltinShellLs(VM *vm, int arg_count, Value *args) {
         }
         for (int i = 0; i < path_count; ++i) {
             const Value *arg = &args[index + i];
-            if (arg->type != TYPE_STRING || !arg->s_val) {
+            if (VALUE_TYPE(*arg) != TYPE_STRING || !AS_STRING(*arg)) {
                 runtimeError(vm, "ls: expected string path arguments");
                 free(paths);
                 shellUpdateStatus(1);
                 return makeVoid();
             }
-            paths[i] = arg->s_val;
+            paths[i] = AS_STRING(*arg);
         }
     }
 
@@ -4647,7 +4647,7 @@ Value vmBuiltinShellPushd(VM *vm, int arg_count, Value *args) {
         return makeVoid();
     }
 
-    if (args[0].type != TYPE_STRING || !args[0].s_val) {
+    if (VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0])) {
         runtimeError(vm, "pushd: expected directory path");
         shellUpdateStatus(1);
         return makeVoid();
@@ -4662,7 +4662,7 @@ Value vmBuiltinShellPushd(VM *vm, int arg_count, Value *args) {
 
     char *new_cwd = NULL;
     char *old_cwd = NULL;
-    if (!shellDirectoryStackChdir(vm, "pushd", args[0].s_val, &new_cwd, &old_cwd)) {
+    if (!shellDirectoryStackChdir(vm, "pushd", AS_STRING(args[0]), &new_cwd, &old_cwd)) {
         return makeVoid();
     }
 
@@ -4725,12 +4725,12 @@ Value vmBuiltinShellFinger(VM *vm, int arg_count, Value *args) {
         return makeVoid();
     }
     if (arg_count == 1) {
-        if (args[0].type != TYPE_STRING || !args[0].s_val || !*args[0].s_val) {
+        if (VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0]) || !*AS_STRING(args[0])) {
             runtimeError(vm, "finger: expected username as string");
             shellUpdateStatus(1);
             return makeVoid();
         }
-        target_user = args[0].s_val;
+        target_user = AS_STRING(args[0]);
     }
 
     struct passwd *pw = NULL;
@@ -4905,7 +4905,7 @@ Value vmBuiltinShellEcho(VM *vm, int arg_count, Value *args) {
             break;
         }
         Value val = args[i];
-        const char *token = (val.type == TYPE_STRING && val.s_val) ? val.s_val : "";
+        const char *token = (VALUE_TYPE(val) == TYPE_STRING && AS_STRING(val)) ? AS_STRING(val) : "";
         if (!token) {
             token = "";
         }
@@ -4952,7 +4952,7 @@ Value vmBuiltinShellEcho(VM *vm, int arg_count, Value *args) {
         if (i > first_arg) {
             fputc(' ', stdout);
         }
-        const char *text = (val.type == TYPE_STRING && val.s_val) ? val.s_val : "";
+        const char *text = (VALUE_TYPE(val) == TYPE_STRING && AS_STRING(val)) ? AS_STRING(val) : "";
         shellEchoWriteString(text, interpret_escapes, &stop_output, &emit_newline);
     }
 
@@ -4983,12 +4983,12 @@ Value vmBuiltinShellFalse(VM *vm, int arg_count, Value *args) {
 }
 
 Value vmBuiltinShellSource(VM *vm, int arg_count, Value *args) {
-    if (arg_count < 1 || args[0].type != TYPE_STRING || !args[0].s_val) {
+    if (arg_count < 1 || VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0])) {
         runtimeError(vm, "source: expected path to script");
         shellUpdateStatus(1);
         return makeVoid();
     }
-    const char *path = args[0].s_val;
+    const char *path = AS_STRING(args[0]);
     const char *base = strrchr(path, '/');
     base = base ? (base + 1) : path;
     if (base && strcmp(base, ".exshrc.local") == 0 && access(path, F_OK) != 0) {
@@ -5020,14 +5020,14 @@ Value vmBuiltinShellSource(VM *vm, int arg_count, Value *args) {
             return makeVoid();
         }
         for (int i = 0; i < new_count; ++i) {
-            if (args[i + 1].type != TYPE_STRING || !args[i + 1].s_val) {
+            if (VALUE_TYPE(args[i + 1]) != TYPE_STRING || !AS_STRING(args[i + 1])) {
                 shellFreeParameterArray(new_params, i);
                 free(source);
                 runtimeError(vm, "source: arguments must be strings");
                 shellUpdateStatus(1);
                 return makeVoid();
             }
-            new_params[i] = strdup(args[i + 1].s_val);
+            new_params[i] = strdup(AS_STRING(args[i + 1]));
             if (!new_params[i]) {
                 shellFreeParameterArray(new_params, i);
                 free(source);
@@ -5084,12 +5084,12 @@ Value vmBuiltinShellEval(VM *vm, int arg_count, Value *args) {
 
     size_t total_len = 0;
     for (int i = 0; i < arg_count; ++i) {
-        if (args[i].type != TYPE_STRING || !args[i].s_val) {
+        if (VALUE_TYPE(args[i]) != TYPE_STRING || !AS_STRING(args[i])) {
             runtimeError(vm, "eval: arguments must be strings");
             shellUpdateStatus(1);
             return makeVoid();
         }
-        total_len += strlen(args[i].s_val);
+        total_len += strlen(AS_STRING(args[i]));
         if (i + 1 < arg_count) {
             total_len += 1; // Space separator.
         }
@@ -5104,8 +5104,8 @@ Value vmBuiltinShellEval(VM *vm, int arg_count, Value *args) {
 
     char *cursor = script;
     for (int i = 0; i < arg_count; ++i) {
-        size_t len = strlen(args[i].s_val);
-        memcpy(cursor, args[i].s_val, len);
+        size_t len = strlen(AS_STRING(args[i]));
+        memcpy(cursor, AS_STRING(args[i]), len);
         cursor += len;
         if (i + 1 < arg_count) {
             *cursor++ = ' ';
@@ -5172,14 +5172,14 @@ Value vmBuiltinShellLet(VM *vm, int arg_count, Value *args) {
     long long last_value = 0;
     for (int i = 0; i < arg_count; ++i) {
         Value value = args[i];
-        if (value.type != TYPE_STRING || !value.s_val) {
+        if (VALUE_TYPE(value) != TYPE_STRING || !AS_STRING(value)) {
             runtimeError(vm, "let: arguments must be strings");
             shellMarkArithmeticError();
             ok = false;
             break;
         }
         long long expr_value = 0;
-        if (!shellLetEvaluateExpression(vm, value.s_val, &expr_value)) {
+        if (!shellLetEvaluateExpression(vm, AS_STRING(value), &expr_value)) {
             ok = false;
             break;
         }
@@ -5200,15 +5200,15 @@ Value vmBuiltinShellExit(VM *vm, int arg_count, Value *args) {
         Value arg = args[0];
         if (IS_INTLIKE(arg)) {
             code = (int)AS_INTEGER(arg);
-        } else if (arg.type == TYPE_STRING && arg.s_val) {
-            if (*arg.s_val == '\0') {
+        } else if (VALUE_TYPE(arg) == TYPE_STRING && AS_STRING(arg)) {
+            if (*AS_STRING(arg) == '\0') {
                 code = 0;
             } else {
                 int parsed = 0;
-                if (shellParseReturnStatus(arg.s_val, &parsed)) {
+                if (shellParseReturnStatus(AS_STRING(arg), &parsed)) {
                     code = parsed;
                 } else {
-                    fprintf(stderr, "exit: %s: numeric argument required\n", arg.s_val);
+                    fprintf(stderr, "exit: %s: numeric argument required\n", AS_STRING(arg));
                     code = 2;
                 }
             }
@@ -5246,15 +5246,15 @@ Value vmBuiltinShellLogout(VM *vm, int arg_count, Value *args) {
     int status = 0;
     if (arg_count == 1) {
         Value v = args[0];
-        if (v.type != TYPE_STRING || !v.s_val) {
+        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
             fprintf(stderr, "logout: status must be a numeric string\n");
             shellUpdateStatus(1);
             shellRestoreCurrentVm(previous_vm);
             return makeVoid();
         }
         int parsed = 0;
-        if (!shellParseReturnStatus(v.s_val, &parsed)) {
-            fprintf(stderr, "logout: invalid status '%s'\n", v.s_val);
+        if (!shellParseReturnStatus(AS_STRING(v), &parsed)) {
+            fprintf(stderr, "logout: invalid status '%s'\n", AS_STRING(v));
             shellUpdateStatus(1);
             shellRestoreCurrentVm(previous_vm);
             return makeVoid();
@@ -5298,13 +5298,13 @@ Value vmBuiltinShellExecCommand(VM *vm, int arg_count, Value *args) {
     bool ok = true;
     for (int i = 0; i < arg_count && ok; ++i) {
         Value val = args[i];
-        if (val.type != TYPE_STRING || !val.s_val) {
+        if (VALUE_TYPE(val) != TYPE_STRING || !AS_STRING(val)) {
             runtimeError(vm, "exec: arguments must be strings");
             shellUpdateStatus(1);
             ok = false;
             break;
         }
-        char *copy = strdup(val.s_val);
+        char *copy = strdup(AS_STRING(val));
         if (!copy) {
             runtimeError(vm, "exec: out of memory");
             shellUpdateStatus(1);
@@ -5338,15 +5338,15 @@ Value vmBuiltinShellReturn(VM *vm, int arg_count, Value *args) {
 
     if (arg_count == 1) {
         Value v = args[0];
-        if (v.type != TYPE_STRING || !v.s_val) {
+        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
             runtimeError(vm, "return: status must be a string number");
             shellUpdateStatus(1);
             shellRestoreCurrentVm(previous_vm);
             return makeVoid();
         }
         int parsed = 0;
-        if (!shellParseReturnStatus(v.s_val, &parsed)) {
-            runtimeError(vm, "return: invalid status '%s'", v.s_val);
+        if (!shellParseReturnStatus(AS_STRING(v), &parsed)) {
+            runtimeError(vm, "return: invalid status '%s'", AS_STRING(v));
             shellUpdateStatus(1);
             shellRestoreCurrentVm(previous_vm);
             return makeVoid();
@@ -5484,13 +5484,13 @@ Value vmBuiltinShellPrintf(VM *vm, int arg_count, Value *args) {
         shellUpdateStatus(2);
         return makeVoid();
     }
-    if (args[0].type != TYPE_STRING || !args[0].s_val) {
+    if (VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0])) {
         shellReportRecoverableError(vm, true, "printf: format string required");
         shellUpdateStatus(2);
         return makeVoid();
     }
 
-    const char *fmt = args[0].s_val;
+    const char *fmt = AS_STRING(args[0]);
     int arg_index = 1;
     bool ok = true;
 
@@ -5680,8 +5680,8 @@ Value vmBuiltinShellPrintf(VM *vm, int arg_count, Value *args) {
                 if (width_from_arg && arg_index < arg_count) {
                     Value value = args[arg_index];
                     const char *width_text = "";
-                    if (value.type == TYPE_STRING && value.s_val) {
-                        width_text = value.s_val;
+                    if (VALUE_TYPE(value) == TYPE_STRING && AS_STRING(value)) {
+                        width_text = AS_STRING(value);
                     }
                     if (width_text[0] == '\0') {
                         width_value = 0;
@@ -5708,8 +5708,8 @@ Value vmBuiltinShellPrintf(VM *vm, int arg_count, Value *args) {
                 if (precision_from_arg && arg_index < arg_count) {
                     Value value = args[arg_index];
                     const char *precision_text = "";
-                    if (value.type == TYPE_STRING && value.s_val) {
-                        precision_text = value.s_val;
+                    if (VALUE_TYPE(value) == TYPE_STRING && AS_STRING(value)) {
+                        precision_text = AS_STRING(value);
                     }
                     if (precision_text[0] == '\0') {
                         precision_value = 0;
@@ -5735,9 +5735,9 @@ Value vmBuiltinShellPrintf(VM *vm, int arg_count, Value *args) {
                 const char *arg_text = "";
                 if (arg_index < arg_count) {
                     Value value = args[arg_index];
-                    if (value.type == TYPE_STRING && value.s_val) {
-                        arg_text = value.s_val;
-                    } else if (value.type == TYPE_STRING && !value.s_val) {
+                    if (VALUE_TYPE(value) == TYPE_STRING && AS_STRING(value)) {
+                        arg_text = AS_STRING(value);
+                    } else if (VALUE_TYPE(value) == TYPE_STRING && !AS_STRING(value)) {
                         arg_text = "";
                     }
                     arg_index++;
@@ -5958,10 +5958,10 @@ Value vmBuiltinShellRead(VM *vm, int arg_count, Value *args) {
         bool legacy_vm_read_call = true;
         for (int i = 0; i < arg_count; ++i) {
             Value val = args[i];
-            if (val.type == TYPE_POINTER && val.ptr_val) {
+            if (VALUE_TYPE(val) == TYPE_POINTER && AS_POINTER(val)) {
                 continue;
             }
-            if (val.type == TYPE_FILE) {
+            if (VALUE_TYPE(val) == TYPE_FILE) {
                 continue;
             }
             legacy_vm_read_call = false;
@@ -5974,12 +5974,12 @@ Value vmBuiltinShellRead(VM *vm, int arg_count, Value *args) {
 
     for (int i = 0; i < arg_count && ok; ++i) {
         Value val = args[i];
-        if (val.type != TYPE_STRING || !val.s_val) {
+        if (VALUE_TYPE(val) != TYPE_STRING || !AS_STRING(val)) {
             runtimeError(vm, "read: arguments must be strings");
             ok = false;
             break;
         }
-        const char *token = val.s_val;
+        const char *token = AS_STRING(val);
         if (parsing_options) {
             if (strcmp(token, "--") == 0) {
                 parsing_options = false;
@@ -6027,12 +6027,12 @@ Value vmBuiltinShellRead(VM *vm, int arg_count, Value *args) {
                         break;
                     }
                     Value prompt_val = args[++i];
-                    if (prompt_val.type != TYPE_STRING || !prompt_val.s_val) {
+                    if (VALUE_TYPE(prompt_val) != TYPE_STRING || !AS_STRING(prompt_val)) {
                         runtimeError(vm, "read: prompt must be a string");
                         ok = false;
                         break;
                     }
-                    prompt = prompt_val.s_val;
+                    prompt = AS_STRING(prompt_val);
                 }
                 if (!ok) {
                     break;
@@ -6044,12 +6044,12 @@ Value vmBuiltinShellRead(VM *vm, int arg_count, Value *args) {
                         break;
                     }
                     Value array_val = args[++i];
-                    if (array_val.type != TYPE_STRING || !array_val.s_val || array_val.s_val[0] == '\0') {
+                    if (VALUE_TYPE(array_val) != TYPE_STRING || !AS_STRING(array_val) || AS_STRING(array_val)[0] == '\0') {
                         runtimeError(vm, "read: array name must be a non-empty string");
                         ok = false;
                         break;
                     }
-                    array_name = array_val.s_val;
+                    array_name = AS_STRING(array_val);
                 }
                 continue;
             }
@@ -6218,24 +6218,24 @@ Value vmBuiltinShellGetopts(VM *vm, int arg_count, Value *args) {
         shellUpdateStatus(2);
         return makeVoid();
     }
-    if (args[0].type != TYPE_STRING || !args[0].s_val) {
+    if (VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0])) {
         runtimeError(vm, "getopts: option string must be provided");
         shellUpdateStatus(2);
         return makeVoid();
     }
-    if (args[1].type != TYPE_STRING || !args[1].s_val || args[1].s_val[0] == '\0') {
+    if (VALUE_TYPE(args[1]) != TYPE_STRING || !AS_STRING(args[1]) || AS_STRING(args[1])[0] == '\0') {
         runtimeError(vm, "getopts: variable name must be a non-empty string");
         shellUpdateStatus(2);
         return makeVoid();
     }
 
-    const char *optstring = args[0].s_val;
+    const char *optstring = AS_STRING(args[0]);
     bool silent_errors = false;
     if (optstring[0] == ':') {
         silent_errors = true;
         optstring++;
     }
-    const char *name = args[1].s_val;
+    const char *name = AS_STRING(args[1]);
 
     char **argv_list = NULL;
     int argc_list = 0;
@@ -6251,11 +6251,11 @@ Value vmBuiltinShellGetopts(VM *vm, int arg_count, Value *args) {
         bool valid = true;
         for (int i = 0; i < argc_list; ++i) {
             Value val = args[i + 2];
-            if (val.type != TYPE_STRING || !val.s_val) {
+            if (VALUE_TYPE(val) != TYPE_STRING || !AS_STRING(val)) {
                 valid = false;
                 break;
             }
-            override_args[i] = val.s_val;
+            override_args[i] = AS_STRING(val);
         }
         if (!valid) {
             free(override_args);
@@ -6431,28 +6431,28 @@ Value vmBuiltinShellMapfile(VM *vm, int arg_count, Value *args) {
 
     while (index < arg_count) {
         Value arg = args[index];
-        if (arg.type != TYPE_STRING || !arg.s_val) {
+        if (VALUE_TYPE(arg) != TYPE_STRING || !AS_STRING(arg)) {
             runtimeError(vm, "mapfile: invalid argument");
             shellUpdateStatus(2);
             return makeVoid();
         }
-        if (strcmp(arg.s_val, "-t") == 0) {
+        if (strcmp(AS_STRING(arg), "-t") == 0) {
             strip_newline = true;
             index++;
             continue;
         }
-        if (arg.s_val[0] == '-') {
-            runtimeError(vm, "mapfile: unsupported option '%s'", arg.s_val);
+        if (AS_STRING(arg)[0] == '-') {
+            runtimeError(vm, "mapfile: unsupported option '%s'", AS_STRING(arg));
             shellUpdateStatus(2);
             return makeVoid();
         }
-        array_name = arg.s_val;
+        array_name = AS_STRING(arg);
         index++;
         break;
     }
 
     if (index < arg_count) {
-        runtimeError(vm, "mapfile: unexpected argument '%s'", args[index].s_val);
+        runtimeError(vm, "mapfile: unexpected argument '%s'", AS_STRING(args[index]));
         shellUpdateStatus(2);
         return makeVoid();
     }
@@ -6511,16 +6511,16 @@ Value vmBuiltinShellShift(VM *vm, int arg_count, Value *args) {
     }
     if (arg_count == 1) {
         Value v = args[0];
-        if (v.type != TYPE_STRING || !v.s_val || !*v.s_val) {
+        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v) || !*AS_STRING(v)) {
             runtimeError(vm, "shift: expected numeric argument");
             shellUpdateStatus(1);
             return makeVoid();
         }
         char *end = NULL;
         errno = 0;
-        long parsed = strtol(v.s_val, &end, 10);
+        long parsed = strtol(AS_STRING(v), &end, 10);
         if (errno != 0 || !end || *end != '\0' || parsed < 0 || parsed > INT_MAX) {
-            runtimeError(vm, "shift: invalid count '%s'", v.s_val);
+            runtimeError(vm, "shift: invalid count '%s'", AS_STRING(v));
             shellUpdateStatus(1);
             return makeVoid();
         }
@@ -6569,32 +6569,32 @@ Value vmBuiltinShellSetenv(VM *vm, int arg_count, Value *args) {
         shellUpdateStatus(1);
         return makeVoid();
     }
-    if (args[0].type != TYPE_STRING || !args[0].s_val || args[0].s_val[0] == '\0') {
+    if (VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0]) || AS_STRING(args[0])[0] == '\0') {
         runtimeError(vm, "setenv: variable name must be a non-empty string");
         shellUpdateStatus(1);
         return makeVoid();
     }
-    if (!shellIsValidEnvName(args[0].s_val)) {
-        runtimeError(vm, "setenv: invalid variable name '%s'", args[0].s_val);
+    if (!shellIsValidEnvName(AS_STRING(args[0]))) {
+        runtimeError(vm, "setenv: invalid variable name '%s'", AS_STRING(args[0]));
         shellUpdateStatus(1);
         return makeVoid();
     }
-    if (strchr(args[0].s_val, '=')) {
+    if (strchr(AS_STRING(args[0]), '=')) {
         runtimeError(vm, "setenv: variable name must not contain '='");
         shellUpdateStatus(1);
         return makeVoid();
     }
     const char *value = "";
     if (arg_count > 1) {
-        if (args[1].type != TYPE_STRING || !args[1].s_val) {
+        if (VALUE_TYPE(args[1]) != TYPE_STRING || !AS_STRING(args[1])) {
             runtimeError(vm, "setenv: value must be a string");
             shellUpdateStatus(1);
             return makeVoid();
         }
-        value = args[1].s_val;
+        value = AS_STRING(args[1]);
     }
-    if (!shellSetTrackedVariable(args[0].s_val, value, false)) {
-        runtimeError(vm, "setenv: unable to set '%s': %s", args[0].s_val, strerror(errno));
+    if (!shellSetTrackedVariable(AS_STRING(args[0]), value, false)) {
+        runtimeError(vm, "setenv: unable to set '%s': %s", AS_STRING(args[0]), strerror(errno));
         shellUpdateStatus(1);
         return makeVoid();
     }
@@ -6699,12 +6699,12 @@ Value vmBuiltinShellBind(VM *vm, int arg_count, Value *args) {
     bool interactive = shellRuntimeIsInteractive();
     while (index < arg_count && parsing_options && ok) {
         Value v = args[index];
-        if (v.type != TYPE_STRING || !v.s_val) {
+        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
             runtimeError(vm, "bind: arguments must be strings");
             ok = false;
             break;
         }
-        const char *token = v.s_val;
+        const char *token = AS_STRING(v);
         if (strcmp(token, "--") == 0) {
             parsing_options = false;
             index++;
@@ -6730,12 +6730,12 @@ Value vmBuiltinShellBind(VM *vm, int arg_count, Value *args) {
 
     for (; ok && index < arg_count; ++index) {
         Value v = args[index];
-        if (v.type != TYPE_STRING || !v.s_val) {
+        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
             runtimeError(vm, "bind: arguments must be strings");
             ok = false;
             break;
         }
-        const char *text = v.s_val;
+        const char *text = AS_STRING(v);
         if (strncmp(text, "set", 3) == 0) {
             const char *cursor = text + 3;
             if (*cursor && !isspace((unsigned char)*cursor)) {
@@ -6815,12 +6815,12 @@ Value vmBuiltinShellShopt(VM *vm, int arg_count, Value *args) {
 
     while (index < arg_count && parsing_options && ok) {
         Value v = args[index];
-        if (v.type != TYPE_STRING || !v.s_val) {
+        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
             runtimeError(vm, "shopt: option names must be strings");
             ok = false;
             break;
         }
-        const char *token = v.s_val;
+        const char *token = AS_STRING(v);
         if (strcmp(token, "--") == 0) {
             parsing_options = false;
             index++;
@@ -6905,14 +6905,14 @@ Value vmBuiltinShellShopt(VM *vm, int arg_count, Value *args) {
 
     for (; ok && index < arg_count; ++index) {
         Value v = args[index];
-        if (v.type != TYPE_STRING || !v.s_val) {
+        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
             runtimeError(vm, "shopt: option names must be strings");
             ok = false;
             break;
         }
-        ShellOptionEntry *entry = shellShoptFindOption(v.s_val);
+        ShellOptionEntry *entry = shellShoptFindOption(AS_STRING(v));
         if (!entry) {
-            runtimeError(vm, "shopt: %s: invalid shell option name", v.s_val);
+            runtimeError(vm, "shopt: %s: invalid shell option name", AS_STRING(v));
             ok = false;
             break;
         }
@@ -7016,10 +7016,10 @@ Value vmBuiltinShellDeclare(VM *vm, int arg_count, Value *args) {
     int index = 0;
     while (index < arg_count) {
         Value v = args[index];
-        if (v.type != TYPE_STRING || !v.s_val) {
+        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
             break;
         }
-        const char *token = v.s_val;
+        const char *token = AS_STRING(v);
         if (strcmp(token, "--") == 0) {
             index++;
             break;
@@ -7080,12 +7080,12 @@ Value vmBuiltinShellDeclare(VM *vm, int arg_count, Value *args) {
 
     for (; index < arg_count && ok; ++index) {
         Value v = args[index];
-        if (v.type != TYPE_STRING || !v.s_val) {
+        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
             runtimeError(vm, "declare: expected string argument");
             ok = false;
             break;
         }
-        const char *spec = v.s_val;
+        const char *spec = AS_STRING(v);
         const char *eq = strchr(spec, '=');
         if (!eq) {
             if (associative) {
@@ -7296,12 +7296,12 @@ Value vmBuiltinShellReadonly(VM *vm, int arg_count, Value *args) {
 
     for (int i = 0; i < arg_count; ++i) {
         Value v = args[i];
-        if (v.type != TYPE_STRING || !v.s_val) {
+        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
             runtimeError(vm, "readonly: arguments must be strings");
             shellUpdateStatus(1);
             return makeVoid();
         }
-        const char *text = v.s_val;
+        const char *text = AS_STRING(v);
         if (parsing_options) {
             if (strcmp(text, "--") == 0) {
                 parsing_options = false;
@@ -7996,12 +7996,12 @@ Value vmBuiltinShellExport(VM *vm, int arg_count, Value *args) {
 
     for (int i = 0; i < arg_count; ++i) {
         Value v = args[i];
-        if (v.type != TYPE_STRING || !v.s_val) {
+        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
             runtimeError(vm, "export: arguments must be strings");
             shellUpdateStatus(1);
             return makeVoid();
         }
-        const char *text = v.s_val;
+        const char *text = AS_STRING(v);
         if (parsing_options) {
             if (strcmp(text, "--") == 0) {
                 parsing_options = false;
@@ -8133,12 +8133,12 @@ Value vmBuiltinShellUmask(VM *vm, int arg_count, Value *args) {
 
     for (int i = 0; i < arg_count; ++i) {
         Value v = args[i];
-        if (v.type != TYPE_STRING || !v.s_val) {
+        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
             runtimeError(vm, "umask: arguments must be strings");
             shellUpdateStatus(1);
             return makeVoid();
         }
-        const char *text = v.s_val;
+        const char *text = AS_STRING(v);
         if (parsing_options && strcmp(text, "--") == 0) {
             parsing_options = false;
             continue;
@@ -8248,12 +8248,12 @@ Value vmBuiltinShellCommand(VM *vm, int arg_count, Value *args) {
 
     for (int i = 0; i < arg_count; ++i) {
         Value v = args[i];
-        if (v.type != TYPE_STRING || !v.s_val) {
+        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
             runtimeError(vm, "command: arguments must be strings");
             shellUpdateStatus(1);
             return makeVoid();
         }
-        const char *text = v.s_val;
+        const char *text = AS_STRING(v);
         if (parsing_options) {
             if (strcmp(text, "--") == 0) {
                 parsing_options = false;
@@ -8312,7 +8312,7 @@ Value vmBuiltinShellCommand(VM *vm, int arg_count, Value *args) {
         }
         bool ok = true;
         for (size_t i = 0; i < exec_argc; ++i) {
-            const char *source = args[first_name + (int)i].s_val;
+            const char *source = AS_STRING(args[first_name + (int)i]);
             cmd.argv[i] = strdup(source ? source : "");
             if (!cmd.argv[i]) {
                 ok = false;
@@ -8371,7 +8371,7 @@ Value vmBuiltinShellCommand(VM *vm, int arg_count, Value *args) {
     bool collect_all_paths = list_all;
 
     for (int i = first_name; i < arg_count; ++i) {
-        const char *name = args[i].s_val;
+        const char *name = AS_STRING(args[i]);
         ShellCommandResult *results = NULL;
         size_t count = 0;
         if (!shellCommandCollectInfo(name, collect_all_paths, use_default_path, &results, &count)) {
@@ -8424,12 +8424,12 @@ Value vmBuiltinShellWhich(VM *vm, int arg_count, Value *args) {
 
     for (int i = 0; i < arg_count; ++i) {
         Value v = args[i];
-        if (v.type != TYPE_STRING || !v.s_val) {
+        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
             runtimeError(vm, "which: arguments must be strings");
             shellUpdateStatus(1);
             return makeVoid();
         }
-        const char *text = v.s_val;
+        const char *text = AS_STRING(v);
         if (parsing_options) {
             if (strcmp(text, "--") == 0) {
                 parsing_options = false;
@@ -8472,7 +8472,7 @@ Value vmBuiltinShellWhich(VM *vm, int arg_count, Value *args) {
     bool collect_all_paths = list_all;
 
     for (int i = first_name; i < arg_count; ++i) {
-        const char *name = args[i].s_val;
+        const char *name = AS_STRING(args[i]);
         ShellCommandResult *results = NULL;
         size_t count = 0;
         if (!shellCommandCollectInfo(name, collect_all_paths, use_default_path, &results, &count)) {
@@ -8543,12 +8543,12 @@ Value vmBuiltinShellHash(VM *vm, int arg_count, Value *args) {
 
     for (int i = 0; i < arg_count; ++i) {
         Value v = args[i];
-        if (v.type != TYPE_STRING || !v.s_val) {
+        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
             runtimeError(vm, "hash: arguments must be strings");
             shellUpdateStatus(1);
             return makeVoid();
         }
-        const char *text = v.s_val;
+        const char *text = AS_STRING(v);
         if (parsing_options) {
             if (strcmp(text, "--") == 0) {
                 parsing_options = false;
@@ -8600,7 +8600,7 @@ Value vmBuiltinShellHash(VM *vm, int arg_count, Value *args) {
 
     bool overall_ok = true;
     for (int i = first_name; i < arg_count; ++i) {
-        const char *name = args[i].s_val ? args[i].s_val : "";
+        const char *name = AS_STRING(args[i]) ? AS_STRING(args[i]) : "";
         if (print_paths) {
             ShellHashEntry *entry = shellHashFindEntry(name);
             if (!entry || !entry->path || !*entry->path) {
@@ -8688,12 +8688,12 @@ Value vmBuiltinShellEnable(VM *vm, int arg_count, Value *args) {
 
     for (int i = 0; i < arg_count; ++i) {
         Value v = args[i];
-        if (v.type != TYPE_STRING || !v.s_val) {
+        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
             runtimeError(vm, "enable: arguments must be strings");
             shellUpdateStatus(1);
             return makeVoid();
         }
-        const char *text = v.s_val;
+        const char *text = AS_STRING(v);
         if (parsing_options) {
             if (strcmp(text, "--") == 0) {
                 parsing_options = false;
@@ -8742,7 +8742,7 @@ Value vmBuiltinShellEnable(VM *vm, int arg_count, Value *args) {
     bool ok = true;
     for (int i = operand_start; i < arg_count; ++i) {
         Value v = args[i];
-        const char *name = (v.type == TYPE_STRING) ? v.s_val : NULL;
+        const char *name = (VALUE_TYPE(v) == TYPE_STRING) ? AS_STRING(v) : NULL;
         if (!name || !*name) {
             runtimeError(vm, "enable: : not a shell builtin");
             ok = false;
@@ -8785,12 +8785,12 @@ Value vmBuiltinShellType(VM *vm, int arg_count, Value *args) {
 
     for (int i = 0; i < arg_count; ++i) {
         Value v = args[i];
-        if (v.type != TYPE_STRING || !v.s_val) {
+        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
             runtimeError(vm, "type: arguments must be strings");
             shellUpdateStatus(1);
             return makeVoid();
         }
-        const char *text = v.s_val;
+        const char *text = AS_STRING(v);
         if (parsing_options) {
             if (strcmp(text, "--") == 0) {
                 parsing_options = false;
@@ -8841,7 +8841,7 @@ Value vmBuiltinShellType(VM *vm, int arg_count, Value *args) {
     bool collect_all_paths = list_all || print_path;
 
     for (int i = first_name; i < arg_count; ++i) {
-        const char *name = args[i].s_val;
+        const char *name = AS_STRING(args[i]);
         ShellCommandResult *results = NULL;
         size_t count = 0;
         if (!shellCommandCollectInfo(name, collect_all_paths, use_default_path, &results, &count)) {
@@ -8908,12 +8908,12 @@ Value vmBuiltinShellType(VM *vm, int arg_count, Value *args) {
 Value vmBuiltinShellUnset(VM *vm, int arg_count, Value *args) {
     bool ok = true;
     for (int i = 0; i < arg_count; ++i) {
-        if (args[i].type != TYPE_STRING || !args[i].s_val) {
+        if (VALUE_TYPE(args[i]) != TYPE_STRING || !AS_STRING(args[i])) {
             runtimeError(vm, "unset: expected variable name");
             shellUpdateStatus(1);
             return makeVoid();
         }
-        const char *name = args[i].s_val;
+        const char *name = AS_STRING(args[i]);
         if (shellReadonlyContains(name)) {
             runtimeError(vm, "unset: %s: readonly variable", name);
             ok = false;
@@ -9039,12 +9039,12 @@ Value vmBuiltinShellSet(VM *vm, int arg_count, Value *args) {
     int positional_start = arg_count;
     for (int i = 0; i < arg_count && ok; ++i) {
         Value v = args[i];
-        if (v.type != TYPE_STRING || !v.s_val) {
+        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
             runtimeError(vm, "set: expected string argument");
             ok = false;
             break;
         }
-        const char *token = v.s_val;
+        const char *token = AS_STRING(v);
         if (!parsing_options) {
             continue;
         }
@@ -9069,18 +9069,18 @@ Value vmBuiltinShellSet(VM *vm, int arg_count, Value *args) {
                 break;
             }
             Value name_val = args[++i];
-            if (name_val.type != TYPE_STRING || !name_val.s_val) {
+            if (VALUE_TYPE(name_val) != TYPE_STRING || !AS_STRING(name_val)) {
                 runtimeError(vm, "set: option name must be a string");
                 ok = false;
                 break;
             }
-            if (strcasecmp(name_val.s_val, "errexit") == 0) {
+            if (strcasecmp(AS_STRING(name_val), "errexit") == 0) {
                 gShellRuntime.errexit_enabled = enable;
                 if (!enable) {
                     gShellRuntime.errexit_pending = false;
                     gShellRuntime.errexit_defer_active = false;
                 }
-            } else if (strcasecmp(name_val.s_val, "posix") == 0) {
+            } else if (strcasecmp(AS_STRING(name_val), "posix") == 0) {
                 shellRuntimeSetPosixMode(enable);
             }
         } else if (token[0] == '-' || token[0] == '+') {
@@ -9103,12 +9103,12 @@ Value vmBuiltinShellSet(VM *vm, int arg_count, Value *args) {
             } else {
                 for (int i = 0; i < new_count && ok; ++i) {
                     Value val = args[positional_start + i];
-                    if (val.type != TYPE_STRING || !val.s_val) {
+                    if (VALUE_TYPE(val) != TYPE_STRING || !AS_STRING(val)) {
                         runtimeError(vm, "set: positional arguments must be strings");
                         ok = false;
                         break;
                     }
-                    new_params[i] = strdup(val.s_val);
+                    new_params[i] = strdup(AS_STRING(val));
                     if (!new_params[i]) {
                         runtimeError(vm, "set: out of memory");
                         ok = false;
@@ -9155,21 +9155,21 @@ Value vmBuiltinShellTrap(VM *vm, int arg_count, Value *args) {
     const char *handler = NULL;
     ShellTrapAction action = SHELL_TRAP_ACTION_COMMAND;
 
-    if (args[0].type != TYPE_STRING || !args[0].s_val) {
+    if (VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0])) {
         runtimeError(vm, "trap: expected string arguments");
         ok = false;
     }
 
     if (ok) {
-        handler = args[0].s_val;
+        handler = AS_STRING(args[0]);
         signal_start = 1;
 
         if (strcmp(handler, "--") == 0) {
-            if (arg_count < 2 || args[1].type != TYPE_STRING || !args[1].s_val) {
+            if (arg_count < 2 || VALUE_TYPE(args[1]) != TYPE_STRING || !AS_STRING(args[1])) {
                 shellUpdateStatus(0);
                 return makeVoid();
             }
-            handler = args[1].s_val;
+            handler = AS_STRING(args[1]);
             signal_start = 2;
         }
 
@@ -9200,14 +9200,14 @@ Value vmBuiltinShellTrap(VM *vm, int arg_count, Value *args) {
     }
 
     for (int i = signal_start; i < arg_count && ok; ++i) {
-        if (args[i].type != TYPE_STRING || !args[i].s_val) {
+        if (VALUE_TYPE(args[i]) != TYPE_STRING || !AS_STRING(args[i])) {
             runtimeError(vm, "trap: expected signal name");
             ok = false;
             break;
         }
         int signo = 0;
-        if (!shellRuntimeParseSignal(args[i].s_val, &signo)) {
-            runtimeError(vm, "trap: invalid signal '%s'", args[i].s_val);
+        if (!shellRuntimeParseSignal(AS_STRING(args[i]), &signo)) {
+            runtimeError(vm, "trap: invalid signal '%s'", AS_STRING(args[i]));
             ok = false;
             break;
         }
@@ -9219,7 +9219,7 @@ Value vmBuiltinShellTrap(VM *vm, int arg_count, Value *args) {
             }
         } else {
             if (!shellRuntimeSetSignalTrap(signo, action, handler)) {
-                runtimeError(vm, "trap: failed to install handler for %s", args[i].s_val);
+                runtimeError(vm, "trap: failed to install handler for %s", AS_STRING(args[i]));
                 ok = false;
                 break;
             }
@@ -9261,12 +9261,12 @@ Value vmBuiltinShellLocal(VM *vm, int arg_count, Value *args) {
     bool ok = true;
     for (int i = 0; i < arg_count && ok; ++i) {
         Value v = args[i];
-        if (v.type != TYPE_STRING || !v.s_val) {
+        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
             runtimeError(vm, "local: arguments must be strings");
             ok = false;
             break;
         }
-        const char *text = v.s_val;
+        const char *text = AS_STRING(v);
         const char *eq = strchr(text, '=');
         size_t name_len = eq ? (size_t)(eq - text) : strlen(text);
         if (name_len == 0) {
@@ -9310,8 +9310,8 @@ Value vmBuiltinShellLocal(VM *vm, int arg_count, Value *args) {
 Value vmBuiltinShellBreak(VM *vm, int arg_count, Value *args) {
     int levels = 1;
     if (arg_count > 0) {
-        if (args[0].type != TYPE_STRING || !args[0].s_val ||
-            !shellParseLoopLevel(args[0].s_val, &levels)) {
+        if (VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0]) ||
+            !shellParseLoopLevel(AS_STRING(args[0]), &levels)) {
             runtimeError(vm, "break: expected positive integer");
             shellUpdateStatus(1);
             return makeVoid();
@@ -9327,8 +9327,8 @@ Value vmBuiltinShellBreak(VM *vm, int arg_count, Value *args) {
 Value vmBuiltinShellContinue(VM *vm, int arg_count, Value *args) {
     int levels = 1;
     if (arg_count > 0) {
-        if (args[0].type != TYPE_STRING || !args[0].s_val ||
-            !shellParseLoopLevel(args[0].s_val, &levels)) {
+        if (VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0]) ||
+            !shellParseLoopLevel(AS_STRING(args[0]), &levels)) {
             runtimeError(vm, "continue: expected positive integer");
             shellUpdateStatus(1);
             return makeVoid();
@@ -10153,13 +10153,13 @@ Value vmBuiltinShellHelp(VM *vm, int arg_count, Value *args) {
         return makeVoid();
     }
 
-    if (args[0].type != TYPE_STRING || !args[0].s_val || args[0].s_val[0] == '\0') {
+    if (VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0]) || AS_STRING(args[0])[0] == '\0') {
         runtimeError(vm, "help: expected builtin name as string");
         shellUpdateStatus(1);
         return makeVoid();
     }
 
-    const char *requested = args[0].s_val;
+    const char *requested = AS_STRING(args[0]);
     if (strcmp(requested, "-l") == 0) {
         shellHelpPrintCatalog();
         shellUpdateStatus(0);
@@ -10199,12 +10199,12 @@ Value vmBuiltinShellAlias(VM *vm, int arg_count, Value *args) {
         return makeVoid();
     }
     for (int i = 0; i < arg_count; ++i) {
-        if (args[i].type != TYPE_STRING || !args[i].s_val) {
+        if (VALUE_TYPE(args[i]) != TYPE_STRING || !AS_STRING(args[i])) {
             runtimeError(vm, "alias: expected name=value");
             shellUpdateStatus(1);
             return makeVoid();
         }
-        const char *assignment = args[i].s_val;
+        const char *assignment = AS_STRING(args[i]);
         const char *eq = strchr(assignment, '=');
         if (!eq || eq == assignment) {
             runtimeError(vm, "alias: invalid assignment '%s'", assignment);
@@ -10236,12 +10236,12 @@ Value vmBuiltinShellUnalias(VM *vm, int arg_count, Value *args) {
     int index = 0;
 
     while (index < arg_count) {
-        if (args[index].type != TYPE_STRING || !args[index].s_val) {
+        if (VALUE_TYPE(args[index]) != TYPE_STRING || !AS_STRING(args[index])) {
             shellReportRecoverableError(vm, false, "unalias: usage: unalias [-a] name [name ...]");
             shellUpdateStatus(2);
             return makeVoid();
         }
-        const char *arg = args[index].s_val;
+        const char *arg = AS_STRING(args[index]);
         if (strcmp(arg, "--") == 0) {
             index++;
             break;
@@ -10262,7 +10262,7 @@ Value vmBuiltinShellUnalias(VM *vm, int arg_count, Value *args) {
 
     if (clear_all) {
         for (; index < arg_count; ++index) {
-            if (args[index].type != TYPE_STRING || !args[index].s_val || args[index].s_val[0] == '\0') {
+            if (VALUE_TYPE(args[index]) != TYPE_STRING || !AS_STRING(args[index]) || AS_STRING(args[index])[0] == '\0') {
                 shellReportRecoverableError(vm, false, "unalias: usage: unalias [-a] name [name ...]");
                 shellUpdateStatus(2);
                 return makeVoid();
@@ -10281,12 +10281,12 @@ Value vmBuiltinShellUnalias(VM *vm, int arg_count, Value *args) {
 
     bool ok = true;
     for (; index < arg_count; ++index) {
-        if (args[index].type != TYPE_STRING || !args[index].s_val || args[index].s_val[0] == '\0') {
+        if (VALUE_TYPE(args[index]) != TYPE_STRING || !AS_STRING(args[index]) || AS_STRING(args[index])[0] == '\0') {
             shellReportRecoverableError(vm, false, "unalias: usage: unalias [-a] name [name ...]");
             shellUpdateStatus(2);
             return makeVoid();
         }
-        const char *name = args[index].s_val;
+        const char *name = AS_STRING(args[index]);
         if (!shellRemoveAlias(name)) {
             shellReportRecoverableError(vm, true, "unalias: %s: not found", name);
             ok = false;
@@ -10305,15 +10305,15 @@ Value vmBuiltinShellCaller(VM *vm, int arg_count, Value *args) {
         return makeVoid();
     }
     if (arg_count == 1) {
-        if (args[0].type != TYPE_STRING || !args[0].s_val) {
+        if (VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0])) {
             runtimeError(vm, "caller: expected numeric depth");
             shellUpdateStatus(2);
             return makeVoid();
         }
         char *end = NULL;
-        depth = strtol(args[0].s_val, &end, 10);
+        depth = strtol(AS_STRING(args[0]), &end, 10);
         if (!end || *end != '\0') {
-            runtimeError(vm, "caller: %s: numeric argument required", args[0].s_val);
+            runtimeError(vm, "caller: %s: numeric argument required", AS_STRING(args[0]));
             shellUpdateStatus(2);
             return makeVoid();
         }
@@ -10634,10 +10634,10 @@ static bool shellKillParseLong(Value value, long *out_value) {
         *out_value = (long)AS_INTEGER(value);
         return true;
     }
-    if (value.type == TYPE_STRING && value.s_val) {
+    if (VALUE_TYPE(value) == TYPE_STRING && AS_STRING(value)) {
         errno = 0;
         char *endptr = NULL;
-        long parsed = strtol(value.s_val, &endptr, 10);
+        long parsed = strtol(AS_STRING(value), &endptr, 10);
         if (errno != 0 || !endptr || *endptr != '\0') {
             return false;
         }
@@ -10662,8 +10662,8 @@ static bool shellKillParseSignal(Value value, bool numeric_only, int *out_signo)
         *out_signo = (int)parsed;
         return true;
     }
-    if (value.type == TYPE_STRING && value.s_val) {
-        return shellRuntimeParseSignal(value.s_val, out_signo);
+    if (VALUE_TYPE(value) == TYPE_STRING && AS_STRING(value)) {
+        return shellRuntimeParseSignal(AS_STRING(value), out_signo);
     }
     if (IS_INTLIKE(value)) {
         long parsed = (long)AS_INTEGER(value);
@@ -10673,8 +10673,8 @@ static bool shellKillParseSignal(Value value, bool numeric_only, int *out_signo)
         *out_signo = (int)parsed;
         return true;
     }
-    if (value.type == TYPE_STRING && value.s_val) {
-        return shellRuntimeParseSignal(value.s_val, out_signo);
+    if (VALUE_TYPE(value) == TYPE_STRING && AS_STRING(value)) {
+        return shellRuntimeParseSignal(AS_STRING(value), out_signo);
     }
     return false;
 }
@@ -10892,7 +10892,7 @@ Value vmBuiltinShellKill(VM *vm, int arg_count, Value *args) {
 
     for (int i = 0; i < arg_count;) {
         Value value = args[i];
-        const char *text = (value.type == TYPE_STRING) ? value.s_val : NULL;
+        const char *text = (VALUE_TYPE(value) == TYPE_STRING) ? AS_STRING(value) : NULL;
 
         if (expect_signal_value) {
             bool numeric_only = (pending_option == 'n');
@@ -10980,14 +10980,14 @@ Value vmBuiltinShellKill(VM *vm, int arg_count, Value *args) {
                     printf("%s\n", name);
                     continue;
                 }
-                if (value.type != TYPE_STRING || !value.s_val) {
+                if (VALUE_TYPE(value) != TYPE_STRING || !AS_STRING(value)) {
                     runtimeError(vm, "kill: invalid signal");
                     ok = false;
                     continue;
                 }
                 int signo = 0;
-                if (!shellRuntimeParseSignal(value.s_val, &signo)) {
-                    fprintf(stderr, "kill: invalid signal '%s'\n", value.s_val);
+                if (!shellRuntimeParseSignal(AS_STRING(value), &signo)) {
+                    fprintf(stderr, "kill: invalid signal '%s'\n", AS_STRING(value));
                     ok = false;
                     continue;
                 }
@@ -11007,19 +11007,19 @@ Value vmBuiltinShellKill(VM *vm, int arg_count, Value *args) {
     bool overall_ok = true;
     for (int i = operand_start; i < arg_count; ++i) {
         Value target = args[i];
-        if (target.type == TYPE_STRING && target.s_val) {
-            const char *text = target.s_val;
+        if (VALUE_TYPE(target) == TYPE_STRING && AS_STRING(target)) {
+            const char *text = AS_STRING(target);
             while (isspace((unsigned char)*text)) {
                 ++text;
             }
             if (*text == '%') {
                 size_t index = 0;
                 if (shellKillTryJobSpec(text, &index) && index < gShellJobCount) {
-                    if (!shellKillSignalJob(vm, target.s_val, index, signal_number)) {
+                    if (!shellKillSignalJob(vm, AS_STRING(target), index, signal_number)) {
                         overall_ok = false;
                     }
                 } else {
-                    fprintf(stderr, "kill: %s: no such job\n", target.s_val);
+                    fprintf(stderr, "kill: %s: no such job\n", AS_STRING(target));
                     overall_ok = false;
                 }
                 continue;
@@ -11027,8 +11027,8 @@ Value vmBuiltinShellKill(VM *vm, int arg_count, Value *args) {
         }
         long pid_value = 0;
         if (!shellKillParseLong(target, &pid_value)) {
-            if (target.type == TYPE_STRING && target.s_val) {
-                fprintf(stderr, "kill: invalid pid '%s'\n", target.s_val);
+            if (VALUE_TYPE(target) == TYPE_STRING && AS_STRING(target)) {
+                fprintf(stderr, "kill: invalid pid '%s'\n", AS_STRING(target));
             } else {
                 fprintf(stderr, "kill: invalid pid\n");
             }
@@ -11201,8 +11201,8 @@ Value vmBuiltinShellFg(VM *vm, int arg_count, Value *args) {
         shellFdPrintf(STDOUT_FILENO, "[%zu]  + resumed  %s\n", resumed_job_id, resume_command);
         Value eval_arg;
         memset(&eval_arg, 0, sizeof(eval_arg));
-        eval_arg.type = TYPE_STRING;
-        eval_arg.s_val = resume_command;
+        SET_VALUE_TYPE(&eval_arg, TYPE_STRING);
+        AS_STRING(eval_arg) = resume_command;
         (void)vmBuiltinShellEval(vm, 1, &eval_arg);
         free(resume_command);
         return makeVoid();
@@ -11307,8 +11307,8 @@ Value vmBuiltinShellWait(VM *vm, int arg_count, Value *args) {
     if (arg_count == 1 && gShellJobCount == 0 && gShellRuntime.last_removed_job_valid) {
         long target = -1;
         Value spec = args[0];
-        if (spec.type == TYPE_STRING && spec.s_val) {
-            const char *text = spec.s_val;
+        if (VALUE_TYPE(spec) == TYPE_STRING && AS_STRING(spec)) {
+            const char *text = AS_STRING(spec);
             if (text[0] == '%') {
                 text++;
             }
@@ -11378,8 +11378,8 @@ Value vmBuiltinShellWait(VM *vm, int arg_count, Value *args) {
         if (arg_count == 1) {
             long target = -1;
             Value spec = args[0];
-            if (spec.type == TYPE_STRING && spec.s_val) {
-                const char *text = spec.s_val;
+            if (VALUE_TYPE(spec) == TYPE_STRING && AS_STRING(spec)) {
+                const char *text = AS_STRING(spec);
                 if (text[0] == '%') {
                     text++;
                 }
@@ -11435,8 +11435,8 @@ Value vmBuiltinShellWaitForThread(VM *vm, int arg_count, Value *args) {
     Value converted = makeVoid();
     bool converted_valid = false;
 
-    if (thread_value.type == TYPE_STRING && thread_value.s_val && thread_value.s_val[0] != '\0') {
-        const char *raw = thread_value.s_val;
+    if (VALUE_TYPE(thread_value) == TYPE_STRING && AS_STRING(thread_value) && AS_STRING(thread_value)[0] != '\0') {
+        const char *raw = AS_STRING(thread_value);
         const char *id_text = raw;
         const char *colon = strchr(raw, ':');
         if (colon && colon[1] != '\0') {
@@ -11454,7 +11454,7 @@ Value vmBuiltinShellWaitForThread(VM *vm, int arg_count, Value *args) {
         converted_valid = true;
     }
 
-    if (!(thread_value.type == TYPE_THREAD || IS_INTLIKE(thread_value))) {
+    if (!(VALUE_TYPE(thread_value) == TYPE_THREAD || IS_INTLIKE(thread_value))) {
         runtimeError(vm, "WaitForThread: expected thread id");
         if (converted_valid) {
             freeValue(&converted);
@@ -11520,7 +11520,7 @@ Value vmBuiltinShellPsThreads(VM *vm, int arg_count, Value *args) {
 
     VM *root = vm && vm->threadOwner ? vm->threadOwner : vm;
     Value stats_json = vmBuiltinThreadStatsJson(root, 0, NULL);
-    const char *text = (stats_json.type == TYPE_STRING && stats_json.s_val) ? stats_json.s_val : "[]";
+    const char *text = (VALUE_TYPE(stats_json) == TYPE_STRING && AS_STRING(stats_json)) ? AS_STRING(stats_json) : "[]";
     printf("%s\n", text);
     freeValue(&stats_json);
     shellUpdateStatus(0);
@@ -11540,10 +11540,10 @@ Value vmBuiltinShellPs(VM *vm, int arg_count, Value *args) {
     (void)vm;
     bool tree = false;
     for (int i = 0; i < arg_count; ++i) {
-        if (args[i].type != TYPE_STRING || !args[i].s_val) {
+        if (VALUE_TYPE(args[i]) != TYPE_STRING || !AS_STRING(args[i])) {
             continue;
         }
-        const char *opt = args[i].s_val;
+        const char *opt = AS_STRING(args[i]);
         if (strcmp(opt, "--tree") == 0) {
             tree = true;
         } else if (strcmp(opt, "--flat") == 0) {
@@ -11679,13 +11679,13 @@ Value vmBuiltinShellPs(VM *vm, int arg_count, Value *args) {
 #endif
 
 Value vmBuiltinShellBuiltin(VM *vm, int arg_count, Value *args) {
-    if (arg_count < 1 || args[0].type != TYPE_STRING || !args[0].s_val || args[0].s_val[0] == '\0') {
+    if (arg_count < 1 || VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0]) || AS_STRING(args[0])[0] == '\0') {
         runtimeError(vm, "builtin: expected VM builtin name");
         shellUpdateStatus(1);
         return makeVoid();
     }
 
-    const char *name = args[0].s_val;
+    const char *name = AS_STRING(args[0]);
     if (shellRuntimeBuiltinDisabled(name)) {
         shellReportRecoverableError(vm, false, "builtin: %s: not a shell builtin", name);
         shellUpdateStatus(1);
@@ -11709,9 +11709,9 @@ Value vmBuiltinShellBuiltin(VM *vm, int arg_count, Value *args) {
         }
         for (int i = 0; i < call_argc; ++i) {
             Value src = args[i + 1];
-            if (src.type == TYPE_STRING && src.s_val) {
-                call_args[i] = shellConvertBuiltinArgument(src.s_val);
-            } else if (src.type == TYPE_NIL) {
+            if (VALUE_TYPE(src) == TYPE_STRING && AS_STRING(src)) {
+                call_args[i] = shellConvertBuiltinArgument(AS_STRING(src));
+            } else if (VALUE_TYPE(src) == TYPE_NIL) {
                 call_args[i] = makeNil();
             } else {
                 call_args[i] = makeString("");
@@ -11750,7 +11750,7 @@ Value vmBuiltinShellBuiltin(VM *vm, int arg_count, Value *args) {
         shellUpdateStatus(0);
     }
 
-    if (status == 0 && result.type != TYPE_VOID) {
+    if (status == 0 && VALUE_TYPE(result) != TYPE_VOID) {
         printValueToStream(result, stdout);
         fputc('\n', stdout);
     }
