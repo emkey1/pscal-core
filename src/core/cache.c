@@ -1864,6 +1864,8 @@ static bool writeProcedureEntriesRecursive(ByteBuf* out, HashTable* table) {
             bufU8(out, sym->upvalue_count);
             bufU32LE(out, (uint32_t)sym->type);
             bufU8(out, sym->arity);
+            bufU8(out, sym->closure_captures ? 1 : 0);
+            bufU8(out, sym->closure_escapes ? 1 : 0);
             Symbol* enclosing = resolveSymbolAlias(sym->enclosing);
             uint8_t has_enclosing = (enclosing && enclosing->name) ? 1 : 0;
             bufU8(out, has_enclosing);
@@ -2023,6 +2025,8 @@ static bool loadProceduresFromStream(Cursor* in, int proc_count, uint32_t chunk_
         uint8_t upvals = curU8(in);
         VarType type = (VarType)curU32LE(in);
         uint8_t arity = curU8(in);
+        uint8_t closure_captures = curU8(in);
+        uint8_t closure_escapes = curU8(in);
         uint8_t has_enclosing = curU8(in);
         if (in->error) {
             free(name);
@@ -2095,6 +2099,8 @@ static bool loadProceduresFromStream(Cursor* in, int proc_count, uint32_t chunk_
         sym->upvalue_count = upvals;
         sym->type = type;
         sym->arity = arity;
+        sym->closure_captures = (bool)closure_captures;
+        sym->closure_escapes = (bool)closure_escapes;
         sym->is_defined = true;
         sym->enclosing = NULL;
 
