@@ -7958,6 +7958,22 @@ comparison_error_label:
 
                     if (VALUE_TYPE(value_to_set) == TYPE_CHAR) {
                         *char_target_addr = AS_CHAR(value_to_set);
+                    } else if (VALUE_TYPE(value_to_set) == TYPE_WIDECHAR) {
+                        /* Rea's `str` type (and other Unicode-aware string
+                         * contexts) is TYPE_UNICODE_STRING, so indexing any
+                         * such string legitimately yields a WIDECHAR codepoint
+                         * even when every character in it happens to be ASCII.
+                         * Narrow it into the single raw byte here, the same
+                         * way a single-char TYPE_STRING is narrowed above;
+                         * only reject codepoints that can't fit in one byte. */
+                        long long codepoint = AS_CHAR(value_to_set);
+                        if (codepoint < 0 || codepoint > PASCAL_CHAR_MAX) {
+                            runtimeError(vm, "VM Error: Cannot assign multi-byte character (codepoint %lld) to a single-byte character location.", codepoint);
+                            freeValue(&value_to_set);
+                            freeValue(&pointer_to_lvalue);
+                            return INTERPRET_RUNTIME_ERROR;
+                        }
+                        *char_target_addr = (char)codepoint;
                     } else if (VALUE_TYPE(value_to_set) == TYPE_STRING) {
                         if (AS_STRING(value_to_set) && strlen(AS_STRING(value_to_set)) == 1) {
                             *char_target_addr = AS_STRING(value_to_set)[0];
