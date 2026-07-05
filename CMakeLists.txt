@@ -82,7 +82,7 @@ set(PSCAL_CORE_SOURCES
     ${SRC}/lexer/lexer.c
     ${SRC}/backend_ast/builtin.c ${SRC}/backend_ast/builtin_network_api_stub.c
     ${SRC}/backend_ast/shell_runtime_stub.c ${SRC}/backend_ast/thread_wrappers.c
-    ${SRC}/compiler/bytecode.c ${SRC}/compiler/bytecode_verify.c ${SRC}/compiler/compiler.c
+    ${SRC}/compiler/bytecode.c ${SRC}/compiler/bytecode_verify.c ${SRC}/compiler/bytecode_link.c ${SRC}/compiler/compiler.c
     ${SRC}/core/cache.c
     ${SRC}/common/runtime_params.c ${SRC}/common/runtime_tty.c ${SRC}/common/runtime_clipboard.c
     ${SRC}/common/env_snapshot.c ${SRC}/common/pscal_hosts.c ${SRC}/common/path_truncate.c

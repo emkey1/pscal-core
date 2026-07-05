@@ -797,9 +797,9 @@ static void ensureMyselfGlobalDefined(BytecodeChunk* chunk, int line) {
     if (compiler_defined_myself_global) return;
     int myself_idx = ensureMyselfGlobalNameIndex(chunk);
     emitConstant(chunk, addNilConstant(chunk), line);
-    emitGlobalNameIdx(chunk, DEFINE_GLOBAL, DEFINE_GLOBAL16, myself_idx, line);
+    emitGlobalNameIdx(chunk, DEFINE_GLOBAL_SLOT, DEFINE_GLOBAL_SLOT, myself_idx, line);
     // Declare the implicit "myself" variable as a generic pointer with a
-    // placeholder type name.  The VM's DEFINE_GLOBAL handler expects every
+    // placeholder type name.  The VM's DEFINE_GLOBAL_SLOT handler expects every
     // global definition to include the declared VarType and an associated
     // type-name constant index.  Previously we omitted these operands, which
     // caused the VM to misinterpret the bytecode stream for the first
@@ -1275,7 +1275,7 @@ static void emitVTables(BytecodeChunk* chunk) {
         writeBytecodeChunk(chunk, (uint8_t)TYPE_INT32, 0); // element type
         int elemNameIdx = addStringConstant(chunk, "integer");
         emitConstantIndex16(chunk, elemNameIdx, 0);
-        emitGlobalNameIdx(chunk, SET_GLOBAL, SET_GLOBAL16, nameIdx, 0);
+        emitGlobalNameIdx(chunk, SET_GSLOT, SET_GSLOT, nameIdx, 0);
         vtableTrackerRecordClass(vt->class_name);
         free(vt->class_name);
         free(vt->addrs);
@@ -1592,7 +1592,7 @@ static void emitGlobalInitializerForVar(AST* var_decl, AST* varNameNode,
     }
 
     int name_idx_set = addStringConstant(chunk, varNameNode->token->value);
-    emitGlobalNameIdx(chunk, SET_GLOBAL, SET_GLOBAL16, name_idx_set, getLine(varNameNode));
+    emitGlobalNameIdx(chunk, SET_GSLOT, SET_GSLOT, name_idx_set, getLine(varNameNode));
 }
 
 static void emitGlobalVarDefinition(AST* var_decl,
@@ -1993,25 +1993,20 @@ static void emitConstantIndex16(BytecodeChunk* chunk, int constant_index, int li
     emitShort(chunk, (uint16_t)constant_index, line);
 }
 
-// Emits this call site's cache_id (VM 2.0 Phase 2a, plan §5.6) and bumps
-// chunk->cache_count. Each GET_GLOBAL/SET_GLOBAL/GET_GLOBAL16/SET_GLOBAL16
-// call site gets its own slot in the chunk's runtime CacheSlot side table
-// rather than sharing one keyed by name -- see bytecode.h's CacheSlot doc
-// comment for why (independent of how the compiler happens to dedupe name
-// constants).
-static void emitGlobalCacheId(BytecodeChunk* chunk, int line) {
-    if (chunk->cache_count >= 0xFFFF) {
-        fprintf(stderr, "L%d: Compiler error: too many global-access cache sites (%d). Limit is 65535.\n",
-                line, chunk->cache_count);
-        compiler_had_error = true;
-        return;
-    }
-    emitShort(chunk, (uint16_t)chunk->cache_count, line);
-    chunk->cache_count++;
-}
-
 // Helper to emit global-variable opcodes that take a name index operand.
-// Selects 8-bit or 16-bit variants based on the index value.
+// Two shapes: field-access opcodes (GET_FIELD_ADDRESS/16,
+// GET_FIELD_ADDRESS_KEEP/16, LOAD_FIELD_VALUE_BY_NAME/16, ...) still select
+// an 8-bit or 16-bit variant based on the index value (op8 != op16, the
+// original behavior); the VM 2.0 Phase 2b slot-addressed global opcodes
+// (DEFINE_GLOBAL_SLOT/GET_GSLOT/SET_GSLOT/GET_GSLOT_ADDRESS) pass the same
+// opcode for both op8 and op16, since they have a single always-wide (u16)
+// form -- the compiler emits a raw constant-pool name index here, and the
+// load-time link step (compiler/bytecode_link.c) rewrites that same 2-byte
+// field in place into a resolved slot index before the chunk is verified
+// or executed, which requires the operand to always be exactly 2 bytes
+// (see opcodes.def's 's' spec-letter doc comment). The old per-call-site
+// cache_id emission (VM 2.0 Phase 2a) is gone: GET_GLOBAL/SET_GLOBAL, the
+// only opcodes that ever carried one, are retired.
 static void emitGlobalNameIdx(BytecodeChunk* chunk, OpCode op8, OpCode op16,
                               int name_idx, int line) {
     if (name_idx < 0) {
@@ -2019,19 +2014,23 @@ static void emitGlobalNameIdx(BytecodeChunk* chunk, OpCode op8, OpCode op16,
         compiler_had_error = true;
         return;
     }
-    bool needs_cache_id = (op8 == GET_GLOBAL || op8 == SET_GLOBAL);
+    if (op8 == op16) {
+        if (name_idx > 0xFFFF) {
+            fprintf(stderr, "L%d: Compiler error: too many constants (%d). Limit is 65535.\n",
+                    line, name_idx);
+            compiler_had_error = true;
+            return;
+        }
+        writeBytecodeChunk(chunk, op8, line);
+        emitShort(chunk, (uint16_t)name_idx, line);
+        return;
+    }
     if (name_idx <= 0xFF) {
         writeBytecodeChunk(chunk, op8, line);
         writeBytecodeChunk(chunk, (uint8_t)name_idx, line);
-        if (needs_cache_id) {
-            emitGlobalCacheId(chunk, line);
-        }
     } else if (name_idx <= 0xFFFF) {
         writeBytecodeChunk(chunk, op16, line);
         emitShort(chunk, (uint16_t)name_idx, line);
-        if (needs_cache_id) {
-            emitGlobalCacheId(chunk, line);
-        }
     } else {
         fprintf(stderr, "L%d: Compiler error: too many constants (%d). Limit is 65535.\n",
                 line, name_idx);
@@ -2039,9 +2038,11 @@ static void emitGlobalNameIdx(BytecodeChunk* chunk, OpCode op8, OpCode op16,
     }
 }
 
-// Helper to emit DEFINE_GLOBAL or DEFINE_GLOBAL16 depending on index size.
+// Helper to emit DEFINE_GLOBAL_SLOT (VM 2.0 Phase 2b; retains its old name
+// for minimal call-site churn even though DEFINE_GLOBAL/DEFINE_GLOBAL16,
+// the opcodes it used to select between by index width, are retired).
 static void emitDefineGlobal(BytecodeChunk* chunk, int name_idx, int line) {
-    emitGlobalNameIdx(chunk, DEFINE_GLOBAL, DEFINE_GLOBAL16, name_idx, line);
+    emitGlobalNameIdx(chunk, DEFINE_GLOBAL_SLOT, DEFINE_GLOBAL_SLOT, name_idx, line);
 }
 
 static const char* ensureSerializableTypeName(AST* type_node) {
@@ -3874,7 +3875,7 @@ static bool emitImplicitMyselfFieldValue(BytecodeChunk* chunk, int line, const c
     }
 
     int myself_idx = ensureMyselfGlobalNameIndex(chunk);
-    emitGlobalNameIdx(chunk, GET_GLOBAL, GET_GLOBAL16, myself_idx, line);
+    emitGlobalNameIdx(chunk, GET_GSLOT, GET_GSLOT, myself_idx, line);
     if (fieldOffset <= UINT8_MAX) {
         writeBytecodeChunk(chunk, LOAD_FIELD_VALUE, line);
         writeBytecodeChunk(chunk, (uint8_t)fieldOffset, line);
@@ -6102,7 +6103,7 @@ static void compileLValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                         break;
                     }
                     int nameIndex = addStringConstant(chunk, varName);
-                    emitGlobalNameIdx(chunk, GET_GLOBAL_ADDRESS, GET_GLOBAL_ADDRESS16,
+                    emitGlobalNameIdx(chunk, GET_GSLOT_ADDRESS, GET_GSLOT_ADDRESS,
                                        nameIndex, line);
                 }
             }
@@ -6119,7 +6120,7 @@ static void compileLValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                 }
 
                 int nameIndex = addStringConstant(chunk, qualified_name);
-                emitGlobalNameIdx(chunk, GET_GLOBAL_ADDRESS, GET_GLOBAL_ADDRESS16,
+                emitGlobalNameIdx(chunk, GET_GSLOT_ADDRESS, GET_GSLOT_ADDRESS,
                                    nameIndex, line);
                 break;
             }
@@ -6233,7 +6234,7 @@ static void compileLValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                 char vtName[512];
                 snprintf(vtName, sizeof(vtName), "%s_vtable", lowerClassName);
                 int vtNameIdx = addStringConstant(chunk, vtName);
-                emitGlobalNameIdx(chunk, GET_GLOBAL_ADDRESS, GET_GLOBAL_ADDRESS16, vtNameIdx, line);
+                emitGlobalNameIdx(chunk, GET_GSLOT_ADDRESS, GET_GSLOT_ADDRESS, vtNameIdx, line);
                 writeBytecodeChunk(chunk, SET_INDIRECT, line);
             }
 
@@ -6345,7 +6346,7 @@ static bool emitDirectStoreForVariable(AST* lvalue, BytecodeChunk* chunk, int li
     }
 
     int nameIdx = addStringConstant(chunk, varName);
-    emitGlobalNameIdx(chunk, SET_GLOBAL, SET_GLOBAL16, nameIdx, line);
+    emitGlobalNameIdx(chunk, SET_GSLOT, SET_GSLOT, nameIdx, line);
     return true;
 }
 
@@ -6847,6 +6848,23 @@ bool compileASTToBytecode(AST* rootNode, BytecodeChunk* outputChunk) {
     if (!compiler_had_error) {
         writeBytecodeChunk(outputChunk, HALT, rootNode ? getLine(rootNode) : 0);
         applyPeepholeOptimizations(outputChunk);
+
+        // VM 2.0 Phase 2b (plan §5.7): deliberately NOT linked here. A chunk
+        // returned by this function may still be written to the .bc cache
+        // by the caller (saveBytecodeToCache()) before it is ever executed;
+        // the on-disk cache format must always hold the PRE-link
+        // representation (name-index operands), never the post-link one
+        // (slot-index operands) -- otherwise a chunk loaded back from that
+        // cache would be linked a *second* time, and the link step would
+        // misinterpret already-resolved slot indices as fresh name indices
+        // (harmless-looking small integers that are frequently, but not
+        // always, valid-but-wrong constant-pool indices -- this exact bug
+        // shipped and was caught by Tests/run_all_suites.py's Rea scope
+        // suite before release). Each frontend's main.c calls
+        // pscalLinkGlobalSlots() itself, once, immediately before
+        // interpretBytecode() -- after saveBytecodeToCache(), and safe to
+        // call unconditionally on a cache-hit chunk too, since the function
+        // is idempotent (chunk->globals_linked short-circuits a second call).
     }
     if (vtable_state_pushed) {
         popVTableTrackerState();
@@ -7066,14 +7084,14 @@ static void compileNode(AST* node, BytecodeChunk* chunk, int current_line_approx
                 for (int pg = 0; pg < pending_global_vtable_count; pg++) {
                     PendingGlobalVTableInit* p = &pending_global_vtables[pg];
                     int objNameIdx = addStringConstant(chunk, p->var_name);
-                    emitGlobalNameIdx(chunk, GET_GLOBAL, GET_GLOBAL16, objNameIdx, 0);
+                    emitGlobalNameIdx(chunk, GET_GSLOT, GET_GSLOT, objNameIdx, 0);
                     writeBytecodeChunk(chunk, DUP, 0);
                     writeBytecodeChunk(chunk, GET_FIELD_OFFSET, 0);
                     writeBytecodeChunk(chunk, (uint8_t)0, 0);
                     char vtName[512];
                     snprintf(vtName, sizeof(vtName), "%s_vtable", p->class_name);
                     int vtIdx = addStringConstant(chunk, vtName);
-                    emitGlobalNameIdx(chunk, GET_GLOBAL_ADDRESS, GET_GLOBAL_ADDRESS16, vtIdx, 0);
+                    emitGlobalNameIdx(chunk, GET_GSLOT_ADDRESS, GET_GSLOT_ADDRESS, vtIdx, 0);
                     writeBytecodeChunk(chunk, SET_INDIRECT, 0);
                     writeBytecodeChunk(chunk, POP, 0);
                     free(p->var_name);
@@ -9755,7 +9773,7 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                 int myself_idx = ensureMyselfGlobalNameIndex(chunk);
                 AST* recv_node = callReceiver;
                 compileMethodReceiverReference(recv_node, chunk, line);
-                emitGlobalNameIdx(chunk, SET_GLOBAL, SET_GLOBAL16, myself_idx, line);
+                emitGlobalNameIdx(chunk, SET_GSLOT, SET_GSLOT, myself_idx, line);
             }
 
             if (isFormatOpenArrayCall(calleeName, node, receiver_offset)) {
@@ -10066,7 +10084,7 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                 char vtName[512];
                 snprintf(vtName, sizeof(vtName), "%s_vtable", lowerClassName);
                 int vtNameIdx = addStringConstant(chunk, vtName);
-                emitGlobalNameIdx(chunk, GET_GLOBAL_ADDRESS, GET_GLOBAL_ADDRESS16, vtNameIdx, line);
+                emitGlobalNameIdx(chunk, GET_GSLOT_ADDRESS, GET_GSLOT_ADDRESS, vtNameIdx, line);
                 writeBytecodeChunk(chunk, SET_INDIRECT, line);
             }
 
@@ -10450,7 +10468,7 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                             }
                             DBG_PRINTF("[dbg] RV %s -> global line=%d\n", varName, line);
                             int nameIndex = addStringConstant(chunk, varName);
-                            emitGlobalNameIdx(chunk, GET_GLOBAL, GET_GLOBAL16,
+                            emitGlobalNameIdx(chunk, GET_GSLOT, GET_GSLOT,
                                                nameIndex, line);
                         }
                     }
@@ -10490,7 +10508,7 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                     emitConstant(chunk, addConstantToChunk(chunk, resolved_symbol->value), line);
                 } else {
                     int nameIndex = addStringConstant(chunk, qualified_name);
-                    emitGlobalNameIdx(chunk, GET_GLOBAL, GET_GLOBAL16,
+                    emitGlobalNameIdx(chunk, GET_GSLOT, GET_GSLOT,
                                        nameIndex, line);
                 }
                 break;
@@ -11356,7 +11374,7 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                 int myself_idx = ensureMyselfGlobalNameIndex(chunk);
                 AST* recv_node = callReceiver;
                 compileMethodReceiverReference(recv_node, chunk, line);
-                emitGlobalNameIdx(chunk, SET_GLOBAL, SET_GLOBAL16, myself_idx, line);
+                emitGlobalNameIdx(chunk, SET_GSLOT, SET_GSLOT, myself_idx, line);
             }
 
             if (!func_symbol) {

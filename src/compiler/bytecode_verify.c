@@ -56,10 +56,27 @@ static bool checkConstIndex(VCtx* ctx, uint32_t idx, int pc, const char* what) {
 
 // VM 2.0 Phase 2a (plan §5.6): validates a GET/SET_GLOBAL[16] cache_id
 // operand against chunk->cache_count, same pattern as checkConstIndex above.
+// The opcodes that carried a 'c' operand are retired as of Phase 2b, so
+// this is now unreachable for any chunk emitted post-2b; kept because the
+// 'c' spec letter itself is kept (opcodes.def) for legacy .bc verification.
 static bool checkCacheIndex(VCtx* ctx, uint32_t idx, int pc, const char* what) {
     if (idx >= (uint32_t)ctx->chunk->cache_count) {
         return vfail(ctx, "pc %d: %s cache index %u out of range (cache_count %d)",
                      pc, what, idx, ctx->chunk->cache_count);
+    }
+    return true;
+}
+
+// VM 2.0 Phase 2b (plan §5.7): validates a GET_GSLOT/SET_GSLOT/
+// GET_GSLOT_ADDRESS/DEFINE_GLOBAL_SLOT slot operand against
+// chunk->global_slot_count. Meaningful only because the load-time link step
+// (compiler/bytecode_link.c) has already run by the time this verifier
+// executes -- see cache.c's load-then-verify ordering and bytecode_link.c's
+// module comment for why that ordering, and not the reverse, is correct.
+static bool checkSlotIndex(VCtx* ctx, uint32_t idx, int pc, const char* what) {
+    if (idx >= (uint32_t)ctx->chunk->global_slot_count) {
+        return vfail(ctx, "pc %d: %s slot index %u out of range (global_slot_count %d)",
+                     pc, what, idx, ctx->chunk->global_slot_count);
     }
     return true;
 }
@@ -99,24 +116,34 @@ static bool verifyInstructionStream(VCtx* ctx) {
 
 // ================== Pass 2: operand / payload validation ===================
 
-// Re-walks a DEFINE_GLOBAL/DEFINE_GLOBAL16/INIT_LOCAL_ARRAY/INIT_FIELD_ARRAY
-// payload (whose bytes are already known in-bounds from pass 1) to validate
-// every embedded constant-pool index and, for the array-shaped opcodes,
-// count dimensions using the runtime-computed-bound sentinel (lo==hi==0xFFFF)
-// -- each such dimension pops one size value at runtime (see opcodes.def's
-// Phase 1e audit comment). out_dynamic_dims may be NULL when the caller only
-// needs validation (DEFINE_GLOBAL/16).
+// Re-walks a DEFINE_GLOBAL/DEFINE_GLOBAL16/DEFINE_GLOBAL_SLOT/
+// INIT_LOCAL_ARRAY/INIT_FIELD_ARRAY payload (whose bytes are already known
+// in-bounds from pass 1) to validate every embedded constant-pool index
+// and, for the array-shaped opcodes, count dimensions using the
+// runtime-computed-bound sentinel (lo==hi==0xFFFF) -- each such dimension
+// pops one size value at runtime (see opcodes.def's Phase 1e audit
+// comment). out_dynamic_dims may be NULL when the caller only needs
+// validation (DEFINE_GLOBAL/16/_SLOT).
 static bool walkVariablePayload(VCtx* ctx, int pc, int* out_dynamic_dims) {
     const BytecodeChunk* chunk = ctx->chunk;
     const uint8_t* code = chunk->code;
     uint8_t opcode = code[pc];
     if (out_dynamic_dims) *out_dynamic_dims = 0;
 
-    if (opcode == DEFINE_GLOBAL || opcode == DEFINE_GLOBAL16) {
-        bool wide = (opcode == DEFINE_GLOBAL16);
+    if (opcode == DEFINE_GLOBAL || opcode == DEFINE_GLOBAL16 || opcode == DEFINE_GLOBAL_SLOT) {
+        // DEFINE_GLOBAL is the narrow (u8 name) legacy form, DEFINE_GLOBAL16
+        // the wide (u16 name) legacy form, and DEFINE_GLOBAL_SLOT (VM 2.0
+        // Phase 2b) the current, always-wide (u16) form whose leading field
+        // is a slot index rather than a name index -- see checkSlotIndex vs
+        // checkConstIndex below for the only difference in this branch.
+        bool wide = (opcode == DEFINE_GLOBAL16 || opcode == DEFINE_GLOBAL_SLOT);
         int name_pos = pc + 1;
         uint32_t name_idx = wide ? verifyReadU16BE(code, name_pos) : code[name_pos];
-        if (!checkConstIndex(ctx, name_idx, pc, "DEFINE_GLOBAL name")) return false;
+        if (opcode == DEFINE_GLOBAL_SLOT) {
+            if (!checkSlotIndex(ctx, name_idx, pc, "DEFINE_GLOBAL_SLOT")) return false;
+        } else {
+            if (!checkConstIndex(ctx, name_idx, pc, "DEFINE_GLOBAL name")) return false;
+        }
         int type_pos = wide ? pc + 3 : pc + 2;
         VarType declared = (VarType)code[type_pos];
         int cursor = type_pos + 1;
@@ -237,6 +264,12 @@ static bool verifyOperands(VCtx* ctx) {
                 case 'c': {
                     uint32_t idx = verifyReadU16BE(code, cursor);
                     if (!checkCacheIndex(ctx, idx, pc, info->name)) return false;
+                    cursor += 2;
+                    break;
+                }
+                case 's': {
+                    uint32_t idx = verifyReadU16BE(code, cursor);
+                    if (!checkSlotIndex(ctx, idx, pc, info->name)) return false;
                     cursor += 2;
                     break;
                 }

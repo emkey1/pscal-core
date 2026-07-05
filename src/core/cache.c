@@ -5,6 +5,7 @@
 
 #include "core/cache.h"
 #include "compiler/bytecode_verify.h"
+#include "compiler/bytecode_link.h"
 #include "core/utils.h" // for Value constructors
 #include "core/globals.h"
 #include "core/version.h"
@@ -45,8 +46,28 @@
  * body, so bumping this is what makes a pre-Phase-2a .bc/cache entry
  * "invalidated by the normal cache freshness check, not silently misparsed"
  * -- reading its CODE section under the new layout would otherwise
- * misinterpret the first code byte(s) as a bogus cache_count. */
-#define PSB3_FORMAT_VERSION 2u
+ * misinterpret the first code byte(s) as a bogus cache_count.
+ *
+ * format_ver 3 (VM 2.0 Phase 2b, plan §5.7): no section shape changed this
+ * time -- global_slot_count/global_slots are computed by the load-time link
+ * step (compiler/bytecode_link.c), never serialized. Bumped anyway, as a
+ * deliberate extension of the format_ver 2 precedent above to a case it
+ * didn't anticipate: GET_GLOBAL/SET_GLOBAL/DEFINE_GLOBAL[16]/
+ * GET_GLOBAL_ADDRESS[16] (0x20-0x27) are RETIRED opcodes as of this phase,
+ * but their opcodes.def entries (and hence pscalOpcodeInfo()/
+ * pscalDecodeInstructionLength()) are deliberately kept intact for legacy
+ * disassembly -- which means a stale Phase-2a-vintage cache entry
+ * containing them is *structurally* indistinguishable from valid bytecode:
+ * it has a well-formed cache_count, its GET_GLOBAL 'kc' operands validate
+ * cleanly against it, and psb3ReadChunk()/pscalVerifyBytecodeChunk() both
+ * accept it without complaint. It would only fail at the vm.c dispatch
+ * switch, at runtime, with a confusing "unknown opcode" error instead of
+ * the intended "stale cache, recompiling" experience. Bumping format_ver
+ * routes this through the normal cache-miss path instead, exactly as it
+ * did for format_ver 2 -- the mechanism generalizes to "any change that
+ * makes old CODE bytes mean something different or nothing at all",
+ * shape changes being only the first instance of that, not the only one. */
+#define PSB3_FORMAT_VERSION 3u
 
 /* VM 2.0 Phase 1e (Docs/pscal_vm2_plan.md §5.5): the load-time verifier can
  * only be skipped via `PSCAL_VM_SKIP_VERIFY=1` in the *host process's*
@@ -1537,6 +1558,20 @@ static bool readPointerValue(Cursor* in, Value* out) {
         return false;
     }
 
+    // VM 2.0 Phase 2b (plan §5.7): link before verify, same ordering as the
+    // top-level loaders below -- exsh's own opcodes never reference a
+    // global slot (see bytecode_link.c's module comment), so this is
+    // effectively a no-op walk for a shell closure chunk, but running it
+    // unconditionally keeps "every chunk is linked before it's verified"
+    // true without a special case here.
+    char link_err[256];
+    if (!pscalLinkGlobalSlots(&compiled->chunk, link_err, sizeof(link_err))) {
+        fprintf(stderr, "Warning: rejecting corrupt embedded closure bytecode: %s\n", link_err);
+        freeBytecodeChunk(&compiled->chunk);
+        free(compiled);
+        return false;
+    }
+
     // The nested chunk is a fully independent BytecodeChunk (its own CODE/
     // CONST/etc. sections), executed directly by interpretBytecode() when the
     // enclosing closure is invoked (see shell_word_expansion.inc). It must be
@@ -2633,6 +2668,21 @@ bool loadBytecodeFromCache(const char* source_path,
             continue;
         }
 
+        // VM 2.0 Phase 2b (plan §5.7): the load-time link step must run
+        // before verification -- see bytecode_link.c's module comment for
+        // why. Runs unconditionally, even when verification itself is
+        // skipped for a trusted chunk, since linking is a functional
+        // necessity (GET_GSLOT/SET_GSLOT are not executable without it),
+        // not a safety-only step.
+        char link_err[256];
+        if (!pscalLinkGlobalSlots(chunk, link_err, sizeof(link_err))) {
+            fprintf(stderr, "Warning: rejecting cached bytecode %s: %s\n", cache_path, link_err);
+            resetChunk(chunk, chunk->constants_count);
+            psb3FileFree(&pf);
+            unlink(cache_path);
+            continue;
+        }
+
         if (!psb3VerificationSkipped(&pf)) {
             char verify_err[256];
             if (!pscalVerifyBytecodeChunk(chunk, procedure_table, verify_err, sizeof(verify_err))) {
@@ -2690,6 +2740,18 @@ bool loadBytecodeFromFile(const char* file_path, BytecodeChunk* chunk) {
     }
 
     bool ok = psb3ReadChunk(&pf, chunk);
+
+    // VM 2.0 Phase 2b (plan §5.7): link before verify -- see
+    // bytecode_link.c's module comment and the loadBytecodeFromCache()
+    // comment above for the same ordering rationale.
+    if (ok) {
+        char link_err[256];
+        if (!pscalLinkGlobalSlots(chunk, link_err, sizeof(link_err))) {
+            fprintf(stderr, "Failed to load bytecode from %s: %s\n", file_path, link_err);
+            resetChunk(chunk, chunk->constants_count);
+            ok = false;
+        }
+    }
 
     if (ok && !psb3VerificationSkipped(&pf)) {
         char verify_err[256];

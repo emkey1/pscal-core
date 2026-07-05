@@ -34,7 +34,21 @@
 //               'c'  u16  global-access cache-table index (VM 2.0 Phase 2a,
 //                    plan §5.6): indexes chunk->caches[]; validated against
 //                    chunk->cache_count by the verifier, same pattern as 'k'/'K'
-//                    against constants_count
+//                    against constants_count. Retired along with the four
+//                    GET/SET_GLOBAL[16] opcodes that carried it -- see Phase 2b
+//                    below; kept as a spec letter purely so the legacy 0x22/
+//                    0x23/0x25/0x26 holes still decode/disassemble at their
+//                    true historical width.
+//               's'  u16  global-slot index (VM 2.0 Phase 2b, plan §5.7):
+//                    indexes chunk->global_slots[]; validated against
+//                    chunk->global_slot_count by the verifier. Unlike 'c',
+//                    this index is NOT what the compiler emits -- the
+//                    compiler emits a constant-pool name index in this same
+//                    field position, and the load-time link step
+//                    (compiler/bytecode_link.c) rewrites it in place into a
+//                    resolved slot index before the chunk is verified or
+//                    executed. See DEFINE_GLOBAL_SLOT/GET_GSLOT/SET_GSLOT/
+//                    GET_GSLOT_ADDRESS below and Docs/pscal_vm2_plan.md §5.7.
 //               'C'  LEGACY (VM 2.0 Phase 1e and earlier) inline-cache slot
 //                    (GLOBAL_INLINE_CACHE_SLOT_SIZE bytes), superseded by 'c'.
 //                    Only appears on the four retired GET/SET_GLOBAL[16]_CACHED
@@ -130,7 +144,20 @@ OP(SWAP,                       0x1E, "",     2,  2)
 OP(DUP,                        0x1F, "",     1,  2)
 
 // --- Globals ---
-// DEFINE_GLOBAL[16] payload (bespoke decode):
+// 0x20-0x27: RETIRED (VM 2.0 Phase 2b, plan §5.7). Name-addressed global
+// access (hash lookup by constant-pool string, accelerated by the Phase 2a
+// cache_id side table) is superseded entirely by slot-addressed access --
+// DEFINE_GLOBAL_SLOT/GET_GSLOT/SET_GSLOT/GET_GSLOT_ADDRESS below. Never
+// emitted by the compiler and never executed by the VM post-2b (no case in
+// vm.c's dispatch switch -- an adversarial chunk containing one hits the
+// switch's default: and gets a clean "unknown opcode" runtime error). Left
+// as explicit holes with their original names/operand-specs/stack-effects,
+// unchanged, purely so a pre-Phase-2b standalone .bc file still disassembles
+// with a readable legacy mnemonic and correct byte width instead of
+// "undefined opcode".
+//
+// Former DEFINE_GLOBAL[16] payload (bespoke decode), preserved here for
+// reference since DEFINE_GLOBAL_SLOT below reuses the identical shape:
 //   [name:k|K][var_type:b]
 //   TYPE_ARRAY:  [dims:b] { [lo:K][hi:K] }*dims [elem_type:b][elem_name:K]
 //   TYPE_STRING: [type_name:K][len:K]  (len const 0 = dynamic length)
@@ -144,17 +171,9 @@ OP(GET_GLOBAL_ADDRESS,         0x24, "k",    0,  1)
 OP(GET_GLOBAL16,               0x25, "Kc",   0,  1)
 OP(SET_GLOBAL16,               0x26, "Kc",   1,  0)
 OP(GET_GLOBAL_ADDRESS16,       0x27, "K",    0,  1)
-// 0x28-0x2B: RETIRED (VM 2.0 Phase 2a, plan §5.6). GET/SET_GLOBAL[16]_CACHED
-// existed only because the old design needed an "inline cache already
-// validated" variant to self-patch into; that distinction disappears once
-// caching is a side-table lookup by cache_id rather than a self-modified
-// opcode byte. Never emitted by the compiler and never executed by the VM
-// (no case for them in vm.c's dispatch switch -- an adversarial chunk
-// containing one hits the switch's default: and gets a clean "unknown
-// opcode" runtime error). Left as explicit holes with their original names/
-// operand-specs/stack-effects, unchanged, purely so a pre-Phase-2a
-// standalone .bc file still disassembles with a readable legacy mnemonic
-// and correct byte width instead of "undefined opcode".
+// 0x28-0x2B: RETIRED (VM 2.0 Phase 2a, plan §5.6; superseded again by 2b
+// above before a single opcode in this range was ever un-retired). See the
+// 0x20-0x27 comment; same rationale applies.
 OP(GET_GLOBAL_CACHED,          0x28, "kC",   0,  1)
 OP(SET_GLOBAL_CACHED,          0x29, "kC",   1,  0)
 OP(GET_GLOBAL16_CACHED,        0x2A, "KC",   0,  1)
@@ -239,3 +258,29 @@ OP(MUTEX_LOCK,                 0x60, "",     1,  0)
 OP(MUTEX_UNLOCK,               0x61, "",     1,  0)
 OP(MUTEX_DESTROY,              0x62, "",     1,  0)
 OP(RESET_LOCAL,                0x63, "b",    0,  0)
+
+// --- Slot-addressed globals (VM 2.0 Phase 2b, plan §5.7) ---
+// Replaces the retired 0x20-0x2B name-addressed family above. The compiler
+// emits these with a constant-pool NAME index in the operand position
+// documented below (identical encoding to what DEFINE_GLOBAL16/GET_GLOBAL16/
+// etc. used to carry); the load-time link step (compiler/bytecode_link.c)
+// rewrites that same field in place into a resolved SLOT index (into
+// chunk->global_slots[]) before the chunk is verified or executed -- see
+// opcodes.def's 's' spec-letter doc comment above and the link step's own
+// module comment for the full rationale (why this must happen before
+// verification, and why it is safe to mutate CODE at this point despite
+// Phase 2a's code-immutability goal).
+//
+// DEFINE_GLOBAL_SLOT payload (bespoke decode, identical shape to the
+// retired DEFINE_GLOBAL16 with a slot field standing in for the name field):
+//   [slot:w][var_type:b]
+//   TYPE_ARRAY:  [dims:b] { [lo:K][hi:K] }*dims [elem_type:b][elem_name:K]
+//   TYPE_STRING: [type_name:K][len:K]  (len const 0 = dynamic length)
+//   TYPE_FILE:   [type_name:K][elem_type:b][elem_name:K]
+//   else:        [type_name:K]
+// (The bounds/type-name/elem-name/len fields are untouched by linking --
+// only the leading name-or-slot field ever changes meaning.)
+OP(DEFINE_GLOBAL_SLOT,         0x64, "?",    0,  0)
+OP(GET_GSLOT,                  0x65, "s",    0,  1)
+OP(SET_GSLOT,                  0x66, "s",    1,  0)
+OP(GET_GSLOT_ADDRESS,          0x67, "s",    0,  1)

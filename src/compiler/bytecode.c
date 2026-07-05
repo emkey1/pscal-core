@@ -49,6 +49,7 @@ int pscalOpcodeOperandSpecLength(const char* operands) {
             case 'w':
             case 'K':
             case 'c':
+            case 's':
                 length += 2;
                 break;
             case 'j':
@@ -79,6 +80,14 @@ void initBytecodeChunk(BytecodeChunk* chunk) { // From all.txt
     chunk->builtin_resolved_ids = NULL;
     chunk->cache_count = 0;
     chunk->caches = NULL;
+    chunk->global_slot_count = 0;
+    chunk->global_slots = NULL;
+    chunk->global_slot_is_const = NULL;
+    chunk->global_slot_names = NULL;
+    chunk->global_myself_slot = -1;
+    chunk->global_pas_exc_pending_slot = -1;
+    chunk->global_pas_exc_message_slot = -1;
+    chunk->globals_linked = false;
     chunk->prepared_for_execution = false;
     chunk->code_is_mapped = false;
     chunk->code_map_size = 0;
@@ -118,6 +127,12 @@ void freeBytecodeChunk(BytecodeChunk* chunk) { // From all.txt
     free(chunk->builtin_lowercase_indices);
     free(chunk->builtin_resolved_ids);
     free(chunk->caches);
+    if (chunk->global_slot_names) {
+        for (int i = 0; i < chunk->global_slot_count; i++) free(chunk->global_slot_names[i]);
+        free(chunk->global_slot_names);
+    }
+    free(chunk->global_slots);
+    free(chunk->global_slot_is_const);
     initBytecodeChunk(chunk);
 }
 
@@ -486,6 +501,40 @@ bool pscalDecodeInstructionLength(const BytecodeChunk* chunk, int offset, int* o
                 int current_pos = offset + 1; // after opcode
                 if (current_pos + 2 >= chunk->count) {
                     length = 1; // ensure enough bytes for name and type
+                    break;
+                }
+                VarType declaredType = (VarType)chunk->code[offset + 3];
+                current_pos = offset + 4; // position after type byte
+
+                if (declaredType == TYPE_ARRAY) {
+                    if (current_pos < chunk->count) {
+                        uint8_t dimension_count = chunk->code[current_pos++];
+                        current_pos += dimension_count * 4; // bounds indices
+                        current_pos += 3; // element var type and 2-byte element type name index
+                        ok = true;
+                    }
+                    // else: dimension_count byte missing; truncated.
+                } else {
+                    current_pos += 2; // type name index (16-bit)
+                    if (declaredType == TYPE_STRING) {
+                        current_pos += 2; // length constant index (16-bit)
+                    } else if (declaredType == TYPE_FILE) {
+                        current_pos += 3; // element VarType byte + 2-byte element type name index
+                    }
+                    ok = true;
+                }
+                length = current_pos - offset;
+                break;
+            }
+            case DEFINE_GLOBAL_SLOT: {
+                // VM 2.0 Phase 2b: identical payload shape to DEFINE_GLOBAL16
+                // above, with the 16-bit field at offset+1 meaning a
+                // resolved slot index (post-link) rather than a name index
+                // (pre-link) -- the shape/width is unchanged either way, so
+                // this decode logic doesn't need to know which.
+                int current_pos = offset + 1; // after opcode
+                if (current_pos + 2 >= chunk->count) {
+                    length = 1; // ensure enough bytes for slot and type
                     break;
                 }
                 VarType declaredType = (VarType)chunk->code[offset + 3];
@@ -888,6 +937,95 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
             fprintf(stderr, "%-16s %4d '%s'\n", info->name, (int)name_index,
                     AS_STRING(chunk->constants[name_index]));
             return offset + (wide ? 3 : 2);
+        }
+
+        // VM 2.0 Phase 2b: slot-addressed globals. `slot` indexes
+        // chunk->global_slots[]/global_slot_names[] (populated by the
+        // load-time link step, compiler/bytecode_link.c) rather than the
+        // constant pool -- this is why these cases print the name from
+        // global_slot_names instead of chunk->constants like CONSTANT/
+        // CONSTANT16 above.
+        case GET_GSLOT:
+        case SET_GSLOT:
+        case GET_GSLOT_ADDRESS: {
+            uint16_t slot = readU16BE(chunk, offset + 1);
+            const char* slot_name = (slot < (uint16_t)chunk->global_slot_count && chunk->global_slot_names)
+                                         ? chunk->global_slot_names[slot]
+                                         : NULL;
+            fprintf(stderr, "%-16s %4u '%s'\n", info->name, (unsigned)slot,
+                    slot_name ? slot_name : "<invalid>");
+            return offset + 3;
+        }
+        case DEFINE_GLOBAL_SLOT: {
+            uint16_t slot = readU16BE(chunk, offset + 1);
+            VarType declaredType = (VarType)chunk->code[offset + 3];
+            const char* slot_name = (slot < (uint16_t)chunk->global_slot_count && chunk->global_slot_names)
+                                         ? chunk->global_slot_names[slot]
+                                         : NULL;
+            fprintf(stderr, "%-16s Slot:%-3u ", "DEFINE_GLOBAL_SLOT", slot);
+            if (slot_name) {
+                fprintf(stderr, "'%s' ", slot_name);
+            } else {
+                fprintf(stderr, "INVALID_SLOT ");
+            }
+            fprintf(stderr, "Type:%s ", varTypeToString(declaredType));
+            int current_offset = offset + 4;
+            if (declaredType == TYPE_ARRAY) {
+                if (current_offset < chunk->count) {
+                    uint8_t dimension_count = chunk->code[current_offset++];
+                    fprintf(stderr, "Dims:%d [", dimension_count);
+                    for (int i = 0; i < dimension_count; i++) {
+                        if (current_offset + 3 < chunk->count) {
+                            uint16_t lower_idx = readU16BE(chunk, current_offset);
+                            current_offset += 2;
+                            uint16_t upper_idx = readU16BE(chunk, current_offset);
+                            current_offset += 2;
+                            fprintf(stderr, "%lld..%lld%s", VAL_INT(chunk->constants[lower_idx]), VAL_INT(chunk->constants[upper_idx]),
+                                   (i == dimension_count - 1) ? "" : ", ");
+                        }
+                    }
+                    fprintf(stderr, "] of ");
+                    if (current_offset < chunk->count) {
+                        VarType elem_var_type = (VarType)chunk->code[current_offset++];
+                        fprintf(stderr, "%s ", varTypeToString(elem_var_type));
+                        if (current_offset + 1 < chunk->count) {
+                            uint16_t elem_name_idx = readU16BE(chunk, current_offset);
+                            current_offset += 2;
+                            if (elem_name_idx < chunk->constants_count &&
+                                VALUE_TYPE(chunk->constants[elem_name_idx]) == TYPE_STRING) {
+                                fprintf(stderr, "('%s')", AS_STRING(chunk->constants[elem_name_idx]));
+                            }
+                        }
+                    }
+                }
+            } else {
+                if (current_offset + 1 < chunk->count) {
+                    uint16_t type_name_idx = readU16BE(chunk, current_offset);
+                    current_offset += 2;
+                    if (type_name_idx > 0 && type_name_idx < chunk->constants_count &&
+                        VALUE_TYPE(chunk->constants[type_name_idx]) == TYPE_STRING) {
+                        fprintf(stderr, "('%s')", AS_STRING(chunk->constants[type_name_idx]));
+                    }
+                    if (declaredType == TYPE_STRING && current_offset + 1 < chunk->count) {
+                        uint16_t len_idx = readU16BE(chunk, current_offset);
+                        current_offset += 2;
+                        if (len_idx < chunk->constants_count && VALUE_TYPE(chunk->constants[len_idx]) == TYPE_INTEGER) {
+                            fprintf(stderr, " len=%lld", VAL_INT(chunk->constants[len_idx]));
+                        }
+                    } else if (declaredType == TYPE_FILE && current_offset + 2 < chunk->count) {
+                        VarType elem_type = (VarType)chunk->code[current_offset++];
+                        uint16_t elem_name_idx = readU16BE(chunk, current_offset);
+                        current_offset += 2;
+                        fprintf(stderr, " elem=%s", varTypeToString(elem_type));
+                        if (elem_name_idx != 0xFFFF && elem_name_idx < chunk->constants_count &&
+                            VALUE_TYPE(chunk->constants[elem_name_idx]) == TYPE_STRING) {
+                            fprintf(stderr, " ('%s')", AS_STRING(chunk->constants[elem_name_idx]));
+                        }
+                    }
+                }
+            }
+            fprintf(stderr, "\n");
+            return current_offset;
         }
 
         case GET_LOCAL:
