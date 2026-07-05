@@ -31,7 +31,16 @@
 //                    (widened from i16 in VM 2.0 Phase 1c; rides the PSB3 format
 //                    epoch since it changes the on-disk code-stream encoding)
 //               'f'  u32  flat element offset
-//               'C'  inline-cache slot (GLOBAL_INLINE_CACHE_SLOT_SIZE bytes)
+//               'c'  u16  global-access cache-table index (VM 2.0 Phase 2a,
+//                    plan §5.6): indexes chunk->caches[]; validated against
+//                    chunk->cache_count by the verifier, same pattern as 'k'/'K'
+//                    against constants_count
+//               'C'  LEGACY (VM 2.0 Phase 1e and earlier) inline-cache slot
+//                    (GLOBAL_INLINE_CACHE_SLOT_SIZE bytes), superseded by 'c'.
+//                    Only appears on the four retired GET/SET_GLOBAL[16]_CACHED
+//                    holes below (0x28-0x2B); kept solely so a legacy
+//                    standalone .bc's disassembly still reports their true
+//                    width instead of misreading it.
 //               "?"  (whole spec) variable-length payload; bespoke decode logic
 //                    in getInstructionLength()/disassembleInstruction()
 //   stack_in  values popped (-1 = variable / operand-dependent)
@@ -129,12 +138,23 @@ OP(DUP,                        0x1F, "",     1,  2)
 //   else:        [type_name:K]
 OP(DEFINE_GLOBAL,              0x20, "?",    0,  0)
 OP(DEFINE_GLOBAL16,            0x21, "?",    0,  0)
-OP(GET_GLOBAL,                 0x22, "kC",   0,  1)
-OP(SET_GLOBAL,                 0x23, "kC",   1,  0)
+OP(GET_GLOBAL,                 0x22, "kc",   0,  1)
+OP(SET_GLOBAL,                 0x23, "kc",   1,  0)
 OP(GET_GLOBAL_ADDRESS,         0x24, "k",    0,  1)
-OP(GET_GLOBAL16,               0x25, "KC",   0,  1)
-OP(SET_GLOBAL16,               0x26, "KC",   1,  0)
+OP(GET_GLOBAL16,               0x25, "Kc",   0,  1)
+OP(SET_GLOBAL16,               0x26, "Kc",   1,  0)
 OP(GET_GLOBAL_ADDRESS16,       0x27, "K",    0,  1)
+// 0x28-0x2B: RETIRED (VM 2.0 Phase 2a, plan §5.6). GET/SET_GLOBAL[16]_CACHED
+// existed only because the old design needed an "inline cache already
+// validated" variant to self-patch into; that distinction disappears once
+// caching is a side-table lookup by cache_id rather than a self-modified
+// opcode byte. Never emitted by the compiler and never executed by the VM
+// (no case for them in vm.c's dispatch switch -- an adversarial chunk
+// containing one hits the switch's default: and gets a clean "unknown
+// opcode" runtime error). Left as explicit holes with their original names/
+// operand-specs/stack-effects, unchanged, purely so a pre-Phase-2a
+// standalone .bc file still disassembles with a readable legacy mnemonic
+// and correct byte width instead of "undefined opcode".
 OP(GET_GLOBAL_CACHED,          0x28, "kC",   0,  1)
 OP(SET_GLOBAL_CACHED,          0x29, "kC",   1,  0)
 OP(GET_GLOBAL16_CACHED,        0x2A, "KC",   0,  1)

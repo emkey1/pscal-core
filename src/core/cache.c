@@ -34,7 +34,19 @@
  * loadable (source is always available; that is the whole point of §2's
  * "recompilation is the compatibility mechanism"). */
 #define PSB3_MAGIC 0x50534233u /* 'PSB3' */
-#define PSB3_FORMAT_VERSION 1u
+/* format_ver 2 (VM 2.0 Phase 2a, plan §5.6): the CODE section body gained a
+ * cache_count field (writeCodeSection/readCodeSection below) -- the first
+ * change to any section's on-disk *shape* since PSB3 was introduced at
+ * format_ver 1 (every phase since has only changed what the opaque CODE
+ * bytes mean, never how a section frames itself). This is exactly the axis
+ * format_ver exists for (Chapter 2: "independent of the VM semantic version
+ * ... can move without a VM version bump"): psb3ParseHeader() already
+ * hard-rejects any format_ver mismatch before touching a single section
+ * body, so bumping this is what makes a pre-Phase-2a .bc/cache entry
+ * "invalidated by the normal cache freshness check, not silently misparsed"
+ * -- reading its CODE section under the new layout would otherwise
+ * misinterpret the first code byte(s) as a bogus cache_count. */
+#define PSB3_FORMAT_VERSION 2u
 
 /* VM 2.0 Phase 1e (Docs/pscal_vm2_plan.md §5.5): the load-time verifier can
  * only be skipped via `PSCAL_VM_SKIP_VERIFY=1` in the *host process's*
@@ -587,6 +599,7 @@ static uint64_t computeChunkHashInternal(const BytecodeChunk* chunk, ChunkHashCo
     if (chunk->code && chunk->count > 0) {
         fnv1aUpdate(&hash, chunk->code, (size_t)chunk->count);
     }
+    fnv1aUpdateInt(&hash, chunk->cache_count);
     fnv1aUpdateInt(&hash, chunk->constants_count);
     if (chunk->lines && chunk->count > 0) {
         fnv1aUpdate(&hash, chunk->lines, sizeof(int) * (size_t)chunk->count);
@@ -686,10 +699,12 @@ static void resetChunk(BytecodeChunk* chunk, int read_consts) {
             freeValue(&chunk->constants[i]);
         }
     }
-    free(chunk->code);
+    pscalReleaseChunkCode(chunk);
     free(chunk->lines);
     free(chunk->constants);
     free(chunk->builtin_lowercase_indices);
+    free(chunk->builtin_resolved_ids); // pre-existing leak, fixed alongside the field this function is being touched for
+    free(chunk->caches);
     initBytecodeChunk(chunk);
 }
 
@@ -1123,8 +1138,17 @@ static bool writeValue(ByteBuf* out, const Value* v) {
  *     addressing overhead.
  */
 
+// VM 2.0 Phase 2a (plan §5.6) added `cache_count` here: the number of
+// GET/SET_GLOBAL[16] call sites in this chunk, i.e. how large the loader
+// must size chunk->caches[]. It's a compile-time constant (the compiler
+// counts cache sites as it emits them), stored right after byte_count since
+// both describe the CODE payload that follows. This is why PSB3_FORMAT_VERSION
+// bumped from 1 to 2 -- an old-format CODE section has no cache_count varint,
+// and reading one under the new layout would misinterpret its first code
+// byte(s) as a bogus count instead of cleanly failing.
 static void writeCodeSection(ByteBuf* out, const BytecodeChunk* chunk) {
     bufVarint(out, (uint64_t)chunk->count);
+    bufVarint(out, (uint64_t)chunk->cache_count);
     if (chunk->count > 0) {
         bufBytes(out, chunk->code, (size_t)chunk->count);
     }
@@ -1133,8 +1157,13 @@ static void writeCodeSection(ByteBuf* out, const BytecodeChunk* chunk) {
 static bool readCodeSection(Cursor* in, BytecodeChunk* chunk) {
     uint64_t count = curVarint(in);
     if (in->error || count > (uint64_t)INT32_MAX) return false;
+    uint64_t cache_count = curVarint(in);
+    // cache_id operands are u16 (opcodes.def's 'c' spec), so no chunk can
+    // legitimately need more than 65536 distinct cache slots.
+    if (in->error || cache_count > 0x10000ull) return false;
     chunk->count = (int)count;
     chunk->capacity = (int)count;
+    chunk->cache_count = (int)cache_count;
     chunk->code = NULL;
     if (count > 0) {
         chunk->code = (uint8_t*)malloc((size_t)count);
@@ -1218,11 +1247,9 @@ static bool readConstSection(Cursor* in, BytecodeChunk* chunk, int* out_read_con
     chunk->constants_count = (int)const_count;
     chunk->constants_capacity = (int)const_count;
     chunk->constants = NULL;
-    chunk->global_symbol_cache = NULL;
     if (const_count == 0) return true;
     chunk->constants = (Value*)calloc((size_t)const_count, sizeof(Value));
-    chunk->global_symbol_cache = (Symbol**)calloc((size_t)const_count, sizeof(Symbol*));
-    if (!chunk->constants || !chunk->global_symbol_cache) return false;
+    if (!chunk->constants) return false;
     for (int i = 0; i < (int)const_count; ++i) {
         if (!readValue(in, &chunk->constants[i])) return false;
         *out_read_consts = i + 1;
@@ -1416,7 +1443,8 @@ static bool readChunkCoreInline(Cursor* in, BytecodeChunk* chunk, uint32_t versi
     chunk->constants = NULL;
     chunk->builtin_lowercase_indices = NULL;
     chunk->builtin_resolved_ids = NULL;
-    chunk->global_symbol_cache = NULL;
+    chunk->cache_count = 0;
+    chunk->caches = NULL;
 
     uint32_t prev_version = g_astCacheVersion;
     g_astCacheVersion = version;
@@ -2312,7 +2340,8 @@ static bool psb3ReadChunk(const Psb3File* pf, BytecodeChunk* chunk) {
     chunk->constants = NULL;
     chunk->builtin_lowercase_indices = NULL;
     chunk->builtin_resolved_ids = NULL;
-    chunk->global_symbol_cache = NULL;
+    chunk->cache_count = 0;
+    chunk->caches = NULL;
 
     Cursor code_c, lines_c, const_c, bmap_c, procs_c, types_c;
     if (!psb3FindSection(pf, PSB3_SEC_CODE, &code_c) ||

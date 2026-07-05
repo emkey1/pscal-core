@@ -12,9 +12,27 @@
 #include "core/types.h" // For Value struct, as constants will be Values
 #include "symbol/symbol.h" // For HashTable definition
 
+// VM 2.0 Phase 1e legacy width: GET_GLOBAL_CACHED/SET_GLOBAL_CACHED/
+// GET_GLOBAL16_CACHED/SET_GLOBAL16_CACHED (opcodes.def 0x28-0x2B) reserved
+// this many in-stream bytes for a self-patched Symbol* before VM 2.0 Phase
+// 2a moved the cache out to a per-chunk side table (CacheSlot, below). Those
+// four opcodes are retired holes now -- never emitted, never executed -- but
+// their operand-spec strings ("kC"/"KC") keep this macro alive so a legacy
+// standalone .bc disassembly still reports their original 10/11-byte width
+// instead of misreading it.
 #define GLOBAL_INLINE_CACHE_SLOT_SIZE 8
 _Static_assert(sizeof(Symbol*) <= GLOBAL_INLINE_CACHE_SLOT_SIZE,
                "GLOBAL_INLINE_CACHE_SLOT_SIZE is too small for Symbol* pointers");
+
+// VM 2.0 Phase 2a: per-chunk global-access inline-cache side table (plan
+// Docs/pscal_vm2_plan.md §5.6). GET_GLOBAL/SET_GLOBAL/GET_GLOBAL16/
+// SET_GLOBAL16 each carry a cache_id:u16 operand (opcodes.def's 'c' spec
+// letter) indexing this table instead of embedding a patchable Symbol* in
+// the instruction stream. `symbol` is NULL until the first successful
+// resolution of that call site's global name.
+typedef struct {
+    struct Symbol_s* symbol;
+} CacheSlot;
 
 // --- Opcode Definitions ---
 // The opcode page is generated from compiler/opcodes.def — the single source
@@ -80,7 +98,13 @@ typedef struct {
     Value* constants;   // Array of constants (Value structs: numbers, strings)
     int* builtin_lowercase_indices; // Maps string constant indices to their lowercase copies (-1 if not a builtin)
     int* builtin_resolved_ids; // Maps string constant indices to resolved builtin ids (-2 unknown, -1 unresolved)
-    struct Symbol_s** global_symbol_cache;
+
+    int cache_count;    // Number of GET/SET_GLOBAL[16] cache sites the compiler emitted (compile-time constant)
+    CacheSlot* caches;  // Per-chunk runtime side table, sized cache_count; allocated lazily on first execution
+    bool prepared_for_execution; // One-time-init guard for `caches` allocation (and, in PSCAL_VM_CODE_PROTECT
+                                 // builds, for mprotect'ing `code` read-only) -- see interpretBytecode()
+    bool code_is_mapped;   // true if `code` is an mmap'd buffer (PSCAL_VM_CODE_PROTECT) rather than malloc'd
+    size_t code_map_size;  // valid only when code_is_mapped
 
     // Optional: For debugging runtime errors
     char* source_path;     // Owning source path label for human-facing diagnostics
@@ -106,7 +130,14 @@ int getInstructionLength(BytecodeChunk* chunk, int offset);
 bool pscalDecodeInstructionLength(const BytecodeChunk* chunk, int offset, int* out_length);
 void setBuiltinLowercaseIndex(BytecodeChunk* chunk, int original_idx, int lowercase_idx);
 int getBuiltinLowercaseIndex(const BytecodeChunk* chunk, int original_idx);
-void writeInlineCacheSlot(BytecodeChunk* chunk, int line);
 void setBytecodeChunkSourcePath(BytecodeChunk* chunk, const char* path);
+// Releases chunk->code, whether it's a plain malloc/realloc'd buffer or an
+// mmap'd one (see pscalProtectChunkCode). Every teardown path that used to
+// free(chunk->code) directly must go through this instead.
+void pscalReleaseChunkCode(BytecodeChunk* chunk);
+// VM 2.0 Phase 2a (plan §5.6): mprotect(PROT_READ) chunk->code in
+// PSCAL_VM_CODE_PROTECT builds; a no-op returning true otherwise. See
+// bytecode.c for the full contract.
+bool pscalProtectChunkCode(BytecodeChunk* chunk);
 
 #endif // PSCAL_BYTECODE_H

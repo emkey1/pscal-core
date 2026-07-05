@@ -54,6 +54,16 @@ static bool checkConstIndex(VCtx* ctx, uint32_t idx, int pc, const char* what) {
     return true;
 }
 
+// VM 2.0 Phase 2a (plan §5.6): validates a GET/SET_GLOBAL[16] cache_id
+// operand against chunk->cache_count, same pattern as checkConstIndex above.
+static bool checkCacheIndex(VCtx* ctx, uint32_t idx, int pc, const char* what) {
+    if (idx >= (uint32_t)ctx->chunk->cache_count) {
+        return vfail(ctx, "pc %d: %s cache index %u out of range (cache_count %d)",
+                     pc, what, idx, ctx->chunk->cache_count);
+    }
+    return true;
+}
+
 static bool checkCodeTarget(VCtx* ctx, uint32_t target, int pc, const char* what) {
     if (target >= (uint32_t)ctx->chunk->count || !ctx->boundary[target]) {
         return vfail(ctx, "pc %d: %s target %u is not a valid instruction boundary",
@@ -224,7 +234,18 @@ static bool verifyOperands(VCtx* ctx) {
                 case 'f':
                     cursor += 4;
                     break;
+                case 'c': {
+                    uint32_t idx = verifyReadU16BE(code, cursor);
+                    if (!checkCacheIndex(ctx, idx, pc, info->name)) return false;
+                    cursor += 2;
+                    break;
+                }
                 case 'C':
+                    // Legacy operand spec, only ever seen on the retired
+                    // GET/SET_GLOBAL[16]_CACHED holes (opcodes.def 0x28-0x2B).
+                    // Never emitted post-Phase-2a; no cache_id-style bounds
+                    // check applies since it's not a table index at all (it
+                    // was a raw in-stream Symbol* slot).
                     cursor += GLOBAL_INLINE_CACHE_SLOT_SIZE;
                     break;
                 default:

@@ -30,6 +30,21 @@ if(PSCAL_VALUE_ACCESS_LINT)
     message(STATUS "pscal-core: Value access lint ENABLED")
 endif()
 
+# VM 2.0 Phase 2a (plan Docs/pscal_vm2_plan.md §5.6, goal G2): mprotect(PROT_READ)
+# a chunk's CODE buffer once it's prepared for execution, so any code path that
+# still tries to write into it (i.e. a regression back toward self-modifying
+# bytecode) crashes loudly instead of silently succeeding. Defaults on for
+# Debug builds, off otherwise (mmap+mprotect has a small per-chunk cost).
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+    option(PSCAL_VM_CODE_PROTECT "mprotect(PROT_READ) bytecode CODE after load (debug-only immutability enforcement)" ON)
+else()
+    option(PSCAL_VM_CODE_PROTECT "mprotect(PROT_READ) bytecode CODE after load (debug-only immutability enforcement)" OFF)
+endif()
+if(PSCAL_VM_CODE_PROTECT)
+    add_compile_definitions(PSCAL_VM_CODE_PROTECT)
+    message(STATUS "pscal-core: VM CODE-section mprotect ENABLED")
+endif()
+
 set(SRC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 find_package(Threads REQUIRED)

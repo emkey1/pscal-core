@@ -1993,6 +1993,23 @@ static void emitConstantIndex16(BytecodeChunk* chunk, int constant_index, int li
     emitShort(chunk, (uint16_t)constant_index, line);
 }
 
+// Emits this call site's cache_id (VM 2.0 Phase 2a, plan §5.6) and bumps
+// chunk->cache_count. Each GET_GLOBAL/SET_GLOBAL/GET_GLOBAL16/SET_GLOBAL16
+// call site gets its own slot in the chunk's runtime CacheSlot side table
+// rather than sharing one keyed by name -- see bytecode.h's CacheSlot doc
+// comment for why (independent of how the compiler happens to dedupe name
+// constants).
+static void emitGlobalCacheId(BytecodeChunk* chunk, int line) {
+    if (chunk->cache_count >= 0xFFFF) {
+        fprintf(stderr, "L%d: Compiler error: too many global-access cache sites (%d). Limit is 65535.\n",
+                line, chunk->cache_count);
+        compiler_had_error = true;
+        return;
+    }
+    emitShort(chunk, (uint16_t)chunk->cache_count, line);
+    chunk->cache_count++;
+}
+
 // Helper to emit global-variable opcodes that take a name index operand.
 // Selects 8-bit or 16-bit variants based on the index value.
 static void emitGlobalNameIdx(BytecodeChunk* chunk, OpCode op8, OpCode op16,
@@ -2002,18 +2019,18 @@ static void emitGlobalNameIdx(BytecodeChunk* chunk, OpCode op8, OpCode op16,
         compiler_had_error = true;
         return;
     }
-    bool needs_inline_cache = (op8 == GET_GLOBAL || op8 == SET_GLOBAL);
+    bool needs_cache_id = (op8 == GET_GLOBAL || op8 == SET_GLOBAL);
     if (name_idx <= 0xFF) {
         writeBytecodeChunk(chunk, op8, line);
         writeBytecodeChunk(chunk, (uint8_t)name_idx, line);
-        if (needs_inline_cache) {
-            writeInlineCacheSlot(chunk, line);
+        if (needs_cache_id) {
+            emitGlobalCacheId(chunk, line);
         }
     } else if (name_idx <= 0xFFFF) {
         writeBytecodeChunk(chunk, op16, line);
         emitShort(chunk, (uint16_t)name_idx, line);
-        if (needs_inline_cache) {
-            writeInlineCacheSlot(chunk, line);
+        if (needs_cache_id) {
+            emitGlobalCacheId(chunk, line);
         }
     } else {
         fprintf(stderr, "L%d: Compiler error: too many constants (%d). Limit is 65535.\n",
@@ -6695,7 +6712,7 @@ static void applyPeepholeOptimizations(BytecodeChunk* chunk) {
     int* resized_lines = (int*)realloc(optimized_lines, (size_t)write_index * sizeof(int));
     if (resized_lines) optimized_lines = resized_lines;
 
-    free(chunk->code);
+    pscalReleaseChunkCode(chunk);
     free(chunk->lines);
     chunk->code = optimized_code;
     chunk->lines = optimized_lines;

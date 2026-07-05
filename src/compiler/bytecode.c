@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h> // For memcpy
 #include <stdint.h>
+#include <sys/mman.h> // For pscalProtectChunkCode/pscalReleaseChunkCode (PSCAL_VM_CODE_PROTECT)
+#include <unistd.h>   // For sysconf(_SC_PAGESIZE)
 
 #include "compiler/bytecode.h"
 #include "core/types.h"
@@ -46,6 +48,7 @@ int pscalOpcodeOperandSpecLength(const char* operands) {
                 break;
             case 'w':
             case 'K':
+            case 'c':
                 length += 2;
                 break;
             case 'j':
@@ -74,13 +77,38 @@ void initBytecodeChunk(BytecodeChunk* chunk) { // From all.txt
     chunk->constants = NULL;
     chunk->builtin_lowercase_indices = NULL;
     chunk->builtin_resolved_ids = NULL;
-    chunk->global_symbol_cache = NULL;
+    chunk->cache_count = 0;
+    chunk->caches = NULL;
+    chunk->prepared_for_execution = false;
+    chunk->code_is_mapped = false;
+    chunk->code_map_size = 0;
     chunk->source_path = NULL;
   //  chunk->lines = 0;
 }
 
+// Releases `chunk->code` regardless of whether it's a plain malloc'd/
+// realloc'd buffer (the normal case, and the only case before a chunk has
+// been prepared for execution) or an mmap'd, mprotect'd buffer
+// (PSCAL_VM_CODE_PROTECT builds, after pscalProtectChunkCode() has run --
+// see vm.c's interpretBytecode()). Every call site that used to `free(chunk->code)`
+// directly must go through this instead, since calling plain free() on an
+// mmap'd region is undefined behavior.
+void pscalReleaseChunkCode(BytecodeChunk* chunk) {
+    if (!chunk) return;
+    if (chunk->code) {
+        if (chunk->code_is_mapped) {
+            munmap(chunk->code, chunk->code_map_size);
+        } else {
+            free(chunk->code);
+        }
+    }
+    chunk->code = NULL;
+    chunk->code_is_mapped = false;
+    chunk->code_map_size = 0;
+}
+
 void freeBytecodeChunk(BytecodeChunk* chunk) { // From all.txt
-    free(chunk->code);
+    pscalReleaseChunkCode(chunk);
     free(chunk->lines);
     free(chunk->source_path);
     for (int i = 0; i < chunk->constants_count; i++) {
@@ -89,7 +117,7 @@ void freeBytecodeChunk(BytecodeChunk* chunk) { // From all.txt
     free(chunk->constants);
     free(chunk->builtin_lowercase_indices);
     free(chunk->builtin_resolved_ids);
-    free(chunk->global_symbol_cache);
+    free(chunk->caches);
     initBytecodeChunk(chunk);
 }
 
@@ -226,13 +254,9 @@ int addConstantToChunk(BytecodeChunk* chunk, const Value* value) {
         chunk->builtin_resolved_ids = (int*)reallocate(chunk->builtin_resolved_ids,
                                                        sizeof(int) * oldCapacity,
                                                        sizeof(int) * chunk->constants_capacity);
-        chunk->global_symbol_cache = (Symbol**)reallocate(chunk->global_symbol_cache,
-                                                          sizeof(Symbol*) * oldCapacity,
-                                                          sizeof(Symbol*) * chunk->constants_capacity);
         for (int i = oldCapacity; i < chunk->constants_capacity; ++i) {
             chunk->builtin_lowercase_indices[i] = -1;
             chunk->builtin_resolved_ids[i] = -2;
-            chunk->global_symbol_cache[i] = NULL;
         }
     } else if (!chunk->builtin_lowercase_indices && chunk->constants_capacity > 0) {
         chunk->builtin_lowercase_indices = (int*)reallocate(NULL,
@@ -250,15 +274,6 @@ int addConstantToChunk(BytecodeChunk* chunk, const Value* value) {
             chunk->builtin_resolved_ids[i] = -2;
         }
     }
-    if (!chunk->global_symbol_cache && chunk->constants_capacity > 0) {
-        chunk->global_symbol_cache = (Symbol**)reallocate(NULL,
-                                                          0,
-                                                          sizeof(Symbol*) * chunk->constants_capacity);
-        for (int i = 0; i < chunk->constants_capacity; ++i) {
-            chunk->global_symbol_cache[i] = NULL;
-        }
-    }
-
     // Perform a deep copy from the provided pointer.
     int index = chunk->constants_count;
     chunk->constants[index] = makeCopyOfValue(value);
@@ -267,9 +282,6 @@ int addConstantToChunk(BytecodeChunk* chunk, const Value* value) {
     }
     if (chunk->builtin_resolved_ids) {
         chunk->builtin_resolved_ids[index] = -2;
-    }
-    if (chunk->global_symbol_cache) {
-        chunk->global_symbol_cache[index] = NULL;
     }
 
     // The function NO LONGER frees the incoming value. The caller is responsible.
@@ -341,13 +353,47 @@ void patchInt32(BytecodeChunk* chunk, int offset_in_code, uint32_t value) {
     chunk->code[offset_in_code + 3] = (uint8_t)(value & 0xFF);
 }
 
-void writeInlineCacheSlot(BytecodeChunk* chunk, int line) {
-    if (!chunk) {
-        return;
+// VM 2.0 Phase 2a (plan §5.6, goal G2): makes CODE genuinely read-only after
+// a chunk is prepared for execution, so the migration away from
+// self-modifying global-access opcodes is enforced rather than merely
+// assumed. Called once per chunk from interpretBytecode()'s prologue, before
+// any instruction executes. Only compiled in when PSCAL_VM_CODE_PROTECT is
+// defined (a debug-only CMake option; see components/pscal-core/CMakeLists.txt) --
+// in ordinary builds this is a no-op returning true, and `code` stays the
+// plain malloc/realloc'd buffer the compiler/loader already built.
+//
+// `code` cannot be mprotect'd in place: malloc/realloc allocations are not
+// page-aligned or page-sized, so mprotect()'ing one would also affect
+// whatever unrelated heap data shares its page. Instead this copies the code
+// into a fresh anonymous mmap sized up to a page boundary, frees the old
+// buffer, and mprotects the new one PROT_READ. pscalReleaseChunkCode() (used
+// by every teardown path) knows to munmap instead of free() once
+// `code_is_mapped` is set.
+bool pscalProtectChunkCode(BytecodeChunk* chunk) {
+#ifdef PSCAL_VM_CODE_PROTECT
+    if (!chunk || !chunk->code || chunk->count <= 0 || chunk->code_is_mapped) {
+        return true; // nothing to protect, or already protected
     }
-    for (int i = 0; i < GLOBAL_INLINE_CACHE_SLOT_SIZE; ++i) {
-        writeBytecodeChunk(chunk, 0, line);
+    long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) page_size = 4096;
+    size_t map_size = (((size_t)chunk->count + (size_t)page_size - 1) / (size_t)page_size) * (size_t)page_size;
+    void* mapped = mmap(NULL, map_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapped == MAP_FAILED) {
+        return false;
     }
+    memcpy(mapped, chunk->code, (size_t)chunk->count);
+    free(chunk->code);
+    chunk->code = (uint8_t*)mapped;
+    chunk->code_map_size = map_size;
+    chunk->code_is_mapped = true;
+    if (mprotect(mapped, map_size, PROT_READ) != 0) {
+        return false;
+    }
+    return true;
+#else
+    (void)chunk;
+    return true;
+#endif
 }
 
 // Corrected helper function to find procedure/function name by its bytecode address
@@ -796,12 +842,10 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
                                 AS_STRING(chunk->constants[name_index]))
                                    ? AS_STRING(chunk->constants[name_index])
                                    : "<invalid>";
-            uintptr_t cached = readInlineCachePtr(chunk, offset + 2);
-            char cache_buffer[32];
-            const char* cache_string = formatInlineCachePointer(cached, cache_buffer, sizeof(cache_buffer));
-            fprintf(stderr, "%-16s %4u '%s' cache=%s\n", info->name,
-                    (unsigned)name_index, name, cache_string);
-            return offset + 2 + GLOBAL_INLINE_CACHE_SLOT_SIZE;
+            uint16_t cache_id = readU16BE(chunk, offset + 2);
+            fprintf(stderr, "%-16s %4u '%s' cache_id=%u\n", info->name,
+                    (unsigned)name_index, name, (unsigned)cache_id);
+            return offset + 4;
         }
         case GET_GLOBAL_CACHED:
         case SET_GLOBAL_CACHED: {
@@ -821,12 +865,10 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
                                 AS_STRING(chunk->constants[name_index]))
                                    ? AS_STRING(chunk->constants[name_index])
                                    : "<invalid>";
-            uintptr_t cached = readInlineCachePtr(chunk, offset + 3);
-            char cache_buffer[32];
-            const char* cache_string = formatInlineCachePointer(cached, cache_buffer, sizeof(cache_buffer));
-            fprintf(stderr, "%-16s %4u '%s' cache=%s\n", info->name,
-                    (unsigned)name_index, name, cache_string);
-            return offset + 3 + GLOBAL_INLINE_CACHE_SLOT_SIZE;
+            uint16_t cache_id = readU16BE(chunk, offset + 3);
+            fprintf(stderr, "%-16s %4u '%s' cache_id=%u\n", info->name,
+                    (unsigned)name_index, name, (unsigned)cache_id);
+            return offset + 5;
         }
         case GET_GLOBAL16_CACHED:
         case SET_GLOBAL16_CACHED: {

@@ -1365,16 +1365,22 @@ static void vmThreadJobQueueWake(ThreadJobQueue* queue) {
     pthread_mutex_unlock(&queue->mutex);
 }
 
-static Symbol* vmGetCachedGlobalSymbol(BytecodeChunk* chunk, int index) {
-    if (!chunk || !chunk->global_symbol_cache) return NULL;
-    if (index < 0 || index >= chunk->constants_capacity) return NULL;
-    return chunk->global_symbol_cache[index];
+// VM 2.0 Phase 2a (plan §5.6): per-call-site global-access cache, read
+// without locking (a benign race against the mutex-protected writer below --
+// pointer-sized reads/writes are effectively atomic on every target this
+// ships on, same tolerance the pre-Phase-2a inline-cache design already
+// relied on). chunk->caches is allocated once, lazily, by interpretBytecode()
+// before any instruction runs; cache_id is bounds-checked against
+// chunk->cache_count by the load-time verifier, so this index is trusted.
+static inline Symbol* vmGetCachedGlobalSymbol(BytecodeChunk* chunk, uint16_t cache_id) {
+    if (!chunk || !chunk->caches || cache_id >= chunk->cache_count) return NULL;
+    return chunk->caches[cache_id].symbol;
 }
 
-static void vmCacheGlobalSymbol(BytecodeChunk* chunk, int index, Symbol* sym) {
-    if (!chunk || !chunk->global_symbol_cache) return;
-    if (index < 0 || index >= chunk->constants_capacity) return;
-    chunk->global_symbol_cache[index] = sym;
+// Caller must hold globals_mutex.
+static inline void vmCacheGlobalSymbolLocked(BytecodeChunk* chunk, uint16_t cache_id, Symbol* sym) {
+    if (!chunk || !chunk->caches || cache_id >= chunk->cache_count) return;
+    chunk->caches[cache_id].symbol = sym;
 }
 
 static ThreadJob* vmThreadJobCreate(VM* vm,
@@ -5334,23 +5340,6 @@ static inline __attribute__((unused)) Value vmFastPeekChecked(VM* vm, int distan
 #define FAST_POP() vmFastPopUnchecked(vm)
 #define FAST_PEEK(dist) vmFastPeekChecked(vm, (dist))
 
-static inline Symbol* vmInlineCacheReadSymbol(uint8_t* slot) {
-    Symbol* sym = NULL;
-    memcpy(&sym, slot, sizeof(Symbol*));
-    return sym;
-}
-
-static inline void vmInlineCacheWriteSymbol(uint8_t* slot, Symbol* sym) {
-    memcpy(slot, &sym, sizeof(Symbol*));
-}
-
-static inline void vmPatchGlobalOpcode(uint8_t* instruction, bool isSet, bool isWide) {
-    uint8_t newOpcode = isSet
-        ? (isWide ? SET_GLOBAL16_CACHED : SET_GLOBAL_CACHED)
-        : (isWide ? GET_GLOBAL16_CACHED : GET_GLOBAL_CACHED);
-    *instruction = newOpcode;
-}
-
 static bool vmSizeForVarType(VarType type, long long* out_bytes) {
     if (!out_bytes) {
         return false;
@@ -5792,6 +5781,39 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
     }
 
     vm->chunk = chunk;
+
+    // VM 2.0 Phase 2a (plan §5.6): one-time-per-chunk prep before any
+    // instruction runs. `chunk` can be shared across multiple interpretBytecode()
+    // calls (THREAD_CREATE spawns a new VM against the *same* chunk pointer;
+    // an embedded shell closure's own chunk can likewise be invoked more than
+    // once, potentially from different threads), so this is guarded by
+    // globals_mutex -- the same lock already used for other per-chunk shared
+    // state (see vmGetCachedGlobalSymbol/vmCacheGlobalSymbolLocked above).
+    if (!chunk->prepared_for_execution) {
+        pthread_mutex_lock(&globals_mutex);
+        if (!chunk->prepared_for_execution) {
+            if (chunk->cache_count > 0 && !chunk->caches) {
+                chunk->caches = (CacheSlot*)calloc((size_t)chunk->cache_count, sizeof(CacheSlot));
+            }
+            bool caches_ok = (chunk->cache_count == 0) || (chunk->caches != NULL);
+            bool protect_ok = caches_ok && pscalProtectChunkCode(chunk);
+            if (caches_ok && protect_ok) {
+                chunk->prepared_for_execution = true;
+            }
+            pthread_mutex_unlock(&globals_mutex);
+            if (!caches_ok) {
+                runtimeError(vm, "VM Error: out of memory allocating global-access cache table.");
+                return INTERPRET_RUNTIME_ERROR;
+            }
+            if (!protect_ok) {
+                runtimeError(vm, "VM Error: failed to prepare bytecode for execution.");
+                return INTERPRET_RUNTIME_ERROR;
+            }
+        } else {
+            pthread_mutex_unlock(&globals_mutex);
+        }
+    }
+
     vm->ip = vm->chunk->code + entry;
     vm->lastInstruction = vm->ip;
     vm->abort_requested = false;
@@ -8460,10 +8482,28 @@ comparison_error_label:
                 break;
             }
             case GET_GLOBAL: {
-                uint8_t* instruction_start = vm->lastInstruction;
                 uint8_t name_idx = READ_BYTE();
-                uint8_t* cache_slot = vm->ip;
-                vm->ip += GLOBAL_INLINE_CACHE_SLOT_SIZE;
+                uint16_t cache_id = READ_SHORT(vm);
+
+                // Fast path (VM 2.0 Phase 2a): a populated cache slot resolves
+                // straight to a Symbol*, skipping the name_idx bounds check
+                // and constant-pool dereference below entirely -- this is the
+                // whole performance point of the per-call-site side table.
+                // `myself` never populates a cache slot (it short-circuits
+                // below before ever touching the cache), so a hit here is
+                // never that name; the check is kept anyway for exact parity
+                // with the miss path's semantics (cheap: same call the old
+                // self-patched GET_GLOBAL_CACHED fast path always made).
+                Symbol* fast_sym = vmGetCachedGlobalSymbol(vm->chunk, cache_id);
+                if (fast_sym && fast_sym->value) {
+                    if (vmNameIsMyself(fast_sym->name)) {
+                        push(vm, vmLoadThreadMyselfCopy(vm));
+                    } else {
+                        push(vm, copyValueForStack(fast_sym->value));
+                    }
+                    break;
+                }
+
                 if (name_idx >= vm->chunk->constants_count) {
                     runtimeError(vm, "VM Error: Name constant index %u out of bounds for GET_GLOBAL.", name_idx);
                     return INTERPRET_RUNTIME_ERROR;
@@ -8479,7 +8519,7 @@ comparison_error_label:
                     break;
                 }
 
-                Symbol* sym = vmGetCachedGlobalSymbol(vm->chunk, name_idx);
+                Symbol* sym = fast_sym;
                 if (!sym || !sym->value) {
                     Symbol* resolved = NULL;
                     bool locked = false;
@@ -8497,30 +8537,38 @@ comparison_error_label:
                         }
                     }
                     if (!locked) pthread_mutex_lock(&globals_mutex);
-                    vmCacheGlobalSymbol(vm->chunk, name_idx, resolved);
+                    vmCacheGlobalSymbolLocked(vm->chunk, cache_id, resolved);
                     pthread_mutex_unlock(&globals_mutex);
                     sym = resolved;
-                }
 
-                if (!gTextAttrInitialized && AS_STRING(*name_val) &&
-                    (strcasecmp(AS_STRING(*name_val), "CRT.TextAttr") == 0 ||
-                     strcasecmp(AS_STRING(*name_val), "TextAttr") == 0 ||
-                     strcasecmp(AS_STRING(*name_val), "crt.textattr") == 0 ||
-                     strcasecmp(AS_STRING(*name_val), "textattr") == 0)) {
-                    gTextAttrInitialized = true;
-                    SET_INT_VALUE(sym->value, 7);
+                    if (!gTextAttrInitialized && AS_STRING(*name_val) &&
+                        (strcasecmp(AS_STRING(*name_val), "CRT.TextAttr") == 0 ||
+                         strcasecmp(AS_STRING(*name_val), "TextAttr") == 0 ||
+                         strcasecmp(AS_STRING(*name_val), "crt.textattr") == 0 ||
+                         strcasecmp(AS_STRING(*name_val), "textattr") == 0)) {
+                        gTextAttrInitialized = true;
+                        SET_INT_VALUE(sym->value, 7);
+                    }
                 }
 
                 push(vm, copyValueForStack(sym->value));
-                vmInlineCacheWriteSymbol(cache_slot, sym);
-                vmPatchGlobalOpcode(instruction_start, false, false);
                 break;
             }
             case GET_GLOBAL16: {
-                uint8_t* instruction_start = vm->lastInstruction;
                 uint16_t name_idx = READ_SHORT(vm);
-                uint8_t* cache_slot = vm->ip;
-                vm->ip += GLOBAL_INLINE_CACHE_SLOT_SIZE;
+                uint16_t cache_id = READ_SHORT(vm);
+
+                // Fast path: see GET_GLOBAL above.
+                Symbol* fast_sym = vmGetCachedGlobalSymbol(vm->chunk, cache_id);
+                if (fast_sym && fast_sym->value) {
+                    if (vmNameIsMyself(fast_sym->name)) {
+                        push(vm, vmLoadThreadMyselfCopy(vm));
+                    } else {
+                        push(vm, copyValueForStack(fast_sym->value));
+                    }
+                    break;
+                }
+
                 if (name_idx >= vm->chunk->constants_count) {
                     runtimeError(vm, "VM Error: Name constant index %u out of bounds for GET_GLOBAL16.", name_idx);
                     return INTERPRET_RUNTIME_ERROR;
@@ -8536,7 +8584,7 @@ comparison_error_label:
                     break;
                 }
 
-                Symbol* sym = vmGetCachedGlobalSymbol(vm->chunk, name_idx);
+                Symbol* sym = fast_sym;
                 if (!sym || !sym->value) {
                     Symbol* resolved = NULL;
                     bool locked = false;
@@ -8554,62 +8602,62 @@ comparison_error_label:
                         }
                     }
                     if (!locked) pthread_mutex_lock(&globals_mutex);
-                    vmCacheGlobalSymbol(vm->chunk, name_idx, resolved);
+                    vmCacheGlobalSymbolLocked(vm->chunk, cache_id, resolved);
                     pthread_mutex_unlock(&globals_mutex);
                     sym = resolved;
-                }
 
-                if (!gTextAttrInitialized && AS_STRING(*name_val) &&
-                    (strcasecmp(AS_STRING(*name_val), "CRT.TextAttr") == 0 ||
-                     strcasecmp(AS_STRING(*name_val), "TextAttr") == 0 ||
-                     strcasecmp(AS_STRING(*name_val), "crt.textattr") == 0 ||
-                     strcasecmp(AS_STRING(*name_val), "textattr") == 0)) {
-                    gTextAttrInitialized = true;
-                    SET_INT_VALUE(sym->value, 7);
+                    if (!gTextAttrInitialized && AS_STRING(*name_val) &&
+                        (strcasecmp(AS_STRING(*name_val), "CRT.TextAttr") == 0 ||
+                         strcasecmp(AS_STRING(*name_val), "TextAttr") == 0 ||
+                         strcasecmp(AS_STRING(*name_val), "crt.textattr") == 0 ||
+                         strcasecmp(AS_STRING(*name_val), "textattr") == 0)) {
+                        gTextAttrInitialized = true;
+                        SET_INT_VALUE(sym->value, 7);
+                    }
                 }
 
                 push(vm, copyValueForStack(sym->value));
-                vmInlineCacheWriteSymbol(cache_slot, sym);
-                vmPatchGlobalOpcode(instruction_start, false, true);
-                break;
-            }
-            case GET_GLOBAL_CACHED: {
-                READ_BYTE();
-                uint8_t* cache_slot = vm->ip;
-                vm->ip += GLOBAL_INLINE_CACHE_SLOT_SIZE;
-                Symbol* sym = vmInlineCacheReadSymbol(cache_slot);
-                if (!sym || !sym->value) {
-                    runtimeError(vm, "VM Error: Cached global unavailable in GET_GLOBAL_CACHED.");
-                    return INTERPRET_RUNTIME_ERROR;
-                }
-                if (vmNameIsMyself(sym->name)) {
-                    push(vm, vmLoadThreadMyselfCopy(vm));
-                } else {
-                    push(vm, copyValueForStack(sym->value));
-                }
-                break;
-            }
-            case GET_GLOBAL16_CACHED: {
-                READ_SHORT(vm);
-                uint8_t* cache_slot = vm->ip;
-                vm->ip += GLOBAL_INLINE_CACHE_SLOT_SIZE;
-                Symbol* sym = vmInlineCacheReadSymbol(cache_slot);
-                if (!sym || !sym->value) {
-                    runtimeError(vm, "VM Error: Cached global unavailable in GET_GLOBAL16_CACHED.");
-                    return INTERPRET_RUNTIME_ERROR;
-                }
-                if (vmNameIsMyself(sym->name)) {
-                    push(vm, vmLoadThreadMyselfCopy(vm));
-                } else {
-                    push(vm, copyValueForStack(sym->value));
-                }
                 break;
             }
             case SET_GLOBAL: {
-                uint8_t* instruction_start = vm->lastInstruction;
                 uint8_t name_idx = READ_BYTE();
-                uint8_t* cache_slot = vm->ip;
-                vm->ip += GLOBAL_INLINE_CACHE_SLOT_SIZE;
+                uint16_t cache_id = READ_SHORT(vm);
+
+                // Fast path (VM 2.0 Phase 2a): a populated cache slot skips
+                // the name_idx bounds check and constant-pool dereference
+                // below entirely, using sym->name wherever the miss path
+                // below uses name_val's string -- same as the old self-patched
+                // SET_GLOBAL_CACHED fast path did.
+                Symbol* fast_sym = vmGetCachedGlobalSymbol(vm->chunk, cache_id);
+                if (fast_sym) {
+                    if (vmPasExceptionPending(vm) &&
+                        !vmNameIsPasExceptionGlobal(fast_sym->name) &&
+                        !vmNameIsMyself(fast_sym->name)) {
+                        Value skipped_value = pop(vm);
+                        freeValue(&skipped_value);
+                        break;
+                    }
+                    if (vmNameIsMyself(fast_sym->name)) {
+                        Value value_from_stack = pop(vm);
+                        vmStoreThreadMyself(vm, value_from_stack);
+                        break;
+                    }
+                    pthread_mutex_lock(&globals_mutex);
+                    if (!fast_sym->value) {
+                        fast_sym->value = (Value*)malloc(sizeof(Value));
+                        if (!fast_sym->value) {
+                            pthread_mutex_unlock(&globals_mutex);
+                            runtimeError(vm, "VM Error: Malloc failed for symbol value in SET_GLOBAL.");
+                            return INTERPRET_RUNTIME_ERROR;
+                        }
+                        *(fast_sym->value) = makeValueForType(fast_sym->type, fast_sym->type_def, fast_sym);
+                    }
+                    Value value_from_stack = pop(vm);
+                    updateSymbolDirect(fast_sym, fast_sym->name, value_from_stack);
+                    pthread_mutex_unlock(&globals_mutex);
+                    break;
+                }
+
                 if (name_idx >= vm->chunk->constants_count) {
                     runtimeError(vm, "VM Error: Name constant index %u out of bounds for SET_GLOBAL.", name_idx);
                     return INTERPRET_RUNTIME_ERROR;
@@ -8634,20 +8682,18 @@ comparison_error_label:
                 }
 
                 pthread_mutex_lock(&globals_mutex);
-                Symbol* sym = vmGetCachedGlobalSymbol(vm->chunk, name_idx);
+                Symbol* sym = hashTableLookup(vm->vmGlobalSymbols, AS_STRING(*name_val));
                 if (!sym) {
-                    sym = hashTableLookup(vm->vmGlobalSymbols, AS_STRING(*name_val));
-                    if (!sym) {
-                        pthread_mutex_unlock(&globals_mutex);
-                        runtimeError(vm, "Runtime Error: Global variable '%s' not defined for assignment.", AS_STRING(*name_val));
-                        return INTERPRET_RUNTIME_ERROR;
-                    }
-                    vmCacheGlobalSymbol(vm->chunk, name_idx, sym);
+                    pthread_mutex_unlock(&globals_mutex);
+                    runtimeError(vm, "Runtime Error: Global variable '%s' not defined for assignment.", AS_STRING(*name_val));
+                    return INTERPRET_RUNTIME_ERROR;
                 }
+                vmCacheGlobalSymbolLocked(vm->chunk, cache_id, sym);
 
                 if (!sym->value) {
                     sym->value = (Value*)malloc(sizeof(Value));
                     if (!sym->value) {
+                        pthread_mutex_unlock(&globals_mutex);
                         runtimeError(vm, "VM Error: Malloc failed for symbol value in SET_GLOBAL.");
                         return INTERPRET_RUNTIME_ERROR;
                     }
@@ -8657,15 +8703,43 @@ comparison_error_label:
                 Value value_from_stack = pop(vm);
                 updateSymbolDirect(sym, AS_STRING(*name_val), value_from_stack);
                 pthread_mutex_unlock(&globals_mutex);
-                vmInlineCacheWriteSymbol(cache_slot, sym);
-                vmPatchGlobalOpcode(instruction_start, true, false);
                 break;
             }
             case SET_GLOBAL16: {
-                uint8_t* instruction_start = vm->lastInstruction;
                 uint16_t name_idx = READ_SHORT(vm);
-                uint8_t* cache_slot = vm->ip;
-                vm->ip += GLOBAL_INLINE_CACHE_SLOT_SIZE;
+                uint16_t cache_id = READ_SHORT(vm);
+
+                // Fast path: see SET_GLOBAL above.
+                Symbol* fast_sym = vmGetCachedGlobalSymbol(vm->chunk, cache_id);
+                if (fast_sym) {
+                    if (vmPasExceptionPending(vm) &&
+                        !vmNameIsPasExceptionGlobal(fast_sym->name) &&
+                        !vmNameIsMyself(fast_sym->name)) {
+                        Value skipped_value = pop(vm);
+                        freeValue(&skipped_value);
+                        break;
+                    }
+                    if (vmNameIsMyself(fast_sym->name)) {
+                        Value value_from_stack = pop(vm);
+                        vmStoreThreadMyself(vm, value_from_stack);
+                        break;
+                    }
+                    pthread_mutex_lock(&globals_mutex);
+                    if (!fast_sym->value) {
+                        fast_sym->value = (Value*)malloc(sizeof(Value));
+                        if (!fast_sym->value) {
+                            pthread_mutex_unlock(&globals_mutex);
+                            runtimeError(vm, "VM Error: Malloc failed for symbol value in SET_GLOBAL16.");
+                            return INTERPRET_RUNTIME_ERROR;
+                        }
+                        *(fast_sym->value) = makeValueForType(fast_sym->type, fast_sym->type_def, fast_sym);
+                    }
+                    Value value_from_stack = pop(vm);
+                    updateSymbolDirect(fast_sym, fast_sym->name, value_from_stack);
+                    pthread_mutex_unlock(&globals_mutex);
+                    break;
+                }
+
                 if (name_idx >= vm->chunk->constants_count) {
                     runtimeError(vm, "VM Error: Name constant index %u out of bounds for SET_GLOBAL16.", name_idx);
                     return INTERPRET_RUNTIME_ERROR;
@@ -8690,20 +8764,18 @@ comparison_error_label:
                 }
 
                 pthread_mutex_lock(&globals_mutex);
-                Symbol* sym = vmGetCachedGlobalSymbol(vm->chunk, name_idx);
+                Symbol* sym = hashTableLookup(vm->vmGlobalSymbols, AS_STRING(*name_val));
                 if (!sym) {
-                    sym = hashTableLookup(vm->vmGlobalSymbols, AS_STRING(*name_val));
-                    if (!sym) {
-                        pthread_mutex_unlock(&globals_mutex);
-                        runtimeError(vm, "Runtime Error: Global variable '%s' not defined for assignment.", AS_STRING(*name_val));
-                        return INTERPRET_RUNTIME_ERROR;
-                    }
-                    vmCacheGlobalSymbol(vm->chunk, name_idx, sym);
+                    pthread_mutex_unlock(&globals_mutex);
+                    runtimeError(vm, "Runtime Error: Global variable '%s' not defined for assignment.", AS_STRING(*name_val));
+                    return INTERPRET_RUNTIME_ERROR;
                 }
+                vmCacheGlobalSymbolLocked(vm->chunk, cache_id, sym);
 
                 if (!sym->value) {
                     sym->value = (Value*)malloc(sizeof(Value));
                     if (!sym->value) {
+                        pthread_mutex_unlock(&globals_mutex);
                         runtimeError(vm, "VM Error: Malloc failed for symbol value in SET_GLOBAL16.");
                         return INTERPRET_RUNTIME_ERROR;
                     }
@@ -8712,66 +8784,6 @@ comparison_error_label:
 
                 Value value_from_stack = pop(vm);
                 updateSymbolDirect(sym, AS_STRING(*name_val), value_from_stack);
-                pthread_mutex_unlock(&globals_mutex);
-                vmInlineCacheWriteSymbol(cache_slot, sym);
-                vmPatchGlobalOpcode(instruction_start, true, true);
-                break;
-            }
-            case SET_GLOBAL_CACHED: {
-                READ_BYTE();
-                uint8_t* cache_slot = vm->ip;
-                vm->ip += GLOBAL_INLINE_CACHE_SLOT_SIZE;
-                Symbol* sym = vmInlineCacheReadSymbol(cache_slot);
-                if (!sym) {
-                    runtimeError(vm, "VM Error: Cached symbol missing for SET_GLOBAL_CACHED.");
-                    return INTERPRET_RUNTIME_ERROR;
-                }
-                if (vmNameIsMyself(sym->name)) {
-                    Value value_from_stack = pop(vm);
-                    vmStoreThreadMyself(vm, value_from_stack);
-                    break;
-                }
-                pthread_mutex_lock(&globals_mutex);
-                if (!sym->value) {
-                    sym->value = (Value*)malloc(sizeof(Value));
-                    if (!sym->value) {
-                        pthread_mutex_unlock(&globals_mutex);
-                        runtimeError(vm, "VM Error: Malloc failed for cached symbol value in SET_GLOBAL.");
-                        return INTERPRET_RUNTIME_ERROR;
-                    }
-                    *(sym->value) = makeValueForType(sym->type, sym->type_def, sym);
-                }
-                Value value_from_stack = pop(vm);
-                updateSymbolDirect(sym, sym->name, value_from_stack);
-                pthread_mutex_unlock(&globals_mutex);
-                break;
-            }
-            case SET_GLOBAL16_CACHED: {
-                READ_SHORT(vm);
-                uint8_t* cache_slot = vm->ip;
-                vm->ip += GLOBAL_INLINE_CACHE_SLOT_SIZE;
-                Symbol* sym = vmInlineCacheReadSymbol(cache_slot);
-                if (!sym) {
-                    runtimeError(vm, "VM Error: Cached symbol missing for SET_GLOBAL16_CACHED.");
-                    return INTERPRET_RUNTIME_ERROR;
-                }
-                if (vmNameIsMyself(sym->name)) {
-                    Value value_from_stack = pop(vm);
-                    vmStoreThreadMyself(vm, value_from_stack);
-                    break;
-                }
-                pthread_mutex_lock(&globals_mutex);
-                if (!sym->value) {
-                    sym->value = (Value*)malloc(sizeof(Value));
-                    if (!sym->value) {
-                        pthread_mutex_unlock(&globals_mutex);
-                        runtimeError(vm, "VM Error: Malloc failed for cached symbol value in SET_GLOBAL16.");
-                        return INTERPRET_RUNTIME_ERROR;
-                    }
-                    *(sym->value) = makeValueForType(sym->type, sym->type_def, sym);
-                }
-                Value value_from_stack = pop(vm);
-                updateSymbolDirect(sym, sym->name, value_from_stack);
                 pthread_mutex_unlock(&globals_mutex);
                 break;
             }
