@@ -220,6 +220,26 @@ typedef struct ValueStruct {
 #define AS_SET(v)        PSCAL_VALUE_FIELD(v, set_val)
 #define AS_ARRAY_RAW(v)  PSCAL_VALUE_FIELD(v, array_raw)
 
+/* Array/string/file/pointer metadata accessors.  Phase 4 Stage A moves
+ * these fields into the heap array/string objects; until then they are
+ * exact aliases like the payload accessors above. */
+#define ARRAY_LOWER_BOUND(v)       PSCAL_VALUE_FIELD(v, lower_bound)
+#define ARRAY_UPPER_BOUND(v)       PSCAL_VALUE_FIELD(v, upper_bound)
+#define ARRAY_LOWER_BOUNDS(v)      PSCAL_VALUE_FIELD(v, lower_bounds)
+#define ARRAY_UPPER_BOUNDS(v)      PSCAL_VALUE_FIELD(v, upper_bounds)
+#define ARRAY_DIMENSIONS(v)        PSCAL_VALUE_FIELD(v, dimensions)
+#define ARRAY_ELEMENT_TYPE(v)      PSCAL_VALUE_FIELD(v, element_type)
+#define ARRAY_ELEMENT_TYPE_DEF(v)  PSCAL_VALUE_FIELD(v, element_type_def)
+#define ARRAY_IS_PACKED(v)         PSCAL_VALUE_FIELD(v, array_is_packed)
+#define ARRAY_IS_DYNAMIC(v)        PSCAL_VALUE_FIELD(v, array_is_dynamic)
+#define ARRAY_REFCOUNT(v)          PSCAL_VALUE_FIELD(v, array_refcount)
+#define STRING_MAX_LENGTH(v)       PSCAL_VALUE_FIELD(v, max_length)
+#define PTR_BASE_TYPE_NODE(v)      PSCAL_VALUE_FIELD(v, base_type_node)
+#define FILE_FILENAME(v)           PSCAL_VALUE_FIELD(v, filename)
+#define FILE_RECORD_SIZE(v)        PSCAL_VALUE_FIELD(v, record_size)
+#define FILE_RECORD_SIZE_EXPLICIT(v) PSCAL_VALUE_FIELD(v, record_size_explicit)
+#define ENUM_META(v)               PSCAL_VALUE_FIELD(v, enum_meta)
+
 typedef struct FieldValue {
     char *name;
     struct ValueStruct value;
