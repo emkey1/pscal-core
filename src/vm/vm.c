@@ -30,6 +30,7 @@
 #include <termios.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h> // For the operand stack's mmap/mprotect-backed growable storage (VM 2.0 Phase 3)
 #include "backend_ast/builtin.h"
 #ifdef SDL
 #include "backend_ast/pscal_sdl_runtime.h"
@@ -531,6 +532,146 @@ void vmSetVerboseErrors(bool enabled) {
 // --- VM Helper Functions ---
 static void resetStack(VM* vm) {
     vm->stackTop = vm->stack;
+}
+
+// --- VM 2.0 Phase 3: growable, never-relocated stack storage ---
+//
+// Effective ceilings are read once per process (consistent with the
+// PSCAL_VM_SKIP_VERIFY convention from the Phase 1e verifier) so the runtime
+// and the load-time verifier (bytecode_verify.c) always agree on the same
+// bound rather than drifting if only one of them were made configurable.
+size_t pscalVmStackCeilingValues(void) {
+    static size_t cached = 0;
+    if (cached == 0) {
+        size_t v = (size_t)VM_STACK_MAX;
+        const char* env = getenv("PSCAL_VM_MAX_STACK_VALUES");
+        if (env && *env) {
+            char* end = NULL;
+            unsigned long long parsed = strtoull(env, &end, 10);
+            if (end && *end == '\0' && parsed > 0) v = (size_t)parsed;
+        }
+        cached = v;
+    }
+    return cached;
+}
+
+size_t pscalVmCallFrameCeiling(void) {
+    static size_t cached = 0;
+    if (cached == 0) {
+        size_t v = (size_t)VM_CALL_STACK_MAX;
+        const char* env = getenv("PSCAL_VM_MAX_CALL_FRAMES");
+        if (env && *env) {
+            char* end = NULL;
+            unsigned long long parsed = strtoull(env, &end, 10);
+            if (end && *end == '\0' && parsed > 0) v = (size_t)parsed;
+        }
+        cached = v;
+    }
+    return cached;
+}
+
+static size_t vmPageRoundUp(size_t nbytes) {
+    static size_t page_size = 0;
+    if (page_size == 0) {
+        long ps = sysconf(_SC_PAGESIZE);
+        page_size = (ps > 0) ? (size_t)ps : 4096;
+    }
+    return ((nbytes + page_size - 1) / page_size) * page_size;
+}
+
+// Reserve the operand stack's full virtual address range up front
+// (PROT_NONE — costs address space, not physical memory) and commit only a
+// small initial prefix (PROT_READ|PROT_WRITE). `vm->stack` is fixed for the
+// life of the VM: GET_LOCAL_ADDRESS/GET_GSLOT_ADDRESS and VAR-parameter
+// passing push real `Value*` pointers into this region (see manual ch1 §1.2
+// and CallFrame.slots), so the base address must never move or be freed
+// until freeVM(). Returns false on allocation failure (fatal in initVM()).
+static bool vmAllocStackStorage(VM* vm) {
+    size_t ceiling = pscalVmStackCeilingValues();
+    size_t initial = VM_STACK_INITIAL_VALUES;
+    if (initial > ceiling) initial = ceiling;
+
+    size_t reserve_bytes = vmPageRoundUp(ceiling * sizeof(Value));
+    void* mapped = mmap(NULL, reserve_bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapped == MAP_FAILED) {
+        return false;
+    }
+
+    size_t commit_bytes = vmPageRoundUp(initial * sizeof(Value));
+    if (commit_bytes > reserve_bytes) commit_bytes = reserve_bytes;
+    if (commit_bytes > 0 && mprotect(mapped, commit_bytes, PROT_READ | PROT_WRITE) != 0) {
+        munmap(mapped, reserve_bytes);
+        return false;
+    }
+
+    vm->stack = (Value*)mapped;
+    vm->stackTop = vm->stack;
+    vm->stackMappedBytes = reserve_bytes;
+    vm->stackReservedValues = reserve_bytes / sizeof(Value);
+    vm->stackCommittedValues = commit_bytes / sizeof(Value);
+    return true;
+}
+
+static void vmFreeStackStorage(VM* vm) {
+    if (vm->stack) {
+        munmap(vm->stack, vm->stackMappedBytes);
+    }
+    vm->stack = NULL;
+    vm->stackTop = NULL;
+    vm->stackMappedBytes = 0;
+    vm->stackReservedValues = 0;
+    vm->stackCommittedValues = 0;
+}
+
+// Extend the accessible prefix in place (mprotect only — never mmap/munmap
+// the base) so `neededValues` Values are usable. Doubles the committed
+// region each time to keep amortized growth cost low. Returns false only
+// when `neededValues` exceeds the hard ceiling (stackReservedValues) or the
+// mprotect() call itself fails — both are reported as a clean stack-overflow
+// runtime error by the caller, never a crash.
+static bool vmGrowStackStorage(VM* vm, size_t neededValues) {
+    if (neededValues <= vm->stackCommittedValues) return true;
+    if (neededValues > vm->stackReservedValues) return false;
+
+    size_t newCommitted = vm->stackCommittedValues * 2;
+    if (newCommitted < neededValues) newCommitted = neededValues;
+    if (newCommitted > vm->stackReservedValues) newCommitted = vm->stackReservedValues;
+
+    size_t oldCommitBytes = vmPageRoundUp(vm->stackCommittedValues * sizeof(Value));
+    size_t newCommitBytes = vmPageRoundUp(newCommitted * sizeof(Value));
+    if (newCommitBytes > oldCommitBytes) {
+        if (mprotect((char*)vm->stack + oldCommitBytes, newCommitBytes - oldCommitBytes,
+                     PROT_READ | PROT_WRITE) != 0) {
+            return false;
+        }
+    }
+    vm->stackCommittedValues = newCommitted;
+    return true;
+}
+
+// Grow frames[] via ordinary realloc (see vm.h: no long-lived CallFrame*
+// escapes, so relocation on growth is safe). Returns false only when
+// frameCount has reached the hard ceiling or the realloc itself fails.
+static bool vmGrowFrames(VM* vm) {
+    size_t ceiling = pscalVmCallFrameCeiling();
+    if ((size_t)vm->frameCount >= ceiling) return false;
+
+    size_t newCap = vm->frameCapacity ? vm->frameCapacity * 2 : VM_CALL_FRAME_INITIAL_CAPACITY;
+    if (newCap > ceiling) newCap = ceiling;
+    if (newCap <= vm->frameCapacity) return false;
+
+    CallFrame* newFrames = (CallFrame*)realloc(vm->frames, newCap * sizeof(CallFrame));
+    if (!newFrames) return false;
+
+    memset(newFrames + vm->frameCapacity, 0, (newCap - vm->frameCapacity) * sizeof(CallFrame));
+    vm->frames = newFrames;
+    vm->frameCapacity = newCap;
+    return true;
+}
+
+static inline bool vmEnsureFrameCapacity(VM* vm) {
+    if ((size_t)vm->frameCount < vm->frameCapacity) return true;
+    return vmGrowFrames(vm);
 }
 
 // Resolve a value to its underlying record by chasing pointer chains.
@@ -3480,7 +3621,8 @@ static Value copyValueForStack(const Value* src) {
 }
 
 static void push(VM* vm, Value value) { // Using your original name 'push'
-    if (vm->stackTop - vm->stack >= VM_STACK_MAX) {
+    size_t used = (size_t)(vm->stackTop - vm->stack);
+    if (used >= vm->stackCommittedValues && !vmGrowStackStorage(vm, used + 1)) {
         runtimeError(vm, "VM Error: Stack overflow.");
         return;
     }
@@ -5056,7 +5198,25 @@ void vmResetExecutionState(VM* vm) {
 
 void initVM(VM* vm) { // As in all.txt, with frameCount
     if (!vm) return;
-    resetStack(vm);
+    vm->stack = NULL;
+    vm->stackTop = NULL;
+    vm->stackMappedBytes = 0;
+    vm->stackReservedValues = 0;
+    vm->stackCommittedValues = 0;
+    if (!vmAllocStackStorage(vm)) {
+        fprintf(stderr, "Fatal VM Error: Could not reserve the operand stack "
+                         "(%zu Values).\n", pscalVmStackCeilingValues());
+        EXIT_FAILURE_HANDLER();
+    }
+
+    vm->frames = NULL;
+    vm->frameCapacity = 0;
+    vm->frameCount = 0; // <--- INITIALIZE frameCount (before vmGrowFrames() reads it below)
+    if (!vmGrowFrames(vm)) {
+        fprintf(stderr, "Fatal VM Error: Could not allocate the call-frame array.\n");
+        EXIT_FAILURE_HANDLER();
+    }
+
     vm->chunk = NULL;
     vm->ip = NULL;
     vm->lastInstruction = NULL;
@@ -5065,8 +5225,6 @@ void initVM(VM* vm) { // As in all.txt, with frameCount
     vm->procedureTable = NULL;
     vm->procedureByAddress = NULL;
     vm->procedureByAddressSize = 0;
-
-    vm->frameCount = 0; // <--- INITIALIZE frameCount
 
     vm->exit_requested = false;
     vm->abort_requested = false;
@@ -5202,6 +5360,17 @@ void freeVM(VM* vm) {
     // No explicit freeing of vm->host_functions array itself as it's part of
     // the VM struct. If HostFn entries allocated memory, that would require
     // additional handling.
+
+    // vmReleaseExecutionResources() (called above) already freed every Value
+    // still on the stack and every frame's upvalues/closureEnv; only the
+    // underlying storage itself (the mmap reservation and the frames[]
+    // heap array) remains to be released now that the VM is being torn down.
+    vmFreeStackStorage(vm);
+    if (vm->frames) {
+        free(vm->frames);
+        vm->frames = NULL;
+    }
+    vm->frameCapacity = 0;
 }
 
 // Unwind the current call frame. If there are no more frames, the VM should halt.
@@ -5301,7 +5470,8 @@ static inline uint32_t READ_UINT32(VM* vm_param) {
 // VM_s.stack array bounds -- real memory corruption, not just a wrong
 // result.
 static inline void vmFastPushUnchecked(VM* vm, Value value) {
-    if (vm->stackTop - vm->stack >= VM_STACK_MAX) {
+    size_t used = (size_t)(vm->stackTop - vm->stack);
+    if (used >= vm->stackCommittedValues && !vmGrowStackStorage(vm, used + 1)) {
         runtimeError(vm, "VM Error: Stack overflow.");
         return;
     }
@@ -9467,7 +9637,7 @@ comparison_error_label:
                 break;
             }
             case CALL_USER_PROC: {
-                if (vm->frameCount >= VM_CALL_STACK_MAX) {
+                if (!vmEnsureFrameCapacity(vm)) {
                     runtimeError(vm, "VM Error: Call stack overflow.");
                     return INTERPRET_RUNTIME_ERROR;
                 }
@@ -9597,7 +9767,7 @@ comparison_error_label:
                 break;
             }
             case CALL: {
-                if (vm->frameCount >= VM_CALL_STACK_MAX) {
+                if (!vmEnsureFrameCapacity(vm)) {
                     runtimeError(vm, "VM Error: Call stack overflow.");
                     return INTERPRET_RUNTIME_ERROR;
                 }
@@ -9719,7 +9889,7 @@ comparison_error_label:
                 }
                 freeValue(&addrVal);
 
-                if (vm->frameCount >= VM_CALL_STACK_MAX) {
+                if (!vmEnsureFrameCapacity(vm)) {
                     if (captured_env) {
                         releaseClosureEnv(captured_env);
                     }
@@ -9876,7 +10046,7 @@ comparison_error_label:
                 }
 
                 uint16_t target_address = (uint32_t)VAL_UINT(vtable_arr[method_index]);
-                if (vm->frameCount >= VM_CALL_STACK_MAX) {
+                if (!vmEnsureFrameCapacity(vm)) {
                     runtimeError(vm, "VM Error: Call stack overflow.");
                     return INTERPRET_RUNTIME_ERROR;
                 }
@@ -9989,7 +10159,7 @@ comparison_error_label:
                 }
                 freeValue(&addrVal);
 
-                if (vm->frameCount >= VM_CALL_STACK_MAX) {
+                if (!vmEnsureFrameCapacity(vm)) {
                     if (captured_env) {
                         releaseClosureEnv(captured_env);
                     }

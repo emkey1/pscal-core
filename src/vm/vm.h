@@ -19,14 +19,28 @@
 #include <stdatomic.h>
 
 // --- VM Configuration ---
-#define VM_STACK_MAX 8192       // Maximum number of Values on the operand stack
+// VM_STACK_MAX / VM_CALL_STACK_MAX are *default ceilings* (VM 2.0 Phase 3,
+// plan Docs/pscal_vm2_plan.md §5.9), not fixed inline array sizes: the
+// operand stack and call-frame array each start small and grow on demand,
+// up to these ceilings. Override at runtime via PSCAL_VM_MAX_STACK_VALUES /
+// PSCAL_VM_MAX_CALL_FRAMES (read once via pscalVmStackCeilingValues() /
+// pscalVmCallFrameCeiling(), below) so the verifier and the runtime always
+// agree on the same bound.
+#define VM_STACK_MAX 1048576         // default ceiling: max Values on the operand stack
+#define VM_STACK_INITIAL_VALUES 4096 // initial committed operand-stack segment
 #define VM_GLOBALS_MAX 4096     // Maximum number of global variables (for simple array storage)
 
 #define MAX_HOST_FUNCTIONS 4096
 
-#define VM_CALL_STACK_MAX 4096
+#define VM_CALL_STACK_MAX 131072            // default ceiling: max active call frames
+#define VM_CALL_FRAME_INITIAL_CAPACITY 256  // initial frames[] capacity
 #define VM_MAX_THREADS 16
 #define VM_MAX_MUTEXES 64
+
+// Effective ceilings (VM_STACK_MAX / VM_CALL_STACK_MAX unless overridden by
+// PSCAL_VM_MAX_STACK_VALUES / PSCAL_VM_MAX_CALL_FRAMES); read once per process.
+size_t pscalVmStackCeilingValues(void);
+size_t pscalVmCallFrameCeiling(void);
 
 #ifndef THREAD_NAME_MAX
 #define THREAD_NAME_MAX 64
@@ -217,9 +231,21 @@ typedef struct VM_s {
     uint8_t* ip;              // Instruction Pointer: points to the *next* byte to be read
     uint8_t* lastInstruction; // Start of the last executed instruction
 
-    Value stack[VM_STACK_MAX]; // The operand stack
+    // The operand stack (VM 2.0 Phase 3, plan §5.9). `stack` is the base of a
+    // single virtual-memory reservation made once in initVM() via mmap(PROT_NONE)
+    // and never relocated or freed until freeVM() — GET_LOCAL_ADDRESS/
+    // GET_GSLOT_ADDRESS and VAR-parameter passing push real `Value*` pointers
+    // into this region that must stay valid for the VM's entire lifetime (see
+    // manual ch1 §1.2). Growth extends the accessible (mprotect'd PROT_READ|
+    // PROT_WRITE) prefix in place rather than reallocating, so the base address
+    // never changes and every existing `vm->stackTop - vm->stack`-style
+    // computation throughout vm.c keeps working unmodified.
+    Value* stack;
     Value* stackTop;          // Pointer to the element just above the top of the stack
                               // (i.e., where the next pushed item will go)
+    size_t stackCommittedValues; // currently accessible (mprotect'd RW) prefix, in Values
+    size_t stackReservedValues;  // total virtual reservation size, in Values (the hard ceiling)
+    size_t stackMappedBytes;     // exact byte length passed to mmap (for munmap in freeVM)
 
     HashTable* vmGlobalSymbols;      // VM's own symbol table for runtime global variable storage
     HashTable* vmConstGlobalSymbols; // Separate table for constant globals (read-only, no mutex)
@@ -229,7 +255,13 @@ typedef struct VM_s {
     
     HostFn host_functions[MAX_HOST_FUNCTIONS];
 
-    CallFrame frames[VM_CALL_STACK_MAX];
+    // Call-frame array (VM 2.0 Phase 3). Grown via ordinary realloc() — unlike
+    // the operand stack, nothing takes the address of a CallFrame and holds it
+    // beyond the immediate scope of the opcode handler that read it (verified
+    // across every CALL/CALL_INDIRECT/CALL_METHOD/PROC_CALL_INDIRECT/RETURN/
+    // THREAD_CREATE site), so relocation on growth is safe.
+    CallFrame* frames;
+    size_t frameCapacity;
     int frameCount;
 
     bool exit_requested;      // Indicates a builtin requested early exit from the current frame

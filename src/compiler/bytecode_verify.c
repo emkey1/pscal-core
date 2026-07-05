@@ -581,9 +581,10 @@ static bool verifySegment(VCtx* ctx, const ProcSegment* seg, uint8_t* visited, D
                     return vfail(ctx, "pc %d: %s would underflow the stack (depth %d, delta %d)",
                                  pc, info->name, item.depth.value, eff.delta);
                 }
-                if (nv > VM_STACK_MAX) {
-                    return vfail(ctx, "pc %d: %s exceeds the maximum stack depth (%d > %d)",
-                                 pc, info->name, nv, VM_STACK_MAX);
+                size_t stack_ceiling = pscalVmStackCeilingValues();
+                if ((size_t)nv > stack_ceiling) {
+                    return vfail(ctx, "pc %d: %s exceeds the maximum stack depth (%d > %zu)",
+                                 pc, info->name, nv, stack_ceiling);
                 }
                 next_depth.value = nv;
             }
