@@ -5293,22 +5293,46 @@ static inline uint32_t READ_UINT32(VM* vm_param) {
 #define READ_HOST_ID() ((HostFunctionID)READ_BYTE())
 
 // --- Fast Stack Helpers -------------------------------------------------
-// These helpers intentionally skip overflow/underflow checks and should only
-// be used in opcode handlers where stack depth has already been validated by
-// preceding logic.
+// These still do the minimum bounds check (a comparison + branch, not a
+// function call into push()/pop()'s fuller error-path setup) so that the
+// load-time verifier's "unknown" abstract-depth regions (see
+// bytecode_verify.c: CALL_INDIRECT/CALL_METHOD/CALL_HOST taint depth
+// tracking to unknown and stop asserting concrete bounds there) have a real
+// runtime backstop, exactly like push()/pop()/peek() already provide. A
+// crafted/adversarial .bc file can make these run with a shallower stack
+// than the fast-path opcodes (ADD/SUBTRACT/MULTIPLY/DIVIDE/NEGATE/NOT/
+// TO_BOOL) expect; without this check that walks vm->stackTop out of the
+// VM_s.stack array bounds -- real memory corruption, not just a wrong
+// result.
 static inline void vmFastPushUnchecked(VM* vm, Value value) {
+    if (vm->stackTop - vm->stack >= VM_STACK_MAX) {
+        runtimeError(vm, "VM Error: Stack overflow.");
+        return;
+    }
     *vm->stackTop = value;
     vm->stackTop++;
 }
 
 static inline Value vmFastPopUnchecked(VM* vm) {
+    if (vm->stackTop == vm->stack) {
+        runtimeError(vm, "VM Error: Stack underflow.");
+        return makeNil();
+    }
     vm->stackTop--;
     return *vm->stackTop;
 }
 
+static inline __attribute__((unused)) Value vmFastPeekChecked(VM* vm, int distance) {
+    if (vm->stackTop - vm->stack < distance + 1) {
+        runtimeError(vm, "VM Error: Stack underflow (peek too deep).");
+        return makeNil();
+    }
+    return vm->stackTop[-(distance + 1)];
+}
+
 #define FAST_PUSH(v) vmFastPushUnchecked(vm, (v))
 #define FAST_POP() vmFastPopUnchecked(vm)
-#define FAST_PEEK(dist) (vm->stackTop[-((dist) + 1)])
+#define FAST_PEEK(dist) vmFastPeekChecked(vm, (dist))
 
 static inline Symbol* vmInlineCacheReadSymbol(uint8_t* slot) {
     Symbol* sym = NULL;
@@ -5530,10 +5554,18 @@ static InterpretResult handleDefineGlobal(VM* vm, Value varNameVal) {
         uint16_t len_idx = 0;
         if (declaredType == TYPE_STRING) {
             len_idx = READ_SHORT(vm);
+            if (len_idx >= vm->chunk->constants_count) {
+                runtimeError(vm, "VM Error: String length constant index out of range for '%s'.", AS_STRING(varNameVal));
+                return INTERPRET_RUNTIME_ERROR;
+            }
             Value len_val = vm->chunk->constants[len_idx];
             if (VALUE_TYPE(len_val) == TYPE_INTEGER) {
                 str_len = (int)VAL_INT(len_val);
             }
+        }
+        if (type_name_idx >= vm->chunk->constants_count) {
+            runtimeError(vm, "VM Error: Type name constant index out of range for '%s'.", AS_STRING(varNameVal));
+            return INTERPRET_RUNTIME_ERROR;
         }
         Value typeNameVal = vm->chunk->constants[type_name_idx];
         // (debug logging removed)
@@ -9198,6 +9230,11 @@ comparison_error_label:
                 free(lower_idx);
                 free(upper_idx);
 
+                if (vm->stackTop == vm->stack) {
+                    runtimeError(vm, "VM Error: Stack underflow (INIT_FIELD_ARRAY on empty stack).");
+                    freeValue(&array_value);
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 Value* base_val_ptr = vm->stackTop - 1;
                 bool invalid_type = false;
                 Value* record_struct_ptr = resolveRecord(base_val_ptr, &invalid_type);

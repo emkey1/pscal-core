@@ -464,10 +464,22 @@ static void addSuccessor(int target, const ProcSegment* seg, int* out, int* out_
     }
 }
 
-static bool verifySegment(VCtx* ctx, const ProcSegment* seg, bool* seen, Depth* depths,
+// Per-pc visit state. A pc is re-checked at most once for a known depth and
+// once for an unknown depth: two visits, not one, because a pc can be
+// reached by both a normal (known-depth) edge and an edge downstream of an
+// unresolvable call (unknown-depth) -- see the Depth/Effect comment above.
+// Whichever arrives first must not suppress checking the other: an earlier
+// arrival with an unknown depth used to mark the pc "seen" and cause a
+// later, checkable, known-depth arrival to be skipped via the seen[pc] gate
+// below, silently accepting bytecode that would underflow/overflow on that
+// second edge (found in review: a join-point dataflow bug independent of
+// finding 1's FAST_PUSH/POP issue).
+enum { VISITED_KNOWN = 1u << 0, VISITED_UNKNOWN = 1u << 1 };
+
+static bool verifySegment(VCtx* ctx, const ProcSegment* seg, uint8_t* visited, Depth* depths,
                            WorkItem* worklist, int worklist_cap) {
     for (int pc = seg->start; pc < seg->end; pc++) {
-        seen[pc] = false;
+        visited[pc] = 0;
     }
 
     int wl_count = 0;
@@ -478,15 +490,20 @@ static bool verifySegment(VCtx* ctx, const ProcSegment* seg, bool* seen, Depth* 
         int pc = item.pc;
         if (pc < seg->start || pc >= seg->end || !ctx->boundary[pc]) continue;
 
-        if (seen[pc]) {
-            if (item.depth.known && depths[pc].known && depths[pc].value != item.depth.value) {
-                return vfail(ctx, "pc %d: stack depth mismatch at control-flow join (%d vs %d)",
-                             pc, depths[pc].value, item.depth.value);
+        if (item.depth.known) {
+            if (visited[pc] & VISITED_KNOWN) {
+                if (depths[pc].value != item.depth.value) {
+                    return vfail(ctx, "pc %d: stack depth mismatch at control-flow join (%d vs %d)",
+                                 pc, depths[pc].value, item.depth.value);
+                }
+                continue; // this exact known depth was already validated here
             }
-            continue;
+            visited[pc] |= VISITED_KNOWN;
+            depths[pc] = item.depth;
+        } else {
+            if (visited[pc] & VISITED_UNKNOWN) continue; // no new information
+            visited[pc] |= VISITED_UNKNOWN;
         }
-        seen[pc] = true;
-        depths[pc] = item.depth;
 
         uint8_t opcode = ctx->chunk->code[pc];
         const OpcodeInfo* info = pscalOpcodeInfo(opcode);
@@ -569,17 +586,19 @@ static bool verifyStackDepths(VCtx* ctx) {
 
     int segment_count = (addrs != NULL && addr_count > 0 && addrs[0].addr == 0) ? addr_count : addr_count + 1;
     ProcSegment* segments = (ProcSegment*)calloc((size_t)segment_count, sizeof(ProcSegment));
-    bool* seen = (bool*)calloc((size_t)(chunk->count > 0 ? chunk->count : 1), sizeof(bool));
+    uint8_t* visited = (uint8_t*)calloc((size_t)(chunk->count > 0 ? chunk->count : 1), sizeof(uint8_t));
     Depth* depths = (Depth*)calloc((size_t)(chunk->count > 0 ? chunk->count : 1), sizeof(Depth));
-    // Any single segment can span up to the whole chunk; a worklist item is
-    // pushed at most twice per processed instruction (JUMP_IF_FALSE's two
-    // successors) plus one initial seed push, so 2*count+8 is a proven upper
+    // Any single segment can span up to the whole chunk. Each pc can now be
+    // *processed* (i.e. reach classifyInstruction and push successors) up to
+    // twice -- once for a known depth, once for an unknown one (see
+    // VISITED_KNOWN/VISITED_UNKNOWN above) -- and each processed pc pushes at
+    // most two successors (JUMP_IF_FALSE), so 4*count+8 is a proven upper
     // bound reusable across every segment (see verifySegment()).
-    int worklist_cap = chunk->count * 2 + 8;
+    int worklist_cap = chunk->count * 4 + 8;
     WorkItem* worklist = (WorkItem*)calloc((size_t)worklist_cap, sizeof(WorkItem));
     bool ok = true;
 
-    if (!segments || !seen || !depths || !worklist) {
+    if (!segments || !visited || !depths || !worklist) {
         ok = vfail(ctx, "out of memory building verifier segments");
         goto done;
     }
@@ -604,7 +623,7 @@ static bool verifyStackDepths(VCtx* ctx) {
 
     for (int i = 0; i < seg_idx; i++) {
         if (segments[i].start >= segments[i].end) continue; // empty segment, nothing to walk
-        if (!verifySegment(ctx, &segments[i], seen, depths, worklist, worklist_cap)) {
+        if (!verifySegment(ctx, &segments[i], visited, depths, worklist, worklist_cap)) {
             ok = false;
             goto done;
         }
@@ -613,7 +632,7 @@ static bool verifyStackDepths(VCtx* ctx) {
 done:
     free(addrs);
     free(segments);
-    free(seen);
+    free(visited);
     free(depths);
     free(worklist);
     return ok;
