@@ -1108,8 +1108,8 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinUpdatetexture) {
         runtimeError(vm, "UpdateTexture argument type mismatch.");
         return makeVoid();
     }
-    if (pixelDataVal.element_type != TYPE_BYTE) {
-        runtimeError(vm, "UpdateTexture PixelData must be an ARRAY OF Byte. Got array of %s.", varTypeToString(pixelDataVal.element_type));
+    if (ARRAY_ELEMENT_TYPE(pixelDataVal) != TYPE_BYTE) {
+        runtimeError(vm, "UpdateTexture PixelData must be an ARRAY OF Byte. Got array of %s.", varTypeToString(ARRAY_ELEMENT_TYPE(pixelDataVal)));
         return makeVoid();
     }
 
@@ -1988,13 +1988,13 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinDrawpolygon) {
     if (!gSdlInitialized || !gSdlRenderer) { runtimeError(vm, "Graphics not initialized for DrawPolygon."); return makeVoid(); }
 
     if (VALUE_TYPE(args[0]) != TYPE_ARRAY || !IS_INTLIKE(args[1])) { runtimeError(vm, "DrawPolygon argument type mismatch."); return makeVoid(); }
-    if (args[0].element_type != TYPE_RECORD) { runtimeError(vm, "DrawPolygon Points argument must be an ARRAY OF PointRecord."); return makeVoid(); }
+    if (ARRAY_ELEMENT_TYPE(args[0]) != TYPE_RECORD) { runtimeError(vm, "DrawPolygon Points argument must be an ARRAY OF PointRecord."); return makeVoid(); }
 
     int numPoints = (int)AS_INTEGER(args[1]);
     if (numPoints < 2) return makeVoid();
 
     int total_elements_in_pascal_array = 1;
-    for(int i=0; i < args[0].dimensions; ++i) { total_elements_in_pascal_array *= (args[0].upper_bounds[i] - args[0].lower_bounds[i] + 1); }
+    for(int i=0; i < ARRAY_DIMENSIONS(args[0]); ++i) { total_elements_in_pascal_array *= (ARRAY_UPPER_BOUNDS(args[0])[i] - ARRAY_LOWER_BOUNDS(args[0])[i] + 1); }
     if (numPoints > total_elements_in_pascal_array) { runtimeError(vm, "NumPoints exceeds actual size of Pscal PointsArray."); return makeVoid(); }
 
     SDL_Point* sdlPoints = malloc(sizeof(SDL_Point) * (numPoints + 1));

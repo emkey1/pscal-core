@@ -28,14 +28,14 @@ static Value* resolveArrayArg(VM* vm, Value* arg, const char* name, int* lower,
         runtimeError(vm, "%s expects VAR array arguments.", name);
         return NULL;
     }
-    if (arrVal->dimensions > 1) {
+    if (ARRAY_DIMENSIONS(*arrVal) > 1) {
         runtimeError(vm, "%s arrays must be single dimensional.", name);
         return NULL;
     }
-    int l = (arrVal->dimensions > 0 && arrVal->lower_bounds) ? arrVal->lower_bounds[0]
-                                                             : arrVal->lower_bound;
-    int u = (arrVal->dimensions > 0 && arrVal->upper_bounds) ? arrVal->upper_bounds[0]
-                                                             : arrVal->upper_bound;
+    int l = (ARRAY_DIMENSIONS(*arrVal) > 0 && ARRAY_LOWER_BOUNDS(*arrVal)) ? ARRAY_LOWER_BOUNDS(*arrVal)[0]
+                                                             : ARRAY_LOWER_BOUND(*arrVal);
+    int u = (ARRAY_DIMENSIONS(*arrVal) > 0 && ARRAY_UPPER_BOUNDS(*arrVal)) ? ARRAY_UPPER_BOUNDS(*arrVal)[0]
+                                                             : ARRAY_UPPER_BOUND(*arrVal);
     if (lower) *lower = l;
     if (upper) *upper = u;
     if (!AS_ARRAY(*arrVal)) {

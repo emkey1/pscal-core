@@ -33,12 +33,12 @@ static const Value* landscapeResolveStringPointer(const Value* value) {
     const Value* current = value;
     int depth = 0;
     while (current && VALUE_TYPE(*current) == TYPE_POINTER &&
-           current->base_type_node != STRING_CHAR_PTR_SENTINEL &&
-           current->base_type_node != SERIALIZED_CHAR_PTR_SENTINEL &&
-           current->base_type_node != STRING_LENGTH_SENTINEL &&
-           current->base_type_node != BYTE_ARRAY_PTR_SENTINEL &&
-           current->base_type_node != SHELL_FUNCTION_PTR_SENTINEL &&
-           current->base_type_node != OPAQUE_POINTER_SENTINEL) {
+           PTR_BASE_TYPE_NODE(*current) != STRING_CHAR_PTR_SENTINEL &&
+           PTR_BASE_TYPE_NODE(*current) != SERIALIZED_CHAR_PTR_SENTINEL &&
+           PTR_BASE_TYPE_NODE(*current) != STRING_LENGTH_SENTINEL &&
+           PTR_BASE_TYPE_NODE(*current) != BYTE_ARRAY_PTR_SENTINEL &&
+           PTR_BASE_TYPE_NODE(*current) != SHELL_FUNCTION_PTR_SENTINEL &&
+           PTR_BASE_TYPE_NODE(*current) != OPAQUE_POINTER_SENTINEL) {
         if (!AS_POINTER(*current)) {
             return NULL;
         }
@@ -56,8 +56,8 @@ static const char* landscapeValueToCString(const Value* value) {
         return AS_STRING(*value) ? AS_STRING(*value) : "";
     }
     if (VALUE_TYPE(*value) == TYPE_POINTER) {
-        if (value->base_type_node == STRING_CHAR_PTR_SENTINEL ||
-            value->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
+        if (PTR_BASE_TYPE_NODE(*value) == STRING_CHAR_PTR_SENTINEL ||
+            PTR_BASE_TYPE_NODE(*value) == SERIALIZED_CHAR_PTR_SENTINEL) {
             return (const char*)AS_POINTER(*value);
         }
         const Value* resolved = landscapeResolveStringPointer(value);
@@ -66,8 +66,8 @@ static const char* landscapeValueToCString(const Value* value) {
             return AS_STRING(*resolved) ? AS_STRING(*resolved) : "";
         }
         if (VALUE_TYPE(*resolved) == TYPE_POINTER &&
-            (resolved->base_type_node == STRING_CHAR_PTR_SENTINEL ||
-             resolved->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL)) {
+            (PTR_BASE_TYPE_NODE(*resolved) == STRING_CHAR_PTR_SENTINEL ||
+             PTR_BASE_TYPE_NODE(*resolved) == SERIALIZED_CHAR_PTR_SENTINEL)) {
             return (const char*)AS_POINTER(*resolved);
         }
     }
@@ -159,15 +159,15 @@ static ArrayArg resolveArrayArg(VM* vm, Value* arg, const char* name, int* lower
         runtimeError(vm, "%s expects VAR array arguments.", name);
         return result;
     }
-    if (arrVal->dimensions > 1) {
+    if (ARRAY_DIMENSIONS(*arrVal) > 1) {
         runtimeError(vm, "%s arrays must be single dimensional.", name);
         return result;
     }
 
-    int l = (arrVal->dimensions > 0 && arrVal->lower_bounds) ? arrVal->lower_bounds[0]
-                                                            : arrVal->lower_bound;
-    int u = (arrVal->dimensions > 0 && arrVal->upper_bounds) ? arrVal->upper_bounds[0]
-                                                            : arrVal->upper_bound;
+    int l = (ARRAY_DIMENSIONS(*arrVal) > 0 && ARRAY_LOWER_BOUNDS(*arrVal)) ? ARRAY_LOWER_BOUNDS(*arrVal)[0]
+                                                            : ARRAY_LOWER_BOUND(*arrVal);
+    int u = (ARRAY_DIMENSIONS(*arrVal) > 0 && ARRAY_UPPER_BOUNDS(*arrVal)) ? ARRAY_UPPER_BOUNDS(*arrVal)[0]
+                                                            : ARRAY_UPPER_BOUND(*arrVal);
     result.lower = l;
     result.upper = u;
     if (lower) *lower = l;

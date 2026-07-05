@@ -30,16 +30,16 @@ static Value vmBuiltinMandelbrotRow(struct VM_s* vm, int arg_count, Value* args)
         runtimeError(vm, "MandelbrotRow expected VAR array parameter.");
         return makeVoid();
     }
-    if (arrVal->dimensions > 1) {
+    if (ARRAY_DIMENSIONS(*arrVal) > 1) {
         runtimeError(vm, "MandelbrotRow output array must be single dimensional.");
         return makeVoid();
     }
-    int lower = (arrVal->dimensions > 0 && arrVal->lower_bounds)
-                    ? arrVal->lower_bounds[0]
-                    : arrVal->lower_bound;
-    int upper = (arrVal->dimensions > 0 && arrVal->upper_bounds)
-                    ? arrVal->upper_bounds[0]
-                    : arrVal->upper_bound;
+    int lower = (ARRAY_DIMENSIONS(*arrVal) > 0 && ARRAY_LOWER_BOUNDS(*arrVal))
+                    ? ARRAY_LOWER_BOUNDS(*arrVal)[0]
+                    : ARRAY_LOWER_BOUND(*arrVal);
+    int upper = (ARRAY_DIMENSIONS(*arrVal) > 0 && ARRAY_UPPER_BOUNDS(*arrVal))
+                    ? ARRAY_UPPER_BOUNDS(*arrVal)[0]
+                    : ARRAY_UPPER_BOUND(*arrVal);
     if (lower != 0) {
         runtimeError(vm, "MandelbrotRow output array must start at index 0.");
         return makeVoid();
