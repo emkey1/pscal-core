@@ -100,6 +100,10 @@ void emitInt32(BytecodeChunk* chunk, uint32_t value, int line);
 void patchShort(BytecodeChunk* chunk, int offset_in_code, uint16_t value);
 void patchInt32(BytecodeChunk* chunk, int offset_in_code, uint32_t value);
 int getInstructionLength(BytecodeChunk* chunk, int offset);
+// Shared decode logic behind getInstructionLength(); see bytecode.c for the
+// exact contract. Used by the Phase 1e verifier (bytecode_verify.c) to tell
+// truncated variable-length instructions apart from well-formed ones.
+bool pscalDecodeInstructionLength(const BytecodeChunk* chunk, int offset, int* out_length);
 void setBuiltinLowercaseIndex(BytecodeChunk* chunk, int original_idx, int lowercase_idx);
 int getBuiltinLowercaseIndex(const BytecodeChunk* chunk, int original_idx);
 void writeInlineCacheSlot(BytecodeChunk* chunk, int line);

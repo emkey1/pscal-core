@@ -39,9 +39,51 @@
 //
 // Stack effects are informational until the Phase 1e verifier consumes them;
 // keep them honest when adding opcodes.
+//
+// Phase 1e audit (2026-07-04, against src/vm/vm.c): most opcodes' declared
+// stack_in/stack_out hold under a NET-DELTA convention (stack_out - stack_in
+// equals the actual net depth change), which is what a handful of opcodes
+// that peek-then-push rather than pop-then-push rely on (DUP, SWAP,
+// GET_FIELD_ADDRESS_KEEP[16]).  A few opcodes have effects that cannot be
+// expressed as a flat per-opcode constant at all, because they depend on
+// payload bytes or on resolved procedure/builtin metadata rather than the
+// instruction's own fixed operands; these are marked stack_in=-1 (or
+// stack_out=-1) even though earlier drafts of this table gave them a
+// concrete-looking number, and the Phase 1e verifier (bytecode_verify.c)
+// carries bespoke per-opcode logic for each:
+//   RETURN, EXIT            - pop 1 iff the enclosing procedure is a
+//                             function (return type != TYPE_VOID); resolved
+//                             via the procedure_table entry the verifier is
+//                             currently walking, not from the instruction.
+//   CALL, CALL_USER_PROC    - net push = callee's locals_count (resolved by
+//                             address/name via procedure_table); requires
+//                             declared_arity args already on the stack.
+//   CALL_INDIRECT,
+//   CALL_METHOD             - callee is a runtime value/vtable slot, not
+//                             statically resolvable; verifier requires the
+//                             statically-known pops (address and/or
+//                             declared_arity+receiver) and upper-bounds the
+//                             net push by the largest locals_count of any
+//                             procedure in the chunk.
+//   CALL_BUILTIN            - pops declared_arity; pushes 1 iff the named
+//                             builtin's registered routine type is
+//                             BUILTIN_TYPE_FUNCTION (getBuiltinType()), else
+//                             0; falls back to assuming 1 if the name can't
+//                             be resolved.
+//   CALL_HOST               - host_fn_id selects a per-function ad hoc
+//                             stack convention with no arg-count operand;
+//                             not derivable statically, so the verifier
+//                             treats it as depth-preserving (net 0).
+//   INIT_LOCAL_ARRAY,
+//   INIT_FIELD_ARRAY        - each array dimension whose bounds are the
+//                             0xFFFF/0xFFFF runtime-computed sentinel pops
+//                             one extra size value; the verifier re-walks
+//                             the "?" payload (same bespoke decode as
+//                             getInstructionLength()) to count them.
+// See Docs/pscal_vm2_plan.md §5.5 for the verifier design.
 
 // --- Constants & immediates ---
-OP(RETURN,                     0x00, "",     1,  0)
+OP(RETURN,                     0x00, "",    -1,  0)
 OP(CONSTANT,                   0x01, "k",    0,  1)
 OP(CONSTANT16,                 0x02, "K",    0,  1)
 OP(CONST_0,                    0x03, "",     0,  1)
@@ -85,8 +127,8 @@ OP(DUP,                        0x1F, "",     1,  2)
 //   TYPE_STRING: [type_name:K][len:K]  (len const 0 = dynamic length)
 //   TYPE_FILE:   [type_name:K][elem_type:b][elem_name:K]
 //   else:        [type_name:K]
-OP(DEFINE_GLOBAL,              0x20, "?",    1,  0)
-OP(DEFINE_GLOBAL16,            0x21, "?",    1,  0)
+OP(DEFINE_GLOBAL,              0x20, "?",    0,  0)
+OP(DEFINE_GLOBAL16,            0x21, "?",    0,  0)
 OP(GET_GLOBAL,                 0x22, "kC",   0,  1)
 OP(SET_GLOBAL,                 0x23, "kC",   1,  0)
 OP(GET_GLOBAL_ADDRESS,         0x24, "k",    0,  1)
@@ -105,13 +147,13 @@ OP(INC_LOCAL,                  0x2E, "b",    0,  0)
 OP(DEC_LOCAL,                  0x2F, "b",    0,  0)
 // INIT_LOCAL_ARRAY payload (bespoke decode):
 //   [slot:b][dims:b] { [lo:K][hi:K] }*dims [elem_type:b][elem_name:K]
-OP(INIT_LOCAL_ARRAY,           0x30, "?",    0,  0)
+OP(INIT_LOCAL_ARRAY,           0x30, "?",   -1,  0)
 OP(INIT_LOCAL_FILE,            0x31, "bbK",  0,  0)
 OP(INIT_LOCAL_POINTER,         0x32, "bK",   0,  0)
 OP(INIT_LOCAL_STRING,          0x33, "bb",   0,  0)
 // INIT_FIELD_ARRAY payload: like INIT_LOCAL_ARRAY with a field index in
 // place of the slot; targets the object on top of the stack.
-OP(INIT_FIELD_ARRAY,           0x34, "?",    1,  1)
+OP(INIT_FIELD_ARRAY,           0x34, "?",   -1,  1)
 OP(GET_LOCAL_ADDRESS,          0x35, "b",    0,  1)
 OP(GET_UPVALUE,                0x36, "b",    0,  1)
 OP(SET_UPVALUE,                0x37, "b",    1,  0)
@@ -124,6 +166,8 @@ OP(GET_FIELD_ADDRESS_KEEP,     0x3B, "k",    1,  2)
 OP(GET_FIELD_ADDRESS_KEEP16,   0x3C, "K",    1,  2)
 OP(LOAD_FIELD_VALUE_BY_NAME,   0x3D, "k",    1,  1)
 OP(LOAD_FIELD_VALUE_BY_NAME16, 0x3E, "K",    1,  1)
+// GET_ELEMENT_ADDRESS/LOAD_ELEMENT_VALUE: 'b' is a dimension count; pops
+// (1 + b) (base value, then one index per dimension), always pushes 1.
 OP(GET_ELEMENT_ADDRESS,        0x3F, "b",   -1,  1)
 OP(GET_ELEMENT_ADDRESS_CONST,  0x40, "f",    1,  1)
 OP(LOAD_ELEMENT_VALUE,         0x41, "b",   -1,  1)
@@ -147,7 +191,13 @@ OP(LOAD_FIELD_VALUE,           0x4E, "b",    1,  1)
 OP(LOAD_FIELD_VALUE16,         0x4F, "w",    1,  1)
 
 // --- Calls ---
-OP(CALL_BUILTIN,               0x50, "Kb",  -1,  1)
+// The trailing 'b' operand on CALL/CALL_USER_PROC/CALL_INDIRECT/CALL_METHOD/
+// PROC_CALL_INDIRECT/CALL_BUILTIN/CALL_BUILTIN_PROC is declared_arity: args
+// are NOT popped-then-repushed, they are reinterpreted in place as the
+// callee's first `declared_arity` local slots (see returnFromCall()/the
+// CALL* handlers in vm.c). CALL_HOST's 'b' is unrelated: a host_fn_id
+// dispatch selector with no arg-count operand at all.
+OP(CALL_BUILTIN,               0x50, "Kb",  -1, -1)
 OP(CALL_BUILTIN_PROC,          0x51, "wKb", -1,  0)
 OP(CALL_USER_PROC,             0x52, "Kb",  -1, -1)
 OP(CALL_HOST,                  0x53, "b",   -1,  1)
@@ -157,12 +207,12 @@ OP(CALL_INDIRECT,              0x56, "b",   -1, -1)
 OP(CALL_METHOD,                0x57, "bb",  -1, -1)
 OP(PROC_CALL_INDIRECT,         0x58, "b",   -1,  0)
 OP(HALT,                       0x59, "",     0,  0)
-OP(EXIT,                       0x5A, "",     0,  0)
+OP(EXIT,                       0x5A, "",    -1,  0)
 OP(FORMAT_VALUE,               0x5B, "bi",   1,  1)
 
 // --- Threads & mutexes ---
 OP(THREAD_CREATE,              0x5C, "W",    0,  1)
-OP(THREAD_JOIN,                0x5D, "",     1,  1)
+OP(THREAD_JOIN,                0x5D, "",     1,  0)
 OP(MUTEX_CREATE,               0x5E, "",     0,  1)
 OP(RCMUTEX_CREATE,             0x5F, "",     0,  1)
 OP(MUTEX_LOCK,                 0x60, "",     1,  0)

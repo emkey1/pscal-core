@@ -364,78 +364,135 @@ static const char* findProcedureNameByAddress(HashTable* procedureTable, uint32_
     }
     return NULL;
 }
-// Length of the instruction at `offset`.  Fixed-length opcodes are driven by
-// the operand-spec table generated from compiler/opcodes.def; the four
-// variable-length opcodes ("?" specs) keep bespoke decode logic below.
-int getInstructionLength(BytecodeChunk* chunk, int offset) {
-    uint8_t instruction = chunk->code[offset];
-    switch (instruction) {
-        case INIT_FIELD_ARRAY:
-        case INIT_LOCAL_ARRAY: {
-            int current_pos = offset + 1; // after opcode
-            current_pos++; // slot (INIT_LOCAL_ARRAY) / field index (INIT_FIELD_ARRAY)
-            if (current_pos >= chunk->count) return 1;
-            uint8_t dimension_count = chunk->code[current_pos++];
-            current_pos += dimension_count * 4; // bounds indices (two 16-bit indices per dimension)
-            current_pos += 3; // elem type and 2-byte elem type name index
-            return current_pos - offset;
-        }
-        case DEFINE_GLOBAL: {
-            // This instruction has a variable length.
-            int current_pos = offset + 1; // Position after the opcode
-            if (current_pos + 1 >= chunk->count) return 1; // Safeguard for incomplete instruction
-
-            VarType declaredType = (VarType)chunk->code[offset + 2];
-            current_pos = offset + 3; // Position after the type byte
-
-            if (declaredType == TYPE_ARRAY) {
-                if (current_pos < chunk->count) {
-                    uint8_t dimension_count = chunk->code[current_pos++];
-                    current_pos += dimension_count * 4; // Skip over all the bounds indices
-                    current_pos += 3; // Skip element VarType and 2-byte element type name index
+// Shared decode logic for instruction length, used by both getInstructionLength()
+// (disassembler, existing callers) and the Phase 1e verifier (bytecode_verify.c).
+// Fixed-length opcodes are driven by the operand-spec table generated from
+// compiler/opcodes.def; the four variable-length opcodes ("?" specs) keep
+// bespoke decode logic below.
+//
+// *out_length always receives a length (falling back to 1 when the real
+// length can't be determined, matching getInstructionLength()'s historical
+// "advance one byte and keep going" behavior for damaged input). The return
+// value additionally tells the caller whether that length is trustworthy:
+// false means the instruction's own discriminant bytes (e.g. DEFINE_GLOBAL's
+// type byte, or INIT_LOCAL_ARRAY's dimension count) could not be read
+// in-bounds, i.e. the instruction is truncated. A true return does NOT by
+// itself guarantee [offset, offset+length) fits inside the chunk — callers
+// that must reject out-of-bounds instructions (the verifier) still need to
+// check that separately, since legacy getInstructionLength() callers rely on
+// getting a length back even when it overruns the buffer.
+bool pscalDecodeInstructionLength(const BytecodeChunk* chunk, int offset, int* out_length) {
+    int length = 1;
+    bool ok = false;
+    if (chunk && offset >= 0 && offset < chunk->count) {
+        uint8_t instruction = chunk->code[offset];
+        switch (instruction) {
+            case INIT_FIELD_ARRAY:
+            case INIT_LOCAL_ARRAY: {
+                int current_pos = offset + 1; // after opcode
+                current_pos++; // slot (INIT_LOCAL_ARRAY) / field index (INIT_FIELD_ARRAY)
+                if (current_pos >= chunk->count) {
+                    length = 1;
+                    break;
                 }
-            } else {
-                // Simple types store a 16-bit type name index. Strings add an
-                // extra 16-bit length constant and files carry element metadata.
-                current_pos += 2; // type name index (16-bit)
-                if (declaredType == TYPE_STRING) {
-                    current_pos += 2; // length constant index (16-bit)
-                } else if (declaredType == TYPE_FILE) {
-                    current_pos += 3; // element VarType byte + 2-byte element type name index
-                }
+                uint8_t dimension_count = chunk->code[current_pos++];
+                current_pos += dimension_count * 4; // bounds indices (two 16-bit indices per dimension)
+                current_pos += 3; // elem type and 2-byte elem type name index
+                length = current_pos - offset;
+                ok = true;
+                break;
             }
-            return (current_pos - offset); // Return the total calculated length
-        }
-        case DEFINE_GLOBAL16: {
-            // Similar to DEFINE_GLOBAL but with a 16-bit name index.
-            int current_pos = offset + 1; // after opcode
-            if (current_pos + 2 >= chunk->count) return 1; // ensure enough bytes for name and type
-            VarType declaredType = (VarType)chunk->code[offset + 3];
-            current_pos = offset + 4; // position after type byte
+            case DEFINE_GLOBAL: {
+                int current_pos = offset + 1; // Position after the opcode
+                if (current_pos + 1 >= chunk->count) {
+                    length = 1; // Safeguard for incomplete instruction
+                    break;
+                }
 
-            if (declaredType == TYPE_ARRAY) {
-                if (current_pos < chunk->count) {
-                    uint8_t dimension_count = chunk->code[current_pos++];
-                    current_pos += dimension_count * 4; // bounds indices
-                    current_pos += 3; // element var type and 2-byte element type name index
+                VarType declaredType = (VarType)chunk->code[offset + 2];
+                current_pos = offset + 3; // Position after the type byte
+
+                if (declaredType == TYPE_ARRAY) {
+                    if (current_pos < chunk->count) {
+                        uint8_t dimension_count = chunk->code[current_pos++];
+                        current_pos += dimension_count * 4; // Skip over all the bounds indices
+                        current_pos += 3; // Skip element VarType and 2-byte element type name index
+                        ok = true;
+                    }
+                    // else: dimension_count byte missing; current_pos stays at
+                    // offset+3 and ok stays false (truncated instruction).
+                } else {
+                    // Simple types store a 16-bit type name index. Strings add an
+                    // extra 16-bit length constant and files carry element metadata.
+                    current_pos += 2; // type name index (16-bit)
+                    if (declaredType == TYPE_STRING) {
+                        current_pos += 2; // length constant index (16-bit)
+                    } else if (declaredType == TYPE_FILE) {
+                        current_pos += 3; // element VarType byte + 2-byte element type name index
+                    }
+                    ok = true;
                 }
-            } else {
-                current_pos += 2; // type name index (16-bit)
-                if (declaredType == TYPE_STRING) {
-                    current_pos += 2; // length constant index (16-bit)
-                } else if (declaredType == TYPE_FILE) {
-                    current_pos += 3; // element VarType byte + 2-byte element type name index
-                }
+                length = current_pos - offset;
+                break;
             }
-            return (current_pos - offset);
-        }
-        default: {
-            const OpcodeInfo* info = pscalOpcodeInfo(instruction);
-            if (!info) return 1; // unknown opcodes advance one byte
-            int operand_len = pscalOpcodeOperandSpecLength(info->operands);
-            return (operand_len < 0) ? 1 : 1 + operand_len;
+            case DEFINE_GLOBAL16: {
+                // Similar to DEFINE_GLOBAL but with a 16-bit name index.
+                int current_pos = offset + 1; // after opcode
+                if (current_pos + 2 >= chunk->count) {
+                    length = 1; // ensure enough bytes for name and type
+                    break;
+                }
+                VarType declaredType = (VarType)chunk->code[offset + 3];
+                current_pos = offset + 4; // position after type byte
+
+                if (declaredType == TYPE_ARRAY) {
+                    if (current_pos < chunk->count) {
+                        uint8_t dimension_count = chunk->code[current_pos++];
+                        current_pos += dimension_count * 4; // bounds indices
+                        current_pos += 3; // element var type and 2-byte element type name index
+                        ok = true;
+                    }
+                    // else: dimension_count byte missing; truncated.
+                } else {
+                    current_pos += 2; // type name index (16-bit)
+                    if (declaredType == TYPE_STRING) {
+                        current_pos += 2; // length constant index (16-bit)
+                    } else if (declaredType == TYPE_FILE) {
+                        current_pos += 3; // element VarType byte + 2-byte element type name index
+                    }
+                    ok = true;
+                }
+                length = current_pos - offset;
+                break;
+            }
+            default: {
+                const OpcodeInfo* info = pscalOpcodeInfo(instruction);
+                if (!info) {
+                    length = 1; // unknown opcodes advance one byte
+                } else {
+                    int operand_len = pscalOpcodeOperandSpecLength(info->operands);
+                    if (operand_len < 0) {
+                        length = 1;
+                    } else {
+                        length = 1 + operand_len;
+                        ok = true;
+                    }
+                }
+                break;
+            }
         }
     }
+    if (out_length) *out_length = length;
+    return ok;
+}
+
+// Length of the instruction at `offset`.  See pscalDecodeInstructionLength()
+// for the shared decode logic; this wrapper preserves the historical
+// contract (always returns a usable length, even for damaged input).
+int getInstructionLength(BytecodeChunk* chunk, int offset) {
+    int length = 1;
+    pscalDecodeInstructionLength(chunk, offset, &length);
+    return length;
 }
 
 // Utility helpers to print strings and characters with escape sequences so

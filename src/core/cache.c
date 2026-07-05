@@ -4,6 +4,7 @@
 #define PSCAL_VALUE_REPRESENTATION_LAYER 1
 
 #include "core/cache.h"
+#include "compiler/bytecode_verify.h"
 #include "core/utils.h" // for Value constructors
 #include "core/globals.h"
 #include "core/version.h"
@@ -34,6 +35,14 @@
  * "recompilation is the compatibility mechanism"). */
 #define PSB3_MAGIC 0x50534233u /* 'PSB3' */
 #define PSB3_FORMAT_VERSION 1u
+
+/* VM 2.0 Phase 1e (Docs/pscal_vm2_plan.md §5.5): bit 0 of the header's
+ * `flags` word marks a chunk as pre-trusted, skipping the load-time
+ * verifier. No current writer sets it (every chunk we produce today is
+ * verified); it exists for a future embedded/pre-verified chunk producer.
+ * `PSCAL_VM_SKIP_VERIFY=1` provides the same opt-out from the environment,
+ * for benchmarking and for callers that re-verify at a different layer. */
+#define PSB3_FLAG_TRUSTED_SKIP_VERIFY 0x1u
 
 #define PSB3_FOURCC(a, b, c, d) \
     ((uint32_t)(uint8_t)(a) | ((uint32_t)(uint8_t)(b) << 8) | \
@@ -2184,6 +2193,7 @@ typedef struct {
     size_t file_size;
     uint16_t format_version;
     uint16_t vm_version;
+    uint32_t flags;
     Psb3SectionEntry* sections;
     uint32_t section_count;
 } Psb3File;
@@ -2206,11 +2216,11 @@ static bool psb3ParseHeader(Psb3File* pf) {
     uint16_t vm_ver = curU16LE(&c);
     uint32_t flags = curU32LE(&c);
     uint32_t section_count = curU32LE(&c);
-    (void)flags;
     if (c.error || magic != PSB3_MAGIC) return false;
     if (section_count > 64) return false; /* sanity bound; real files carry <= 7 */
     pf->format_version = format_ver;
     pf->vm_version = vm_ver;
+    pf->flags = flags;
     pf->section_count = section_count;
     pf->sections = (Psb3SectionEntry*)malloc(sizeof(Psb3SectionEntry) * (section_count ? section_count : 1));
     if (!pf->sections) return false;
@@ -2300,6 +2310,12 @@ static bool psb3ReadChunk(const Psb3File* pf, BytecodeChunk* chunk) {
     if (!readProcsSection(&procs_c, chunk)) { resetChunk(chunk, read_consts); return false; }
     if (!readTypesSection(&types_c)) { resetChunk(chunk, read_consts); return false; }
     return true;
+}
+
+static bool psb3VerificationSkipped(const Psb3File* pf) {
+    if (pf->flags & PSB3_FLAG_TRUSTED_SKIP_VERIFY) return true;
+    const char* env = getenv("PSCAL_VM_SKIP_VERIFY");
+    return env && env[0] && env[0] != '0';
 }
 
 static bool psb3ReadMeta(const Psb3File* pf, MetaSection* meta) {
@@ -2566,6 +2582,18 @@ bool loadBytecodeFromCache(const char* source_path,
             continue;
         }
 
+        if (!psb3VerificationSkipped(&pf)) {
+            char verify_err[256];
+            if (!pscalVerifyBytecodeChunk(chunk, procedure_table, verify_err, sizeof(verify_err))) {
+                fprintf(stderr, "Warning: rejecting corrupt cached bytecode %s: %s\n",
+                        cache_path, verify_err);
+                resetChunk(chunk, chunk->constants_count);
+                psb3FileFree(&pf);
+                unlink(cache_path);
+                continue;
+            }
+        }
+
         psb3FileFree(&pf);
 
         restoreProcedureConstructorAliases(procedure_table);
@@ -2611,6 +2639,16 @@ bool loadBytecodeFromFile(const char* file_path, BytecodeChunk* chunk) {
     }
 
     bool ok = psb3ReadChunk(&pf, chunk);
+
+    if (ok && !psb3VerificationSkipped(&pf)) {
+        char verify_err[256];
+        if (!pscalVerifyBytecodeChunk(chunk, procedure_table, verify_err, sizeof(verify_err))) {
+            fprintf(stderr, "Failed to load bytecode from %s: %s\n", file_path, verify_err);
+            resetChunk(chunk, chunk->constants_count);
+            ok = false;
+        }
+    }
+
     psb3FileFree(&pf);
 
     if (ok) {
