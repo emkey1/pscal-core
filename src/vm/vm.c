@@ -1301,6 +1301,7 @@ typedef struct ThreadJob {
     Thread* assignedThread;
     int assignedThreadId;
     bool assignmentSatisfied;
+    bool assignmentConsumed;
     pthread_mutex_t assignmentMutex;
     pthread_cond_t assignmentCond;
     bool assignmentSyncInitialized;
@@ -1438,6 +1439,30 @@ static void vmThreadJobDestroy(ThreadJob* job) {
     free(job);
 }
 
+// A worker must not free a job until the creator that spawned/queued it has
+// finished reading job->assignedThread/assignedThreadId back out of it: for
+// the queue-reuse path (createThreadJob's "push" branch) that read happens
+// asynchronously, racing against how fast the worker can pick up, run, and
+// tear down a (possibly trivial/instant) job. Freeing the job as soon as it
+// finishes -- without this handshake -- destroys assignmentMutex/Cond out
+// from under a creator that hasn't started (or is mid-) waiting on them,
+// which is a use-after-free that manifests as the creator hanging forever
+// on a condvar nobody will ever signal again. Call this instead of
+// vmThreadJobDestroy() at every worker-side teardown point.
+static void vmThreadJobAwaitConsumedAndDestroy(ThreadJob* job) {
+    if (!job) {
+        return;
+    }
+    if (job->assignmentSyncInitialized) {
+        pthread_mutex_lock(&job->assignmentMutex);
+        while (!job->assignmentConsumed) {
+            pthread_cond_wait(&job->assignmentCond, &job->assignmentMutex);
+        }
+        pthread_mutex_unlock(&job->assignmentMutex);
+    }
+    vmThreadJobDestroy(job);
+}
+
 static bool vmThreadJobQueuePush(ThreadJobQueue* queue, ThreadJob* job) {
     if (!queue || !job) {
         return false;
@@ -1554,6 +1579,7 @@ static ThreadJob* vmThreadJobCreate(VM* vm,
     job->assignedThread = NULL;
     job->assignedThreadId = -1;
     job->assignmentSatisfied = false;
+    job->assignmentConsumed = false;
     job->assignmentSyncInitialized = false;
     job->submitOnly = submitOnly;
     job->next = NULL;
@@ -1941,7 +1967,7 @@ static void* threadStart(void* arg) {
 
         if (!vmThreadPrepareWorkerVm(thread, owner, job, threadId)) {
             vmThreadStoreResultDirect(thread, NULL, false);
-            vmThreadJobDestroy(job);
+            vmThreadJobAwaitConsumedAndDestroy(job);
             job = NULL;
             continue;
         }
@@ -2141,7 +2167,7 @@ static void* threadStart(void* arg) {
             vmThreadStoreResultDirect(thread, NULL, false);
         }
 
-        vmThreadJobDestroy(job);
+        vmThreadJobAwaitConsumedAndDestroy(job);
         job = NULL;
 
         pthread_mutex_lock(&thread->stateMutex);
@@ -2310,6 +2336,16 @@ static int createThreadJob(VM* vm,
         }
 
         vmThreadJobSignalAssignment(job, assignedThread, assignedId);
+        // We already have assignedThread/assignedId locally (we created this
+        // worker ourselves), so we won't read them back out of job -- mark
+        // consumed immediately so the worker's teardown isn't left waiting
+        // for an ack we'd otherwise never send on this path.
+        if (job->assignmentSyncInitialized) {
+            pthread_mutex_lock(&job->assignmentMutex);
+            job->assignmentConsumed = true;
+            pthread_cond_broadcast(&job->assignmentCond);
+            pthread_mutex_unlock(&job->assignmentMutex);
+        }
         if (assignedId >= vm->threadCount) {
             vm->threadCount = assignedId + 1;
         }
@@ -2330,6 +2366,10 @@ static int createThreadJob(VM* vm,
         }
         assignedThread = job->assignedThread;
         assignedId = job->assignedThreadId;
+        // Tell the worker it's safe to free this job now that we've copied
+        // out the fields we need -- see vmThreadJobAwaitConsumedAndDestroy().
+        job->assignmentConsumed = true;
+        pthread_cond_broadcast(&job->assignmentCond);
         pthread_mutex_unlock(&job->assignmentMutex);
     }
 
@@ -4802,12 +4842,24 @@ static Value vmHostInterfaceIs(VM* vm) {
 static Value vmHostWaitThread(VM* vm) {
     // Expects top of stack: integer thread id
     Value tidVal = pop(vm);
-    if (VALUE_TYPE(tidVal) == TYPE_THREAD) {
+    if (VALUE_TYPE(tidVal) == TYPE_THREAD || IS_INTLIKE(tidVal)) {
         int id = (int)AS_INTEGER(tidVal);
-        joinThread(vm, id);
-    } else if (IS_INTLIKE(tidVal)) {
-        int id = (int)AS_INTEGER(tidVal);
-        joinThread(vm, id);
+        // joinThread() only waits for the job's status; it never consumes the
+        // result or flips readyForReuse, so the worker thread would sit in its
+        // post-job wait loop (vm.c threadStart, awaitingReuse) forever and its
+        // pool slot would never be recyclable. vmJoinThreadById() performs the
+        // same wait plus the release handshake that vmBuiltinWaitForThread
+        // (the indirect-call path) already relies on -- mirror that here so
+        // CALL_HOST/HOST_FN_WAIT_THREAD (the direct WaitForThread(id) call
+        // form) actually returns the worker to the pool.
+        VM* thread_vm = vm;
+        if (vm && vm->threadOwner) {
+            thread_vm = vm->threadOwner;
+        }
+        bool joined = thread_vm ? vmJoinThreadById(thread_vm, id) : false;
+        if (!joined && thread_vm && thread_vm != vm) {
+            vmJoinThreadById(vm, id);
+        }
     }
     freeValue(&tidVal);
     return makeInt(0);
