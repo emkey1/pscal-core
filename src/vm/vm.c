@@ -768,7 +768,7 @@ static AST* resolveRecordTypeFromBaseValue(Value* base_val_ptr) {
         return NULL;
     }
 
-    type_node = base_val_ptr->base_type_node;
+    type_node = PTR_BASE_TYPE_NODE(*base_val_ptr);
     type_node = vmResolveTypeAlias(type_node);
     if (type_node && type_node->type == AST_POINTER_TYPE && type_node->right) {
         type_node = vmResolveTypeAlias(type_node->right);
@@ -882,7 +882,7 @@ static bool pushFieldValueByName(VM* vm, Value* base_val_ptr, const char* field_
     FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
     if (current) {
         Value* fieldStorage = fieldValueStorage(current);
-        if (fieldStorage && VALUE_TYPE(*fieldStorage) == TYPE_ARRAY && fieldStorage->array_is_dynamic) {
+        if (fieldStorage && VALUE_TYPE(*fieldStorage) == TYPE_ARRAY && ARRAY_IS_DYNAMIC(*fieldStorage)) {
             push(vm, copyDynamicArraySnapshotValue(fieldStorage));
         } else {
             push(vm, copyValueForStack(fieldStorage));
@@ -1012,7 +1012,7 @@ static Value makeOwnedString(char* data, size_t len) {
     memset(&v, 0, sizeof(Value));
     SET_VALUE_TYPE(&v, TYPE_STRING);
     AS_STRING(v) = data;
-    v.max_length = -1;
+    STRING_MAX_LENGTH(v) = -1;
     if (data) {
         data[len] = '\0';
     }
@@ -1159,8 +1159,8 @@ static void replaceValueCell(Value* target, Value replacement, AST* preserved_ba
     pthread_mutex_lock(&value_cell_mutex);
     Value old_value = *target;
     *target = replacement;
-    if (VALUE_TYPE(*target) == TYPE_POINTER && target->base_type_node == NULL && preserved_base_type) {
-        target->base_type_node = preserved_base_type;
+    if (VALUE_TYPE(*target) == TYPE_POINTER && PTR_BASE_TYPE_NODE(*target) == NULL && preserved_base_type) {
+        PTR_BASE_TYPE_NODE(*target) = preserved_base_type;
     }
     pthread_mutex_unlock(&value_cell_mutex);
     freeValue(&old_value);
@@ -1203,7 +1203,7 @@ static void vmStoreThreadMyself(VM* vm, Value value) {
         freeValue(&value);
         return;
     }
-    AST* preserved_base = vm->threadMyself.base_type_node;
+    AST* preserved_base = PTR_BASE_TYPE_NODE(vm->threadMyself);
     Value replacement = makeCopyOfValue(&value);
     replaceValueCell(&vm->threadMyself, replacement, preserved_base);
     freeValue(&value);
@@ -3313,14 +3313,14 @@ static bool vmAddOrdinalToSet(Value* setVal, long long ordinal) {
             return true;
         }
     }
-    if (AS_SET(*setVal).set_size >= setVal->max_length) {
-        int new_capacity = (setVal->max_length == 0) ? 8 : setVal->max_length * 2;
+    if (AS_SET(*setVal).set_size >= STRING_MAX_LENGTH(*setVal)) {
+        int new_capacity = (STRING_MAX_LENGTH(*setVal) == 0) ? 8 : STRING_MAX_LENGTH(*setVal) * 2;
         long long* new_values = realloc(AS_SET(*setVal).set_values, sizeof(long long) * new_capacity);
         if (!new_values) {
             return false;
         }
         AS_SET(*setVal).set_values = new_values;
-        setVal->max_length = new_capacity;
+        STRING_MAX_LENGTH(*setVal) = new_capacity;
     }
     AS_SET(*setVal).set_values[AS_SET(*setVal).set_size++] = ordinal;
     return true;
@@ -3592,8 +3592,8 @@ static void push(VM* vm, Value value) { // Using your original name 'push'
 
 static Value copyInterfaceReceiverAlias(Value* receiverCell) {
     Value alias = copyValueForStack(receiverCell);
-    if (VALUE_TYPE(alias) == TYPE_POINTER && alias.base_type_node == OWNED_POINTER_SENTINEL) {
-        alias.base_type_node = NULL;
+    if (VALUE_TYPE(alias) == TYPE_POINTER && PTR_BASE_TYPE_NODE(alias) == OWNED_POINTER_SENTINEL) {
+        PTR_BASE_TYPE_NODE(alias) = NULL;
     }
     return alias;
 }
@@ -4355,7 +4355,7 @@ static Value vmHostBoxInterface(VM* vm) {
         }
         *clone = makeCopyOfValue(&receiverVal);
         receiverVal = makePointer(clone, NULL);
-        receiverVal.base_type_node = OWNED_POINTER_SENTINEL;
+        PTR_BASE_TYPE_NODE(receiverVal) = OWNED_POINTER_SENTINEL;
 
         bool invalid_type = false;
         Value* clonedRecord = resolveRecord(&receiverVal, &invalid_type);
@@ -4437,9 +4437,9 @@ static Value vmHostBoxInterface(VM* vm) {
     }
 
     *receiverCell = makeCopyOfValue(&receiverVal);
-    if (VALUE_TYPE(*receiverCell) == TYPE_POINTER && receiverCell->base_type_node == NULL &&
-        receiverVal.base_type_node == OWNED_POINTER_SENTINEL) {
-        receiverCell->base_type_node = OWNED_POINTER_SENTINEL;
+    if (VALUE_TYPE(*receiverCell) == TYPE_POINTER && PTR_BASE_TYPE_NODE(*receiverCell) == NULL &&
+        PTR_BASE_TYPE_NODE(receiverVal) == OWNED_POINTER_SENTINEL) {
+        PTR_BASE_TYPE_NODE(*receiverCell) = OWNED_POINTER_SENTINEL;
     }
     *tableCell = makePointer(tableValuePtr, NULL);
     const char* class_identity_source = class_name_str ? class_name_str : "";
@@ -4473,8 +4473,8 @@ static Value vmHostBoxInterface(VM* vm) {
     releaseClosureEnv(payload);
     freeValue(&classNameVal);
     freeValue(&typeNameVal);
-    if (VALUE_TYPE(receiverVal) == TYPE_POINTER && receiverVal.base_type_node == OWNED_POINTER_SENTINEL) {
-        receiverVal.base_type_node = NULL;
+    if (VALUE_TYPE(receiverVal) == TYPE_POINTER && PTR_BASE_TYPE_NODE(receiverVal) == OWNED_POINTER_SENTINEL) {
+        PTR_BASE_TYPE_NODE(receiverVal) = NULL;
     }
     freeValue(&receiverVal);
     freeValue(&tablePtrVal);
@@ -4538,29 +4538,29 @@ static Value vmHostInterfaceLookup(VM* vm) {
         return makeNil();
     }
 
-    if (tableValue->dimensions <= 0) {
+    if (ARRAY_DIMENSIONS(*tableValue) <= 0) {
         freeValue(&methodIndexVal);
         freeValue(&ifaceVal);
         runtimeError(vm, "VM Error: Interface method table is empty.");
         return makeNil();
     }
 
-    if (tableValue->dimensions != 1) {
+    if (ARRAY_DIMENSIONS(*tableValue) != 1) {
         freeValue(&methodIndexVal);
         freeValue(&ifaceVal);
         runtimeError(vm, "VM Error: Interface method table must be one-dimensional.");
         return makeNil();
     }
 
-    if (!tableValue->lower_bounds || !tableValue->upper_bounds) {
+    if (!ARRAY_LOWER_BOUNDS(*tableValue) || !ARRAY_UPPER_BOUNDS(*tableValue)) {
         freeValue(&methodIndexVal);
         freeValue(&ifaceVal);
         runtimeError(vm, "VM Error: Interface method table missing bounds metadata.");
         return makeNil();
     }
 
-    int lower = tableValue->lower_bounds[0];
-    int upper = tableValue->upper_bounds[0];
+    int lower = ARRAY_LOWER_BOUNDS(*tableValue)[0];
+    int upper = ARRAY_UPPER_BOUNDS(*tableValue)[0];
     int total = calculateArrayTotalSize(tableValue);
     if (total <= 0 || upper < lower) {
         freeValue(&methodIndexVal);
@@ -5573,7 +5573,7 @@ static InterpretResult handleDefineGlobal(VM* vm, Value varNameVal) {
         }
         if (lower_bounds) free(lower_bounds);
         if (upper_bounds) free(upper_bounds);
-        if (dimension_count > 0 && array_value.dimensions == 0) {
+        if (dimension_count > 0 && ARRAY_DIMENSIONS(array_value) == 0) {
             runtimeError(vm, "VM Error: Failed to allocate array for global '%s'.", AS_STRING(varNameVal));
             freeValue(&array_value);
             return INTERPRET_RUNTIME_ERROR;
@@ -5707,11 +5707,11 @@ static InterpretResult handleDefineGlobal(VM* vm, Value varNameVal) {
 
         if (declaredType == TYPE_FILE && sym && sym->value) {
             if (file_element_type != TYPE_VOID && file_element_type != TYPE_UNKNOWN) {
-                sym->value->element_type = file_element_type;
+                ARRAY_ELEMENT_TYPE(*sym->value) = file_element_type;
                 long long bytes = 0;
                 if (vmSizeForVarType(file_element_type, &bytes) && bytes > 0 && bytes <= INT_MAX) {
-                    sym->value->record_size = (int)bytes;
-                    sym->value->record_size_explicit = true;
+                    FILE_RECORD_SIZE(*sym->value) = (int)bytes;
+                    FILE_RECORD_SIZE_EXPLICIT(*sym->value) = true;
                 }
             }
             if (file_element_name_idx != 0xFFFF && file_element_name_idx < vm->chunk->constants_count) {
@@ -5719,7 +5719,7 @@ static InterpretResult handleDefineGlobal(VM* vm, Value varNameVal) {
                 if (VALUE_TYPE(elem_name_val) == TYPE_STRING && AS_STRING(elem_name_val) && AS_STRING(elem_name_val)[0] != '\0') {
                     AST* elem_def = lookupType(AS_STRING(elem_name_val));
                     if (elem_def) {
-                        sym->value->element_type_def = elem_def;
+                        ARRAY_ELEMENT_TYPE_DEF(*sym->value) = elem_def;
                     }
                 }
             }
@@ -6137,16 +6137,16 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
                     long long delta = asI64(int_val); \
                     int new_ord = AS_ENUM(enum_value).ordinal + \
                         ((current_instruction_code == ADD) ? (int)delta : -(int)delta); \
-                    if (enum_value.enum_meta && \
-                        (new_ord < 0 || new_ord >= enum_value.enum_meta->member_count)) { \
+                    if (ENUM_META(enum_value) && \
+                        (new_ord < 0 || new_ord >= ENUM_META(enum_value)->member_count)) { \
                         runtimeError(vm, "Runtime Error: Enum '%s' out of range.", \
                                      AS_ENUM(enum_value).enum_name ? AS_ENUM(enum_value).enum_name : "<anon>"); \
                         freeValue(&a_val_popped); freeValue(&b_val_popped); \
                         return INTERPRET_RUNTIME_ERROR; \
                     } \
                     result_val = makeEnum(AS_ENUM(enum_value).enum_name, new_ord); \
-                    result_val.enum_meta = enum_value.enum_meta; \
-                    result_val.base_type_node = enum_value.base_type_node; \
+                    ENUM_META(result_val) = ENUM_META(enum_value); \
+                    PTR_BASE_TYPE_NODE(result_val) = PTR_BASE_TYPE_NODE(enum_value); \
                     op_is_handled = true; \
                 } \
             } \
@@ -7442,26 +7442,26 @@ comparison_error_label:
                     Value* candidate = (Value*)AS_POINTER(operand);
                     if (candidate && VALUE_TYPE(*candidate) == TYPE_ARRAY) {
                         array_val_ptr = candidate;
-                    } else if (operand.base_type_node && operand.base_type_node->type == AST_ARRAY_TYPE) {
-                        AST* arrayType = operand.base_type_node;
+                    } else if (PTR_BASE_TYPE_NODE(operand) && PTR_BASE_TYPE_NODE(operand)->type == AST_ARRAY_TYPE) {
+                        AST* arrayType = PTR_BASE_TYPE_NODE(operand);
                         int dims = arrayType->child_count;
                         SET_VALUE_TYPE(&temp_wrapper, TYPE_ARRAY);
-                        temp_wrapper.dimensions = dims;
-                        temp_wrapper.element_type = vmResolveArrayElementType(arrayType);
-                        temp_wrapper.array_is_packed = isPackedByteElementType(temp_wrapper.element_type);
-                        if (temp_wrapper.array_is_packed) {
+                        ARRAY_DIMENSIONS(temp_wrapper) = dims;
+                        ARRAY_ELEMENT_TYPE(temp_wrapper) = vmResolveArrayElementType(arrayType);
+                        ARRAY_IS_PACKED(temp_wrapper) = isPackedByteElementType(ARRAY_ELEMENT_TYPE(temp_wrapper));
+                        if (ARRAY_IS_PACKED(temp_wrapper)) {
                             AS_ARRAY_RAW(temp_wrapper) = (uint8_t*)AS_POINTER(operand);
                             AS_ARRAY(temp_wrapper) = NULL;
                         } else {
                             AS_ARRAY(temp_wrapper) = (Value*)AS_POINTER(operand);
                             AS_ARRAY_RAW(temp_wrapper) = NULL;
                         }
-                        temp_wrapper.lower_bounds = malloc(sizeof(int) * dims);
-                        temp_wrapper.upper_bounds = malloc(sizeof(int) * dims);
-                        if (!temp_wrapper.lower_bounds || !temp_wrapper.upper_bounds) {
+                        ARRAY_LOWER_BOUNDS(temp_wrapper) = malloc(sizeof(int) * dims);
+                        ARRAY_UPPER_BOUNDS(temp_wrapper) = malloc(sizeof(int) * dims);
+                        if (!ARRAY_LOWER_BOUNDS(temp_wrapper) || !ARRAY_UPPER_BOUNDS(temp_wrapper)) {
                             runtimeError(vm, "VM Error: Malloc failed for temporary array wrapper bounds.");
-                            if (temp_wrapper.lower_bounds) free(temp_wrapper.lower_bounds);
-                            if (temp_wrapper.upper_bounds) free(temp_wrapper.upper_bounds);
+                            if (ARRAY_LOWER_BOUNDS(temp_wrapper)) free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                            if (ARRAY_UPPER_BOUNDS(temp_wrapper)) free(ARRAY_UPPER_BOUNDS(temp_wrapper));
                             free(indices);
                             freeValue(&operand);
                             return INTERPRET_RUNTIME_ERROR;
@@ -7470,14 +7470,14 @@ comparison_error_label:
                             int lb = 0, ub = -1;
                             AST* sub = arrayType->children[i];
                             if (sub && !vmResolveArraySubrangeBounds(vm, sub, &lb, &ub)) {
-                                free(temp_wrapper.lower_bounds);
-                                free(temp_wrapper.upper_bounds);
+                                free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                                free(ARRAY_UPPER_BOUNDS(temp_wrapper));
                                 free(indices);
                                 freeValue(&operand);
                                 return INTERPRET_RUNTIME_ERROR;
                             }
-                            temp_wrapper.lower_bounds[i] = lb;
-                            temp_wrapper.upper_bounds[i] = ub;
+                            ARRAY_LOWER_BOUNDS(temp_wrapper)[i] = lb;
+                            ARRAY_UPPER_BOUNDS(temp_wrapper)[i] = ub;
                         }
                         array_val_ptr = &temp_wrapper;
                         using_wrapper = true;
@@ -7504,26 +7504,26 @@ comparison_error_label:
                     runtimeError(vm, "VM Error: Array element index out of bounds.");
                     freeValue(&operand);
                     if (using_wrapper) {
-                        free(temp_wrapper.lower_bounds);
-                        free(temp_wrapper.upper_bounds);
+                        free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                        free(ARRAY_UPPER_BOUNDS(temp_wrapper));
                     }
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
                 AST* element_base_type = NULL;
-                if (array_val_ptr->element_type_def) {
-                    element_base_type = array_val_ptr->element_type_def;
-                } else if (operand.base_type_node && operand.base_type_node->type == AST_ARRAY_TYPE) {
-                    element_base_type = operand.base_type_node->right;
+                if (ARRAY_ELEMENT_TYPE_DEF(*array_val_ptr)) {
+                    element_base_type = ARRAY_ELEMENT_TYPE_DEF(*array_val_ptr);
+                } else if (PTR_BASE_TYPE_NODE(operand) && PTR_BASE_TYPE_NODE(operand)->type == AST_ARRAY_TYPE) {
+                    element_base_type = PTR_BASE_TYPE_NODE(operand)->right;
                 }
 
-                if (array_val_ptr->array_is_packed) {
+                if (ARRAY_IS_PACKED(*array_val_ptr)) {
                     if (!AS_ARRAY_RAW(*array_val_ptr)) {
                         runtimeError(vm, "VM Error: Packed array storage missing.");
                         freeValue(&operand);
                         if (using_wrapper) {
-                            free(temp_wrapper.lower_bounds);
-                            free(temp_wrapper.upper_bounds);
+                            free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                            free(ARRAY_UPPER_BOUNDS(temp_wrapper));
                         }
                         return INTERPRET_RUNTIME_ERROR;
                     }
@@ -7536,8 +7536,8 @@ comparison_error_label:
                     freeValue(&operand);
                 }
                 if (using_wrapper) {
-                    free(temp_wrapper.lower_bounds);
-                    free(temp_wrapper.upper_bounds);
+                    free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                    free(ARRAY_UPPER_BOUNDS(temp_wrapper));
                 }
 
                 break;
@@ -7569,34 +7569,34 @@ comparison_error_label:
 
                 Value* array_val_ptr = NULL;
                 Value temp_wrapper;
-                temp_wrapper.lower_bounds = NULL;
-                temp_wrapper.upper_bounds = NULL;
+                ARRAY_LOWER_BOUNDS(temp_wrapper) = NULL;
+                ARRAY_UPPER_BOUNDS(temp_wrapper) = NULL;
                 bool using_wrapper = false;
 
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* candidate = (Value*)AS_POINTER(operand);
                     if (candidate && VALUE_TYPE(*candidate) == TYPE_ARRAY) {
                         array_val_ptr = candidate;
-                    } else if (operand.base_type_node && operand.base_type_node->type == AST_ARRAY_TYPE) {
-                        AST* arrayType = operand.base_type_node;
+                    } else if (PTR_BASE_TYPE_NODE(operand) && PTR_BASE_TYPE_NODE(operand)->type == AST_ARRAY_TYPE) {
+                        AST* arrayType = PTR_BASE_TYPE_NODE(operand);
                         int dims = arrayType->child_count;
                         SET_VALUE_TYPE(&temp_wrapper, TYPE_ARRAY);
-                        temp_wrapper.dimensions = dims;
-                        temp_wrapper.element_type = vmResolveArrayElementType(arrayType);
-                        temp_wrapper.array_is_packed = isPackedByteElementType(temp_wrapper.element_type);
-                        if (temp_wrapper.array_is_packed) {
+                        ARRAY_DIMENSIONS(temp_wrapper) = dims;
+                        ARRAY_ELEMENT_TYPE(temp_wrapper) = vmResolveArrayElementType(arrayType);
+                        ARRAY_IS_PACKED(temp_wrapper) = isPackedByteElementType(ARRAY_ELEMENT_TYPE(temp_wrapper));
+                        if (ARRAY_IS_PACKED(temp_wrapper)) {
                             AS_ARRAY_RAW(temp_wrapper) = (uint8_t*)AS_POINTER(operand);
                             AS_ARRAY(temp_wrapper) = NULL;
                         } else {
                             AS_ARRAY(temp_wrapper) = (Value*)AS_POINTER(operand);
                             AS_ARRAY_RAW(temp_wrapper) = NULL;
                         }
-                        temp_wrapper.lower_bounds = malloc(sizeof(int) * dims);
-                        temp_wrapper.upper_bounds = malloc(sizeof(int) * dims);
-                        if (!temp_wrapper.lower_bounds || !temp_wrapper.upper_bounds) {
+                        ARRAY_LOWER_BOUNDS(temp_wrapper) = malloc(sizeof(int) * dims);
+                        ARRAY_UPPER_BOUNDS(temp_wrapper) = malloc(sizeof(int) * dims);
+                        if (!ARRAY_LOWER_BOUNDS(temp_wrapper) || !ARRAY_UPPER_BOUNDS(temp_wrapper)) {
                             runtimeError(vm, "VM Error: Malloc failed for temporary array wrapper bounds.");
-                            if (temp_wrapper.lower_bounds) free(temp_wrapper.lower_bounds);
-                            if (temp_wrapper.upper_bounds) free(temp_wrapper.upper_bounds);
+                            if (ARRAY_LOWER_BOUNDS(temp_wrapper)) free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                            if (ARRAY_UPPER_BOUNDS(temp_wrapper)) free(ARRAY_UPPER_BOUNDS(temp_wrapper));
                             freeValue(&operand);
                             return INTERPRET_RUNTIME_ERROR;
                         }
@@ -7604,13 +7604,13 @@ comparison_error_label:
                             int lb = 0, ub = -1;
                             AST* sub = arrayType->children[i];
                             if (sub && !vmResolveArraySubrangeBounds(vm, sub, &lb, &ub)) {
-                                free(temp_wrapper.lower_bounds);
-                                free(temp_wrapper.upper_bounds);
+                                free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                                free(ARRAY_UPPER_BOUNDS(temp_wrapper));
                                 freeValue(&operand);
                                 return INTERPRET_RUNTIME_ERROR;
                             }
-                            temp_wrapper.lower_bounds[i] = lb;
-                            temp_wrapper.upper_bounds[i] = ub;
+                            ARRAY_LOWER_BOUNDS(temp_wrapper)[i] = lb;
+                            ARRAY_UPPER_BOUNDS(temp_wrapper)[i] = ub;
                         }
                         array_val_ptr = &temp_wrapper;
                         using_wrapper = true;
@@ -7634,26 +7634,26 @@ comparison_error_label:
                         freeValue(&operand);
                     }
                     if (using_wrapper) {
-                        free(temp_wrapper.lower_bounds);
-                        free(temp_wrapper.upper_bounds);
+                        free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                        free(ARRAY_UPPER_BOUNDS(temp_wrapper));
                     }
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
                 AST* element_base_type = NULL;
-                if (array_val_ptr->element_type_def) {
-                    element_base_type = array_val_ptr->element_type_def;
-                } else if (operand.base_type_node && operand.base_type_node->type == AST_ARRAY_TYPE) {
-                    element_base_type = operand.base_type_node->right;
+                if (ARRAY_ELEMENT_TYPE_DEF(*array_val_ptr)) {
+                    element_base_type = ARRAY_ELEMENT_TYPE_DEF(*array_val_ptr);
+                } else if (PTR_BASE_TYPE_NODE(operand) && PTR_BASE_TYPE_NODE(operand)->type == AST_ARRAY_TYPE) {
+                    element_base_type = PTR_BASE_TYPE_NODE(operand)->right;
                 }
 
-                if (array_val_ptr->array_is_packed) {
+                if (ARRAY_IS_PACKED(*array_val_ptr)) {
                     if (!AS_ARRAY_RAW(*array_val_ptr)) {
                         runtimeError(vm, "VM Error: Packed array storage missing.");
                         freeValue(&operand);
                         if (using_wrapper) {
-                            free(temp_wrapper.lower_bounds);
-                            free(temp_wrapper.upper_bounds);
+                            free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                            free(ARRAY_UPPER_BOUNDS(temp_wrapper));
                         }
                         return INTERPRET_RUNTIME_ERROR;
                     }
@@ -7666,8 +7666,8 @@ comparison_error_label:
                     freeValue(&operand);
                 }
                 if (using_wrapper) {
-                    free(temp_wrapper.lower_bounds);
-                    free(temp_wrapper.upper_bounds);
+                    free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                    free(ARRAY_UPPER_BOUNDS(temp_wrapper));
                 }
 
                 break;
@@ -7737,41 +7737,41 @@ comparison_error_label:
                 Value* array_val_ptr = NULL;
                 Value shared_snapshot = makeNil();
                 Value temp_wrapper;
-                temp_wrapper.lower_bounds = NULL;
-                temp_wrapper.upper_bounds = NULL;
+                ARRAY_LOWER_BOUNDS(temp_wrapper) = NULL;
+                ARRAY_UPPER_BOUNDS(temp_wrapper) = NULL;
                 bool using_wrapper = false;
                 bool using_snapshot = false;
 
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* candidate = (Value*)AS_POINTER(operand);
                     if (candidate && VALUE_TYPE(*candidate) == TYPE_ARRAY) {
-                        if (candidate->array_is_dynamic) {
+                        if (ARRAY_IS_DYNAMIC(*candidate)) {
                             shared_snapshot = copyDynamicArraySnapshotValue(candidate);
                             array_val_ptr = &shared_snapshot;
                             using_snapshot = true;
                         } else {
                             array_val_ptr = candidate;
                         }
-                    } else if (operand.base_type_node && operand.base_type_node->type == AST_ARRAY_TYPE) {
-                        AST* arrayType = operand.base_type_node;
+                    } else if (PTR_BASE_TYPE_NODE(operand) && PTR_BASE_TYPE_NODE(operand)->type == AST_ARRAY_TYPE) {
+                        AST* arrayType = PTR_BASE_TYPE_NODE(operand);
                         int dims = arrayType->child_count;
                         SET_VALUE_TYPE(&temp_wrapper, TYPE_ARRAY);
-                        temp_wrapper.dimensions = dims;
-                        temp_wrapper.element_type = vmResolveArrayElementType(arrayType);
-                        temp_wrapper.array_is_packed = isPackedByteElementType(temp_wrapper.element_type);
-                        if (temp_wrapper.array_is_packed) {
+                        ARRAY_DIMENSIONS(temp_wrapper) = dims;
+                        ARRAY_ELEMENT_TYPE(temp_wrapper) = vmResolveArrayElementType(arrayType);
+                        ARRAY_IS_PACKED(temp_wrapper) = isPackedByteElementType(ARRAY_ELEMENT_TYPE(temp_wrapper));
+                        if (ARRAY_IS_PACKED(temp_wrapper)) {
                             AS_ARRAY_RAW(temp_wrapper) = (uint8_t*)AS_POINTER(operand);
                             AS_ARRAY(temp_wrapper) = NULL;
                         } else {
                             AS_ARRAY(temp_wrapper) = (Value*)AS_POINTER(operand);
                             AS_ARRAY_RAW(temp_wrapper) = NULL;
                         }
-                        temp_wrapper.lower_bounds = malloc(sizeof(int) * dims);
-                        temp_wrapper.upper_bounds = malloc(sizeof(int) * dims);
-                        if (!temp_wrapper.lower_bounds || !temp_wrapper.upper_bounds) {
+                        ARRAY_LOWER_BOUNDS(temp_wrapper) = malloc(sizeof(int) * dims);
+                        ARRAY_UPPER_BOUNDS(temp_wrapper) = malloc(sizeof(int) * dims);
+                        if (!ARRAY_LOWER_BOUNDS(temp_wrapper) || !ARRAY_UPPER_BOUNDS(temp_wrapper)) {
                             runtimeError(vm, "VM Error: Malloc failed for temporary array wrapper bounds.");
-                            if (temp_wrapper.lower_bounds) free(temp_wrapper.lower_bounds);
-                            if (temp_wrapper.upper_bounds) free(temp_wrapper.upper_bounds);
+                            if (ARRAY_LOWER_BOUNDS(temp_wrapper)) free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                            if (ARRAY_UPPER_BOUNDS(temp_wrapper)) free(ARRAY_UPPER_BOUNDS(temp_wrapper));
                             free(indices);
                             freeValue(&operand);
                             return INTERPRET_RUNTIME_ERROR;
@@ -7780,14 +7780,14 @@ comparison_error_label:
                             int lb = 0, ub = -1;
                             AST* sub = arrayType->children[i];
                             if (sub && !vmResolveArraySubrangeBounds(vm, sub, &lb, &ub)) {
-                                free(temp_wrapper.lower_bounds);
-                                free(temp_wrapper.upper_bounds);
+                                free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                                free(ARRAY_UPPER_BOUNDS(temp_wrapper));
                                 free(indices);
                                 freeValue(&operand);
                                 return INTERPRET_RUNTIME_ERROR;
                             }
-                            temp_wrapper.lower_bounds[i] = lb;
-                            temp_wrapper.upper_bounds[i] = ub;
+                            ARRAY_LOWER_BOUNDS(temp_wrapper)[i] = lb;
+                            ARRAY_UPPER_BOUNDS(temp_wrapper)[i] = ub;
                         }
                         array_val_ptr = &temp_wrapper;
                         using_wrapper = true;
@@ -7814,8 +7814,8 @@ comparison_error_label:
                     runtimeError(vm, "VM Error: Array element index out of bounds.");
                     if (VALUE_TYPE(operand) == TYPE_POINTER) freeValue(&operand);
                     if (using_wrapper) {
-                        free(temp_wrapper.lower_bounds);
-                        free(temp_wrapper.upper_bounds);
+                        free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                        free(ARRAY_UPPER_BOUNDS(temp_wrapper));
                     }
                     if (using_snapshot) {
                         freeValue(&shared_snapshot);
@@ -7823,13 +7823,13 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
-                if (array_val_ptr->array_is_packed) {
+                if (ARRAY_IS_PACKED(*array_val_ptr)) {
                     if (!AS_ARRAY_RAW(*array_val_ptr)) {
                         runtimeError(vm, "VM Error: Packed array storage missing.");
                         freeValue(&operand);
                         if (using_wrapper) {
-                            free(temp_wrapper.lower_bounds);
-                            free(temp_wrapper.upper_bounds);
+                            free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                            free(ARRAY_UPPER_BOUNDS(temp_wrapper));
                         }
                         if (using_snapshot) {
                             freeValue(&shared_snapshot);
@@ -7843,8 +7843,8 @@ comparison_error_label:
 
                 freeValue(&operand);
                 if (using_wrapper) {
-                    free(temp_wrapper.lower_bounds);
-                    free(temp_wrapper.upper_bounds);
+                    free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                    free(ARRAY_UPPER_BOUNDS(temp_wrapper));
                 }
                 if (using_snapshot) {
                     freeValue(&shared_snapshot);
@@ -7881,41 +7881,41 @@ comparison_error_label:
                 Value* array_val_ptr = NULL;
                 Value shared_snapshot = makeNil();
                 Value temp_wrapper;
-                temp_wrapper.lower_bounds = NULL;
-                temp_wrapper.upper_bounds = NULL;
+                ARRAY_LOWER_BOUNDS(temp_wrapper) = NULL;
+                ARRAY_UPPER_BOUNDS(temp_wrapper) = NULL;
                 bool using_wrapper = false;
                 bool using_snapshot = false;
 
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* candidate = (Value*)AS_POINTER(operand);
                     if (candidate && VALUE_TYPE(*candidate) == TYPE_ARRAY) {
-                        if (candidate->array_is_dynamic) {
+                        if (ARRAY_IS_DYNAMIC(*candidate)) {
                             shared_snapshot = copyDynamicArraySnapshotValue(candidate);
                             array_val_ptr = &shared_snapshot;
                             using_snapshot = true;
                         } else {
                             array_val_ptr = candidate;
                         }
-                    } else if (operand.base_type_node && operand.base_type_node->type == AST_ARRAY_TYPE) {
-                        AST* arrayType = operand.base_type_node;
+                    } else if (PTR_BASE_TYPE_NODE(operand) && PTR_BASE_TYPE_NODE(operand)->type == AST_ARRAY_TYPE) {
+                        AST* arrayType = PTR_BASE_TYPE_NODE(operand);
                         int dims = arrayType->child_count;
                         SET_VALUE_TYPE(&temp_wrapper, TYPE_ARRAY);
-                        temp_wrapper.dimensions = dims;
-                        temp_wrapper.element_type = vmResolveArrayElementType(arrayType);
-                        temp_wrapper.array_is_packed = isPackedByteElementType(temp_wrapper.element_type);
-                        if (temp_wrapper.array_is_packed) {
+                        ARRAY_DIMENSIONS(temp_wrapper) = dims;
+                        ARRAY_ELEMENT_TYPE(temp_wrapper) = vmResolveArrayElementType(arrayType);
+                        ARRAY_IS_PACKED(temp_wrapper) = isPackedByteElementType(ARRAY_ELEMENT_TYPE(temp_wrapper));
+                        if (ARRAY_IS_PACKED(temp_wrapper)) {
                             AS_ARRAY_RAW(temp_wrapper) = (uint8_t*)AS_POINTER(operand);
                             AS_ARRAY(temp_wrapper) = NULL;
                         } else {
                             AS_ARRAY(temp_wrapper) = (Value*)AS_POINTER(operand);
                             AS_ARRAY_RAW(temp_wrapper) = NULL;
                         }
-                        temp_wrapper.lower_bounds = malloc(sizeof(int) * dims);
-                        temp_wrapper.upper_bounds = malloc(sizeof(int) * dims);
-                        if (!temp_wrapper.lower_bounds || !temp_wrapper.upper_bounds) {
+                        ARRAY_LOWER_BOUNDS(temp_wrapper) = malloc(sizeof(int) * dims);
+                        ARRAY_UPPER_BOUNDS(temp_wrapper) = malloc(sizeof(int) * dims);
+                        if (!ARRAY_LOWER_BOUNDS(temp_wrapper) || !ARRAY_UPPER_BOUNDS(temp_wrapper)) {
                             runtimeError(vm, "VM Error: Malloc failed for temporary array wrapper bounds.");
-                            if (temp_wrapper.lower_bounds) free(temp_wrapper.lower_bounds);
-                            if (temp_wrapper.upper_bounds) free(temp_wrapper.upper_bounds);
+                            if (ARRAY_LOWER_BOUNDS(temp_wrapper)) free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                            if (ARRAY_UPPER_BOUNDS(temp_wrapper)) free(ARRAY_UPPER_BOUNDS(temp_wrapper));
                             freeValue(&operand);
                             return INTERPRET_RUNTIME_ERROR;
                         }
@@ -7923,13 +7923,13 @@ comparison_error_label:
                             int lb = 0, ub = -1;
                             AST* sub = arrayType->children[i];
                             if (sub && !vmResolveArraySubrangeBounds(vm, sub, &lb, &ub)) {
-                                free(temp_wrapper.lower_bounds);
-                                free(temp_wrapper.upper_bounds);
+                                free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                                free(ARRAY_UPPER_BOUNDS(temp_wrapper));
                                 freeValue(&operand);
                                 return INTERPRET_RUNTIME_ERROR;
                             }
-                            temp_wrapper.lower_bounds[i] = lb;
-                            temp_wrapper.upper_bounds[i] = ub;
+                            ARRAY_LOWER_BOUNDS(temp_wrapper)[i] = lb;
+                            ARRAY_UPPER_BOUNDS(temp_wrapper)[i] = ub;
                         }
                         array_val_ptr = &temp_wrapper;
                         using_wrapper = true;
@@ -7951,8 +7951,8 @@ comparison_error_label:
                     runtimeError(vm, "VM Error: Array element index out of bounds.");
                     freeValue(&operand);
                     if (using_wrapper) {
-                        free(temp_wrapper.lower_bounds);
-                        free(temp_wrapper.upper_bounds);
+                        free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                        free(ARRAY_UPPER_BOUNDS(temp_wrapper));
                     }
                     if (using_snapshot) {
                         freeValue(&shared_snapshot);
@@ -7960,13 +7960,13 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
-                if (array_val_ptr->array_is_packed) {
+                if (ARRAY_IS_PACKED(*array_val_ptr)) {
                     if (!AS_ARRAY_RAW(*array_val_ptr)) {
                         runtimeError(vm, "VM Error: Packed array storage missing.");
                         freeValue(&operand);
                         if (using_wrapper) {
-                            free(temp_wrapper.lower_bounds);
-                            free(temp_wrapper.upper_bounds);
+                            free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                            free(ARRAY_UPPER_BOUNDS(temp_wrapper));
                         }
                         if (using_snapshot) {
                             freeValue(&shared_snapshot);
@@ -7980,8 +7980,8 @@ comparison_error_label:
 
                 freeValue(&operand);
                 if (using_wrapper) {
-                    free(temp_wrapper.lower_bounds);
-                    free(temp_wrapper.upper_bounds);
+                    free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                    free(ARRAY_UPPER_BOUNDS(temp_wrapper));
                 }
                 if (using_snapshot) {
                     freeValue(&shared_snapshot);
@@ -8004,8 +8004,8 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
-                if (pointer_to_lvalue.base_type_node == STRING_CHAR_PTR_SENTINEL ||
-                    pointer_to_lvalue.base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
+                if (PTR_BASE_TYPE_NODE(pointer_to_lvalue) == STRING_CHAR_PTR_SENTINEL ||
+                    PTR_BASE_TYPE_NODE(pointer_to_lvalue) == SERIALIZED_CHAR_PTR_SENTINEL) {
                     char* char_target_addr = (char*)AS_POINTER(pointer_to_lvalue);
                     if (char_target_addr == NULL) {
                         runtimeError(vm, "VM Error: Attempting to assign to a NULL character address.");
@@ -8031,7 +8031,7 @@ comparison_error_label:
                         freeValue(&pointer_to_lvalue);
                         return INTERPRET_RUNTIME_ERROR;
                     }
-                } else if (pointer_to_lvalue.base_type_node == BYTE_ARRAY_PTR_SENTINEL) {
+                } else if (PTR_BASE_TYPE_NODE(pointer_to_lvalue) == BYTE_ARRAY_PTR_SENTINEL) {
                     uint8_t* byte_target_addr = (uint8_t*)AS_POINTER(pointer_to_lvalue);
                     if (byte_target_addr == NULL) {
                         runtimeError(vm, "VM Error: Attempting to assign to a NULL byte address.");
@@ -8070,15 +8070,15 @@ comparison_error_label:
                         runtimeWarning(vm, "Warning: Range check error assigning to BYTE.");
                     }
                     *byte_target_addr = (uint8_t)stored;
-                } else if (pointer_to_lvalue.base_type_node == STRING_LENGTH_SENTINEL) {
+                } else if (PTR_BASE_TYPE_NODE(pointer_to_lvalue) == STRING_LENGTH_SENTINEL) {
                     if (!frontendIsShell()) {
                         runtimeError(vm, "VM Error: Cannot assign to string length.");
                         freeValue(&value_to_set);
                         freeValue(&pointer_to_lvalue);
                         return INTERPRET_RUNTIME_ERROR;
                     }
-                } else if (pointer_to_lvalue.base_type_node == SHELL_FUNCTION_PTR_SENTINEL ||
-                           pointer_to_lvalue.base_type_node == OPAQUE_POINTER_SENTINEL) {
+                } else if (PTR_BASE_TYPE_NODE(pointer_to_lvalue) == SHELL_FUNCTION_PTR_SENTINEL ||
+                           PTR_BASE_TYPE_NODE(pointer_to_lvalue) == OPAQUE_POINTER_SENTINEL) {
                     runtimeError(vm, "VM Error: Cannot assign through opaque/function pointer constants.");
                     freeValue(&value_to_set);
                     freeValue(&pointer_to_lvalue);
@@ -8093,7 +8093,7 @@ comparison_error_label:
                         return INTERPRET_RUNTIME_ERROR;
                     }
 
-                    AST* declaredTypeNode = pointer_to_lvalue.base_type_node;
+                    AST* declaredTypeNode = PTR_BASE_TYPE_NODE(pointer_to_lvalue);
                     VarType declaredType = vmDeclaredVarType(declaredTypeNode);
                     AST* resolvedDeclaredType = vmResolveTypeAlias(declaredTypeNode);
                     if (declaredType != TYPE_VOID) {
@@ -8118,12 +8118,12 @@ comparison_error_label:
                         } else if (declaredType == TYPE_POINTER && resolvedDeclaredType &&
                                    resolvedDeclaredType->type == AST_POINTER_TYPE &&
                                    resolvedDeclaredType->right) {
-                            target_lvalue_ptr->base_type_node = resolvedDeclaredType->right;
+                            PTR_BASE_TYPE_NODE(*target_lvalue_ptr) = resolvedDeclaredType->right;
                         }
                     }
 
                     // (Your existing logic for handling fixed-length strings, pointers, reals, etc. goes here)
-                    if (isPascalStringType(VALUE_TYPE(*target_lvalue_ptr)) && target_lvalue_ptr->max_length <= 0) {
+                    if (isPascalStringType(VALUE_TYPE(*target_lvalue_ptr)) && STRING_MAX_LENGTH(*target_lvalue_ptr) <= 0) {
                         if (VALUE_TYPE(value_to_set) == TYPE_CHAR || VALUE_TYPE(value_to_set) == TYPE_WIDECHAR) {
                             freeValue(target_lvalue_ptr);
                             char encoded[5] = {0};
@@ -8145,7 +8145,7 @@ comparison_error_label:
                                            VALUE_TYPE(*target_lvalue_ptr) == TYPE_UNICODE_STRING
                                                ? TYPE_UNICODE_STRING
                                                : TYPE_STRING);
-                            target_lvalue_ptr->max_length = -1;
+                            STRING_MAX_LENGTH(*target_lvalue_ptr) = -1;
                         } else if (isPascalStringType(VALUE_TYPE(value_to_set)) && AS_STRING(value_to_set)) {
                             VarType destType = VALUE_TYPE(*target_lvalue_ptr);
                             freeValue(target_lvalue_ptr);
@@ -8153,15 +8153,15 @@ comparison_error_label:
                             AS_STRING(*target_lvalue_ptr) = AS_STRING(value_to_set);
                             AS_STRING(value_to_set) = NULL; /* Prevent double-free */
                             SET_VALUE_TYPE(target_lvalue_ptr, destType);
-                            target_lvalue_ptr->max_length = -1;
+                            STRING_MAX_LENGTH(*target_lvalue_ptr) = -1;
                         } else {
                             runtimeError(vm, "Type mismatch: Cannot assign this type to a dynamic string.");
                         }
                     }
-                    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_STRING && target_lvalue_ptr->max_length > 0) {
+                    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_STRING && STRING_MAX_LENGTH(*target_lvalue_ptr) > 0) {
                         if (VALUE_TYPE(value_to_set) == TYPE_STRING && AS_STRING(value_to_set)) {
-                            strncpy(AS_STRING(*target_lvalue_ptr), AS_STRING(value_to_set), target_lvalue_ptr->max_length);
-                            AS_STRING(*target_lvalue_ptr)[target_lvalue_ptr->max_length] = '\0'; // Ensure null termination
+                            strncpy(AS_STRING(*target_lvalue_ptr), AS_STRING(value_to_set), STRING_MAX_LENGTH(*target_lvalue_ptr));
+                            AS_STRING(*target_lvalue_ptr)[STRING_MAX_LENGTH(*target_lvalue_ptr)] = '\0'; // Ensure null termination
                         } else if (VALUE_TYPE(value_to_set) == TYPE_CHAR) {
                             AS_STRING(*target_lvalue_ptr)[0] = AS_CHAR(value_to_set);
                             AS_STRING(*target_lvalue_ptr)[1] = '\0';
@@ -8175,8 +8175,8 @@ comparison_error_label:
                             AS_POINTER(*target_lvalue_ptr) = NULL;
                         } else {
                             AS_POINTER(*target_lvalue_ptr) = AS_POINTER(value_to_set);
-                            if (value_to_set.base_type_node) {
-                                target_lvalue_ptr->base_type_node = value_to_set.base_type_node;
+                            if (PTR_BASE_TYPE_NODE(value_to_set)) {
+                                PTR_BASE_TYPE_NODE(*target_lvalue_ptr) = PTR_BASE_TYPE_NODE(value_to_set);
                             }
                         }
                     }
@@ -8252,7 +8252,7 @@ comparison_error_label:
                         SET_INT_VALUE(target_lvalue_ptr, AS_CHAR(*target_lvalue_ptr));
                     }
                     else {
-                        AST* preserved_base = target_lvalue_ptr->base_type_node;
+                        AST* preserved_base = PTR_BASE_TYPE_NODE(*target_lvalue_ptr);
                         if (VALUE_TYPE(value_to_set) == TYPE_MEMORYSTREAM) {
                             /* Transfer ownership of the MStream pointer without freeing it
                              * when the temporary value is cleaned up below. */
@@ -8354,8 +8354,8 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
-                if (pointer_val.base_type_node == STRING_CHAR_PTR_SENTINEL ||
-                    pointer_val.base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
+                if (PTR_BASE_TYPE_NODE(pointer_val) == STRING_CHAR_PTR_SENTINEL ||
+                    PTR_BASE_TYPE_NODE(pointer_val) == SERIALIZED_CHAR_PTR_SENTINEL) {
                     // Special case: pointer into a string's character buffer.
                     char* char_target_addr = (char*)AS_POINTER(pointer_val);
                     if (char_target_addr == NULL) {
@@ -8364,7 +8364,7 @@ comparison_error_label:
                         return INTERPRET_RUNTIME_ERROR;
                     }
                     push(vm, makeChar(*char_target_addr));
-                } else if (pointer_val.base_type_node == BYTE_ARRAY_PTR_SENTINEL) {
+                } else if (PTR_BASE_TYPE_NODE(pointer_val) == BYTE_ARRAY_PTR_SENTINEL) {
                     uint8_t* byte_target_addr = (uint8_t*)AS_POINTER(pointer_val);
                     if (byte_target_addr == NULL) {
                         runtimeError(vm, "VM Error: Attempting to dereference a NULL byte address.");
@@ -8372,7 +8372,7 @@ comparison_error_label:
                         return INTERPRET_RUNTIME_ERROR;
                     }
                     push(vm, makeByte(*byte_target_addr));
-                } else if (pointer_val.base_type_node == STRING_LENGTH_SENTINEL && !frontendIsShell()) {
+                } else if (PTR_BASE_TYPE_NODE(pointer_val) == STRING_LENGTH_SENTINEL && !frontendIsShell()) {
                     // Special case: request for string length via element 0.
                     Value* str_val = (Value*)AS_POINTER(pointer_val);
                     size_t len = 0;
@@ -8383,8 +8383,8 @@ comparison_error_label:
                             : byte_len;
                     }
                     push(vm, makeInt((long long)len));
-                } else if (pointer_val.base_type_node == SHELL_FUNCTION_PTR_SENTINEL ||
-                           pointer_val.base_type_node == OPAQUE_POINTER_SENTINEL) {
+                } else if (PTR_BASE_TYPE_NODE(pointer_val) == SHELL_FUNCTION_PTR_SENTINEL ||
+                           PTR_BASE_TYPE_NODE(pointer_val) == OPAQUE_POINTER_SENTINEL) {
                     runtimeError(vm, "VM Error: Cannot dereference opaque/function pointer constants.");
                     freeValue(&pointer_val);
                     return INTERPRET_RUNTIME_ERROR;
@@ -8870,7 +8870,7 @@ comparison_error_label:
                     // Assigning nil to a pointer variable preserves its base type and type
                     AS_POINTER(*target_slot) = NULL;
                     // type and base_type_node remain unchanged
-                } else if (isPascalStringType(VALUE_TYPE(*target_slot)) && target_slot->max_length <= 0) {
+                } else if (isPascalStringType(VALUE_TYPE(*target_slot)) && STRING_MAX_LENGTH(*target_slot) <= 0) {
                     VarType destType = VALUE_TYPE(*target_slot);
                     char encoded[5] = {0};
                     const char* source_str = NULL;
@@ -8901,8 +8901,8 @@ comparison_error_label:
                         return INTERPRET_RUNTIME_ERROR;
                     }
                     SET_VALUE_TYPE(target_slot, destType);
-                    target_slot->max_length = -1;
-                } else if (VALUE_TYPE(*target_slot) == TYPE_STRING && target_slot->max_length > 0) {
+                    STRING_MAX_LENGTH(*target_slot) = -1;
+                } else if (VALUE_TYPE(*target_slot) == TYPE_STRING && STRING_MAX_LENGTH(*target_slot) > 0) {
                     // Special case: Assignment to a fixed-length string.
                     const char* source_str = "";
                     char char_buf[2] = {0};
@@ -8914,8 +8914,8 @@ comparison_error_label:
                         source_str = char_buf;
                     }
                     
-                    strncpy(AS_STRING(*target_slot), source_str, target_slot->max_length);
-                    AS_STRING(*target_slot)[target_slot->max_length] = '\0';
+                    strncpy(AS_STRING(*target_slot), source_str, STRING_MAX_LENGTH(*target_slot));
+                    AS_STRING(*target_slot)[STRING_MAX_LENGTH(*target_slot)] = '\0';
 
                 } else if (isRealType(VALUE_TYPE(*target_slot))) {
                     if (isRealType(VALUE_TYPE(value_from_stack))) {
@@ -8950,7 +8950,7 @@ comparison_error_label:
                 } else {
                     // This is the logic for all other types, including dynamic strings,
                     // numbers, records, etc., which requires a deep copy.
-                    AST* preserved_base = target_slot->base_type_node;
+                    AST* preserved_base = PTR_BASE_TYPE_NODE(*target_slot);
                     Value replacement = makeCopyOfValue(&value_from_stack);
                     replaceValueCell(target_slot, replacement, preserved_base);
                 }
@@ -8961,8 +8961,8 @@ comparison_error_label:
                             "[DEBUG set_local] slot %u ptr=%p base=%p (%s) val=%p\n",
                             (unsigned)slot,
                             (void*)target_slot,
-                            (void*)target_slot->base_type_node,
-                            target_slot->base_type_node ? astTypeToString(VALUE_TYPE(*target_slot->base_type_node)) : "NULL",
+                            (void*)PTR_BASE_TYPE_NODE(*target_slot),
+                            PTR_BASE_TYPE_NODE(*target_slot) ? astTypeToString(VALUE_TYPE(*PTR_BASE_TYPE_NODE(*target_slot))) : "NULL",
                             AS_POINTER(*target_slot));
                 }
                 #endif
@@ -9032,7 +9032,7 @@ comparison_error_label:
                 if (VALUE_TYPE(*target_slot) == TYPE_POINTER && VALUE_TYPE(value_from_stack) == TYPE_NIL) {
                     // Preserve pointer metadata when assigning NIL.
                     AS_POINTER(*target_slot) = NULL;
-                } else if (VALUE_TYPE(*target_slot) == TYPE_STRING && target_slot->max_length > 0) {
+                } else if (VALUE_TYPE(*target_slot) == TYPE_STRING && STRING_MAX_LENGTH(*target_slot) > 0) {
                     const char* source_str = "";
                     char char_buf[2] = {0};
                     if (isPascalStringType(VALUE_TYPE(value_from_stack)) && AS_STRING(value_from_stack)) {
@@ -9041,8 +9041,8 @@ comparison_error_label:
                         char_buf[0] = AS_CHAR(value_from_stack);
                         source_str = char_buf;
                     }
-                    strncpy(AS_STRING(*target_slot), source_str, target_slot->max_length);
-                    AS_STRING(*target_slot)[target_slot->max_length] = '\0';
+                    strncpy(AS_STRING(*target_slot), source_str, STRING_MAX_LENGTH(*target_slot));
+                    AS_STRING(*target_slot)[STRING_MAX_LENGTH(*target_slot)] = '\0';
                 } else if (isRealType(VALUE_TYPE(*target_slot))) {
                     if (IS_NUMERIC(value_from_stack)) {
                         long double tmp = asLd(value_from_stack);
@@ -9069,7 +9069,7 @@ comparison_error_label:
                         return INTERPRET_RUNTIME_ERROR;
                     }
                 } else {
-                    AST* preserved_base = target_slot->base_type_node;
+                    AST* preserved_base = PTR_BASE_TYPE_NODE(*target_slot);
                     Value replacement = makeCopyOfValue(&value_from_stack);
                     replaceValueCell(target_slot, replacement, preserved_base);
                 }
@@ -9173,7 +9173,7 @@ comparison_error_label:
                     array_value = makeEmptyArray(elem_var_type, elem_type_def);
                 }
 
-                if (dimension_count > 0 && array_value.dimensions == 0) {
+                if (dimension_count > 0 && ARRAY_DIMENSIONS(array_value) == 0) {
                     runtimeError(vm, "VM Error: Failed to allocate array for local slot %u.", slot);
                     freeValue(&array_value);
                     free(lower_idx);
@@ -9277,7 +9277,7 @@ comparison_error_label:
                     array_value = makeEmptyArray(elem_var_type, elem_type_def);
                 }
 
-                if (dimension_count > 0 && array_value.dimensions == 0) {
+                if (dimension_count > 0 && ARRAY_DIMENSIONS(array_value) == 0) {
                     runtimeError(vm, "VM Error: Failed to allocate array for field %u.", field_index);
                     freeValue(&array_value);
                     free(lower_idx);
@@ -9330,12 +9330,12 @@ comparison_error_label:
                 freeValue(target_slot);
                 Value file_val = makeValueForType(TYPE_FILE, NULL, NULL);
                 if (element_type != TYPE_VOID && element_type != TYPE_UNKNOWN) {
-                    file_val.element_type = element_type;
-                    file_val.element_type_def = element_type_def;
+                    ARRAY_ELEMENT_TYPE(file_val) = element_type;
+                    ARRAY_ELEMENT_TYPE_DEF(file_val) = element_type_def;
                     long long bytes = 0;
                     if (vmSizeForVarType(element_type, &bytes) && bytes > 0 && bytes <= INT_MAX) {
-                        file_val.record_size = (int)bytes;
-                        file_val.record_size_explicit = true;
+                        FILE_RECORD_SIZE(file_val) = (int)bytes;
+                        FILE_RECORD_SIZE_EXPLICIT(file_val) = true;
                     }
                 }
                 *target_slot = file_val;
@@ -9383,11 +9383,11 @@ comparison_error_label:
                         resolved = resolved->right;
                     }
                     if (resolved->type == AST_POINTER_TYPE && resolved->right) {
-                        ptr.base_type_node = resolved->right;
+                        PTR_BASE_TYPE_NODE(ptr) = resolved->right;
                     } else if (resolved->type == AST_VARIABLE || resolved->type == AST_TYPE_IDENTIFIER) {
-                        ptr.base_type_node = resolved;
+                        PTR_BASE_TYPE_NODE(ptr) = resolved;
                     } else {
-                        ptr.base_type_node = resolved;
+                        PTR_BASE_TYPE_NODE(ptr) = resolved;
                     }
                 }
                 *target_slot = ptr;
@@ -9400,7 +9400,7 @@ comparison_error_label:
                 Value* target_slot = &frame->slots[slot];
                 freeValue(target_slot);
                 SET_VALUE_TYPE(target_slot, TYPE_STRING);
-                target_slot->max_length = length;
+                STRING_MAX_LENGTH(*target_slot) = length;
                 AS_STRING(*target_slot) = (char*)calloc(length + 1, 1);
                 if (!AS_STRING(*target_slot)) {
                     runtimeError(vm, "VM Error: Malloc failed for fixed-length string initialization.");
@@ -10138,8 +10138,8 @@ comparison_error_label:
 
                 Symbol* method_symbol = NULL;
                 const char* className = NULL;
-                if (objVal->base_type_node && objVal->base_type_node->token) {
-                    className = objVal->base_type_node->token->value;
+                if (PTR_BASE_TYPE_NODE(*objVal) && PTR_BASE_TYPE_NODE(*objVal)->token) {
+                    className = PTR_BASE_TYPE_NODE(*objVal)->token->value;
                 }
                 if (className) {
                     method_symbol = vmFindClassMethod(vm, className, method_index);
