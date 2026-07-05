@@ -1,3 +1,8 @@
+/* The bytecode-cache serializer reads/writes Value fields at the byte
+ * level, so this file is part of the Value representation layer and opts
+ * out of the PSCAL_VALUE_ACCESS_LINT poison (see core/utils.h). */
+#define PSCAL_VALUE_REPRESENTATION_LAYER 1
+
 #include "core/cache.h"
 #include "core/utils.h" // for Value constructors
 #include "core/globals.h"

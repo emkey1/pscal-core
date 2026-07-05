@@ -343,4 +343,24 @@ Value setUnion(Value setA, Value setB);
 Value setDifference(Value setA, Value setB);
 Value setIntersection(Value setA, Value setB);
 
+/*
+ * Optional lint (VM 2.0 Phase 0 item 3): forbid new direct Value payload
+ * accesses outside the representation layer, so the accessor sweep cannot
+ * silently regress before the Phase 4 representation swap.  Enable with
+ * the PSCAL_VALUE_ACCESS_LINT CMake option; the representation layer
+ * (core/utils.c, core/cache.c) opts out by defining
+ * PSCAL_VALUE_REPRESENTATION_LAYER before its includes.
+ *
+ * i_val is deliberately not poisoned (the AST node type shares that member
+ * name for enum ordinals); `type`/`real`/`closure`/`interface` are too
+ * generic to poison; `mstream` is skipped because it is a common local
+ * variable name for MStream*.  Everything else payload-shaped is
+ * Value-only.
+ */
+#if defined(PSCAL_VALUE_ACCESS_LINT) && !defined(PSCAL_VALUE_REPRESENTATION_LAYER)
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC poison s_val u_val c_val record_val f_val array_val enum_val ptr_val set_val array_raw
+#endif
+#endif
+
 #endif // UTILS_H

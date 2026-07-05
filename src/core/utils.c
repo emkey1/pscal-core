@@ -1,3 +1,8 @@
+/* Value constructors, freeValue, makeCopyOfValue etc. ARE the Value
+ * representation layer, so this file keeps raw field access and opts out
+ * of the PSCAL_VALUE_ACCESS_LINT poison (see core/utils.h). */
+#define PSCAL_VALUE_REPRESENTATION_LAYER 1
+
 #include "utils.h"
 #include "core/globals.h"
 #include <stdlib.h>

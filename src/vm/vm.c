@@ -5564,18 +5564,18 @@ static InterpretResult handleDefineGlobal(VM* vm, Value varNameVal) {
             elem_type_def = lookupType(AS_STRING(elem_name_val));
         }
 
-        Value array_val;
+        Value array_value;
         if (dimension_count > 0) {
-            array_val = makeArrayND(dimension_count, lower_bounds, upper_bounds,
+            array_value = makeArrayND(dimension_count, lower_bounds, upper_bounds,
                                     elem_var_type, elem_type_def);
         } else {
-            array_val = makeEmptyArray(elem_var_type, elem_type_def);
+            array_value = makeEmptyArray(elem_var_type, elem_type_def);
         }
         if (lower_bounds) free(lower_bounds);
         if (upper_bounds) free(upper_bounds);
-        if (dimension_count > 0 && array_val.dimensions == 0) {
+        if (dimension_count > 0 && array_value.dimensions == 0) {
             runtimeError(vm, "VM Error: Failed to allocate array for global '%s'.", AS_STRING(varNameVal));
-            freeValue(&array_val);
+            freeValue(&array_value);
             return INTERPRET_RUNTIME_ERROR;
         }
 
@@ -5584,13 +5584,13 @@ static InterpretResult handleDefineGlobal(VM* vm, Value varNameVal) {
             sym = (Symbol*)malloc(sizeof(Symbol));
             if (!sym) {
                 runtimeError(vm, "VM Error: Malloc failed for Symbol struct for global array '%s'.", AS_STRING(varNameVal));
-                freeValue(&array_val);
+                freeValue(&array_value);
                 return INTERPRET_RUNTIME_ERROR;
             }
             sym->name = strdup(AS_STRING(varNameVal));
             if (!sym->name) {
                 runtimeError(vm, "VM Error: Malloc failed for symbol name for global array '%s'.", AS_STRING(varNameVal));
-                free(sym); freeValue(&array_val);
+                free(sym); freeValue(&array_value);
                 return INTERPRET_RUNTIME_ERROR;
             }
             toLowerString(sym->name);
@@ -5599,10 +5599,10 @@ static InterpretResult handleDefineGlobal(VM* vm, Value varNameVal) {
             sym->value = (Value*)malloc(sizeof(Value));
             if (!sym->value) {
                 runtimeError(vm, "VM Error: Malloc failed for Value struct for global array '%s'.", AS_STRING(varNameVal));
-                free(sym->name); free(sym); freeValue(&array_val);
+                free(sym->name); free(sym); freeValue(&array_value);
                 return INTERPRET_RUNTIME_ERROR;
             }
-            *(sym->value) = array_val;
+            *(sym->value) = array_value;
             sym->is_alias = false;
             sym->is_const = false;
             sym->is_local_var = false;
@@ -5614,7 +5614,7 @@ static InterpretResult handleDefineGlobal(VM* vm, Value varNameVal) {
         } else {
             runtimeWarning(vm, "VM Warning: Global variable '%s' redefined.", AS_STRING(varNameVal));
             freeValue(sym->value);
-            *(sym->value) = array_val;
+            *(sym->value) = array_value;
         }
     } else {
         uint16_t type_name_idx = READ_SHORT(vm);
@@ -6132,21 +6132,21 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
                 bool a_enum_b_int = (VALUE_TYPE(a_val_popped) == TYPE_ENUM && IS_INTLIKE(b_val_popped)); \
                 bool a_int_b_enum = (IS_INTLIKE(a_val_popped) && VALUE_TYPE(b_val_popped) == TYPE_ENUM); \
                 if (a_enum_b_int || a_int_b_enum) { \
-                    Value enum_val = a_enum_b_int ? a_val_popped : b_val_popped; \
+                    Value enum_value = a_enum_b_int ? a_val_popped : b_val_popped; \
                     Value int_val  = a_enum_b_int ? b_val_popped : a_val_popped; \
                     long long delta = asI64(int_val); \
-                    int new_ord = AS_ENUM(enum_val).ordinal + \
+                    int new_ord = AS_ENUM(enum_value).ordinal + \
                         ((current_instruction_code == ADD) ? (int)delta : -(int)delta); \
-                    if (enum_val.enum_meta && \
-                        (new_ord < 0 || new_ord >= enum_val.enum_meta->member_count)) { \
+                    if (enum_value.enum_meta && \
+                        (new_ord < 0 || new_ord >= enum_value.enum_meta->member_count)) { \
                         runtimeError(vm, "Runtime Error: Enum '%s' out of range.", \
-                                     AS_ENUM(enum_val).enum_name ? AS_ENUM(enum_val).enum_name : "<anon>"); \
+                                     AS_ENUM(enum_value).enum_name ? AS_ENUM(enum_value).enum_name : "<anon>"); \
                         freeValue(&a_val_popped); freeValue(&b_val_popped); \
                         return INTERPRET_RUNTIME_ERROR; \
                     } \
-                    result_val = makeEnum(AS_ENUM(enum_val).enum_name, new_ord); \
-                    result_val.enum_meta = enum_val.enum_meta; \
-                    result_val.base_type_node = enum_val.base_type_node; \
+                    result_val = makeEnum(AS_ENUM(enum_value).enum_name, new_ord); \
+                    result_val.enum_meta = enum_value.enum_meta; \
+                    result_val.base_type_node = enum_value.base_type_node; \
                     op_is_handled = true; \
                 } \
             } \
@@ -8284,20 +8284,20 @@ comparison_error_label:
                 break;
             }
             case IN: {
-                Value set_val = pop(vm);
+                Value set_value = pop(vm);
                 Value item_val = pop(vm);
 
-                if (VALUE_TYPE(set_val) != TYPE_SET) {
+                if (VALUE_TYPE(set_value) != TYPE_SET) {
                     runtimeError(vm, "Right operand of IN must be a set.");
                     freeValue(&item_val);
-                    freeValue(&set_val);
+                    freeValue(&set_value);
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
-                bool result = vmSetContains(&set_val, &item_val);
+                bool result = vmSetContains(&set_value, &item_val);
 
                 freeValue(&item_val);
-                freeValue(&set_val);
+                freeValue(&set_value);
 
                 push(vm, makeBoolean(result));
                 break;
@@ -8311,14 +8311,14 @@ comparison_error_label:
                     freeValue(&item_val);
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                Value set_val;
-                if (!vmBuildSetFromOrdinal(&set_val, ordinal)) {
+                Value set_value;
+                if (!vmBuildSetFromOrdinal(&set_value, ordinal)) {
                     runtimeError(vm, "VM Error: Failed to allocate set singleton.");
                     freeValue(&item_val);
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 freeValue(&item_val);
-                push(vm, set_val);
+                push(vm, set_value);
                 break;
             }
 
@@ -8334,8 +8334,8 @@ comparison_error_label:
                     freeValue(&end_val);
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                Value set_val;
-                if (!vmBuildSetFromRange(&set_val, start_ord, end_ord)) {
+                Value set_value;
+                if (!vmBuildSetFromRange(&set_value, start_ord, end_ord)) {
                     runtimeError(vm, "VM Error: Failed to allocate set range.");
                     freeValue(&start_val);
                     freeValue(&end_val);
@@ -8343,7 +8343,7 @@ comparison_error_label:
                 }
                 freeValue(&start_val);
                 freeValue(&end_val);
-                push(vm, set_val);
+                push(vm, set_value);
                 break;
             }
 
@@ -9121,7 +9121,7 @@ comparison_error_label:
                     elem_type_def = lookupType(AS_STRING(elem_name_val));
                 }
 
-                Value array_val;
+                Value array_value;
                 if (dimension_count > 0) {
                     int* lower_bounds = malloc(sizeof(int) * dimension_count);
                     int* upper_bounds = malloc(sizeof(int) * dimension_count);
@@ -9166,16 +9166,16 @@ comparison_error_label:
                         }
                     }
 
-                    array_val = makeArrayND(dimension_count, lower_bounds, upper_bounds, elem_var_type, elem_type_def);
+                    array_value = makeArrayND(dimension_count, lower_bounds, upper_bounds, elem_var_type, elem_type_def);
                     free(lower_bounds);
                     free(upper_bounds);
                 } else {
-                    array_val = makeEmptyArray(elem_var_type, elem_type_def);
+                    array_value = makeEmptyArray(elem_var_type, elem_type_def);
                 }
 
-                if (dimension_count > 0 && array_val.dimensions == 0) {
+                if (dimension_count > 0 && array_value.dimensions == 0) {
                     runtimeError(vm, "VM Error: Failed to allocate array for local slot %u.", slot);
-                    freeValue(&array_val);
+                    freeValue(&array_value);
                     free(lower_idx);
                     free(upper_idx);
                     return INTERPRET_RUNTIME_ERROR;
@@ -9187,7 +9187,7 @@ comparison_error_label:
                 CallFrame* frame = &vm->frames[vm->frameCount - 1];
                 Value* target_slot = &frame->slots[slot];
                 freeValue(target_slot);
-                *target_slot = array_val;
+                *target_slot = array_value;
                 break;
             }
             case INIT_FIELD_ARRAY: {
@@ -9225,7 +9225,7 @@ comparison_error_label:
                     elem_type_def = lookupType(AS_STRING(elem_name_val));
                 }
 
-                Value array_val;
+                Value array_value;
                 if (dimension_count > 0) {
                     int* lower_bounds = malloc(sizeof(int) * dimension_count);
                     int* upper_bounds = malloc(sizeof(int) * dimension_count);
@@ -9270,16 +9270,16 @@ comparison_error_label:
                         }
                     }
 
-                    array_val = makeArrayND(dimension_count, lower_bounds, upper_bounds, elem_var_type, elem_type_def);
+                    array_value = makeArrayND(dimension_count, lower_bounds, upper_bounds, elem_var_type, elem_type_def);
                     free(lower_bounds);
                     free(upper_bounds);
                 } else {
-                    array_val = makeEmptyArray(elem_var_type, elem_type_def);
+                    array_value = makeEmptyArray(elem_var_type, elem_type_def);
                 }
 
-                if (dimension_count > 0 && array_val.dimensions == 0) {
+                if (dimension_count > 0 && array_value.dimensions == 0) {
                     runtimeError(vm, "VM Error: Failed to allocate array for field %u.", field_index);
-                    freeValue(&array_val);
+                    freeValue(&array_value);
                     free(lower_idx);
                     free(upper_idx);
                     return INTERPRET_RUNTIME_ERROR;
@@ -9293,24 +9293,24 @@ comparison_error_label:
                 Value* record_struct_ptr = resolveRecord(base_val_ptr, &invalid_type);
                 if (invalid_type) {
                     runtimeError(vm, "VM Error: Cannot access field on a non-record/non-pointer type.");
-                    freeValue(&array_val);
+                    freeValue(&array_value);
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 if (record_struct_ptr == NULL || VALUE_TYPE(*record_struct_ptr) != TYPE_RECORD) {
                     runtimeError(vm, "VM Error: Cannot access field on a nil pointer or non-record value.");
-                    freeValue(&array_val);
+                    freeValue(&array_value);
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
                 FieldValue* current = findRecordFieldBySlot(record_struct_ptr, field_index);
                 if (!current) {
                     runtimeError(vm, "VM Error: Field index out of range for INIT_FIELD_ARRAY.");
-                    freeValue(&array_val);
+                    freeValue(&array_value);
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 Value* fieldCell = fieldValueStorage(current);
                 freeValue(fieldCell);
-                *fieldCell = array_val;
+                *fieldCell = array_value;
                 break;
             }
             case INIT_LOCAL_FILE: {

@@ -23,6 +23,12 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang")
 endif()
 
 option(PSCAL_SDL "Enable the SDL graphics/audio backend (sdl/gl/audio + 3D)" OFF)
+option(PSCAL_VALUE_ACCESS_LINT
+    "Poison raw Value payload field names outside the representation layer (VM 2.0 Phase 0 accessor-sweep lint)" OFF)
+if(PSCAL_VALUE_ACCESS_LINT)
+    add_compile_definitions(PSCAL_VALUE_ACCESS_LINT)
+    message(STATUS "pscal-core: Value access lint ENABLED")
+endif()
 
 set(SRC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
