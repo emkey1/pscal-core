@@ -276,7 +276,7 @@ void vmResetExecutionState(VM* vm); // Reset stack/frames so a VM can be reused
 
 // Main function to interpret a chunk of bytecode
 // Takes a BytecodeChunk that was successfully compiled.
-InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globals, HashTable* const_globals, HashTable* procedures, uint16_t entry);
+InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globals, HashTable* const_globals, HashTable* procedures, uint32_t entry);
 void vmNullifyAliases(VM* vm, uintptr_t disposedAddrValue);
 int vmSpawnCallbackThread(VM* vm, VMThreadCallback callback, void* user_data, VMThreadCleanup cleanup);
 int vmSpawnBuiltinThread(VM* vm, int builtinId, const char* builtinName, int argCount,

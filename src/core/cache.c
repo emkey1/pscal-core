@@ -25,7 +25,28 @@
 
 #define CACHE_ROOT ".pscal"
 #define CACHE_DIR "bc_cache"
-#define CACHE_MAGIC 0x50534232 /* 'PSB2' */
+
+/* VM 2.0 Phase 1b: PSB3 container (Docs/pscal_vm2_plan.md §5.2). Hard cutover
+ * from PSB2: the old reader/writer are deleted, not kept as a fallback. Old
+ * cache entries simply miss the magic check and recompile (the cache's
+ * normal cold path); explicit .bc files written by a pre-PSB3 build are not
+ * loadable (source is always available; that is the whole point of §2's
+ * "recompilation is the compatibility mechanism"). */
+#define PSB3_MAGIC 0x50534233u /* 'PSB3' */
+#define PSB3_FORMAT_VERSION 1u
+
+#define PSB3_FOURCC(a, b, c, d) \
+    ((uint32_t)(uint8_t)(a) | ((uint32_t)(uint8_t)(b) << 8) | \
+     ((uint32_t)(uint8_t)(c) << 16) | ((uint32_t)(uint8_t)(d) << 24))
+
+#define PSB3_SEC_CODE  PSB3_FOURCC('C', 'O', 'D', 'E')
+#define PSB3_SEC_LINE  PSB3_FOURCC('L', 'I', 'N', 'E')
+#define PSB3_SEC_CONS  PSB3_FOURCC('C', 'O', 'N', 'S')
+#define PSB3_SEC_PROC  PSB3_FOURCC('P', 'R', 'O', 'C')
+#define PSB3_SEC_TYPE  PSB3_FOURCC('T', 'Y', 'P', 'E')
+#define PSB3_SEC_BMAP  PSB3_FOURCC('B', 'M', 'A', 'P')
+#define PSB3_SEC_META  PSB3_FOURCC('M', 'E', 'T', 'A')
+#define PSB3_SECTION_ALIGN 8u
 
 static uint32_t g_astCacheVersion = 0;
 
@@ -258,19 +279,226 @@ static bool computeSourceHash(const char* source_path, bool require_file, uint64
     return true;
 }
 
-static bool writeChunkCore(FILE* f, const BytecodeChunk* chunk);
-static bool readChunkCore(FILE* f,
-                          BytecodeChunk* chunk,
-                          uint32_t version,
-                          uint64_t source_hash,
-                          uint64_t expected_combined_hash,
-                          bool verify_combined);
-static bool writePointerValue(FILE* f, const Value* v);
-static bool readPointerValue(FILE* f, Value* out);
-static bool readValue(FILE* f, Value* out);
+/* ================= PSB3 primitives: ByteBuf (write) / Cursor (read) =====
+ *
+ * Every multi-byte integer in the PSB3 container goes through these helpers
+ * so the on-disk format is little-endian and host-int-width independent
+ * (VM 2.0 plan §5.2). Cursor reads are bounds-checked against the buffer
+ * they were initialized with (never the whole file) and stick an `error`
+ * flag on first overrun instead of reading out of bounds (Phase 1d loader
+ * hardening); callers check `cur->error` once after a batch of reads
+ * instead of per-call.
+ */
+
+typedef struct {
+    uint8_t* data;
+    size_t len;
+    size_t cap;
+} ByteBuf;
+
+static void bufInit(ByteBuf* b) {
+    b->data = NULL;
+    b->len = 0;
+    b->cap = 0;
+}
+
+static void bufFree(ByteBuf* b) {
+    free(b->data);
+    b->data = NULL;
+    b->len = b->cap = 0;
+}
+
+static void bufReserve(ByteBuf* b, size_t extra) {
+    if (b->len + extra <= b->cap) return;
+    size_t new_cap = b->cap ? b->cap * 2 : 64;
+    while (new_cap < b->len + extra) new_cap *= 2;
+    uint8_t* grown = (uint8_t*)realloc(b->data, new_cap);
+    if (!grown) {
+        fprintf(stderr, "Memory allocation error (bytecode buffer grow failed)\n");
+        EXIT_FAILURE_HANDLER();
+        return;
+    }
+    b->data = grown;
+    b->cap = new_cap;
+}
+
+static void bufBytes(ByteBuf* b, const void* p, size_t n) {
+    if (n == 0) return;
+    bufReserve(b, n);
+    memcpy(b->data + b->len, p, n);
+    b->len += n;
+}
+
+static void bufU8(ByteBuf* b, uint8_t v) { bufBytes(b, &v, 1); }
+
+static void bufU16LE(ByteBuf* b, uint16_t v) {
+    uint8_t bytes[2] = { (uint8_t)v, (uint8_t)(v >> 8) };
+    bufBytes(b, bytes, 2);
+}
+
+static void bufU32LE(ByteBuf* b, uint32_t v) {
+    uint8_t bytes[4] = { (uint8_t)v, (uint8_t)(v >> 8), (uint8_t)(v >> 16), (uint8_t)(v >> 24) };
+    bufBytes(b, bytes, 4);
+}
+
+static void bufU64LE(ByteBuf* b, uint64_t v) {
+    uint8_t bytes[8];
+    for (int i = 0; i < 8; ++i) bytes[i] = (uint8_t)(v >> (8 * i));
+    bufBytes(b, bytes, 8);
+}
+
+static void bufI32LE(ByteBuf* b, int32_t v) { bufU32LE(b, (uint32_t)v); }
+
+static void bufF32LE(ByteBuf* b, float v) {
+    uint32_t bits;
+    memcpy(&bits, &v, sizeof(bits));
+    bufU32LE(b, bits);
+}
+
+static void bufF64LE(ByteBuf* b, double v) {
+    uint64_t bits;
+    memcpy(&bits, &v, sizeof(bits));
+    bufU64LE(b, bits);
+}
+
+/* Unsigned LEB128 varint: 7 payload bits per byte, MSB = continuation. */
+static void bufVarint(ByteBuf* b, uint64_t v) {
+    do {
+        uint8_t byte = (uint8_t)(v & 0x7F);
+        v >>= 7;
+        if (v != 0) byte |= 0x80;
+        bufU8(b, byte);
+    } while (v != 0);
+}
+
+/* Zigzag-encoded signed varint (small magnitudes, either sign, stay small). */
+static void bufSVarint(ByteBuf* b, int64_t v) {
+    uint64_t zigzag = ((uint64_t)v << 1) ^ (uint64_t)(v >> 63);
+    bufVarint(b, zigzag);
+}
+
+static void bufLenPrefixedBytes(ByteBuf* b, const void* p, size_t n) {
+    bufVarint(b, (uint64_t)n);
+    bufBytes(b, p, n);
+}
+
+typedef struct {
+    const uint8_t* data;
+    size_t size;
+    size_t pos;
+    bool error;
+} Cursor;
+
+static void curInit(Cursor* c, const uint8_t* data, size_t size) {
+    c->data = data;
+    c->size = size;
+    c->pos = 0;
+    c->error = false;
+}
+
+static bool curEnsure(Cursor* c, size_t n) {
+    if (c->error) return false;
+    /* Overflow-safe: avoid c->pos + n wrapping on adversarial huge n. */
+    if (n > c->size - c->pos) {
+        c->error = true;
+        return false;
+    }
+    return true;
+}
+
+static uint8_t curU8(Cursor* c) {
+    if (!curEnsure(c, 1)) return 0;
+    return c->data[c->pos++];
+}
+
+static uint16_t curU16LE(Cursor* c) {
+    if (!curEnsure(c, 2)) return 0;
+    uint16_t v = (uint16_t)(c->data[c->pos] | ((uint16_t)c->data[c->pos + 1] << 8));
+    c->pos += 2;
+    return v;
+}
+
+static uint32_t curU32LE(Cursor* c) {
+    if (!curEnsure(c, 4)) return 0;
+    const uint8_t* p = c->data + c->pos;
+    uint32_t v = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    c->pos += 4;
+    return v;
+}
+
+static uint64_t curU64LE(Cursor* c) {
+    if (!curEnsure(c, 8)) return 0;
+    const uint8_t* p = c->data + c->pos;
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v |= ((uint64_t)p[i]) << (8 * i);
+    c->pos += 8;
+    return v;
+}
+
+static int32_t curI32LE(Cursor* c) { return (int32_t)curU32LE(c); }
+
+static float curF32LE(Cursor* c) {
+    uint32_t bits = curU32LE(c);
+    float v;
+    memcpy(&v, &bits, sizeof(v));
+    return v;
+}
+
+static double curF64LE(Cursor* c) {
+    uint64_t bits = curU64LE(c);
+    double v;
+    memcpy(&v, &bits, sizeof(v));
+    return v;
+}
+
+static bool curBytes(Cursor* c, void* out, size_t n) {
+    if (!curEnsure(c, n)) return false;
+    if (n > 0) memcpy(out, c->data + c->pos, n);
+    c->pos += n;
+    return true;
+}
+
+static uint64_t curVarint(Cursor* c) {
+    uint64_t result = 0;
+    int shift = 0;
+    for (;;) {
+        if (c->error || shift > 63) { c->error = true; return 0; }
+        uint8_t byte = curU8(c);
+        if (c->error) return 0;
+        result |= ((uint64_t)(byte & 0x7F)) << shift;
+        if ((byte & 0x80) == 0) break;
+        shift += 7;
+    }
+    return result;
+}
+
+static int64_t curSVarint(Cursor* c) {
+    uint64_t zigzag = curVarint(c);
+    return (int64_t)(zigzag >> 1) ^ -(int64_t)(zigzag & 1);
+}
+
+/* Reads a varint length prefix then that many bytes; returns a malloc'd,
+ * NUL-terminated buffer (length in *out_len) or NULL on error/truncation. */
+static char* curLenPrefixedString(Cursor* c, size_t* out_len) {
+    uint64_t len = curVarint(c);
+    if (c->error || len > c->size) { c->error = true; return NULL; }
+    char* s = (char*)malloc((size_t)len + 1);
+    if (!s) { c->error = true; return NULL; }
+    if (!curBytes(c, s, (size_t)len)) { free(s); return NULL; }
+    s[len] = '\0';
+    if (out_len) *out_len = (size_t)len;
+    return s;
+}
+
+static bool writeChunkCoreInline(ByteBuf* out, const BytecodeChunk* chunk);
+static bool readChunkCoreInline(Cursor* in, BytecodeChunk* chunk, uint32_t version);
+static bool writeValue(ByteBuf* out, const Value* v);
+static bool readValue(Cursor* in, Value* out);
+static bool writePointerValue(ByteBuf* out, const Value* v);
+static bool readPointerValue(Cursor* in, Value* out);
 static void countProceduresRecursive(HashTable* table, int* count);
-static bool writeProcedureEntriesRecursive(FILE* f, HashTable* table);
-static bool loadProceduresFromStream(FILE* f, int proc_count, uint32_t chunk_version);
+static bool writeProcedureEntriesRecursive(ByteBuf* out, HashTable* table);
+static bool loadProceduresFromStream(Cursor* in, int proc_count, uint32_t chunk_version);
 static void hashValue(uint64_t* hash, const Value* v, ChunkHashContext* ctx);
 static uint64_t computeChunkHashInternal(const BytecodeChunk* chunk, ChunkHashContext* ctx);
 static bool chunkHashContextContains(const ChunkHashContext* ctx, const BytecodeChunk* chunk);
@@ -624,59 +852,41 @@ static char* resolveExecutablePath(const char* executable) {
     return NULL;
 }
 
-static bool writeSourcePath(FILE* f, const char* source_path) {
+/* META section body: optional, cache-only (VM 2.0 plan §5.2). Holds the
+ * absolute source path plus the source/combined integrity hashes. Omitted
+ * entirely (no directory entry) for distributable .bc files written by
+ * saveBytecodeToFile, so those artifacts stop embedding local paths. */
+static void writeMetaSection(ByteBuf* out, const char* source_path,
+                             uint64_t source_hash, uint64_t combined_hash) {
     char* abs = realpath(source_path, NULL);
-    const char* src = abs ? abs : source_path;
-    int len = (int)strlen(src);
-    int stored = -len; /* negative signals presence of path */
-    if (fwrite(&stored, sizeof(stored), 1, f) != 1) {
-        if (abs) free(abs);
-        return false;
-    }
-    bool ok = fwrite(src, 1, len, f) == (size_t)len;
+    const char* src = abs ? abs : (source_path ? source_path : "");
+    bufU64LE(out, source_hash);
+    bufU64LE(out, combined_hash);
+    bufLenPrefixedBytes(out, src, strlen(src));
     if (abs) free(abs);
-    return ok;
 }
 
-static bool verifySourcePath(FILE* f, const char* source_path, bool strict) {
-    long pos = ftell(f);
-    int stored = 0;
-    if (fread(&stored, sizeof(stored), 1, f) != 1) return false;
-    if (stored >= 0) {
-        /* old cache without embedded path */
-        fseek(f, pos, SEEK_SET);
-        return true;
-    }
-    int len = -stored;
-    char* buf = (char*)malloc(len + 1);
-    if (!buf) return false;
-    if (fread(buf, 1, len, f) != (size_t)len) { free(buf); return false; }
-    buf[len] = '\0';
-    char* abs = realpath(source_path, NULL);
-    const char* src = abs ? abs : source_path;
-    bool match = (strcmp(buf, src) == 0);
-    if (abs) free(abs);
-    if (!match && strict) {
-        free(buf);
-        return false;
-    }
-    free(buf);
-    return true;
+typedef struct {
+    uint64_t source_hash;
+    uint64_t combined_hash;
+    char* source_path; /* malloc'd; caller frees */
+} MetaSection;
+
+static bool readMetaSection(Cursor* in, MetaSection* out) {
+    memset(out, 0, sizeof(*out));
+    out->source_hash = curU64LE(in);
+    out->combined_hash = curU64LE(in);
+    out->source_path = curLenPrefixedString(in, NULL);
+    return !in->error && out->source_path != NULL;
 }
 
-static void skipSourcePath(FILE* f) {
-    long pos = ftell(f);
-    int stored = 0;
-    if (fread(&stored, sizeof(stored), 1, f) != 1) {
-        fseek(f, pos, SEEK_SET);
-        return;
-    }
-    if (stored >= 0) {
-        fseek(f, pos, SEEK_SET);
-        return;
-    }
-    int len = -stored;
-    fseek(f, len, SEEK_CUR);
+static bool verifySourcePathString(const char* stored_path, const char* source_path, bool strict) {
+    if (!stored_path) return !strict;
+    char* abs = realpath(source_path, NULL);
+    const char* src = abs ? abs : source_path;
+    bool match = (strcmp(stored_path, src) == 0);
+    if (abs) free(abs);
+    return match || !strict;
 }
 
 static bool isCacheFresh(const char* cache_path, const char* source_path) {
@@ -700,35 +910,27 @@ static bool isCacheFresh(const char* cache_path, const char* source_path) {
 #undef PSCAL_STAT_SEC
 }
 
-// ----- AST serialization helpers -----
-static bool writeToken(FILE* f, const Token* tok) {
-    int has = (tok != NULL);
-    fwrite(&has, sizeof(has), 1, f);
-    if (!has) return true;
-    fwrite(&tok->type, sizeof(tok->type), 1, f);
-    int len = tok && tok->value ? (int)tok->length : 0;
-    fwrite(&len, sizeof(len), 1, f);
-    if (len > 0) fwrite(tok->value, 1, len, f);
-    return true;
+// ----- AST serialization helpers (little-endian, VM 2.0 plan §5.2) -----
+static void writeToken(ByteBuf* out, const Token* tok) {
+    bufU8(out, tok != NULL ? 1 : 0);
+    if (!tok) return;
+    bufU32LE(out, (uint32_t)tok->type);
+    size_t len = tok->value ? tok->length : 0;
+    bufLenPrefixedBytes(out, tok->value, len);
 }
 
-static Token* readToken(FILE* f) {
-    int has = 0;
-    if (fread(&has, sizeof(has), 1, f) != 1) return NULL;
-    if (!has) return NULL;
-    TokenType type;
-    if (fread(&type, sizeof(type), 1, f) != 1) return NULL;
-    int len = 0;
-    if (fread(&len, sizeof(len), 1, f) != 1) return NULL;
-    char* buf = (char*)malloc(len + 1);
-    if (!buf) return NULL;
-    if (len > 0 && fread(buf, 1, len, f) != (size_t)len) { free(buf); return NULL; }
-    buf[len] = '\0';
+static Token* readToken(Cursor* in) {
+    uint8_t has = curU8(in);
+    if (in->error || !has) return NULL;
+    TokenType type = (TokenType)curU32LE(in);
+    size_t len = 0;
+    char* buf = curLenPrefixedString(in, &len);
+    if (in->error || !buf) { free(buf); return NULL; }
     Token* tok = (Token*)malloc(sizeof(Token));
     if (!tok) { free(buf); return NULL; }
     tok->type = type;
     tok->value = buf;
-    tok->length = (size_t)len;
+    tok->length = len;
     tok->line = 0;
     tok->column = 0;
     tok->is_char_code = false;
@@ -736,69 +938,59 @@ static Token* readToken(FILE* f) {
     return tok;
 }
 
-static bool writeAst(FILE* f, const AST* node) {
-    int has = (node != NULL);
-    fwrite(&has, sizeof(has), 1, f);
-    if (!has) return true;
-    fwrite(&node->type, sizeof(node->type), 1, f);
-    fwrite(&node->var_type, sizeof(node->var_type), 1, f);
-    if (g_astCacheVersion >= 9) {
-        uint8_t flags = 0;
-        if (node->by_ref) flags |= 0x01;
-        if (node->is_inline) flags |= 0x02;
-        if (node->is_virtual) flags |= 0x04;
-        if (node->is_global_scope) flags |= 0x08;
-        fwrite(&flags, sizeof(flags), 1, f);
-    }
-    writeToken(f, node->token);
-    fwrite(&node->i_val, sizeof(node->i_val), 1, f);
-    writeAst(f, node->left);
-    writeAst(f, node->right);
-    writeAst(f, node->extra);
-    fwrite(&node->child_count, sizeof(node->child_count), 1, f);
+static void writeAst(ByteBuf* out, const AST* node) {
+    bufU8(out, node != NULL ? 1 : 0);
+    if (!node) return;
+    bufU32LE(out, (uint32_t)node->type);
+    bufU32LE(out, (uint32_t)node->var_type);
+    uint8_t flags = 0;
+    if (node->by_ref) flags |= 0x01;
+    if (node->is_inline) flags |= 0x02;
+    if (node->is_virtual) flags |= 0x04;
+    if (node->is_global_scope) flags |= 0x08;
+    bufU8(out, flags);
+    writeToken(out, node->token);
+    bufI32LE(out, (int32_t)node->i_val);
+    writeAst(out, node->left);
+    writeAst(out, node->right);
+    writeAst(out, node->extra);
+    bufI32LE(out, (int32_t)node->child_count);
     for (int i = 0; i < node->child_count; i++) {
-        writeAst(f, node->children[i]);
+        writeAst(out, node->children[i]);
     }
-    return true;
 }
 
-static AST* readAst(FILE* f) {
-    int has = 0;
-    if (fread(&has, sizeof(has), 1, f) != 1) return NULL;
-    if (!has) return NULL;
-    ASTNodeType t;
-    VarType vt;
-    if (fread(&t, sizeof(t), 1, f) != 1) return NULL;
-    if (fread(&vt, sizeof(vt), 1, f) != 1) return NULL;
-    uint8_t flags = 0;
-    if (g_astCacheVersion >= 9) {
-        if (fread(&flags, sizeof(flags), 1, f) != 1) return NULL;
-    }
-    Token* tok = readToken(f);
-    int i_val = 0;
-    if (fread(&i_val, sizeof(i_val), 1, f) != 1) { if (tok) freeToken(tok); return NULL; }
+static AST* readAst(Cursor* in) {
+    uint8_t has = curU8(in);
+    if (in->error || !has) return NULL;
+    ASTNodeType t = (ASTNodeType)curU32LE(in);
+    VarType vt = (VarType)curU32LE(in);
+    uint8_t flags = curU8(in);
+    Token* tok = readToken(in);
+    if (in->error) { if (tok) freeToken(tok); return NULL; }
+    int32_t i_val = curI32LE(in);
+    if (in->error) { if (tok) freeToken(tok); return NULL; }
     AST* node = newASTNode(t, tok);
     if (node) {
         setTypeAST(node, vt);
         node->i_val = i_val;
-        if (g_astCacheVersion >= 9) {
-            node->by_ref = (flags & 0x01) != 0;
-            node->is_inline = (flags & 0x02) != 0;
-            node->is_virtual = (flags & 0x04) != 0;
-            node->is_global_scope = (flags & 0x08) != 0;
-        }
-        node->left = readAst(f); if (node->left) node->left->parent = node;
-        node->right = readAst(f); if (node->right) node->right->parent = node;
-        node->extra = readAst(f); if (node->extra) node->extra->parent = node;
-        int child_count = 0;
-        if (fread(&child_count, sizeof(child_count), 1, f) != 1) { freeAST(node); return NULL; }
+        node->by_ref = (flags & 0x01) != 0;
+        node->is_inline = (flags & 0x02) != 0;
+        node->is_virtual = (flags & 0x04) != 0;
+        node->is_global_scope = (flags & 0x08) != 0;
+        node->left = readAst(in); if (node->left) node->left->parent = node;
+        node->right = readAst(in); if (node->right) node->right->parent = node;
+        node->extra = readAst(in); if (node->extra) node->extra->parent = node;
+        if (in->error) { freeAST(node); return NULL; }
+        int32_t child_count = curI32LE(in);
+        if (in->error || child_count < 0) { freeAST(node); return NULL; }
         if (child_count > 0) {
-            node->children = (AST**)malloc(sizeof(AST*) * child_count);
+            node->children = (AST**)malloc(sizeof(AST*) * (size_t)child_count);
             if (!node->children) { freeAST(node); return NULL; }
             node->child_count = child_count;
             node->child_capacity = child_count;
             for (int i = 0; i < child_count; i++) {
-                node->children[i] = readAst(f);
+                node->children[i] = readAst(in);
                 if (node->children[i]) node->children[i]->parent = node;
             }
         }
@@ -807,8 +999,15 @@ static AST* readAst(FILE* f) {
 }
 
 
-static bool writeValue(FILE* f, const Value* v) {
-    fwrite(&v->type, sizeof(v->type), 1, f);
+/* Value payloads, little-endian (VM 2.0 plan §5.2: "reals as IEEE754 bits").
+ * TYPE_LONG_DOUBLE is stored as a plain f64: every deployment target in the
+ * fleet already has sizeof(long double) == sizeof(double) (ARM64 macOS and
+ * Linux), so this is lossless there; on a hypothetical 80-bit-extended-double
+ * host it truncates precision, which is the accepted risk-register trade
+ * documented in Docs/pscal_vm2_plan.md §9 (TYPE_LONG_DOUBLE is rare in
+ * generated code per Phase 4's own note). */
+static bool writeValue(ByteBuf* out, const Value* v) {
+    bufU32LE(out, (uint32_t)v->type);
     switch (v->type) {
         case TYPE_INTEGER:
         case TYPE_WORD:
@@ -817,52 +1016,53 @@ static bool writeValue(FILE* f, const Value* v) {
         case TYPE_INT8:
         case TYPE_INT16:
         case TYPE_INT64:
-            fwrite(&v->i_val, sizeof(v->i_val), 1, f); break;
+            bufU64LE(out, (uint64_t)v->i_val); break;
         case TYPE_UINT8:
         case TYPE_UINT16:
         case TYPE_UINT32:
         case TYPE_UINT64:
-            fwrite(&v->u_val, sizeof(v->u_val), 1, f); break;
+            bufU64LE(out, (uint64_t)v->u_val); break;
         case TYPE_FLOAT:
-            fwrite(&v->real.f32_val, sizeof(v->real.f32_val), 1, f); break;
+            bufF32LE(out, v->real.f32_val); break;
         case TYPE_REAL:
-            fwrite(&v->real.d_val, sizeof(v->real.d_val), 1, f); break;
+            bufF64LE(out, v->real.d_val); break;
         case TYPE_LONG_DOUBLE:
-            fwrite(&v->real.r_val, sizeof(v->real.r_val), 1, f); break;
+            bufF64LE(out, (double)v->real.r_val); break;
         case TYPE_CHAR:
-            fwrite(&v->c_val, sizeof(v->c_val), 1, f); break;
+            bufU32LE(out, (uint32_t)v->c_val); break;
         case TYPE_STRING: {
-            int len = v->s_val ? (int)strlen(v->s_val) : -1;
-            fwrite(&len, sizeof(len), 1, f);
-            if (len > 0) fwrite(v->s_val, 1, len, f);
+            /* varint length prefix; NULL vs empty string distinguished by a
+             * leading presence byte (varint length alone can't represent -1). */
+            uint8_t present = v->s_val ? 1 : 0;
+            bufU8(out, present);
+            if (present) bufLenPrefixedBytes(out, v->s_val, strlen(v->s_val));
             break;
         }
         case TYPE_NIL:
             break;
         case TYPE_ENUM: {
-            int len = v->enum_val.enum_name ? (int)strlen(v->enum_val.enum_name) : 0;
-            fwrite(&len, sizeof(len), 1, f);
-            if (len > 0) fwrite(v->enum_val.enum_name, 1, len, f);
-            fwrite(&v->enum_val.ordinal, sizeof(v->enum_val.ordinal), 1, f);
+            size_t len = v->enum_val.enum_name ? strlen(v->enum_val.enum_name) : 0;
+            bufLenPrefixedBytes(out, v->enum_val.enum_name, len);
+            bufI32LE(out, (int32_t)v->enum_val.ordinal);
             break;
         }
         case TYPE_SET: {
-            int sz = v->set_val.set_size;
-            fwrite(&sz, sizeof(sz), 1, f);
-            if (sz > 0 && v->set_val.set_values) {
-                fwrite(v->set_val.set_values, sizeof(long long), sz, f);
+            int32_t sz = v->set_val.set_size;
+            bufI32LE(out, sz);
+            for (int i = 0; i < sz && v->set_val.set_values; i++) {
+                bufU64LE(out, (uint64_t)v->set_val.set_values[i]);
             }
             break;
         }
         case TYPE_ARRAY: {
-            int dims = v->dimensions;
-            fwrite(&dims, sizeof(dims), 1, f);
-            fwrite(&v->element_type, sizeof(v->element_type), 1, f);
+            int32_t dims = v->dimensions;
+            bufI32LE(out, dims);
+            bufU32LE(out, (uint32_t)v->element_type);
             for (int i = 0; i < dims; i++) {
-                int lb = v->lower_bounds ? v->lower_bounds[i] : 0;
-                int ub = v->upper_bounds ? v->upper_bounds[i] : -1;
-                fwrite(&lb, sizeof(lb), 1, f);
-                fwrite(&ub, sizeof(ub), 1, f);
+                int32_t lb = v->lower_bounds ? v->lower_bounds[i] : 0;
+                int32_t ub = v->upper_bounds ? v->upper_bounds[i] : -1;
+                bufI32LE(out, lb);
+                bufI32LE(out, ub);
             }
             int total = 1;
             if (!v->lower_bounds || !v->upper_bounds) {
@@ -878,74 +1078,224 @@ static bool writeValue(FILE* f, const Value* v) {
                 if (!v->array_raw) return false;
                 for (int i = 0; i < total; i++) {
                     Value temp = makeByte(v->array_raw[i]);
-                    if (!writeValue(f, &temp)) return false;
+                    if (!writeValue(out, &temp)) return false;
                 }
             } else {
                 for (int i = 0; i < total; i++) {
-                    if (!writeValue(f, &v->array_val[i])) return false;
+                    if (!writeValue(out, &v->array_val[i])) return false;
                 }
             }
             break;
         }
         case TYPE_POINTER:
-            return writePointerValue(f, v);
+            return writePointerValue(out, v);
         default:
             return false;
     }
     return true;
 }
 
-static bool writeChunkCore(FILE* f, const BytecodeChunk* chunk) {
-    if (!f || !chunk) {
-        return false;
-    }
+/* ============ PSB3 section bodies (VM 2.0 plan §5.2) ==================
+ *
+ * Each write*Section/read*Section pair is self-contained: it carries its own
+ * varint length/count prefixes, so the same functions serve two callers —
+ * (a) the top-level PSB3 container, where each section also gets an
+ *     independent directory entry (id/offset/length), and
+ * (b) writeChunkCoreInline/readChunkCoreInline, which call all of them back
+ *     to back into one shared buffer with no directory at all, for
+ *     ShellCompiledFunction values embedded inline in the CONST section
+ *     (writePointerValue kind 1). Nested chunks never need mmap/random
+ *     section access, so they don't carry the top-level's per-section
+ *     addressing overhead.
+ */
 
-    uint32_t prev_version = g_astCacheVersion;
-    g_astCacheVersion = chunk->version;
-    bool success = false;
-
-    if (fwrite(&chunk->count, sizeof(chunk->count), 1, f) != 1) goto cleanup;
-    if (fwrite(&chunk->constants_count, sizeof(chunk->constants_count), 1, f) != 1) goto cleanup;
-
+static void writeCodeSection(ByteBuf* out, const BytecodeChunk* chunk) {
+    bufVarint(out, (uint64_t)chunk->count);
     if (chunk->count > 0) {
-        if (!chunk->code || !chunk->lines) goto cleanup;
-        if (fwrite(chunk->code, 1, (size_t)chunk->count, f) != (size_t)chunk->count) goto cleanup;
-        if (fwrite(chunk->lines, sizeof(int), (size_t)chunk->count, f) != (size_t)chunk->count) goto cleanup;
+        bufBytes(out, chunk->code, (size_t)chunk->count);
     }
+}
 
-    for (int i = 0; i < chunk->constants_count; ++i) {
-        if (!writeValue(f, &chunk->constants[i])) {
-            goto cleanup;
+static bool readCodeSection(Cursor* in, BytecodeChunk* chunk) {
+    uint64_t count = curVarint(in);
+    if (in->error || count > (uint64_t)INT32_MAX) return false;
+    chunk->count = (int)count;
+    chunk->capacity = (int)count;
+    chunk->code = NULL;
+    if (count > 0) {
+        chunk->code = (uint8_t*)malloc((size_t)count);
+        if (!chunk->code) return false;
+        if (!curBytes(in, chunk->code, (size_t)count)) return false;
+    }
+    return true;
+}
+
+/* LINES: varint (pc_delta, line_delta) run-transition pairs, replacing the
+ * old per-code-byte int[] on disk (plan §5.2). Reconstructed in memory as
+ * the same flat per-byte chunk->lines[] every other part of the codebase
+ * (the disassembler, runtime error reporting) already expects — only the
+ * on-disk shape changes. */
+static void writeLinesSection(ByteBuf* out, const BytecodeChunk* chunk) {
+    int run_count = 0;
+    for (int pc = 0; pc < chunk->count; ++pc) {
+        if (pc == 0 || chunk->lines[pc] != chunk->lines[pc - 1]) run_count++;
+    }
+    bufVarint(out, (uint64_t)run_count);
+    int prev_pc = 0, prev_line = 0;
+    for (int pc = 0; pc < chunk->count; ++pc) {
+        int line = chunk->lines[pc];
+        if (pc == 0 || line != chunk->lines[pc - 1]) {
+            bufVarint(out, (uint64_t)(pc - prev_pc));
+            bufSVarint(out, (int64_t)line - (int64_t)prev_line);
+            prev_pc = pc;
+            prev_line = line;
         }
     }
+}
 
+/* Explicit run-count prefix (rather than "decode until the cursor's bytes
+ * are exhausted") because this reader also runs inline, sharing one cursor
+ * with the sections that follow it in an embedded ShellCompiledFunction
+ * blob (readChunkCoreInline) — it must stop after exactly its own runs,
+ * not eat bytes belonging to CONST/BMAP/PROCS/TYPES that come after it. */
+static bool readLinesSection(Cursor* in, BytecodeChunk* chunk) {
+    chunk->lines = NULL;
+    uint64_t run_count = curVarint(in);
+    if (in->error || run_count > (uint64_t)(chunk->count > 0 ? chunk->count : 0)) {
+        return chunk->count == 0 && run_count == 0;
+    }
+    if (chunk->count <= 0) {
+        return run_count == 0;
+    }
+    chunk->lines = (int*)malloc(sizeof(int) * (size_t)chunk->count);
+    if (!chunk->lines) return false;
+
+    int cur_pc = 0, cur_line = 0, fill_from = 0;
+    for (uint64_t r = 0; r < run_count; ++r) {
+        uint64_t pc_delta = curVarint(in);
+        int64_t line_delta = curSVarint(in);
+        if (in->error) return false;
+        int new_pc = cur_pc + (int)pc_delta;
+        if (new_pc < cur_pc || new_pc > chunk->count) return false;
+        if (r > 0) {
+            for (int i = fill_from; i < new_pc; ++i) chunk->lines[i] = cur_line;
+        } else if (new_pc != 0) {
+            return false; /* first run must start at pc 0 */
+        }
+        cur_line = (int)((int64_t)cur_line + line_delta);
+        cur_pc = new_pc;
+        fill_from = new_pc;
+    }
+    for (int i = fill_from; i < chunk->count; ++i) chunk->lines[i] = cur_line;
+    return true;
+}
+
+static void writeConstSection(ByteBuf* out, const BytecodeChunk* chunk) {
+    bufVarint(out, (uint64_t)chunk->constants_count);
+    for (int i = 0; i < chunk->constants_count; ++i) {
+        writeValue(out, &chunk->constants[i]);
+    }
+}
+
+static bool readConstSection(Cursor* in, BytecodeChunk* chunk, int* out_read_consts) {
+    uint64_t const_count = curVarint(in);
+    *out_read_consts = 0;
+    if (in->error || const_count > (uint64_t)INT32_MAX) return false;
+    chunk->constants_count = (int)const_count;
+    chunk->constants_capacity = (int)const_count;
+    chunk->constants = NULL;
+    chunk->global_symbol_cache = NULL;
+    if (const_count == 0) return true;
+    chunk->constants = (Value*)calloc((size_t)const_count, sizeof(Value));
+    chunk->global_symbol_cache = (Symbol**)calloc((size_t)const_count, sizeof(Symbol*));
+    if (!chunk->constants || !chunk->global_symbol_cache) return false;
+    for (int i = 0; i < (int)const_count; ++i) {
+        if (!readValue(in, &chunk->constants[i])) return false;
+        *out_read_consts = i + 1;
+    }
+    return true;
+}
+
+/* BMAP: builtin lowercase-copy map plus a registry fingerprint (VM 2.0 plan
+ * §5.2/§9 risk register: "fingerprint = ordered hash of (name,id) pairs
+ * actually referenced by the chunk's BMAP, not the whole registry").
+ *
+ * The fingerprint here is name-only (no id lookup at write time): calling
+ * getVmBuiltinID()/the registry resolver from this path runs during
+ * saveBytecodeToCache(), which fires right after compilation and before
+ * interpretBytecode() has finished bringing up VM/extension-builtin state.
+ * Triggering the registry's lazy pthread_once init that early was observed
+ * to corrupt unrelated interpreter state (surfaced as nil upvalues in
+ * Pascal closures — see the ClosureReturnFunctionRuntime regression this
+ * fixed). So this phase only lays the fingerprint groundwork; it never
+ * populates `chunk->builtin_resolved_ids` from the cache (stays NULL, as
+ * PSB2 always left it), and vm.c's existing per-call-site lazy
+ * resolve-by-name path keeps running unchanged for every loaded chunk. A
+ * future phase can revisit wholesale-trust once the id lookup can be made
+ * safe this early in the load path. */
+static uint64_t computeBuiltinFingerprintEntry(const char* lower_name) {
+    uint64_t h = FNV1A64_OFFSET;
+    if (lower_name) fnv1aUpdate(&h, lower_name, strlen(lower_name));
+    return h;
+}
+
+static void writeBmapSection(ByteBuf* out, const BytecodeChunk* chunk) {
     int builtin_map_count = 0;
     if (chunk->builtin_lowercase_indices) {
         for (int i = 0; i < chunk->constants_count; ++i) {
             int lower_idx = chunk->builtin_lowercase_indices[i];
-            if (lower_idx >= 0 && lower_idx < chunk->constants_count) {
-                builtin_map_count++;
-            }
+            if (lower_idx >= 0 && lower_idx < chunk->constants_count) builtin_map_count++;
         }
     }
-    if (fwrite(&builtin_map_count, sizeof(builtin_map_count), 1, f) != 1) goto cleanup;
+    bufVarint(out, (uint64_t)builtin_map_count);
+    uint64_t fingerprint = FNV1A64_OFFSET;
     if (chunk->builtin_lowercase_indices) {
         for (int i = 0; i < chunk->constants_count; ++i) {
             int lower_idx = chunk->builtin_lowercase_indices[i];
-            if (lower_idx >= 0 && lower_idx < chunk->constants_count) {
-                if (fwrite(&i, sizeof(i), 1, f) != 1) goto cleanup;
-                if (fwrite(&lower_idx, sizeof(lower_idx), 1, f) != 1) goto cleanup;
-            }
+            if (lower_idx < 0 || lower_idx >= chunk->constants_count) continue;
+            const char* lname = (VALUE_TYPE(chunk->constants[lower_idx]) == TYPE_STRING)
+                                     ? AS_STRING(chunk->constants[lower_idx]) : NULL;
+            bufVarint(out, (uint64_t)i);
+            bufVarint(out, (uint64_t)lower_idx);
+            fnv1aUpdateUInt64(&fingerprint, computeBuiltinFingerprintEntry(lname));
         }
     }
+    bufU64LE(out, fingerprint);
+}
 
+static bool readBmapSection(Cursor* in, BytecodeChunk* chunk) {
+    chunk->builtin_lowercase_indices = NULL;
+    chunk->builtin_resolved_ids = NULL;
+    int cap = chunk->constants_capacity;
+    if (cap > 0) {
+        chunk->builtin_lowercase_indices = (int*)malloc(sizeof(int) * (size_t)cap);
+        if (!chunk->builtin_lowercase_indices) return false;
+        for (int i = 0; i < cap; ++i) chunk->builtin_lowercase_indices[i] = -1;
+    }
+
+    uint64_t builtin_map_count = curVarint(in);
+    if (in->error) return false;
+    bool ok = true;
+    for (uint64_t n = 0; ok && n < builtin_map_count; ++n) {
+        uint64_t orig_idx = curVarint(in);
+        uint64_t lower_idx = curVarint(in);
+        if (in->error) { ok = false; break; }
+        if (orig_idx >= (uint64_t)cap || lower_idx >= (uint64_t)chunk->constants_count) {
+            ok = false;
+            break;
+        }
+        chunk->builtin_lowercase_indices[orig_idx] = (int)lower_idx;
+    }
+    curU64LE(in); /* stored fingerprint: currently informational only, not consumed */
+    if (!ok || in->error) return false;
+    return true;
+}
+
+static void writeProcsSection(ByteBuf* out) {
     int proc_count = 0;
     countProceduresRecursive(procedure_table, &proc_count);
-    int stored_proc_count = -(proc_count + 1);
-    if (fwrite(&stored_proc_count, sizeof(stored_proc_count), 1, f) != 1) goto cleanup;
-    if (!writeProcedureEntriesRecursive(f, procedure_table)) {
-        goto cleanup;
-    }
+    bufVarint(out, (uint64_t)proc_count);
+    writeProcedureEntriesRecursive(out, procedure_table);
 
     int const_sym_count = 0;
     if (globalSymbols) {
@@ -956,218 +1306,38 @@ static bool writeChunkCore(FILE* f, const BytecodeChunk* chunk) {
             }
         }
     }
-    if (fwrite(&const_sym_count, sizeof(const_sym_count), 1, f) != 1) goto cleanup;
+    bufVarint(out, (uint64_t)const_sym_count);
     if (globalSymbols) {
         for (int i = 0; i < HASHTABLE_SIZE; i++) {
             for (Symbol* sym = globalSymbols->buckets[i]; sym; sym = sym->next) {
                 if (sym->is_alias || !sym->is_const) continue;
-                int name_len = (int)strlen(sym->name);
-                if (fwrite(&name_len, sizeof(name_len), 1, f) != 1) goto cleanup;
-                if (fwrite(sym->name, 1, (size_t)name_len, f) != (size_t)name_len) goto cleanup;
-                if (fwrite(&sym->type, sizeof(sym->type), 1, f) != 1) goto cleanup;
+                bufLenPrefixedBytes(out, sym->name, strlen(sym->name));
+                bufU32LE(out, (uint32_t)sym->type);
                 if (sym->value) {
-                    if (!writeValue(f, sym->value)) goto cleanup;
+                    writeValue(out, sym->value);
                 } else {
                     Value tmp = makeVoid();
-                    if (!writeValue(f, &tmp)) goto cleanup;
+                    writeValue(out, &tmp);
                 }
             }
         }
     }
-
-    int type_count = 0;
-    for (TypeEntry* entry = type_table; entry; entry = entry->next) type_count++;
-    if (fwrite(&type_count, sizeof(type_count), 1, f) != 1) goto cleanup;
-    for (TypeEntry* entry = type_table; entry; entry = entry->next) {
-        int name_len = (int)strlen(entry->name);
-        if (fwrite(&name_len, sizeof(name_len), 1, f) != 1) goto cleanup;
-        if (fwrite(entry->name, 1, (size_t)name_len, f) != (size_t)name_len) goto cleanup;
-        writeAst(f, entry->typeAST);
-    }
-
-    success = true;
-
-cleanup:
-    g_astCacheVersion = prev_version;
-    return success;
 }
 
-static bool readChunkCore(FILE* f,
-                          BytecodeChunk* chunk,
-                          uint32_t version,
-                          uint64_t source_hash,
-                          uint64_t expected_combined_hash,
-                          bool verify_combined) {
-    if (!f || !chunk) {
-        return false;
-    }
+static bool readProcsSection(Cursor* in, BytecodeChunk* chunk) {
+    uint64_t proc_count = curVarint(in);
+    if (in->error || proc_count > (uint64_t)INT32_MAX) return false;
+    if (!loadProceduresFromStream(in, (int)proc_count, chunk->version)) return false;
 
-    int count = 0;
-    int const_count = 0;
-    if (fread(&count, sizeof(count), 1, f) != 1 ||
-        fread(&const_count, sizeof(const_count), 1, f) != 1) {
-        return false;
-    }
-
-    chunk->code = NULL;
-    chunk->lines = NULL;
-    chunk->constants = NULL;
-    chunk->builtin_lowercase_indices = NULL;
-
-    uint32_t prev_version = g_astCacheVersion;
-    g_astCacheVersion = version;
-#define RETURN_FALSE do { g_astCacheVersion = prev_version; return false; } while (0)
-
-    if (count > 0) {
-        chunk->code = (uint8_t*)malloc((size_t)count);
-        chunk->lines = (int*)malloc(sizeof(int) * (size_t)count);
-        if (!chunk->code || !chunk->lines) {
-            free(chunk->code);
-            free(chunk->lines);
-            RETURN_FALSE;
-        }
-    }
-
-    if (const_count > 0) {
-        chunk->constants = (Value*)calloc((size_t)const_count, sizeof(Value));
-        if (!chunk->constants) {
-            free(chunk->code);
-            free(chunk->lines);
-            chunk->code = NULL;
-            chunk->lines = NULL;
-            RETURN_FALSE;
-        }
-        chunk->global_symbol_cache = (Symbol**)calloc((size_t)const_count, sizeof(Symbol*));
-        if (!chunk->global_symbol_cache) {
-            free(chunk->code);
-            free(chunk->lines);
-            free(chunk->constants);
-            chunk->code = NULL;
-            chunk->lines = NULL;
-            chunk->constants = NULL;
-            RETURN_FALSE;
-        }
-    }
-
-    chunk->count = count;
-    chunk->capacity = count;
-    chunk->constants_count = const_count;
-    chunk->constants_capacity = const_count;
-
-    if (count > 0) {
-        if (fread(chunk->code, 1, (size_t)count, f) != (size_t)count ||
-            fread(chunk->lines, sizeof(int), (size_t)count, f) != (size_t)count) {
-            resetChunk(chunk, 0);
-            RETURN_FALSE;
-        }
-    }
-
-    int read_consts = 0;
-    for (; read_consts < const_count; ++read_consts) {
-        if (!readValue(f, &chunk->constants[read_consts])) {
-            resetChunk(chunk, read_consts);
-            RETURN_FALSE;
-        }
-    }
-
-    if (const_count > 0) {
-        chunk->builtin_lowercase_indices = (int*)malloc(sizeof(int) * (size_t)const_count);
-        if (!chunk->builtin_lowercase_indices) {
-            resetChunk(chunk, const_count);
-            RETURN_FALSE;
-        }
-        for (int i = 0; i < const_count; ++i) {
-            chunk->builtin_lowercase_indices[i] = -1;
-        }
-    }
-
-    if (version >= 8) {
-        int builtin_map_count = 0;
-        if (fread(&builtin_map_count, sizeof(builtin_map_count), 1, f) != 1) {
-            resetChunk(chunk, const_count);
-            RETURN_FALSE;
-        }
-        for (int i = 0; i < builtin_map_count; ++i) {
-            int original_idx = 0;
-            int lower_idx = 0;
-            if (fread(&original_idx, sizeof(original_idx), 1, f) != 1 ||
-                fread(&lower_idx, sizeof(lower_idx), 1, f) != 1) {
-                resetChunk(chunk, const_count);
-                RETURN_FALSE;
-            }
-            if (chunk->builtin_lowercase_indices &&
-                original_idx >= 0 && original_idx < chunk->constants_count) {
-                chunk->builtin_lowercase_indices[original_idx] = lower_idx;
-            }
-        }
-    } else {
-        int dummy = 0;
-        if (fread(&dummy, sizeof(dummy), 1, f) != 1) {
-            resetChunk(chunk, const_count);
-            RETURN_FALSE;
-        }
-    }
-
-    if (verify_combined) {
-        uint64_t computed = computeCombinedHash(source_hash, chunk);
-        if (computed != expected_combined_hash) {
-            resetChunk(chunk, const_count);
-            RETURN_FALSE;
-        }
-    }
-
-    int stored_proc_count = 0;
-    if (fread(&stored_proc_count, sizeof(stored_proc_count), 1, f) != 1) {
-        resetChunk(chunk, const_count);
-        RETURN_FALSE;
-    }
-    if (stored_proc_count < 0) {
-        int proc_count = -stored_proc_count - 1;
-        if (!loadProceduresFromStream(f, proc_count, version)) {
-            resetChunk(chunk, const_count);
-            RETURN_FALSE;
-        }
-    } else {
-        resetChunk(chunk, const_count);
-        RETURN_FALSE;
-    }
-
-    int const_sym_count = 0;
-    if (fread(&const_sym_count, sizeof(const_sym_count), 1, f) != 1) {
-        resetChunk(chunk, const_count);
-        RETURN_FALSE;
-    }
-    for (int i = 0; i < const_sym_count; ++i) {
-        int name_len = 0;
-        if (fread(&name_len, sizeof(name_len), 1, f) != 1) {
-            resetChunk(chunk, const_count);
-            RETURN_FALSE;
-        }
-        char* name = (char*)malloc((size_t)name_len + 1);
-        if (!name) {
-            resetChunk(chunk, const_count);
-            RETURN_FALSE;
-        }
-        if (fread(name, 1, (size_t)name_len, f) != (size_t)name_len) {
-            free(name);
-            resetChunk(chunk, const_count);
-            RETURN_FALSE;
-        }
-        name[name_len] = '\0';
-
-        VarType type;
-        if (fread(&type, sizeof(type), 1, f) != 1) {
-            free(name);
-            resetChunk(chunk, const_count);
-            RETURN_FALSE;
-        }
-
+    uint64_t const_sym_count = curVarint(in);
+    if (in->error) return false;
+    for (uint64_t i = 0; i < const_sym_count; ++i) {
+        size_t name_len = 0;
+        char* name = curLenPrefixedString(in, &name_len);
+        if (in->error || !name) { free(name); return false; }
+        VarType type = (VarType)curU32LE(in);
         Value val = {0};
-        if (!readValue(f, &val)) {
-            free(name);
-            resetChunk(chunk, const_count);
-            RETURN_FALSE;
-        }
+        if (in->error || !readValue(in, &val)) { free(name); return false; }
 
         insertGlobalSymbol(name, type, NULL);
         Symbol* sym = lookupGlobalSymbol(name);
@@ -1181,74 +1351,88 @@ static bool readChunkCore(FILE* f,
         }
         free(name);
     }
+    return true;
+}
 
+static void writeTypesSection(ByteBuf* out) {
     int type_count = 0;
-    if (fread(&type_count, sizeof(type_count), 1, f) != 1) {
-        resetChunk(chunk, const_count);
-        RETURN_FALSE;
+    for (TypeEntry* entry = type_table; entry; entry = entry->next) type_count++;
+    bufVarint(out, (uint64_t)type_count);
+    for (TypeEntry* entry = type_table; entry; entry = entry->next) {
+        bufLenPrefixedBytes(out, entry->name, strlen(entry->name));
+        writeAst(out, entry->typeAST);
     }
-    for (int i = 0; i < type_count; ++i) {
-        int name_len = 0;
-        if (fread(&name_len, sizeof(name_len), 1, f) != 1) {
-            resetChunk(chunk, const_count);
-            RETURN_FALSE;
-        }
-        char* name = (char*)malloc((size_t)name_len + 1);
-        if (!name) {
-            resetChunk(chunk, const_count);
-            RETURN_FALSE;
-        }
-        if (fread(name, 1, (size_t)name_len, f) != (size_t)name_len) {
-            free(name);
-            resetChunk(chunk, const_count);
-            RETURN_FALSE;
-        }
-        name[name_len] = '\0';
-        AST* type_ast = readAst(f);
-        if (!type_ast) {
-            free(name);
-            resetChunk(chunk, const_count);
-            RETURN_FALSE;
-        }
+}
+
+static bool readTypesSection(Cursor* in) {
+    uint64_t type_count = curVarint(in);
+    if (in->error) return false;
+    for (uint64_t i = 0; i < type_count; ++i) {
+        size_t name_len = 0;
+        char* name = curLenPrefixedString(in, &name_len);
+        if (in->error || !name) { free(name); return false; }
+        AST* type_ast = readAst(in);
+        if (in->error || !type_ast) { free(name); freeAST(type_ast); return false; }
         insertType(name, type_ast);
         freeAST(type_ast);
         free(name);
     }
-
-    g_astCacheVersion = prev_version;
-
-#undef RETURN_FALSE
-
     return true;
 }
 
-static bool writePointerValue(FILE* f, const Value* v) {
-    if (!f || !v) {
+/* Sequential embed used only for ShellCompiledFunction values nested inside
+ * a CONST section (writePointerValue kind 1): all six pieces back to back
+ * in one buffer, no section directory. */
+static bool writeChunkCoreInline(ByteBuf* out, const BytecodeChunk* chunk) {
+    uint32_t prev_version = g_astCacheVersion;
+    g_astCacheVersion = chunk->version;
+    writeCodeSection(out, chunk);
+    writeLinesSection(out, chunk);
+    writeConstSection(out, chunk);
+    writeBmapSection(out, chunk);
+    writeProcsSection(out);
+    writeTypesSection(out);
+    g_astCacheVersion = prev_version;
+    return true;
+}
+
+static bool readChunkCoreInline(Cursor* in, BytecodeChunk* chunk, uint32_t version) {
+    chunk->code = NULL;
+    chunk->lines = NULL;
+    chunk->constants = NULL;
+    chunk->builtin_lowercase_indices = NULL;
+    chunk->builtin_resolved_ids = NULL;
+    chunk->global_symbol_cache = NULL;
+
+    uint32_t prev_version = g_astCacheVersion;
+    g_astCacheVersion = version;
+    int read_consts = 0;
+    bool ok = readCodeSection(in, chunk) &&
+              readLinesSection(in, chunk) &&
+              readConstSection(in, chunk, &read_consts) &&
+              readBmapSection(in, chunk) &&
+              readProcsSection(in, chunk) &&
+              readTypesSection(in);
+    g_astCacheVersion = prev_version;
+    if (!ok) {
+        resetChunk(chunk, read_consts);
         return false;
     }
+    return true;
+}
 
-    uint8_t kind = 0;
-    if (!v->ptr_val) {
-        return fwrite(&kind, sizeof(kind), 1, f) == 1;
+static bool writePointerValue(ByteBuf* out, const Value* v) {
+    if (!v || !v->ptr_val) {
+        bufU8(out, 0);
+        return true;
     }
 
     if (v->base_type_node == STRING_CHAR_PTR_SENTINEL ||
         v->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
         const char *text = (const char *)v->ptr_val;
-        if (!text) {
-            return false;
-        }
-        int len = (int)strlen(text);
-        kind = 2;
-        if (fwrite(&kind, sizeof(kind), 1, f) != 1) {
-            return false;
-        }
-        if (fwrite(&len, sizeof(len), 1, f) != 1) {
-            return false;
-        }
-        if (len > 0 && fwrite(text, 1, (size_t)len, f) != (size_t)len) {
-            return false;
-        }
+        if (!text) return false;
+        bufU8(out, 2);
+        bufLenPrefixedBytes(out, text, strlen(text));
         return true;
     }
 
@@ -1257,66 +1441,36 @@ static bool writePointerValue(FILE* f, const Value* v) {
         if (!compiled || compiled->magic != SHELL_COMPILED_FUNCTION_MAGIC) {
             return false;
         }
-
-        kind = 1;
-        if (fwrite(&kind, sizeof(kind), 1, f) != 1) {
-            return false;
-        }
-        if (fwrite(&compiled->chunk.version, sizeof(compiled->chunk.version), 1, f) != 1) {
-            return false;
-        }
-        return writeChunkCore(f, &compiled->chunk);
+        bufU8(out, 1);
+        bufU32LE(out, compiled->chunk.version);
+        return writeChunkCoreInline(out, &compiled->chunk);
     }
 
-    kind = 3;
-    if (fwrite(&kind, sizeof(kind), 1, f) != 1) {
-        return false;
-    }
-    uint64_t raw_addr = (uint64_t)(uintptr_t)v->ptr_val;
-    if (fwrite(&raw_addr, sizeof(raw_addr), 1, f) != 1) {
-        return false;
-    }
+    bufU8(out, 3);
+    bufU64LE(out, (uint64_t)(uintptr_t)v->ptr_val);
     return true;
 }
 
-static bool readPointerValue(FILE* f, Value* out) {
-    if (!f || !out) {
-        return false;
-    }
-
-    uint8_t kind = 0;
-    if (fread(&kind, sizeof(kind), 1, f) != 1) {
-        return false;
-    }
+static bool readPointerValue(Cursor* in, Value* out) {
+    uint8_t kind = curU8(in);
+    if (in->error) return false;
     if (kind == 0) {
         out->ptr_val = NULL;
         out->base_type_node = NULL;
         return true;
     }
     if (kind == 2) {
-        int len = 0;
-        if (fread(&len, sizeof(len), 1, f) != 1 || len < 0) {
-            return false;
-        }
-        char *text = (char *)malloc((size_t)len + 1u);
-        if (!text) {
-            return false;
-        }
-        if (len > 0 && fread(text, 1, (size_t)len, f) != (size_t)len) {
-            free(text);
-            return false;
-        }
-        text[len] = '\0';
+        size_t len = 0;
+        char* text = curLenPrefixedString(in, &len);
+        if (in->error || !text) { free(text); return false; }
         out->ptr_val = (Value*)text;
         out->base_type_node = SERIALIZED_CHAR_PTR_SENTINEL;
         out->element_type = TYPE_UNKNOWN;
         return true;
     }
     if (kind == 3) {
-        uint64_t raw_addr = 0;
-        if (fread(&raw_addr, sizeof(raw_addr), 1, f) != 1) {
-            return false;
-        }
+        uint64_t raw_addr = curU64LE(in);
+        if (in->error) return false;
         out->ptr_val = (Value*)(uintptr_t)raw_addr;
         out->base_type_node = OPAQUE_POINTER_SENTINEL;
         out->element_type = TYPE_UNKNOWN;
@@ -1327,20 +1481,15 @@ static bool readPointerValue(FILE* f, Value* out) {
     }
 
     ShellCompiledFunction* compiled = (ShellCompiledFunction*)calloc(1, sizeof(ShellCompiledFunction));
-    if (!compiled) {
-        return false;
-    }
+    if (!compiled) return false;
     compiled->magic = SHELL_COMPILED_FUNCTION_MAGIC;
     initBytecodeChunk(&compiled->chunk);
 
-    uint32_t version = 0;
-    if (fread(&version, sizeof(version), 1, f) != 1) {
-        free(compiled);
-        return false;
-    }
+    uint32_t version = curU32LE(in);
+    if (in->error) { free(compiled); return false; }
     compiled->chunk.version = version;
 
-    if (!readChunkCore(f, &compiled->chunk, version, 0, 0, false)) {
+    if (!readChunkCoreInline(in, &compiled->chunk, version)) {
         freeBytecodeChunk(&compiled->chunk);
         free(compiled);
         return false;
@@ -1484,10 +1633,11 @@ static void hashValue(uint64_t* hash, const Value* v, ChunkHashContext* ctx) {
     }
 }
 
-static bool readValue(FILE* f, Value* out) {
+static bool readValue(Cursor* in, Value* out) {
     if (!out) return false;
     memset(out, 0, sizeof(Value));
-    if (fread(&out->type, sizeof(out->type), 1, f) != 1) return false;
+    out->type = (VarType)curU32LE(in);
+    if (in->error) return false;
     switch (out->type) {
         case TYPE_INTEGER:
         case TYPE_WORD:
@@ -1496,46 +1646,41 @@ static bool readValue(FILE* f, Value* out) {
         case TYPE_INT8:
         case TYPE_INT16:
         case TYPE_INT64:
-            if (fread(&out->i_val, sizeof(out->i_val), 1, f) != 1) return false;
+            out->i_val = (long long)curU64LE(in);
             out->u_val = (unsigned long long)out->i_val;
             break;
         case TYPE_UINT8:
         case TYPE_UINT16:
         case TYPE_UINT32:
         case TYPE_UINT64: {
-            unsigned long long tmp = 0;
-            if (fread(&tmp, sizeof(tmp), 1, f) != 1) return false;
+            unsigned long long tmp = curU64LE(in);
             out->u_val = tmp;
             out->i_val = (long long)tmp;
             break;
         }
         case TYPE_FLOAT: {
-            float tmp;
-            if (fread(&tmp, sizeof(tmp), 1, f) != 1) return false;
+            float tmp = curF32LE(in);
             SET_REAL_VALUE(out, tmp);
             break; }
         case TYPE_REAL: {
-            double tmp;
-            if (fread(&tmp, sizeof(tmp), 1, f) != 1) return false;
+            double tmp = curF64LE(in);
             SET_REAL_VALUE(out, tmp);
             break; }
         case TYPE_LONG_DOUBLE: {
-            long double tmp;
-            if (fread(&tmp, sizeof(tmp), 1, f) != 1) return false;
-            SET_REAL_VALUE(out, tmp);
+            double tmp = curF64LE(in);
+            SET_REAL_VALUE(out, (long double)tmp);
             break; }
         case TYPE_CHAR:
-            if (fread(&out->c_val, sizeof(out->c_val), 1, f) != 1) return false;
+            out->c_val = (char)curU32LE(in);
             SET_INT_VALUE(out, out->c_val);
             break;
         case TYPE_STRING: {
-            int len = 0;
-            if (fread(&len, sizeof(len), 1, f) != 1) return false;
-            if (len >= 0) {
-                out->s_val = (char*)malloc(len + 1);
-                if (!out->s_val) return false;
-                if (len > 0 && fread(out->s_val, 1, len, f) != (size_t)len) return false;
-                out->s_val[len] = '\0';
+            uint8_t present = curU8(in);
+            if (in->error) return false;
+            if (present) {
+                size_t len = 0;
+                out->s_val = curLenPrefixedString(in, &len);
+                if (in->error || !out->s_val) return false;
             } else {
                 out->s_val = NULL;
             }
@@ -1545,46 +1690,46 @@ static bool readValue(FILE* f, Value* out) {
         case TYPE_NIL:
             break;
         case TYPE_ENUM: {
-            int len = 0;
-            if (fread(&len, sizeof(len), 1, f) != 1) return false;
-            if (len > 0) {
-                out->enum_val.enum_name = (char*)malloc(len + 1);
-                if (!out->enum_val.enum_name) return false;
-                if (fread(out->enum_val.enum_name, 1, len, f) != (size_t)len) return false;
-                out->enum_val.enum_name[len] = '\0';
-            } else {
-                out->enum_val.enum_name = NULL;
-            }
-            if (fread(&out->enum_val.ordinal, sizeof(out->enum_val.ordinal), 1, f) != 1) return false;
+            size_t len = 0;
+            out->enum_val.enum_name = curLenPrefixedString(in, &len);
+            if (in->error) return false;
+            if (len == 0) { free(out->enum_val.enum_name); out->enum_val.enum_name = NULL; }
+            out->enum_val.ordinal = curI32LE(in);
+            if (in->error) return false;
             break;
         }
         case TYPE_SET: {
-            int sz = 0;
-            if (fread(&sz, sizeof(sz), 1, f) != 1) return false;
+            int32_t sz = curI32LE(in);
+            if (in->error || sz < 0) return false;
             out->set_val.set_size = sz;
             if (sz > 0) {
-                out->set_val.set_values = (long long*)malloc(sizeof(long long) * sz);
+                out->set_val.set_values = (long long*)malloc(sizeof(long long) * (size_t)sz);
                 if (!out->set_val.set_values) return false;
-                if (fread(out->set_val.set_values, sizeof(long long), sz, f) != (size_t)sz) return false;
+                for (int i = 0; i < sz; i++) {
+                    out->set_val.set_values[i] = (long long)curU64LE(in);
+                }
+                if (in->error) return false;
             } else {
                 out->set_val.set_values = NULL;
             }
             break;
         }
         case TYPE_ARRAY: {
-            int dims = 0;
-            if (fread(&dims, sizeof(dims), 1, f) != 1) return false;
+            int32_t dims = curI32LE(in);
+            if (in->error || dims < 0) return false;
             out->dimensions = dims;
-            if (fread(&out->element_type, sizeof(out->element_type), 1, f) != 1) return false;
+            out->element_type = (VarType)curU32LE(in);
+            if (in->error) return false;
             out->array_is_packed = isPackedByteElementType(out->element_type);
             if (dims > 0) {
-                out->lower_bounds = (int*)malloc(sizeof(int) * dims);
-                out->upper_bounds = (int*)malloc(sizeof(int) * dims);
+                out->lower_bounds = (int*)malloc(sizeof(int) * (size_t)dims);
+                out->upper_bounds = (int*)malloc(sizeof(int) * (size_t)dims);
                 if (!out->lower_bounds || !out->upper_bounds) return false;
                 for (int i = 0; i < dims; i++) {
-                    if (fread(&out->lower_bounds[i], sizeof(int), 1, f) != 1) return false;
-                    if (fread(&out->upper_bounds[i], sizeof(int), 1, f) != 1) return false;
+                    out->lower_bounds[i] = curI32LE(in);
+                    out->upper_bounds[i] = curI32LE(in);
                 }
+                if (in->error) return false;
                 out->lower_bound = out->lower_bounds[0];
                 out->upper_bound = out->upper_bounds[0];
             } else {
@@ -1605,7 +1750,7 @@ static bool readValue(FILE* f, Value* out) {
                     if (!out->array_raw) return false;
                     for (int i = 0; i < total; i++) {
                         Value temp;
-                        if (!readValue(f, &temp)) return false;
+                        if (!readValue(in, &temp)) return false;
                         out->array_raw[i] = (unsigned char)AS_INTEGER(temp);
                         freeValue(&temp);
                     }
@@ -1613,14 +1758,14 @@ static bool readValue(FILE* f, Value* out) {
                     out->array_val = (Value*)calloc((size_t)total, sizeof(Value));
                     if (!out->array_val) return false;
                     for (int i = 0; i < total; i++) {
-                        if (!readValue(f, &out->array_val[i])) return false;
+                        if (!readValue(in, &out->array_val[i])) return false;
                     }
                 }
             }
             break;
         }
         case TYPE_POINTER:
-            return readPointerValue(f, out);
+            return readPointerValue(in, out);
         default:
             return false;
     }
@@ -1708,39 +1853,31 @@ static void countProceduresRecursive(HashTable* table, int* count) {
     }
 }
 
-static bool writeProcedureEntriesRecursive(FILE* f, HashTable* table) {
+static bool writeProcedureEntriesRecursive(ByteBuf* out, HashTable* table) {
     if (!table) return true;
     for (int i = 0; i < HASHTABLE_SIZE; i++) {
         for (Symbol* sym = table->buckets[i]; sym; sym = sym->next) {
             if (!sym || sym->is_alias) continue;
-            int name_len = (int)strlen(sym->name);
-            if (fwrite(&name_len, sizeof(name_len), 1, f) != 1) return false;
-            if (fwrite(sym->name, 1, name_len, f) != (size_t)name_len) return false;
-            if (fwrite(&sym->bytecode_address, sizeof(sym->bytecode_address), 1, f) != 1) return false;
-            uint16_t locals = sym->locals_count;
-            if (fwrite(&locals, sizeof(locals), 1, f) != 1) return false;
-            if (fwrite(&sym->upvalue_count, sizeof(sym->upvalue_count), 1, f) != 1) return false;
-            if (fwrite(&sym->type, sizeof(sym->type), 1, f) != 1) return false;
-            if (fwrite(&sym->arity, sizeof(sym->arity), 1, f) != 1) return false;
+            bufLenPrefixedBytes(out, sym->name, strlen(sym->name));
+            bufI32LE(out, (int32_t)sym->bytecode_address);
+            bufU16LE(out, sym->locals_count);
+            bufU8(out, sym->upvalue_count);
+            bufU32LE(out, (uint32_t)sym->type);
+            bufU8(out, sym->arity);
             Symbol* enclosing = resolveSymbolAlias(sym->enclosing);
             uint8_t has_enclosing = (enclosing && enclosing->name) ? 1 : 0;
-            if (fwrite(&has_enclosing, sizeof(has_enclosing), 1, f) != 1) return false;
+            bufU8(out, has_enclosing);
             if (has_enclosing) {
-                int parent_len = (int)strlen(enclosing->name);
-                if (fwrite(&parent_len, sizeof(parent_len), 1, f) != 1) return false;
-                if (fwrite(enclosing->name, 1, parent_len, f) != (size_t)parent_len) return false;
+                bufLenPrefixedBytes(out, enclosing->name, strlen(enclosing->name));
             }
             for (int uv = 0; uv < sym->upvalue_count; uv++) {
-                uint8_t idx = sym->upvalues[uv].index;
-                uint8_t isLocal = sym->upvalues[uv].isLocal ? 1 : 0;
-                uint8_t isRef = sym->upvalues[uv].is_ref ? 1 : 0;
-                if (fwrite(&idx, sizeof(idx), 1, f) != 1) return false;
-                if (fwrite(&isLocal, sizeof(isLocal), 1, f) != 1) return false;
-                if (fwrite(&isRef, sizeof(isRef), 1, f) != 1) return false;
+                bufU8(out, sym->upvalues[uv].index);
+                bufU8(out, sym->upvalues[uv].isLocal ? 1 : 0);
+                bufU8(out, sym->upvalues[uv].is_ref ? 1 : 0);
             }
             if (sym->type_def && sym->type_def->symbol_table) {
                 HashTable* nested = (HashTable*)sym->type_def->symbol_table;
-                if (!writeProcedureEntriesRecursive(f, nested)) return false;
+                if (!writeProcedureEntriesRecursive(out, nested)) return false;
             }
         }
     }
@@ -1865,72 +2002,29 @@ void restoreProcedureConstructorAliases(HashTable* table) {
     restoreConstructorAliasesImpl(table);
 }
 
-static bool loadProceduresFromStream(FILE* f, int proc_count, uint32_t chunk_version) {
+static bool loadProceduresFromStream(Cursor* in, int proc_count, uint32_t chunk_version) {
+    (void)chunk_version; /* PSB3 hard cutover: no pre-PSB3 procedure layouts to branch on. */
     EnclosingFixup* fixups = NULL;
     int fixup_count = 0;
     int fixup_capacity = 0;
     bool ok = true;
 
     for (int i = 0; ok && i < proc_count; ++i) {
-        int name_len = 0;
-        if (fread(&name_len, sizeof(name_len), 1, f) != 1 || name_len < 0) {
-            ok = false;
-            break;
-        }
-        char* name = (char*)malloc((size_t)name_len + 1);
-        if (!name) {
-            ok = false;
-            break;
-        }
-        if (name_len > 0 && fread(name, 1, (size_t)name_len, f) != (size_t)name_len) {
-            free(name);
-            ok = false;
-            break;
-        }
-        name[name_len] = '\0';
-
-        int addr = 0;
-        uint16_t locals = 0;
-        uint8_t upvals = 0;
-        VarType type;
-        if (fread(&addr, sizeof(addr), 1, f) != 1) {
+        size_t name_len_sz = 0;
+        char* name = curLenPrefixedString(in, &name_len_sz);
+        if (in->error || !name) {
             free(name);
             ok = false;
             break;
         }
 
-        if (chunk_version >= 7) {
-            if (fread(&locals, sizeof(locals), 1, f) != 1) {
-                free(name);
-                ok = false;
-                break;
-            }
-        } else {
-            uint8_t locals8 = 0;
-            if (fread(&locals8, sizeof(locals8), 1, f) != 1) {
-                free(name);
-                ok = false;
-                break;
-            }
-            locals = locals8;
-        }
-
-        if (fread(&upvals, sizeof(upvals), 1, f) != 1 ||
-            fread(&type, sizeof(type), 1, f) != 1) {
-            free(name);
-            ok = false;
-            break;
-        }
-
-        uint8_t arity = 0;
-        if (fread(&arity, sizeof(arity), 1, f) != 1) {
-            free(name);
-            ok = false;
-            break;
-        }
-
-        uint8_t has_enclosing = 0;
-        if (fread(&has_enclosing, sizeof(has_enclosing), 1, f) != 1) {
+        int32_t addr = curI32LE(in);
+        uint16_t locals = curU16LE(in);
+        uint8_t upvals = curU8(in);
+        VarType type = (VarType)curU32LE(in);
+        uint8_t arity = curU8(in);
+        uint8_t has_enclosing = curU8(in);
+        if (in->error) {
             free(name);
             ok = false;
             break;
@@ -1938,25 +2032,14 @@ static bool loadProceduresFromStream(FILE* f, int proc_count, uint32_t chunk_ver
 
         char* enclosing_name = NULL;
         if (has_enclosing) {
-            int parent_len = 0;
-            if (fread(&parent_len, sizeof(parent_len), 1, f) != 1 || parent_len < 0) {
-                free(name);
-                ok = false;
-                break;
-            }
-            enclosing_name = (char*)malloc((size_t)parent_len + 1);
-            if (!enclosing_name) {
-                free(name);
-                ok = false;
-                break;
-            }
-            if (parent_len > 0 && fread(enclosing_name, 1, (size_t)parent_len, f) != (size_t)parent_len) {
+            size_t parent_len_sz = 0;
+            enclosing_name = curLenPrefixedString(in, &parent_len_sz);
+            if (in->error || !enclosing_name) {
                 free(name);
                 free(enclosing_name);
                 ok = false;
                 break;
             }
-            enclosing_name[parent_len] = '\0';
         }
 
         Symbol* parent_sym = NULL;
@@ -2017,10 +2100,10 @@ static bool loadProceduresFromStream(FILE* f, int proc_count, uint32_t chunk_ver
 
         bool upvalues_ok = true;
         for (int uv = 0; uv < upvals; uv++) {
-            uint8_t idx = 0, isLocal = 0, isRef = 0;
-            if (fread(&idx, sizeof(idx), 1, f) != 1 ||
-                fread(&isLocal, sizeof(isLocal), 1, f) != 1 ||
-                fread(&isRef, sizeof(isRef), 1, f) != 1) {
+            uint8_t idx = curU8(in);
+            uint8_t isLocal = curU8(in);
+            uint8_t isRef = curU8(in);
+            if (in->error) {
                 upvalues_ok = false;
                 break;
             }
@@ -2069,6 +2152,251 @@ static bool loadProceduresFromStream(FILE* f, int proc_count, uint32_t chunk_ver
     }
 
     free(fixups);
+    return ok;
+}
+
+/* ============ Top-level PSB3 container (VM 2.0 plan §5.2) =============
+ *
+ * [magic u32le 'PSB3'] [format_ver u16] [vm_ver u16] [flags u32] [section_count u32]
+ * section_count * { id:u32  offset:u32  length:u32 }      -- directory
+ * section bodies, each starting on an 8-byte boundary
+ *
+ * Unknown section ids are simply not looked up (future sections can be
+ * added without another format break). This is a hard cutover: the old PSB2
+ * reader/writer are gone, not kept as a fallback (Docs/pscal_vm2_plan.md §2)
+ * — a pre-PSB3 cache entry just misses the magic check below and recompiles,
+ * which is the cache's normal cold path.
+ */
+typedef struct {
+    uint32_t id;
+    uint32_t offset;
+    uint32_t length;
+} Psb3SectionEntry;
+
+typedef struct {
+    uint8_t* file_data;
+    size_t file_size;
+    uint16_t format_version;
+    uint16_t vm_version;
+    Psb3SectionEntry* sections;
+    uint32_t section_count;
+} Psb3File;
+
+static void psb3FileFree(Psb3File* pf) {
+    free(pf->file_data);
+    free(pf->sections);
+    memset(pf, 0, sizeof(*pf));
+}
+
+/* Phase 1d loader hardening: every section's [offset, offset+length) must be
+ * fully inside the file and sections must not overlap, checked once here
+ * before any section body is parsed (so a corrupt directory can never send
+ * a reader off the end of the buffer). */
+static bool psb3ParseHeader(Psb3File* pf) {
+    Cursor c;
+    curInit(&c, pf->file_data, pf->file_size);
+    uint32_t magic = curU32LE(&c);
+    uint16_t format_ver = curU16LE(&c);
+    uint16_t vm_ver = curU16LE(&c);
+    uint32_t flags = curU32LE(&c);
+    uint32_t section_count = curU32LE(&c);
+    (void)flags;
+    if (c.error || magic != PSB3_MAGIC) return false;
+    if (section_count > 64) return false; /* sanity bound; real files carry <= 7 */
+    pf->format_version = format_ver;
+    pf->vm_version = vm_ver;
+    pf->section_count = section_count;
+    pf->sections = (Psb3SectionEntry*)malloc(sizeof(Psb3SectionEntry) * (section_count ? section_count : 1));
+    if (!pf->sections) return false;
+    for (uint32_t i = 0; i < section_count; ++i) {
+        pf->sections[i].id = curU32LE(&c);
+        pf->sections[i].offset = curU32LE(&c);
+        pf->sections[i].length = curU32LE(&c);
+    }
+    if (c.error) return false;
+
+    for (uint32_t i = 0; i < section_count; ++i) {
+        uint64_t start = pf->sections[i].offset;
+        uint64_t len = pf->sections[i].length;
+        if (len > 0 && (start >= pf->file_size || len > pf->file_size - start)) {
+            return false; /* section runs off the end of the file */
+        }
+        uint64_t end = start + len;
+        for (uint32_t j = i + 1; j < section_count; ++j) {
+            uint64_t ostart = pf->sections[j].offset;
+            uint64_t oend = ostart + (uint64_t)pf->sections[j].length;
+            if (start < oend && ostart < end) {
+                return false; /* overlapping sections */
+            }
+        }
+    }
+    return true;
+}
+
+static bool psb3FindSection(const Psb3File* pf, uint32_t id, Cursor* out) {
+    for (uint32_t i = 0; i < pf->section_count; ++i) {
+        if (pf->sections[i].id == id) {
+            curInit(out, pf->file_data + pf->sections[i].offset, pf->sections[i].length);
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool psb3Load(const char* path, Psb3File* pf) {
+    memset(pf, 0, sizeof(*pf));
+    FILE* f = fopen(path, "rb");
+    if (!f) return false;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    long sz = ftell(f);
+    if (sz < 0) { fclose(f); return false; }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return false; }
+    pf->file_data = (uint8_t*)malloc((size_t)sz > 0 ? (size_t)sz : 1);
+    if (!pf->file_data) { fclose(f); return false; }
+    pf->file_size = (size_t)sz;
+    if (sz > 0 && fread(pf->file_data, 1, (size_t)sz, f) != (size_t)sz) {
+        fclose(f);
+        psb3FileFree(pf);
+        return false;
+    }
+    fclose(f);
+    if (!psb3ParseHeader(pf)) {
+        psb3FileFree(pf);
+        return false;
+    }
+    return true;
+}
+
+static bool psb3ReadChunk(const Psb3File* pf, BytecodeChunk* chunk) {
+    chunk->version = pf->vm_version;
+    chunk->code = NULL;
+    chunk->lines = NULL;
+    chunk->constants = NULL;
+    chunk->builtin_lowercase_indices = NULL;
+    chunk->builtin_resolved_ids = NULL;
+    chunk->global_symbol_cache = NULL;
+
+    Cursor code_c, lines_c, const_c, bmap_c, procs_c, types_c;
+    if (!psb3FindSection(pf, PSB3_SEC_CODE, &code_c) ||
+        !psb3FindSection(pf, PSB3_SEC_LINE, &lines_c) ||
+        !psb3FindSection(pf, PSB3_SEC_CONS, &const_c) ||
+        !psb3FindSection(pf, PSB3_SEC_BMAP, &bmap_c) ||
+        !psb3FindSection(pf, PSB3_SEC_PROC, &procs_c) ||
+        !psb3FindSection(pf, PSB3_SEC_TYPE, &types_c)) {
+        return false;
+    }
+
+    int read_consts = 0;
+    if (!readCodeSection(&code_c, chunk)) { resetChunk(chunk, 0); return false; }
+    if (!readLinesSection(&lines_c, chunk)) { resetChunk(chunk, 0); return false; }
+    if (!readConstSection(&const_c, chunk, &read_consts)) { resetChunk(chunk, read_consts); return false; }
+    if (!readBmapSection(&bmap_c, chunk)) { resetChunk(chunk, read_consts); return false; }
+    if (!readProcsSection(&procs_c, chunk)) { resetChunk(chunk, read_consts); return false; }
+    if (!readTypesSection(&types_c)) { resetChunk(chunk, read_consts); return false; }
+    return true;
+}
+
+static bool psb3ReadMeta(const Psb3File* pf, MetaSection* meta) {
+    Cursor meta_c;
+    if (!psb3FindSection(pf, PSB3_SEC_META, &meta_c)) return false;
+    return readMetaSection(&meta_c, meta);
+}
+
+/* Shared writer for both the bytecode cache (include_meta=true: embeds
+ * source path + integrity hashes, cache-only) and explicit .bc files
+ * (include_meta=false: no local-path leakage in distributable artifacts). */
+static bool psb3Write(FILE* f, const BytecodeChunk* chunk,
+                      const char* source_path,
+                      uint64_t source_hash, uint64_t combined_hash,
+                      bool include_meta) {
+    ByteBuf code_buf, lines_buf, const_buf, bmap_buf, procs_buf, types_buf, meta_buf;
+    bufInit(&code_buf); bufInit(&lines_buf); bufInit(&const_buf);
+    bufInit(&bmap_buf); bufInit(&procs_buf); bufInit(&types_buf); bufInit(&meta_buf);
+
+    uint32_t prev_version = g_astCacheVersion;
+    g_astCacheVersion = chunk->version;
+    writeCodeSection(&code_buf, chunk);
+    writeLinesSection(&lines_buf, chunk);
+    writeConstSection(&const_buf, chunk);
+    writeBmapSection(&bmap_buf, chunk);
+    writeProcsSection(&procs_buf);
+    writeTypesSection(&types_buf);
+    g_astCacheVersion = prev_version;
+    if (include_meta) {
+        writeMetaSection(&meta_buf, source_path, source_hash, combined_hash);
+    }
+
+    struct { uint32_t id; ByteBuf* buf; } sections[7];
+    int n = 0;
+    sections[n].id = PSB3_SEC_CODE; sections[n++].buf = &code_buf;
+    sections[n].id = PSB3_SEC_LINE; sections[n++].buf = &lines_buf;
+    sections[n].id = PSB3_SEC_CONS; sections[n++].buf = &const_buf;
+    sections[n].id = PSB3_SEC_BMAP; sections[n++].buf = &bmap_buf;
+    sections[n].id = PSB3_SEC_PROC; sections[n++].buf = &procs_buf;
+    sections[n].id = PSB3_SEC_TYPE; sections[n++].buf = &types_buf;
+    if (include_meta) {
+        sections[n].id = PSB3_SEC_META; sections[n++].buf = &meta_buf;
+    }
+
+    ByteBuf header;
+    bufInit(&header);
+    bufU32LE(&header, PSB3_MAGIC);
+    bufU16LE(&header, (uint16_t)PSB3_FORMAT_VERSION);
+    bufU16LE(&header, (uint16_t)chunk->version);
+    bufU32LE(&header, 0); /* flags: reserved */
+    bufU32LE(&header, (uint32_t)n);
+
+    size_t dir_entry_size = 12;
+    size_t running_offset = header.len + (size_t)n * dir_entry_size;
+    running_offset = (running_offset + (PSB3_SECTION_ALIGN - 1)) & ~((size_t)PSB3_SECTION_ALIGN - 1);
+
+    uint32_t offsets[7];
+    for (int i = 0; i < n; ++i) {
+        offsets[i] = (uint32_t)running_offset;
+        running_offset += sections[i].buf->len;
+        running_offset = (running_offset + (PSB3_SECTION_ALIGN - 1)) & ~((size_t)PSB3_SECTION_ALIGN - 1);
+    }
+
+    ByteBuf directory;
+    bufInit(&directory);
+    for (int i = 0; i < n; ++i) {
+        bufU32LE(&directory, sections[i].id);
+        bufU32LE(&directory, offsets[i]);
+        bufU32LE(&directory, (uint32_t)sections[i].buf->len);
+    }
+
+    bool ok = true;
+    if (fwrite(header.data, 1, header.len, f) != header.len) ok = false;
+    if (ok && fwrite(directory.data, 1, directory.len, f) != directory.len) ok = false;
+
+    size_t written = header.len + directory.len;
+    static const uint8_t zeros[PSB3_SECTION_ALIGN] = {0};
+    for (int i = 0; ok && i < n; ++i) {
+        while (written < offsets[i]) {
+            size_t pad = offsets[i] - written;
+            size_t chunklen = pad < PSB3_SECTION_ALIGN ? pad : PSB3_SECTION_ALIGN;
+            if (fwrite(zeros, 1, chunklen, f) != chunklen) { ok = false; break; }
+            written += chunklen;
+        }
+        if (!ok) break;
+        if (sections[i].buf->len > 0 &&
+            fwrite(sections[i].buf->data, 1, sections[i].buf->len, f) != sections[i].buf->len) {
+            ok = false;
+            break;
+        }
+        written += sections[i].buf->len;
+        size_t aligned = (written + (PSB3_SECTION_ALIGN - 1)) & ~((size_t)PSB3_SECTION_ALIGN - 1);
+        while (written < aligned) {
+            size_t pad = aligned - written;
+            size_t chunklen = pad < PSB3_SECTION_ALIGN ? pad : PSB3_SECTION_ALIGN;
+            if (fwrite(zeros, 1, chunklen, f) != chunklen) { ok = false; break; }
+            written += chunklen;
+        }
+    }
+
+    bufFree(&code_buf); bufFree(&lines_buf); bufFree(&const_buf);
+    bufFree(&bmap_buf); bufFree(&procs_buf); bufFree(&types_buf); bufFree(&meta_buf);
+    bufFree(&header); bufFree(&directory);
     return ok;
 }
 
@@ -2174,29 +2502,19 @@ bool loadBytecodeFromCache(const char* source_path,
             continue;
         }
 
-        FILE* f = fopen(cache_path, "rb");
-        if (!f) {
-            continue;
-        }
-
-        uint32_t magic = 0, ver = 0;
-        uint64_t stored_source_hash = 0, stored_combined_hash = 0;
-        if (fread(&magic, sizeof(magic), 1, f) != 1 ||
-            fread(&ver, sizeof(ver), 1, f) != 1 ||
-            fread(&stored_source_hash, sizeof(stored_source_hash), 1, f) != 1 ||
-            fread(&stored_combined_hash, sizeof(stored_combined_hash), 1, f) != 1 ||
-            magic != CACHE_MAGIC) {
-            fclose(f);
+        Psb3File pf;
+        if (!psb3Load(cache_path, &pf)) {
             unlink(cache_path);
             continue;
         }
 
+        uint32_t ver = pf.vm_version;
         if (ver > vm_ver) {
             if (strict) {
                 fprintf(stderr,
                         "Cached bytecode requires VM version %u but current VM version is %u\n",
                         ver, vm_ver);
-                fclose(f);
+                psb3FileFree(&pf);
                 abort_all = true;
                 break;
             } else {
@@ -2206,26 +2524,43 @@ bool loadBytecodeFromCache(const char* source_path,
             }
         }
 
-        if (stored_source_hash != source_hash) {
-            fclose(f);
+        MetaSection meta;
+        if (!psb3ReadMeta(&pf, &meta)) {
+            psb3FileFree(&pf);
             unlink(cache_path);
             continue;
         }
 
-        chunk->version = ver;
-        if (!verifySourcePath(f, source_path, strict)) {
-            fclose(f);
+        if (meta.source_hash != source_hash) {
+            free(meta.source_path);
+            psb3FileFree(&pf);
             unlink(cache_path);
             continue;
         }
 
-        if (!readChunkCore(f, chunk, ver, source_hash, stored_combined_hash, true)) {
-            fclose(f);
+        if (!verifySourcePathString(meta.source_path, source_path, strict)) {
+            free(meta.source_path);
+            psb3FileFree(&pf);
+            unlink(cache_path);
+            continue;
+        }
+        free(meta.source_path);
+
+        if (!psb3ReadChunk(&pf, chunk)) {
+            psb3FileFree(&pf);
             unlink(cache_path);
             continue;
         }
 
-        fclose(f);
+        uint64_t computed_combined = computeCombinedHash(source_hash, chunk);
+        if (computed_combined != meta.combined_hash) {
+            resetChunk(chunk, chunk->constants_count);
+            psb3FileFree(&pf);
+            unlink(cache_path);
+            continue;
+        }
+
+        psb3FileFree(&pf);
 
         restoreProcedureConstructorAliases(procedure_table);
 
@@ -2248,175 +2583,33 @@ bool loadBytecodeFromCache(const char* source_path,
 }
 
 bool loadBytecodeFromFile(const char* file_path, BytecodeChunk* chunk) {
-    bool ok = false;
-    int const_count = 0;
-    int read_consts = 0;
-    uint32_t prev_ast_version = g_astCacheVersion;
-
-    FILE* f = fopen(file_path, "rb");
-    if (f) {
-        uint32_t magic = 0, ver = 0;
-        uint64_t source_hash = 0, combined_hash = 0;
-        if (fread(&magic, sizeof(magic), 1, f) == 1 &&
-            fread(&ver, sizeof(ver), 1, f) == 1 &&
-            fread(&source_hash, sizeof(source_hash), 1, f) == 1 &&
-            fread(&combined_hash, sizeof(combined_hash), 1, f) == 1 &&
-            magic == CACHE_MAGIC) {
-            const char* strict_env = getenv("PSCAL_STRICT_VM");
-            bool strict = strict_env && strict_env[0] != '\0';
-            uint32_t vm_ver = pscal_vm_version();
-            if (ver > vm_ver) {
-                if (strict) {
-                    fprintf(stderr,
-                            "Bytecode requires VM version %u but this VM only supports version %u\\n",
-                            ver, vm_ver);
-                    fclose(f);
-                    g_astCacheVersion = prev_ast_version;
-                    return false;
-                } else {
-                    fprintf(stderr,
-                            "Warning: bytecode targets VM version %u but running version is %u\\n",
-                            ver, vm_ver);
-                }
-            }
-            chunk->version = ver;
-            g_astCacheVersion = ver;
-            skipSourcePath(f);
-            int count = 0;
-            if (fread(&count, sizeof(count), 1, f) == 1 &&
-                fread(&const_count, sizeof(const_count), 1, f) == 1) {
-                chunk->code = (uint8_t*)malloc(count);
-                chunk->lines = (int*)malloc(sizeof(int) * count);
-                chunk->constants = (Value*)calloc(const_count, sizeof(Value));
-                if (chunk->code && chunk->lines && chunk->constants) {
-                    chunk->count = count;
-                    chunk->capacity = count;
-                    chunk->constants_count = const_count;
-                    chunk->constants_capacity = const_count;
-                    if (fread(chunk->code, 1, count, f) == (size_t)count &&
-                        fread(chunk->lines, sizeof(int), count, f) == (size_t)count) {
-                        ok = true;
-                        for (read_consts = 0; read_consts < const_count; ++read_consts) {
-                            if (!readValue(f, &chunk->constants[read_consts])) { ok = false; break; }
-                        }
-                        if (ok && chunk->constants_capacity > 0) {
-                            chunk->builtin_lowercase_indices = (int*)malloc(sizeof(int) * chunk->constants_capacity);
-                            if (!chunk->builtin_lowercase_indices) {
-                                ok = false;
-                            } else {
-                                for (int i = 0; i < chunk->constants_capacity; ++i) {
-                                    chunk->builtin_lowercase_indices[i] = -1;
-                                }
-                            }
-                        }
-                        if (ok && ver >= 8) {
-                            int builtin_map_count = 0;
-                            if (fread(&builtin_map_count, sizeof(builtin_map_count), 1, f) != 1) {
-                                ok = false;
-                            } else {
-                                for (int i = 0; i < builtin_map_count; ++i) {
-                                    int original_idx = 0;
-                                    int lower_idx = 0;
-                                    if (fread(&original_idx, sizeof(original_idx), 1, f) != 1 ||
-                                        fread(&lower_idx, sizeof(lower_idx), 1, f) != 1) {
-                                        ok = false;
-                                        break;
-                                    }
-                                    if (!chunk->builtin_lowercase_indices) {
-                                        continue;
-                                    }
-                                    if (original_idx >= 0 && original_idx < chunk->constants_count) {
-                                        chunk->builtin_lowercase_indices[original_idx] = lower_idx;
-                                    }
-                                }
-                            }
-                        }
-                        if (ok) {
-                            int stored_proc_count = 0;
-                            if (fread(&stored_proc_count, sizeof(stored_proc_count), 1, f) == 1) {
-                                if (stored_proc_count < 0) {
-                                    int proc_count = -stored_proc_count - 1;
-                                    if (!loadProceduresFromStream(f, proc_count, ver)) {
-                                        ok = false;
-                                    }
-                                } else {
-                                    ok = false;
-                                }
-                            } else {
-                                ok = false;
-                            }
-                        }
-                        if (ok) {
-                            int const_sym_count = 0;
-                            if (fread(&const_sym_count, sizeof(const_sym_count), 1, f) == 1) {
-                                for (int i = 0; i < const_sym_count; ++i) {
-                                    int name_len = 0;
-                                    if (fread(&name_len, sizeof(name_len), 1, f) != 1) { ok = false; break; }
-                                    char* name = (char*)malloc(name_len + 1);
-                                    if (!name) { ok = false; break; }
-                                    if (fread(name, 1, name_len, f) != (size_t)name_len) {
-                                        free(name); ok = false; break; }
-                                    name[name_len] = '\0';
-                                    VarType type;
-                                    if (fread(&type, sizeof(type), 1, f) != 1) { free(name); ok = false; break; }
-
-                                    Value val = {0};
-                                    if (!readValue(f, &val)) { free(name); ok = false; break; }
-                                    insertGlobalSymbol(name, type, NULL);
-                                    Symbol* sym = lookupGlobalSymbol(name);
-                                    if (sym && sym->value) {
-                                        freeValue(sym->value);
-                                        *(sym->value) = val;
-                                        sym->is_const = true;
-                                    } else {
-                                        freeValue(&val);
-                                    }
-                                    free(name);
-                                }
-                            } else {
-                                ok = false;
-                            }
-                        }
-                        if (ok) {
-                            int type_count = 0;
-                            if (fread(&type_count, sizeof(type_count), 1, f) == 1) {
-                                for (int i = 0; i < type_count; ++i) {
-                                    int name_len = 0;
-                                    if (fread(&name_len, sizeof(name_len), 1, f) != 1) { ok = false; break; }
-                                    char* name = (char*)malloc(name_len + 1);
-                                    if (!name) { ok = false; break; }
-                                    if (fread(name, 1, name_len, f) != (size_t)name_len) { free(name); ok = false; break; }
-                                    name[name_len] = '\0';
-                                    AST* type_ast = readAst(f);
-                                    if (!type_ast) { free(name); ok = false; break; }
-                                    insertType(name, type_ast);
-                                    freeAST(type_ast);
-                                    free(name);
-                                }
-                            } else {
-                                ok = false;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        fclose(f);
+    Psb3File pf;
+    if (!psb3Load(file_path, &pf)) {
+        return false;
     }
 
-    g_astCacheVersion = prev_ast_version;
+    const char* strict_env = getenv("PSCAL_STRICT_VM");
+    bool strict = strict_env && strict_env[0] != '\0';
+    uint32_t vm_ver = pscal_vm_version();
+    if (pf.vm_version > vm_ver) {
+        if (strict) {
+            fprintf(stderr,
+                    "Bytecode requires VM version %u but this VM only supports version %u\n",
+                    pf.vm_version, vm_ver);
+            psb3FileFree(&pf);
+            return false;
+        }
+        fprintf(stderr,
+                "Warning: bytecode targets VM version %u but running version is %u\n",
+                pf.vm_version, vm_ver);
+    }
+
+    bool ok = psb3ReadChunk(&pf, chunk);
+    psb3FileFree(&pf);
 
     if (ok) {
         restoreProcedureConstructorAliases(procedure_table);
-    }
-
-    if (!ok) {
-        for (int i = 0; i < read_consts; ++i) {
-            freeValue(&chunk->constants[i]);
-        }
-        free(chunk->code);
-        free(chunk->lines);
-        free(chunk->constants);
+    } else {
         initBytecodeChunk(chunk);
     }
     return ok;
@@ -2426,17 +2619,10 @@ static bool serializeBytecodeChunk(FILE* f,
                                    const char* source_path,
                                    const BytecodeChunk* chunk,
                                    uint64_t source_hash,
-                                   uint64_t combined_hash) {
+                                   uint64_t combined_hash,
+                                   bool include_meta) {
     if (!f) return false;
-    uint32_t magic = CACHE_MAGIC, ver = chunk->version;
-    fwrite(&magic, sizeof(magic), 1, f);
-    fwrite(&ver, sizeof(ver), 1, f);
-    fwrite(&source_hash, sizeof(source_hash), 1, f);
-    fwrite(&combined_hash, sizeof(combined_hash), 1, f);
-    if (!writeSourcePath(f, source_path)) {
-        return false;
-    }
-    return writeChunkCore(f, chunk);
+    return psb3Write(f, chunk, source_path, source_hash, combined_hash, include_meta);
 }
 
 void saveBytecodeToCache(const char* source_path, const char* compiler_id, const BytecodeChunk* chunk) {
@@ -2505,7 +2691,7 @@ void saveBytecodeToCache(const char* source_path, const char* compiler_id, const
         free(dir);
         return;
     }
-    if (!serializeBytecodeChunk(f, source_path, chunk, source_hash, combined_hash)) {
+    if (!serializeBytecodeChunk(f, source_path, chunk, source_hash, combined_hash, true)) {
         fclose(f);
         unlink(cache_path);
         free(cache_path);
@@ -2529,7 +2715,7 @@ bool saveBytecodeToFile(const char* file_path, const char* source_path, const By
 
     FILE* f = fopen(file_path, "wb");
     if (!f) return false;
-    bool ok = serializeBytecodeChunk(f, source_path, chunk, source_hash, combined_hash);
+    bool ok = serializeBytecodeChunk(f, source_path, chunk, source_hash, combined_hash, false);
     fclose(f);
     return ok;
 }

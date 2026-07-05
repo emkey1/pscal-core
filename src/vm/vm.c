@@ -1144,7 +1144,7 @@ typedef enum {
 
 typedef struct ThreadJob {
     ThreadJobKind kind;
-    uint16_t entry;
+    uint32_t entry;
     BytecodeChunk* chunk;
     int argc;
     Value* args;
@@ -1380,7 +1380,7 @@ static void vmCacheGlobalSymbol(BytecodeChunk* chunk, int index, Symbol* sym) {
 static ThreadJob* vmThreadJobCreate(VM* vm,
                                     ThreadJobKind kind,
                                     BytecodeChunk* chunk,
-                                    uint16_t entry,
+                                    uint32_t entry,
                                     ClosureEnvPayload* closureEnv,
                                     Symbol* closureSymbol,
                                     int argc,
@@ -1469,9 +1469,9 @@ static ThreadJob* vmThreadJobCreate(VM* vm,
 
 // Forward declarations for helpers used by threadStart.
 static void push(VM* vm, Value value);
-static Symbol* findProcedureByAddress(HashTable* table, uint16_t address);
+static Symbol* findProcedureByAddress(HashTable* table, uint32_t address);
 static void vmPopulateProcedureAddressCache(VM* vm);
-static Symbol* vmGetProcedureByAddress(VM* vm, uint16_t address);
+static Symbol* vmGetProcedureByAddress(VM* vm, uint32_t address);
 
 static bool vmThreadCaptureUpvaluesForJob(VM* vm, ThreadJob* job) {
     if (!vm || !job || job->kind != THREAD_JOB_BYTECODE) {
@@ -2058,7 +2058,7 @@ static void* threadStart(void* arg) {
 static int createThreadJob(VM* vm,
                            ThreadJobKind kind,
                            BytecodeChunk* chunk,
-                           uint16_t entry,
+                           uint32_t entry,
                            ClosureEnvPayload* closureEnv,
                            Symbol* closureSymbol,
                            int argc,
@@ -2200,7 +2200,7 @@ static int createThreadJob(VM* vm,
 }
 
 static int createThreadWithArgs(VM* vm,
-                                uint16_t entry,
+                                uint32_t entry,
                                 ClosureEnvPayload* closureEnv,
                                 Symbol* closureSymbol,
                                 int argc,
@@ -2210,7 +2210,7 @@ static int createThreadWithArgs(VM* vm,
 }
 
 // Backward-compatible helper: no argument provided, pass NIL
-static int createThread(VM* vm, uint16_t entry) {
+static int createThread(VM* vm, uint32_t entry) {
     return createThreadWithArgs(vm, entry, NULL, NULL, 0, NULL);
 }
 
@@ -3500,7 +3500,7 @@ static Value copyInterfaceReceiverAlias(Value* receiverCell) {
     return alias;
 }
 
-static Symbol* findProcedureByAddress(HashTable* table, uint16_t address) {
+static Symbol* findProcedureByAddress(HashTable* table, uint32_t address) {
     if (!table) return NULL;
     for (int i = 0; i < HASHTABLE_SIZE; i++) {
         for (Symbol* s = table->buckets[i]; s; s = s->next) {
@@ -3579,7 +3579,7 @@ static void vmPopulateProcedureAddressCache(VM* vm) {
     populateProcedureCacheFromTable(vm, vm->procedureTable);
 }
 
-static Symbol* vmGetProcedureByAddress(VM* vm, uint16_t address) {
+static Symbol* vmGetProcedureByAddress(VM* vm, uint32_t address) {
     if (!vm) return NULL;
 
     Symbol* symbol = NULL;
@@ -3684,12 +3684,12 @@ static Value vmHostCreateThreadAddr(VM* vm) {
             }
         }
         Value addrVal = pop(vm);
-        uint16_t entry = 0;
+        uint32_t entry = 0;
         bool validEntry = false;
         ClosureEnvPayload* closureEnv = NULL;
         Symbol* closureSymbol = NULL;
         if (VALUE_TYPE(addrVal) == TYPE_CLOSURE) {
-            entry = (uint16_t)AS_CLOSURE(addrVal).entry_offset;
+            entry = (uint32_t)AS_CLOSURE(addrVal).entry_offset;
             closureEnv = AS_CLOSURE(addrVal).env;
             closureSymbol = AS_CLOSURE(addrVal).symbol;
             if (closureEnv) {
@@ -3703,12 +3703,12 @@ static Value vmHostCreateThreadAddr(VM* vm) {
             toLowerString(lookup_name);
             Symbol* proc_symbol = findProcedureByName(vm->procedureTable, lookup_name, vm);
             if (proc_symbol && proc_symbol->is_defined && proc_symbol->bytecode_address >= 0) {
-                entry = (uint16_t)proc_symbol->bytecode_address;
+                entry = (uint32_t)proc_symbol->bytecode_address;
                 closureSymbol = proc_symbol;
                 validEntry = true;
             }
         } else if (IS_INTLIKE(addrVal)) {
-            entry = (uint16_t)AS_INTEGER(addrVal);
+            entry = (uint32_t)AS_INTEGER(addrVal);
             validEntry = true;
         }
         freeValue(&addrVal);
@@ -3734,12 +3734,12 @@ static Value vmHostCreateThreadAddr(VM* vm) {
         // Backwards-compatible path: [addr, arg]
         Value argVal = argcVal; // already popped
         Value addrVal = pop(vm);
-        uint16_t entry = 0;
+        uint32_t entry = 0;
         bool validEntry = false;
         ClosureEnvPayload* closureEnv = NULL;
         Symbol* closureSymbol = NULL;
         if (VALUE_TYPE(addrVal) == TYPE_CLOSURE) {
-            entry = (uint16_t)AS_CLOSURE(addrVal).entry_offset;
+            entry = (uint32_t)AS_CLOSURE(addrVal).entry_offset;
             closureEnv = AS_CLOSURE(addrVal).env;
             closureSymbol = AS_CLOSURE(addrVal).symbol;
             if (closureEnv) {
@@ -3753,12 +3753,12 @@ static Value vmHostCreateThreadAddr(VM* vm) {
             toLowerString(lookup_name);
             Symbol* proc_symbol = findProcedureByName(vm->procedureTable, lookup_name, vm);
             if (proc_symbol && proc_symbol->is_defined && proc_symbol->bytecode_address >= 0) {
-                entry = (uint16_t)proc_symbol->bytecode_address;
+                entry = (uint32_t)proc_symbol->bytecode_address;
                 closureSymbol = proc_symbol;
                 validEntry = true;
             }
         } else if (IS_INTLIKE(addrVal)) {
-            entry = (uint16_t)AS_INTEGER(addrVal);
+            entry = (uint32_t)AS_INTEGER(addrVal);
             validEntry = true;
         }
         freeValue(&addrVal);
@@ -3787,7 +3787,7 @@ static Value vmHostCreateClosure(VM* vm) {
         runtimeError(vm, "VM Error: Closure creation requires integer entry address.");
         return makeNil();
     }
-    uint16_t entry = (uint16_t)AS_INTEGER(entryVal);
+    uint32_t entry = (uint32_t)AS_INTEGER(entryVal);
     freeValue(&entryVal);
 
     Value countVal = pop(vm);
@@ -4497,7 +4497,7 @@ static Value vmHostInterfaceLookup(VM* vm) {
 
     vmStoreThreadMyself(vm, copyInterfaceReceiverAlias(receiverCell));
 
-    uint16_t target_address = (uint16_t)AS_INTEGER(entry);
+    uint32_t target_address = (uint32_t)AS_INTEGER(entry);
 
     freeValue(&methodIndexVal);
     freeValue(&ifaceVal);
@@ -5746,7 +5746,7 @@ static BuiltinRoutineType vmBuiltinTypeCached(int builtin_id, const char* fallba
 }
 
 // --- Main Interpretation Loop ---
-InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globals, HashTable* const_globals, HashTable* procedures, uint16_t entry) {
+InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globals, HashTable* const_globals, HashTable* procedures, uint32_t entry) {
     if (!vm || !chunk) return INTERPRET_RUNTIME_ERROR;
 
     /* Defensive: ensure symbol tables exist so DEFINE_GLOBAL and similar ops
@@ -5772,11 +5772,22 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
     vmPopulateProcedureAddressCache(vm);
 
 #if VM_USE_COMPUTED_GOTO
-    static void *dispatch_table[OPCODE_COUNT] = {
-#define OP(name, value, operands, stack_in, stack_out) [value] = &&LABEL_##name,
+    // VM 2.0 Phase 1a: full 256-entry dispatch table (reserved-range dispatch,
+    // plan Docs/pscal_vm2_plan.md §5.1). Unused opcode values (holes in the
+    // 0x00-0x63 published page, and the whole 0x64-0xFF reserved space) point
+    // at LABEL_INVALID so `goto *dispatch_table[instruction_val]` is always
+    // safe for any uint8_t opcode byte with no bounds check on the hot path.
+    static void *dispatch_table[256];
+    static bool dispatch_table_ready = false;
+    if (!dispatch_table_ready) {
+        for (int dt_i = 0; dt_i < 256; ++dt_i) {
+            dispatch_table[dt_i] = &&LABEL_INVALID;
+        }
+#define OP(name, value, operands, stack_in, stack_out) dispatch_table[value] = &&LABEL_##name;
 #include "compiler/opcodes.def"
 #undef OP
-    };
+        dispatch_table_ready = true;
+    }
 #endif
 
     bool opcode_profile_enabled = vmOpcodeProfileIsEnabled();
@@ -6243,9 +6254,6 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
             vm->trace_executed++;
         }
 #if VM_USE_COMPUTED_GOTO
-        if (instruction_val >= OPCODE_COUNT) {
-            goto LABEL_INVALID;
-        }
         goto *dispatch_table[instruction_val];
 
 #define OP(name, value, operands, stack_in, stack_out) \
@@ -9311,7 +9319,7 @@ comparison_error_label:
                 break;
             }
             case JUMP_IF_FALSE: {
-                uint16_t offset_val = READ_SHORT(vm);
+                uint32_t offset_val = READ_UINT32(vm);
                 Value condition_value = pop(vm);
                 bool condition_truth = false;
                 bool value_valid = true;
@@ -9343,13 +9351,13 @@ comparison_error_label:
                 freeValue(&condition_value);
 
                 if (!condition_truth) {
-                    vm->ip += (int16_t)offset_val;
+                    vm->ip += (int32_t)offset_val;
                 }
                 break;
             }
             case JUMP: {
-                uint16_t offset = READ_SHORT(vm);
-                vm->ip += (int16_t)offset;
+                uint32_t offset = READ_UINT32(vm);
+                vm->ip += (int32_t)offset;
                 break;
             }
             case POP: {
@@ -9754,10 +9762,10 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
-                // Operands: name_idx (2 bytes), target_address (2 bytes), declared_arity (1 byte)
+                // Operands: name_idx (2 bytes), target_address (4 bytes), declared_arity (1 byte)
                 uint16_t name_idx_ignored = READ_SHORT(vm); // Read and discard the name index
                 (void)name_idx_ignored; // Suppress unused variable warning
-                uint16_t target_address = READ_SHORT(vm);
+                uint32_t target_address = READ_UINT32(vm);
                 uint8_t declared_arity = READ_BYTE();
 
                 if (vm->stackTop - vm->stack < declared_arity) {
@@ -9773,7 +9781,7 @@ comparison_error_label:
 
                 Symbol* proc_symbol = vmGetProcedureByAddress(vm, target_address);
                 if (!proc_symbol) {
-                    runtimeError(vm, "VM Error: Could not retrieve procedure symbol for called address %04d.", target_address);
+                    runtimeError(vm, "VM Error: Could not retrieve procedure symbol for called address %04u.", target_address);
                     vm->frameCount--;
                     return INTERPRET_RUNTIME_ERROR;
                 }
@@ -9853,17 +9861,17 @@ comparison_error_label:
                 Value addrVal = pop(vm);
                 ClosureEnvPayload* captured_env = NULL;
                 Symbol* proc_symbol = NULL;
-                uint16_t target_address = 0;
+                uint32_t target_address = 0;
 
                 if (VALUE_TYPE(addrVal) == TYPE_CLOSURE) {
-                    target_address = (uint16_t)AS_CLOSURE(addrVal).entry_offset;
+                    target_address = (uint32_t)AS_CLOSURE(addrVal).entry_offset;
                     captured_env = AS_CLOSURE(addrVal).env;
                     if (captured_env) {
                         retainClosureEnv(captured_env);
                     }
                     proc_symbol = AS_CLOSURE(addrVal).symbol;
                 } else if (IS_INTLIKE(addrVal)) {
-                    target_address = (uint16_t)AS_INTEGER(addrVal);
+                    target_address = (uint32_t)AS_INTEGER(addrVal);
                 } else {
                     freeValue(&addrVal);
                     runtimeError(vm, "VM Error: Indirect call requires procedure pointer.");
@@ -9900,7 +9908,7 @@ comparison_error_label:
                     if (captured_env) {
                         releaseClosureEnv(captured_env);
                     }
-                    runtimeError(vm, "VM Error: No procedure found at address %04d for indirect call.", target_address);
+                    runtimeError(vm, "VM Error: No procedure found at address %04u for indirect call.", target_address);
                     vm->frameCount--;
                     return INTERPRET_RUNTIME_ERROR;
                 }
@@ -10027,7 +10035,7 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
-                uint16_t target_address = (uint16_t)VAL_UINT(vtable_arr[method_index]);
+                uint16_t target_address = (uint32_t)VAL_UINT(vtable_arr[method_index]);
                 if (vm->frameCount >= VM_CALL_STACK_MAX) {
                     runtimeError(vm, "VM Error: Call stack overflow.");
                     return INTERPRET_RUNTIME_ERROR;
@@ -10123,17 +10131,17 @@ comparison_error_label:
                 Value addrVal = pop(vm);
                 ClosureEnvPayload* captured_env = NULL;
                 Symbol* proc_symbol = NULL;
-                uint16_t target_address = 0;
+                uint32_t target_address = 0;
 
                 if (VALUE_TYPE(addrVal) == TYPE_CLOSURE) {
-                    target_address = (uint16_t)AS_CLOSURE(addrVal).entry_offset;
+                    target_address = (uint32_t)AS_CLOSURE(addrVal).entry_offset;
                     captured_env = AS_CLOSURE(addrVal).env;
                     if (captured_env) {
                         retainClosureEnv(captured_env);
                     }
                     proc_symbol = AS_CLOSURE(addrVal).symbol;
                 } else if (IS_INTLIKE(addrVal)) {
-                    target_address = (uint16_t)AS_INTEGER(addrVal);
+                    target_address = (uint32_t)AS_INTEGER(addrVal);
                 } else {
                     freeValue(&addrVal);
                     runtimeError(vm, "VM Error: Indirect call requires procedure pointer.");
@@ -10169,7 +10177,7 @@ comparison_error_label:
                     if (captured_env) {
                         releaseClosureEnv(captured_env);
                     }
-                    runtimeError(vm, "VM Error: No procedure found at address %04d for indirect call.", target_address);
+                    runtimeError(vm, "VM Error: No procedure found at address %04u for indirect call.", target_address);
                     vm->frameCount--;
                     return INTERPRET_RUNTIME_ERROR;
                 }
@@ -10284,7 +10292,7 @@ comparison_error_label:
                 break;
             }
             case THREAD_CREATE: {
-                uint16_t entry = READ_SHORT(vm);
+                uint32_t entry = READ_UINT32(vm);
                 int id = createThread(vm, entry);
                 if (id < 0) {
                     if (!vm->abort_requested) {

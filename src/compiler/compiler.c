@@ -1030,8 +1030,8 @@ static void defineLabel(Token* token, BytecodeChunk* chunk, int line) {
 
     for (int i = 0; i < info->patch_count; i++) {
         int operand_index = info->patches[i].offset;
-        int distance = info->bytecode_offset - (operand_index + 2);
-        patchShort(chunk, operand_index, (uint16_t)distance);
+        int distance = info->bytecode_offset - (operand_index + 4);
+        patchInt32(chunk, operand_index, (uint32_t)distance);
     }
     if (info->patches) {
         free(info->patches);
@@ -1064,11 +1064,11 @@ static void compileGotoStatement(AST* node, BytecodeChunk* chunk, int line) {
 
     writeBytecodeChunk(chunk, JUMP, line);
     int operand_index = chunk->count;
-    emitShort(chunk, 0xFFFF, line);
+    emitInt32(chunk, 0xFFFFFFFF, line);
 
     if (info->bytecode_offset >= 0) {
-        int distance = info->bytecode_offset - (operand_index + 2);
-        patchShort(chunk, operand_index, (uint16_t)distance);
+        int distance = info->bytecode_offset - (operand_index + 4);
+        patchInt32(chunk, operand_index, (uint32_t)distance);
     } else {
         if (!ensurePatchCapacity(info, info->patch_count + 1)) {
             return;
@@ -4557,7 +4557,7 @@ static void addBreakJump(BytecodeChunk* chunk, int line) {
 
     writeBytecodeChunk(chunk, JUMP, line);
     current_loop->break_jumps[current_loop->break_count - 1] = chunk->count; // Store offset of the operand
-    emitShort(chunk, 0xFFFF, line); // Placeholder
+    emitInt32(chunk, 0xFFFFFFFF, line); // Placeholder
 }
 
 static void patchBreaks(BytecodeChunk* chunk) {
@@ -4567,7 +4567,7 @@ static void patchBreaks(BytecodeChunk* chunk) {
 
     for (int i = 0; i < current_loop->break_count; i++) {
         int jump_offset = current_loop->break_jumps[i];
-        patchShort(chunk, jump_offset, (uint16_t)(jump_target - (jump_offset + 2)));
+        patchInt32(chunk, jump_offset, (uint32_t)(jump_target - (jump_offset + 4)));
     }
 
     if (current_loop->break_jumps) {
@@ -4586,10 +4586,10 @@ static void addContinueJump(BytecodeChunk* chunk, int line) {
     Loop* current_loop = &loop_stack[loop_depth];
     writeBytecodeChunk(chunk, JUMP, line);
     if (current_loop->continue_target >= 0) {
-        int from = chunk->count + 2; // after operand
+        int from = chunk->count + 4; // after operand
         int to = current_loop->continue_target;
-        int16_t rel = (int16_t)(to - from);
-        emitShort(chunk, (uint16_t)rel, line);
+        int32_t rel = (int32_t)(to - from);
+        emitInt32(chunk, (uint32_t)rel, line);
     } else {
         current_loop->continue_count++;
         int* temp = realloc(current_loop->continue_jumps, sizeof(int) * current_loop->continue_count);
@@ -4600,7 +4600,7 @@ static void addContinueJump(BytecodeChunk* chunk, int line) {
         }
         current_loop->continue_jumps = temp;
         current_loop->continue_jumps[current_loop->continue_count - 1] = chunk->count; // operand offset
-        emitShort(chunk, 0xFFFF, line);
+        emitInt32(chunk, 0xFFFFFFFF, line);
     }
 }
 
@@ -4609,7 +4609,7 @@ static void patchContinuesTo(BytecodeChunk* chunk, int targetAddress) {
     Loop* current_loop = &loop_stack[loop_depth];
     for (int i = 0; i < current_loop->continue_count; i++) {
         int jump_offset = current_loop->continue_jumps[i];
-        patchShort(chunk, jump_offset, (uint16_t)(targetAddress - (jump_offset + 2)));
+        patchInt32(chunk, jump_offset, (uint32_t)(targetAddress - (jump_offset + 4)));
     }
     if (current_loop->continue_jumps) {
         free(current_loop->continue_jumps);
@@ -6579,7 +6579,7 @@ static void applyPeepholeOptimizations(BytecodeChunk* chunk) {
         int instruction_length = getInstructionLength(chunk, read_index);
         if (instruction_length <= 0) instruction_length = 1;
 
-        if ((opcode == JUMP || opcode == JUMP_IF_FALSE) && read_index + 2 < original_count) {
+        if ((opcode == JUMP || opcode == JUMP_IF_FALSE) && read_index + 4 < original_count) {
             if (jump_count >= jump_capacity) {
                 int new_capacity = jump_capacity < 8 ? 8 : jump_capacity * 2;
                 JumpFixup* resized = (JumpFixup*)realloc(jump_fixes, (size_t)new_capacity * sizeof(JumpFixup));
@@ -6589,11 +6589,14 @@ static void applyPeepholeOptimizations(BytecodeChunk* chunk) {
                 jump_fixes = resized;
                 jump_capacity = new_capacity;
             }
-            int16_t operand = (int16_t)((original_code[read_index + 1] << 8) | original_code[read_index + 2]);
-            jump_fixes[jump_count].original_target = read_index + 3 + operand;
+            int32_t operand = (int32_t)(((uint32_t)original_code[read_index + 1] << 24) |
+                                         ((uint32_t)original_code[read_index + 2] << 16) |
+                                         ((uint32_t)original_code[read_index + 3] << 8) |
+                                         (uint32_t)original_code[read_index + 4]);
+            jump_fixes[jump_count].original_target = read_index + 5 + operand;
             jump_fixes[jump_count].new_offset = write_index;
             jump_count++;
-        } else if (opcode == THREAD_CREATE && read_index + 2 < original_count) {
+        } else if (opcode == THREAD_CREATE && read_index + 4 < original_count) {
             if (absolute_count >= absolute_capacity) {
                 int new_capacity = absolute_capacity < 8 ? 8 : absolute_capacity * 2;
                 AbsoluteFixup* resized = (AbsoluteFixup*)realloc(absolute_fixes, (size_t)new_capacity * sizeof(AbsoluteFixup));
@@ -6603,8 +6606,10 @@ static void applyPeepholeOptimizations(BytecodeChunk* chunk) {
                 absolute_fixes = resized;
                 absolute_capacity = new_capacity;
             }
-            uint16_t original_address = (uint16_t)((original_code[read_index + 1] << 8) |
-                                                    original_code[read_index + 2]);
+            uint32_t original_address = ((uint32_t)original_code[read_index + 1] << 24) |
+                                         ((uint32_t)original_code[read_index + 2] << 16) |
+                                         ((uint32_t)original_code[read_index + 3] << 8) |
+                                         (uint32_t)original_code[read_index + 4];
             absolute_fixes[absolute_count].operand_offset = write_index + 1;
             absolute_fixes[absolute_count].original_address = (int)original_address;
             absolute_count++;
@@ -6666,9 +6671,11 @@ static void applyPeepholeOptimizations(BytecodeChunk* chunk) {
         }
 
         int new_offset = jump_fixes[i].new_offset;
-        int new_delta = new_target - (new_offset + 3);
-        optimized_code[new_offset + 1] = (uint8_t)((new_delta >> 8) & 0xFF);
-        optimized_code[new_offset + 2] = (uint8_t)(new_delta & 0xFF);
+        int new_delta = new_target - (new_offset + 5);
+        optimized_code[new_offset + 1] = (uint8_t)((new_delta >> 24) & 0xFF);
+        optimized_code[new_offset + 2] = (uint8_t)((new_delta >> 16) & 0xFF);
+        optimized_code[new_offset + 3] = (uint8_t)((new_delta >> 8) & 0xFF);
+        optimized_code[new_offset + 4] = (uint8_t)(new_delta & 0xFF);
     }
 
     for (int i = 0; i < absolute_count; ++i) {
@@ -6677,8 +6684,10 @@ static void applyPeepholeOptimizations(BytecodeChunk* chunk) {
         if (original_address > original_count) original_address = original_count;
         int new_address = offset_map[original_address];
         if (new_address < 0) new_address = offset_map[original_count];
-        optimized_code[absolute_fixes[i].operand_offset] = (uint8_t)((new_address >> 8) & 0xFF);
-        optimized_code[absolute_fixes[i].operand_offset + 1] = (uint8_t)(new_address & 0xFF);
+        optimized_code[absolute_fixes[i].operand_offset] = (uint8_t)((new_address >> 24) & 0xFF);
+        optimized_code[absolute_fixes[i].operand_offset + 1] = (uint8_t)((new_address >> 16) & 0xFF);
+        optimized_code[absolute_fixes[i].operand_offset + 2] = (uint8_t)((new_address >> 8) & 0xFF);
+        optimized_code[absolute_fixes[i].operand_offset + 3] = (uint8_t)(new_address & 0xFF);
     }
 
     uint8_t* resized_code = (uint8_t*)realloc(optimized_code, (size_t)write_index);
@@ -7522,10 +7531,10 @@ static void compileNode(AST* node, BytecodeChunk* chunk, int current_line_approx
             DBG_PRINTF("[dbg] compile decl %s\n", node->token->value);
             writeBytecodeChunk(chunk, JUMP, line);
             int jump_over_body_operand_offset = chunk->count;
-            emitShort(chunk, 0xFFFF, line);
+            emitInt32(chunk, 0xFFFFFFFF, line);
             compileDefinedFunction(node, chunk, line);
-            uint16_t offset_to_skip_body = (uint16_t)(chunk->count - (jump_over_body_operand_offset + 2));
-            patchShort(chunk, jump_over_body_operand_offset, offset_to_skip_body);
+            uint32_t offset_to_skip_body = (uint32_t)(chunk->count - (jump_over_body_operand_offset + 4));
+            patchInt32(chunk, jump_over_body_operand_offset, offset_to_skip_body);
             break;
         }
         case AST_MODULE: {
@@ -7604,7 +7613,7 @@ static void compileDefinedFunction(AST* func_decl_node, BytecodeChunk* chunk, in
     if (outer_fc != NULL) {
         writeBytecodeChunk(chunk, JUMP, line);
         jump_over_body_operand_offset = chunk->count;
-        emitShort(chunk, 0xFFFF, line);
+        emitInt32(chunk, 0xFFFFFFFF, line);
     }
 
     // --- FIX: Declare all variables at the top of the function ---
@@ -7829,8 +7838,10 @@ static void compileDefinedFunction(AST* func_decl_node, BytecodeChunk* chunk, in
                     bool is_jump = (opcode == JUMP || opcode == JUMP_IF_FALSE);
                     if (is_jump && scan_offset + instr_len <= func_code_end) {
                         int operand_idx = scan_offset + 1;
-                        int16_t rel = (int16_t)((chunk->code[operand_idx] << 8) |
-                                                chunk->code[operand_idx + 1]);
+                        int32_t rel = (int32_t)(((uint32_t)chunk->code[operand_idx] << 24) |
+                                                ((uint32_t)chunk->code[operand_idx + 1] << 16) |
+                                                ((uint32_t)chunk->code[operand_idx + 2] << 8) |
+                                                (uint32_t)chunk->code[operand_idx + 3]);
                         int instr_end = scan_offset + instr_len;
                         int dest = instr_end + rel;
                         bool dest_is_end = (dest == func_code_end);
@@ -7915,8 +7926,8 @@ static void compileDefinedFunction(AST* func_decl_node, BytecodeChunk* chunk, in
     }
 
     if (jump_over_body_operand_offset >= 0) {
-        uint16_t offset_to_skip_body = (uint16_t)(chunk->count - (jump_over_body_operand_offset + 2));
-        patchShort(chunk, jump_over_body_operand_offset, offset_to_skip_body);
+        uint32_t offset_to_skip_body = (uint32_t)(chunk->count - (jump_over_body_operand_offset + 4));
+        patchInt32(chunk, jump_over_body_operand_offset, offset_to_skip_body);
     }
 
     for(int i = 0; i < fc.local_count; i++) {
@@ -8108,7 +8119,7 @@ static void compileInlineRoutine(Symbol* proc_symbol, AST* call_node, BytecodeCh
     current_procedure_table = saved_table;
 
     for (int i = 0; i < inline_routine_exit_count; i++) {
-        patchShort(chunk, inline_routine_exit_jumps[i] + 1, chunk->count - (inline_routine_exit_jumps[i] + 3));
+        patchInt32(chunk, inline_routine_exit_jumps[i] + 1, chunk->count - (inline_routine_exit_jumps[i] + 5));
     }
 
     finalizeLabelTable(&inline_labels, proc_symbol->name ? proc_symbol->name : "inline routine");
@@ -8249,7 +8260,7 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                 }
                 int jump_to_end = chunk->count;
                 writeBytecodeChunk(chunk, JUMP, line);
-                emitShort(chunk, 0xFFFF, line);
+                emitInt32(chunk, 0xFFFFFFFF, line);
                 recordInlineRoutineExitJump(jump_to_end);
                 break;
             }
@@ -8458,7 +8469,7 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
 
             writeBytecodeChunk(chunk, JUMP_IF_FALSE, line);
             int exitJumpOffset = chunk->count;
-            emitShort(chunk, 0xFFFF, line);
+            emitInt32(chunk, 0xFFFFFFFF, line);
 
             compileStatement(node->right, chunk, getLine(node->right));
 
@@ -8466,11 +8477,11 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
             patchContinuesTo(chunk, loopStart);
 
             writeBytecodeChunk(chunk, JUMP, line);
-            int backwardJumpOffset = loopStart - (chunk->count + 2);
-            emitShort(chunk, (uint16_t)backwardJumpOffset, line);
+            int backwardJumpOffset = loopStart - (chunk->count + 4);
+            emitInt32(chunk, (uint32_t)backwardJumpOffset, line);
 
-            patchShort(chunk, exitJumpOffset, (uint16_t)(chunk->count - (exitJumpOffset + 2)));
-            
+            patchInt32(chunk, exitJumpOffset, (uint32_t)(chunk->count - (exitJumpOffset + 4)));
+
             patchBreaks(chunk); // <<< MODIFIED: Patch any breaks inside the loop
             endLoop(); // <<< MODIFIED: End loop context
             break;
@@ -8492,7 +8503,7 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                 if (!branch || branch->type != AST_CASE_BRANCH) continue;
 
                 if (fallthrough_jump != -1) {
-                    patchShort(chunk, fallthrough_jump, chunk->count - (fallthrough_jump + 2));
+                    patchInt32(chunk, fallthrough_jump, chunk->count - (fallthrough_jump + 4));
                     fallthrough_jump = -1;
                 }
 
@@ -8541,7 +8552,7 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
 
                     // If the comparison is false, skip the branch body.
                     int false_jump = chunk->count;
-                    writeBytecodeChunk(chunk, JUMP_IF_FALSE, line); emitShort(chunk, 0xFFFF, line);
+                    writeBytecodeChunk(chunk, JUMP_IF_FALSE, line); emitInt32(chunk, 0xFFFFFFFF, line);
 
                     // When the label matches, pop the case value.
                     writeBytecodeChunk(chunk, POP, line);
@@ -8549,13 +8560,13 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                     if (share_branch_body) {
                         // For multi-label branches, jump to the shared branch body.
                         int match_jump = chunk->count;
-                        writeBytecodeChunk(chunk, JUMP, line); emitShort(chunk, 0xFFFF, line);
+                        writeBytecodeChunk(chunk, JUMP, line); emitInt32(chunk, 0xFFFFFFFF, line);
 
                         match_jumps = realloc(match_jumps, (match_jumps_count + 1) * sizeof(int));
                         match_jumps[match_jumps_count++] = match_jump;
 
                         // Patch the false jump to point to the next label check.
-                        patchShort(chunk, false_jump + 1, chunk->count - (false_jump + 3));
+                        patchInt32(chunk, false_jump + 1, chunk->count - (false_jump + 5));
                         fallthrough_jump = false_jump + 1;
                         continue;
                     }
@@ -8566,10 +8577,10 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                     // After body, jump to the end of the CASE.
                     end_jumps = realloc(end_jumps, (end_jumps_count + 1) * sizeof(int));
                     end_jumps[end_jumps_count++] = chunk->count;
-                    writeBytecodeChunk(chunk, JUMP, line); emitShort(chunk, 0xFFFF, line);
+                    writeBytecodeChunk(chunk, JUMP, line); emitInt32(chunk, 0xFFFFFFFF, line);
 
                     // Patch the false jump to point to the next label / branch.
-                    patchShort(chunk, false_jump + 1, chunk->count - (false_jump + 3));
+                    patchInt32(chunk, false_jump + 1, chunk->count - (false_jump + 5));
                     fallthrough_jump = false_jump + 1;
 
                     // Move to the next CASE branch.
@@ -8579,7 +8590,7 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                 if (share_branch_body) {
                     int branch_body_start = chunk->count;
                     for (int j = 0; j < match_jumps_count; j++) {
-                        patchShort(chunk, match_jumps[j] + 1, branch_body_start - (match_jumps[j] + 3));
+                        patchInt32(chunk, match_jumps[j] + 1, branch_body_start - (match_jumps[j] + 5));
                     }
                     if (match_jumps) free(match_jumps);
 
@@ -8588,7 +8599,7 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                     // After body, jump to the end of the CASE.
                     end_jumps = realloc(end_jumps, (end_jumps_count + 1) * sizeof(int));
                     end_jumps[end_jumps_count++] = chunk->count;
-                    writeBytecodeChunk(chunk, JUMP, line); emitShort(chunk, 0xFFFF, line);
+                    writeBytecodeChunk(chunk, JUMP, line); emitInt32(chunk, 0xFFFFFFFF, line);
                 }
 
             next_branch:;
@@ -8596,17 +8607,17 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
 
             // After all branches, if an 'else' exists, compile it.
             if (fallthrough_jump != -1) {
-                patchShort(chunk, fallthrough_jump, chunk->count - (fallthrough_jump + 2));
+                patchInt32(chunk, fallthrough_jump, chunk->count - (fallthrough_jump + 4));
             }
             writeBytecodeChunk(chunk, POP, line); // Pop the case value if no branch was taken.
-            
+
             if (node->extra) {
                 compileStatement(node->extra, chunk, getLine(node->extra));
             }
-            
+
             // End of the CASE. Patch all jumps from successful branches to here.
             for (int i = 0; i < end_jumps_count; i++) {
-                patchShort(chunk, end_jumps[i] + 1, chunk->count - (end_jumps[i] + 3));
+                patchInt32(chunk, end_jumps[i] + 1, chunk->count - (end_jumps[i] + 5));
             }
             if (end_jumps) free(end_jumps);
 
@@ -8631,8 +8642,8 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
             }
 
             writeBytecodeChunk(chunk, JUMP_IF_FALSE, line);
-            int backward_jump_offset = loopStart - (chunk->count + 2);
-            emitShort(chunk, (uint16_t)backward_jump_offset, line);
+            int backward_jump_offset = loopStart - (chunk->count + 4);
+            emitInt32(chunk, (uint32_t)backward_jump_offset, line);
 
             patchBreaks(chunk); // <<< MODIFIED
             endLoop(); // <<< MODIFIED
@@ -8881,7 +8892,7 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
 
             writeBytecodeChunk(chunk, JUMP_IF_FALSE, line);
             int exitJump = chunk->count;
-            emitShort(chunk, 0xFFFF, line);
+            emitInt32(chunk, 0xFFFFFFFF, line);
 
             // 4. Compile the loop body
             compileStatement(body_node, chunk, getLine(body_node));
@@ -8902,11 +8913,11 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
 
             // 6. Jump back to the top of the loop to re-evaluate the condition
             writeBytecodeChunk(chunk, JUMP, line);
-            int backward_jump_offset = loopStart - (chunk->count + 2);
-            emitShort(chunk, (uint16_t)backward_jump_offset, line);
+            int backward_jump_offset = loopStart - (chunk->count + 4);
+            emitInt32(chunk, (uint32_t)backward_jump_offset, line);
 
             // 7. This is the exit point for the loop. Patch the initial condition jump.
-            patchShort(chunk, exitJump, (uint16_t)(chunk->count - (exitJump + 2)));
+            patchInt32(chunk, exitJump, (uint32_t)(chunk->count - (exitJump + 4)));
             
             // 8. Patch any 'break' statements that occurred inside the loop body.
             patchBreaks(chunk);
@@ -8934,20 +8945,20 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
             compileRValue(node->left, chunk, line);
             int jump_to_else_or_end_addr = chunk->count;
             writeBytecodeChunk(chunk, JUMP_IF_FALSE, line);
-            emitShort(chunk, 0xFFFF, line);
+            emitInt32(chunk, 0xFFFFFFFF, line);
             compileStatement(node->right, chunk, getLine(node->right));
             if (node->extra) {
                 int jump_over_else_addr = chunk->count;
                 writeBytecodeChunk(chunk, JUMP, line);
-                emitShort(chunk, 0xFFFF, line);
-                uint16_t offsetToElse = (uint16_t)(chunk->count - (jump_to_else_or_end_addr + 3));
-                patchShort(chunk, jump_to_else_or_end_addr + 1, offsetToElse);
+                emitInt32(chunk, 0xFFFFFFFF, line);
+                uint32_t offsetToElse = (uint32_t)(chunk->count - (jump_to_else_or_end_addr + 5));
+                patchInt32(chunk, jump_to_else_or_end_addr + 1, offsetToElse);
                 compileStatement(node->extra, chunk, getLine(node->extra));
-                uint16_t offsetToEndOfIf = (uint16_t)(chunk->count - (jump_over_else_addr + 3));
-                patchShort(chunk, jump_over_else_addr + 1, offsetToEndOfIf);
+                uint32_t offsetToEndOfIf = (uint32_t)(chunk->count - (jump_over_else_addr + 5));
+                patchInt32(chunk, jump_over_else_addr + 1, offsetToEndOfIf);
             } else {
-                uint16_t offsetToEndOfThen = (uint16_t)(chunk->count - (jump_to_else_or_end_addr + 3));
-                patchShort(chunk, jump_to_else_or_end_addr + 1, offsetToEndOfThen);
+                uint32_t offsetToEndOfThen = (uint32_t)(chunk->count - (jump_to_else_or_end_addr + 5));
+                patchInt32(chunk, jump_to_else_or_end_addr + 1, offsetToEndOfThen);
             }
             break;
         }
@@ -9848,7 +9859,7 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                     if (inline_routine_active) {
                         int jump_to_end = chunk->count;
                         writeBytecodeChunk(chunk, JUMP, line);
-                        emitShort(chunk, 0xFFFF, line);
+                        emitInt32(chunk, 0xFFFFFFFF, line);
                         recordInlineRoutineExitJump(jump_to_end);
                     } else {
                         writeBytecodeChunk(chunk, EXIT, line);
@@ -10298,7 +10309,7 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
             bool needs_closure = proc_symbol->closure_captures || proc_symbol->closure_escapes || proc_symbol->upvalue_count > 0;
             if (call->child_count == 0 && !needs_closure) {
                 writeBytecodeChunk(chunk, THREAD_CREATE, line);
-                emitShort(chunk, (uint16_t)proc_symbol->bytecode_address, line);
+                emitInt32(chunk, (uint32_t)proc_symbol->bytecode_address, line);
             } else {
                 // Support spawning with multiple arguments (including receiver for methods).
                 // Stack layout for host: [addr, arg0, arg1, ..., argc]
@@ -10668,21 +10679,21 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                     compileRValue(node->left, chunk, getLine(node->left)); // stack: [A]
                     int jump_if_false = chunk->count;
                     writeBytecodeChunk(chunk, JUMP_IF_FALSE, line);     // Pops A. Jumps if A is false.
-                    emitShort(chunk, 0xFFFF, line);
+                    emitInt32(chunk, 0xFFFFFFFF, line);
 
                     // If A was true, result is B.
                     compileRValue(node->right, chunk, getLine(node->right)); // stack: [B]
                     writeBytecodeChunk(chunk, TO_BOOL, line);
                     int jump_over_false_case = chunk->count;
                     writeBytecodeChunk(chunk, JUMP, line);
-                    emitShort(chunk, 0xFFFF, line);
+                    emitInt32(chunk, 0xFFFFFFFF, line);
                     // If A was false, jump here and push 'false' as the result.
-                    patchShort(chunk, jump_if_false + 1, chunk->count - (jump_if_false + 3));
+                    patchInt32(chunk, jump_if_false + 1, chunk->count - (jump_if_false + 5));
                     int false_const_idx = addBooleanConstant(chunk, false);
                     emitConstant(chunk, false_const_idx, line); // stack: [false]
 
                     // End of the expression for both paths.
-                    patchShort(chunk, jump_over_false_case + 1, chunk->count - (jump_over_false_case + 3));
+                    patchInt32(chunk, jump_over_false_case + 1, chunk->count - (jump_over_false_case + 5));
                 }
             } else if (node_token && node_token->type == TOKEN_OR) {
                 // Check annotated type for bitwise vs. logical OR
@@ -10696,23 +10707,23 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                 compileRValue(node->left, chunk, getLine(node->left)); // stack: [A]
                 int jump_if_false = chunk->count;
                 writeBytecodeChunk(chunk, JUMP_IF_FALSE, line);     // Pops A. Jumps if A is false.
-                emitShort(chunk, 0xFFFF, line);
+                emitInt32(chunk, 0xFFFFFFFF, line);
 
                 // If we get here, A was true. Stack is empty. The result must be 'true'.
                 int true_const_idx = addBooleanConstant(chunk, true);
                 emitConstant(chunk, true_const_idx, line);
                 int jump_to_end = chunk->count;
                 writeBytecodeChunk(chunk, JUMP, line);
-                emitShort(chunk, 0xFFFF, line);
+                emitInt32(chunk, 0xFFFFFFFF, line);
 
                 // This is where we land if A was false. Stack is empty.
                 // The result of the expression is the result of B.
-                patchShort(chunk, jump_if_false + 1, chunk->count - (jump_if_false + 3));
+                patchInt32(chunk, jump_if_false + 1, chunk->count - (jump_if_false + 5));
                 compileRValue(node->right, chunk, getLine(node->right));
                 writeBytecodeChunk(chunk, TO_BOOL, line);
 
                 // The end for both paths.
-                patchShort(chunk, jump_to_end + 1, chunk->count - (jump_to_end + 3));
+                patchInt32(chunk, jump_to_end + 1, chunk->count - (jump_to_end + 5));
                 }
             }
             else if (node_token && node_token->type == TOKEN_XOR) {
@@ -10775,19 +10786,19 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
             compileRValue(node->left, chunk, getLine(node->left));
             int jumpToElse = chunk->count;
             writeBytecodeChunk(chunk, JUMP_IF_FALSE, line);
-            emitShort(chunk, 0xFFFF, line);
+            emitInt32(chunk, 0xFFFFFFFF, line);
 
             compileRValue(node->right, chunk, getLine(node->right));
             int jumpToEnd = chunk->count;
             writeBytecodeChunk(chunk, JUMP, line);
-            emitShort(chunk, 0xFFFF, line);
+            emitInt32(chunk, 0xFFFFFFFF, line);
 
-            uint16_t elseOffset = (uint16_t)(chunk->count - (jumpToElse + 3));
-            patchShort(chunk, jumpToElse + 1, elseOffset);
+            uint32_t elseOffset = (uint32_t)(chunk->count - (jumpToElse + 5));
+            patchInt32(chunk, jumpToElse + 1, elseOffset);
 
             compileRValue(node->extra, chunk, getLine(node->extra));
-            uint16_t endOffset = (uint16_t)(chunk->count - (jumpToEnd + 3));
-            patchShort(chunk, jumpToEnd + 1, endOffset);
+            uint32_t endOffset = (uint32_t)(chunk->count - (jumpToEnd + 5));
+            patchInt32(chunk, jumpToEnd + 1, endOffset);
             break;
         }
         case AST_BOOLEAN: {
@@ -11502,23 +11513,25 @@ void finalizeBytecode(BytecodeChunk* chunk) {
 
         if (opcode == CALL) {
             // Ensure we can read the full CALL instruction
-            if (offset + 5 >= chunk->count) {
+            if (offset + 7 >= chunk->count) {
                 fprintf(stderr, "Compiler Error: Malformed CALL instruction at offset %d.\n", offset);
                 compiler_had_error = true;
                 break;
             }
 
-            uint16_t address = (uint16_t)((chunk->code[offset + 3] << 8) |
-                                          chunk->code[offset + 4]);
+            uint32_t address = ((uint32_t)chunk->code[offset + 3] << 24) |
+                                ((uint32_t)chunk->code[offset + 4] << 16) |
+                                ((uint32_t)chunk->code[offset + 5] << 8) |
+                                (uint32_t)chunk->code[offset + 6];
 
             // Check if this is a placeholder that needs patching.
-            if (address == 0xFFFF) {
+            if (address == 0xFFFFFFFF) {
                 uint16_t name_index = (uint16_t)((chunk->code[offset + 1] << 8) |
                                                  chunk->code[offset + 2]);
                 if (name_index >= chunk->constants_count) {
                     fprintf(stderr, "Compiler Error: Invalid name index in CALL at offset %d.\n", name_index);
                     compiler_had_error = true;
-                    offset += 6; // Skip this malformed instruction
+                    offset += 8; // Skip this malformed instruction
                     continue;
                 }
 
@@ -11526,7 +11539,7 @@ void finalizeBytecode(BytecodeChunk* chunk) {
                 if (VALUE_TYPE(name_val) != TYPE_STRING) {
                     fprintf(stderr, "Compiler Error: Constant at index %d is not a string for CALL.\n", name_index);
                     compiler_had_error = true;
-                    offset += 6; // Skip
+                    offset += 8; // Skip
                     continue;
                 }
 
@@ -11545,14 +11558,14 @@ void finalizeBytecode(BytecodeChunk* chunk) {
                 symbol_to_patch = resolveSymbolAlias(symbol_to_patch);
 
                 if (symbol_to_patch && symbol_to_patch->is_defined) {
-                    // Patch the address in place. The address occupies bytes offset+3 and offset+4.
-                    patchShort(chunk, offset + 3, (uint16_t)symbol_to_patch->bytecode_address);
+                    // Patch the address in place. The address occupies bytes offset+3..offset+6.
+                    patchInt32(chunk, offset + 3, (uint32_t)symbol_to_patch->bytecode_address);
                 } else {
                     fprintf(stderr, "Compiler Error: Procedure '%s' was called but never defined.\n", proc_name);
                     compiler_had_error = true;
                 }
             }
-            offset += 6; // Advance past the 6-byte CALL instruction
+            offset += 8; // Advance past the 8-byte CALL instruction
         } else {
             // For any other instruction, use the new helper to get the correct length and advance the offset.
             offset += getInstructionLength(chunk, offset);

@@ -98,6 +98,7 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
 void emitShort(BytecodeChunk* chunk, uint16_t value, int line);
 void emitInt32(BytecodeChunk* chunk, uint32_t value, int line);
 void patchShort(BytecodeChunk* chunk, int offset_in_code, uint16_t value);
+void patchInt32(BytecodeChunk* chunk, int offset_in_code, uint32_t value);
 int getInstructionLength(BytecodeChunk* chunk, int offset);
 void setBuiltinLowercaseIndex(BytecodeChunk* chunk, int original_idx, int lowercase_idx);
 int getBuiltinLowercaseIndex(const BytecodeChunk* chunk, int original_idx);

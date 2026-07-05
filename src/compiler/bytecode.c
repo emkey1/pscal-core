@@ -45,11 +45,12 @@ int pscalOpcodeOperandSpecLength(const char* operands) {
                 length += 1;
                 break;
             case 'w':
-            case 'j':
             case 'K':
                 length += 2;
                 break;
+            case 'j':
             case 'f':
+            case 'W':
                 length += 4;
                 break;
             case 'C':
@@ -328,6 +329,18 @@ void patchShort(BytecodeChunk* chunk, int offset_in_code, uint16_t value) {
     chunk->code[offset_in_code + 1] = (uint8_t)(value & 0xFF);
 }
 
+void patchInt32(BytecodeChunk* chunk, int offset_in_code, uint32_t value) {
+    if (offset_in_code < 0 || (offset_in_code + 3) >= chunk->count) {
+        fprintf(stderr, "Error: patchInt32 out of bounds. Offset: %d, Chunk count: %d.\n",
+                offset_in_code, chunk->count);
+        return;
+    }
+    chunk->code[offset_in_code]     = (uint8_t)((value >> 24) & 0xFF);
+    chunk->code[offset_in_code + 1] = (uint8_t)((value >> 16) & 0xFF);
+    chunk->code[offset_in_code + 2] = (uint8_t)((value >> 8) & 0xFF);
+    chunk->code[offset_in_code + 3] = (uint8_t)(value & 0xFF);
+}
+
 void writeInlineCacheSlot(BytecodeChunk* chunk, int line) {
     if (!chunk) {
         return;
@@ -338,7 +351,7 @@ void writeInlineCacheSlot(BytecodeChunk* chunk, int line) {
 }
 
 // Corrected helper function to find procedure/function name by its bytecode address
-static const char* findProcedureNameByAddress(HashTable* procedureTable, uint16_t address) {
+static const char* findProcedureNameByAddress(HashTable* procedureTable, uint32_t address) {
     if (!procedureTable) return NULL;
     for (int i = 0; i < HASHTABLE_SIZE; i++) {
         Symbol* symbol = procedureTable->buckets[i];
@@ -521,6 +534,13 @@ static uint16_t readU16BE(const BytecodeChunk* chunk, int offset) {
     return (uint16_t)((chunk->code[offset] << 8) | chunk->code[offset + 1]);
 }
 
+static uint32_t readU32BE(const BytecodeChunk* chunk, int offset) {
+    return ((uint32_t)chunk->code[offset] << 24) |
+           ((uint32_t)chunk->code[offset + 1] << 16) |
+           ((uint32_t)chunk->code[offset + 2] << 8) |
+           (uint32_t)chunk->code[offset + 3];
+}
+
 // This is the function declared in bytecode.h and called by disassembleBytecodeChunk.
 // Mnemonics and operand widths come from the compiler/opcodes.def metadata
 // table; formatting that needs constant-pool context stays hand-written per
@@ -569,15 +589,15 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
 
         case JUMP_IF_FALSE:
         case JUMP: {
-            int16_t jump_operand = (int16_t)readU16BE(chunk, offset + 1);
-            int target_addr = offset + 3 + jump_operand;
+            int32_t jump_operand = (int32_t)readU32BE(chunk, offset + 1);
+            int target_addr = offset + 5 + jump_operand;
             const char* targetName = findProcedureNameByAddress(procedureTable, target_addr);
             fprintf(stderr, "%-16s %4d (to %04d)", info->name, jump_operand, target_addr);
             if (targetName) {
                 fprintf(stderr, " -> %s", targetName);
             }
             fprintf(stderr, "\n");
-            return offset + 3;
+            return offset + 5;
         }
 
         case DEFINE_GLOBAL: {
@@ -983,17 +1003,17 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
         }
         case CALL: {
             uint16_t name_index = readU16BE(chunk, offset + 1);
-            uint16_t address = readU16BE(chunk, offset + 3);
-            uint8_t declared_arity = chunk->code[offset + 5];
+            uint32_t address = readU32BE(chunk, offset + 3);
+            uint8_t declared_arity = chunk->code[offset + 7];
             const char* targetProcName = "<INVALID>";
             if (name_index < chunk->constants_count &&
                 VALUE_TYPE(chunk->constants[name_index]) == TYPE_STRING &&
                 AS_STRING(chunk->constants[name_index])) {
                 targetProcName = AS_STRING(chunk->constants[name_index]);
             }
-            fprintf(stderr, "%-16s %04d (%s) (%d args)\n",
+            fprintf(stderr, "%-16s %04u (%s) (%d args)\n",
                     "CALL", address, targetProcName, declared_arity);
-            return offset + 6;
+            return offset + 8;
         }
         case CALL_INDIRECT:
         case PROC_CALL_INDIRECT: {
@@ -1008,9 +1028,9 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
             return offset + 3;
         }
         case THREAD_CREATE: {
-            uint16_t entry = readU16BE(chunk, offset + 1);
-            fprintf(stderr, "%-16s %04d\n", "THREAD_CREATE", entry);
-            return offset + 3;
+            uint32_t entry = readU32BE(chunk, offset + 1);
+            fprintf(stderr, "%-16s %04u\n", "THREAD_CREATE", entry);
+            return offset + 5;
         }
 
         // CALL_METHOD has never had a disassembly case; it intentionally
