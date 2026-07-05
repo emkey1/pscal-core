@@ -120,7 +120,7 @@ static inline bool isPackedByteElementType(VarType t) {
 }
 
 static inline bool arrayUsesPackedBytes(const Value* v) {
-    return v && v->type == TYPE_ARRAY && v->array_is_packed;
+    return v && VALUE_TYPE(*v) == TYPE_ARRAY && ARRAY_IS_PACKED(*v);
 }
 
 static inline bool isOrdinalType(VarType t) {
@@ -356,10 +356,18 @@ Value setIntersection(Value setA, Value setB);
  * generic to poison; `mstream` is skipped because it is a common local
  * variable name for MStream*.  Everything else payload-shaped is
  * Value-only.
+ *
+ * Metadata fields (follow-up sweep): only the Value-unique names are
+ * poisoned.  `lower_bound(s)`/`upper_bound(s)`, `dimensions`,
+ * `element_type(_def)`, `max_length`, `filename` and `record_size` are
+ * common local/parameter/other-struct names (clike's AST has
+ * element_type; vm.c/builtin.c use bounds-array locals), so they rely on
+ * the _Generic guard alone.
  */
 #if defined(PSCAL_VALUE_ACCESS_LINT) && !defined(PSCAL_VALUE_REPRESENTATION_LAYER)
 #if defined(__GNUC__) || defined(__clang__)
 #pragma GCC poison s_val u_val c_val record_val f_val array_val enum_val ptr_val set_val array_raw
+#pragma GCC poison array_is_packed array_is_dynamic array_refcount base_type_node record_size_explicit enum_meta
 #endif
 #endif
 
