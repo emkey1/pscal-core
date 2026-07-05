@@ -89,12 +89,12 @@ static const Value* resolveStringPointer(const Value* value) {
     const Value* current = value;
     int depth = 0;
     while (current && VALUE_TYPE(*current) == TYPE_POINTER &&
-           current->base_type_node != STRING_CHAR_PTR_SENTINEL &&
-           current->base_type_node != SERIALIZED_CHAR_PTR_SENTINEL &&
-           current->base_type_node != STRING_LENGTH_SENTINEL &&
-           current->base_type_node != BYTE_ARRAY_PTR_SENTINEL &&
-           current->base_type_node != SHELL_FUNCTION_PTR_SENTINEL &&
-           current->base_type_node != OPAQUE_POINTER_SENTINEL) {
+           PTR_BASE_TYPE_NODE(*current) != STRING_CHAR_PTR_SENTINEL &&
+           PTR_BASE_TYPE_NODE(*current) != SERIALIZED_CHAR_PTR_SENTINEL &&
+           PTR_BASE_TYPE_NODE(*current) != STRING_LENGTH_SENTINEL &&
+           PTR_BASE_TYPE_NODE(*current) != BYTE_ARRAY_PTR_SENTINEL &&
+           PTR_BASE_TYPE_NODE(*current) != SHELL_FUNCTION_PTR_SENTINEL &&
+           PTR_BASE_TYPE_NODE(*current) != OPAQUE_POINTER_SENTINEL) {
         if (!AS_POINTER(*current)) {
             return NULL;
         }
@@ -110,14 +110,14 @@ static int valueIsStringLike(const Value* value) {
     if (!value) return 0;
     if (isPascalStringType(VALUE_TYPE(*value))) return 1;
     if (VALUE_TYPE(*value) == TYPE_POINTER) {
-        if (value->base_type_node == STRING_CHAR_PTR_SENTINEL ||
-            value->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) return 1;
+        if (PTR_BASE_TYPE_NODE(*value) == STRING_CHAR_PTR_SENTINEL ||
+            PTR_BASE_TYPE_NODE(*value) == SERIALIZED_CHAR_PTR_SENTINEL) return 1;
         const Value* resolved = resolveStringPointer(value);
         if (!resolved) return 0;
         if (isPascalStringType(VALUE_TYPE(*resolved))) return 1;
         if (VALUE_TYPE(*resolved) == TYPE_POINTER &&
-            (resolved->base_type_node == STRING_CHAR_PTR_SENTINEL ||
-             resolved->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL)) {
+            (PTR_BASE_TYPE_NODE(*resolved) == STRING_CHAR_PTR_SENTINEL ||
+             PTR_BASE_TYPE_NODE(*resolved) == SERIALIZED_CHAR_PTR_SENTINEL)) {
             return 1;
         }
     }
@@ -128,8 +128,8 @@ static const char* valueToCStringLike(const Value* value) {
     if (!value) return NULL;
     if (isPascalStringType(VALUE_TYPE(*value))) return AS_STRING(*value) ? AS_STRING(*value) : "";
     if (VALUE_TYPE(*value) == TYPE_POINTER) {
-        if (value->base_type_node == STRING_CHAR_PTR_SENTINEL ||
-            value->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
+        if (PTR_BASE_TYPE_NODE(*value) == STRING_CHAR_PTR_SENTINEL ||
+            PTR_BASE_TYPE_NODE(*value) == SERIALIZED_CHAR_PTR_SENTINEL) {
             return (const char*)AS_POINTER(*value);
         }
         const Value* resolved = resolveStringPointer(value);
@@ -138,8 +138,8 @@ static const char* valueToCStringLike(const Value* value) {
             return AS_STRING(*resolved) ? AS_STRING(*resolved) : "";
         }
         if (VALUE_TYPE(*resolved) == TYPE_POINTER &&
-            (resolved->base_type_node == STRING_CHAR_PTR_SENTINEL ||
-             resolved->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL)) {
+            (PTR_BASE_TYPE_NODE(*resolved) == STRING_CHAR_PTR_SENTINEL ||
+             PTR_BASE_TYPE_NODE(*resolved) == SERIALIZED_CHAR_PTR_SENTINEL)) {
             return (const char*)AS_POINTER(*resolved);
         }
     }
@@ -148,8 +148,8 @@ static const char* valueToCStringLike(const Value* value) {
 
 static int valueIsNullCharPointer(const Value* value) {
     return value && VALUE_TYPE(*value) == TYPE_POINTER &&
-           (value->base_type_node == STRING_CHAR_PTR_SENTINEL ||
-            value->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) &&
+           (PTR_BASE_TYPE_NODE(*value) == STRING_CHAR_PTR_SENTINEL ||
+            PTR_BASE_TYPE_NODE(*value) == SERIALIZED_CHAR_PTR_SENTINEL) &&
            AS_POINTER(*value) == NULL;
 }
 

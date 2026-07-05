@@ -1492,7 +1492,7 @@ static bool populateCompileTimeArrayLiteral(Value* arr_val, AST* array_literal, 
     int total = calculateArrayTotalSize(arr_val);
     for (int j = 0; j < total && j < array_literal->child_count; j++) {
         Value ev = evaluateCompileTimeValue(array_literal->children[j]);
-        if (arr_val->array_is_packed) {
+        if (ARRAY_IS_PACKED(*arr_val)) {
             long long ordinal = 0;
             if (!valueToOrdinal(&ev, &ordinal)) {
                 fprintf(stderr,

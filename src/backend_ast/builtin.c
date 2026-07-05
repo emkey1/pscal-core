@@ -531,12 +531,12 @@ static const Value* resolveStringPointerBuiltin(const Value* value) {
     const Value* current = value;
     int depth = 0;
     while (current && VALUE_TYPE(*current) == TYPE_POINTER &&
-           current->base_type_node != STRING_CHAR_PTR_SENTINEL &&
-           current->base_type_node != SERIALIZED_CHAR_PTR_SENTINEL &&
-           current->base_type_node != STRING_LENGTH_SENTINEL &&
-           current->base_type_node != BYTE_ARRAY_PTR_SENTINEL &&
-           current->base_type_node != SHELL_FUNCTION_PTR_SENTINEL &&
-           current->base_type_node != OPAQUE_POINTER_SENTINEL) {
+           PTR_BASE_TYPE_NODE(*current) != STRING_CHAR_PTR_SENTINEL &&
+           PTR_BASE_TYPE_NODE(*current) != SERIALIZED_CHAR_PTR_SENTINEL &&
+           PTR_BASE_TYPE_NODE(*current) != STRING_LENGTH_SENTINEL &&
+           PTR_BASE_TYPE_NODE(*current) != BYTE_ARRAY_PTR_SENTINEL &&
+           PTR_BASE_TYPE_NODE(*current) != SHELL_FUNCTION_PTR_SENTINEL &&
+           PTR_BASE_TYPE_NODE(*current) != OPAQUE_POINTER_SENTINEL) {
         if (!AS_POINTER(*current)) {
             return NULL;
         }
@@ -552,14 +552,14 @@ static int builtinValueIsStringLike(const Value* value) {
     if (!value) return 0;
     if (isPascalStringType(VALUE_TYPE(*value))) return 1;
     if (VALUE_TYPE(*value) == TYPE_POINTER) {
-        if (value->base_type_node == STRING_CHAR_PTR_SENTINEL ||
-            value->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) return 1;
+        if (PTR_BASE_TYPE_NODE(*value) == STRING_CHAR_PTR_SENTINEL ||
+            PTR_BASE_TYPE_NODE(*value) == SERIALIZED_CHAR_PTR_SENTINEL) return 1;
         const Value* resolved = resolveStringPointerBuiltin(value);
         if (!resolved) return 0;
         if (isPascalStringType(VALUE_TYPE(*resolved))) return 1;
         if (VALUE_TYPE(*resolved) == TYPE_POINTER &&
-            (resolved->base_type_node == STRING_CHAR_PTR_SENTINEL ||
-             resolved->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL)) {
+            (PTR_BASE_TYPE_NODE(*resolved) == STRING_CHAR_PTR_SENTINEL ||
+             PTR_BASE_TYPE_NODE(*resolved) == SERIALIZED_CHAR_PTR_SENTINEL)) {
             return 1;
         }
     }
@@ -570,8 +570,8 @@ static const char* builtinValueToCString(const Value* value) {
     if (!value) return NULL;
     if (isPascalStringType(VALUE_TYPE(*value))) return AS_STRING(*value) ? AS_STRING(*value) : "";
     if (VALUE_TYPE(*value) == TYPE_POINTER) {
-        if (value->base_type_node == STRING_CHAR_PTR_SENTINEL ||
-            value->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
+        if (PTR_BASE_TYPE_NODE(*value) == STRING_CHAR_PTR_SENTINEL ||
+            PTR_BASE_TYPE_NODE(*value) == SERIALIZED_CHAR_PTR_SENTINEL) {
             return (const char*)AS_POINTER(*value);
         }
         const Value* resolved = resolveStringPointerBuiltin(value);
@@ -580,8 +580,8 @@ static const char* builtinValueToCString(const Value* value) {
             return AS_STRING(*resolved) ? AS_STRING(*resolved) : "";
         }
         if (VALUE_TYPE(*resolved) == TYPE_POINTER &&
-            (resolved->base_type_node == STRING_CHAR_PTR_SENTINEL ||
-             resolved->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL)) {
+            (PTR_BASE_TYPE_NODE(*resolved) == STRING_CHAR_PTR_SENTINEL ||
+             PTR_BASE_TYPE_NODE(*resolved) == SERIALIZED_CHAR_PTR_SENTINEL)) {
             return (const char*)AS_POINTER(*resolved);
         }
     }
@@ -1099,8 +1099,8 @@ static bool computeValueSizeBytesInternal(const Value *value, long long *out_byt
             *out_bytes = (long long)sizeof(void*);
             return true;
         case TYPE_STRING:
-            if (value->max_length > 0) {
-                *out_bytes = (long long)value->max_length + 1;
+            if (STRING_MAX_LENGTH(*value) > 0) {
+                *out_bytes = (long long)STRING_MAX_LENGTH(*value) + 1;
             } else {
                 *out_bytes = (long long)sizeof(char*);
             }
@@ -1120,10 +1120,10 @@ static bool computeValueSizeBytesInternal(const Value *value, long long *out_byt
                     }
                 }
             }
-            if (!have_elem && value->element_type != TYPE_VOID) {
-                have_elem = builtinSizeForVarType(value->element_type, &elem_size);
+            if (!have_elem && ARRAY_ELEMENT_TYPE(*value) != TYPE_VOID) {
+                have_elem = builtinSizeForVarType(ARRAY_ELEMENT_TYPE(*value), &elem_size);
                 if (!have_elem) {
-                    Value temp = makeValueForType(value->element_type, value->element_type_def, NULL);
+                    Value temp = makeValueForType(ARRAY_ELEMENT_TYPE(*value), ARRAY_ELEMENT_TYPE_DEF(*value), NULL);
                     have_elem = computeValueSizeBytesInternal(&temp, &elem_size, depth + 1);
                     freeValue(&temp);
                 }
@@ -2449,13 +2449,13 @@ Value vmBuiltinSucc(VM* vm, int arg_count, Value* args) {
         }
         case TYPE_ENUM: {
             int ordinal = AS_ENUM(arg).ordinal;
-            if (arg.enum_meta && ordinal + 1 >= arg.enum_meta->member_count) {
+            if (ENUM_META(arg) && ordinal + 1 >= ENUM_META(arg)->member_count) {
                 runtimeError(vm, "Succ enum overflow.");
                 return makeVoid();
             }
             Value result = makeEnum(AS_ENUM(arg).enum_name, ordinal + 1);
-            result.enum_meta = arg.enum_meta;
-            result.base_type_node = arg.base_type_node;
+            ENUM_META(result) = ENUM_META(arg);
+            PTR_BASE_TYPE_NODE(result) = PTR_BASE_TYPE_NODE(arg);
             return result;
         }
         default:
@@ -3041,7 +3041,7 @@ Value vmBuiltinFopen(VM* vm, int arg_count, Value* args) {
     Value v = makeVoid();
     SET_VALUE_TYPE(&v, TYPE_FILE);
     AS_FILE(v) = f;
-    v.filename = strdup(path);
+    FILE_FILENAME(v) = strdup(path);
     return v;
 }
 
@@ -3233,15 +3233,15 @@ static bool resizeDynamicArrayValue(VM* vm,
         return false;
     }
 
-    if (array_value->dimensions > 0 && array_value->dimensions != dimension_count) {
+    if (ARRAY_DIMENSIONS(*array_value) > 0 && ARRAY_DIMENSIONS(*array_value) != dimension_count) {
         runtimeError(vm, "SetLength dimension count (%d) does not match existing array (%d).",
                      dimension_count,
-                     array_value->dimensions);
+                     ARRAY_DIMENSIONS(*array_value));
         return false;
     }
 
-    VarType element_type = array_value->element_type;
-    AST* element_type_def = array_value->element_type_def;
+    VarType element_type = ARRAY_ELEMENT_TYPE(*array_value);
+    AST* element_type_def = ARRAY_ELEMENT_TYPE_DEF(*array_value);
     bool use_packed = isPackedByteElementType(element_type);
 
     int* new_lower = (int*)malloc(sizeof(int) * dimension_count);
@@ -3293,18 +3293,18 @@ static bool resizeDynamicArrayValue(VM* vm,
     }
 
     size_t old_total = 0;
-    int* old_lower_bounds = array_value->lower_bounds;
-    int* old_upper_bounds = array_value->upper_bounds;
+    int* old_lower_bounds = ARRAY_LOWER_BOUNDS(*array_value);
+    int* old_upper_bounds = ARRAY_UPPER_BOUNDS(*array_value);
     Value* old_array_val = AS_ARRAY(*array_value);
     unsigned char* old_array_raw = AS_ARRAY_RAW(*array_value);
-    bool old_array_is_packed = array_value->array_is_packed;
-    bool old_array_is_dynamic = array_value->array_is_dynamic;
-    uint32_t* old_array_refcount = array_value->array_refcount;
-    if (array_value->dimensions > 0 &&
-        array_value->lower_bounds && array_value->upper_bounds) {
+    bool old_array_is_packed = ARRAY_IS_PACKED(*array_value);
+    bool old_array_is_dynamic = ARRAY_IS_DYNAMIC(*array_value);
+    uint32_t* old_array_refcount = ARRAY_REFCOUNT(*array_value);
+    if (ARRAY_DIMENSIONS(*array_value) > 0 &&
+        ARRAY_LOWER_BOUNDS(*array_value) && ARRAY_UPPER_BOUNDS(*array_value)) {
         old_total = 1;
-        for (int i = 0; i < array_value->dimensions; ++i) {
-            int span = array_value->upper_bounds[i] - array_value->lower_bounds[i] + 1;
+        for (int i = 0; i < ARRAY_DIMENSIONS(*array_value); ++i) {
+            int span = ARRAY_UPPER_BOUNDS(*array_value)[i] - ARRAY_LOWER_BOUNDS(*array_value)[i] + 1;
             if (span <= 0) {
                 old_total = 0;
                 break;
@@ -3338,8 +3338,8 @@ static bool resizeDynamicArrayValue(VM* vm,
             }
         }
 
-        if (old_total > 0 && array_value->lower_bounds &&
-            array_value->upper_bounds && array_value->dimensions == dimension_count &&
+        if (old_total > 0 && ARRAY_LOWER_BOUNDS(*array_value) &&
+            ARRAY_UPPER_BOUNDS(*array_value) && ARRAY_DIMENSIONS(*array_value) == dimension_count &&
             ((use_packed && (AS_ARRAY_RAW(*array_value) || AS_ARRAY(*array_value))) ||
              (!use_packed && AS_ARRAY(*array_value)))) {
             copy_lower = (int*)malloc(sizeof(int) * dimension_count);
@@ -3351,10 +3351,10 @@ static bool resizeDynamicArrayValue(VM* vm,
 
             bool has_overlap = true;
             for (int i = 0; i < dimension_count; ++i) {
-                int overlap_low = array_value->lower_bounds[i] > new_lower[i] ?
-                                  array_value->lower_bounds[i] : new_lower[i];
-                int overlap_high = array_value->upper_bounds[i] < new_upper[i] ?
-                                   array_value->upper_bounds[i] : new_upper[i];
+                int overlap_low = ARRAY_LOWER_BOUNDS(*array_value)[i] > new_lower[i] ?
+                                  ARRAY_LOWER_BOUNDS(*array_value)[i] : new_lower[i];
+                int overlap_high = ARRAY_UPPER_BOUNDS(*array_value)[i] < new_upper[i] ?
+                                   ARRAY_UPPER_BOUNDS(*array_value)[i] : new_upper[i];
                 if (overlap_high < overlap_low) {
                     has_overlap = false;
                     break;
@@ -3374,9 +3374,9 @@ static bool resizeDynamicArrayValue(VM* vm,
                 Value new_array_stub;
                 memset(&new_array_stub, 0, sizeof(Value));
                 SET_VALUE_TYPE(&new_array_stub, TYPE_ARRAY);
-                new_array_stub.dimensions = dimension_count;
-                new_array_stub.lower_bounds = new_lower;
-                new_array_stub.upper_bounds = new_upper;
+                ARRAY_DIMENSIONS(new_array_stub) = dimension_count;
+                ARRAY_LOWER_BOUNDS(new_array_stub) = new_lower;
+                ARRAY_UPPER_BOUNDS(new_array_stub) = new_upper;
 
                 for (int i = 0; i < dimension_count; ++i) {
                     copy_indices[i] = copy_lower[i];
@@ -3387,7 +3387,7 @@ static bool resizeDynamicArrayValue(VM* vm,
                     int new_offset = computeFlatOffset(&new_array_stub, copy_indices);
                     if (use_packed) {
                         unsigned char byte = 0;
-                        if (array_value->array_is_packed && AS_ARRAY_RAW(*array_value)) {
+                        if (ARRAY_IS_PACKED(*array_value) && AS_ARRAY_RAW(*array_value)) {
                             byte = AS_ARRAY_RAW(*array_value)[old_offset];
                         } else if (AS_ARRAY(*array_value)) {
                             byte = valueToByte(&AS_ARRAY(*array_value)[old_offset]);
@@ -3423,7 +3423,7 @@ static bool resizeDynamicArrayValue(VM* vm,
         }
     }
 
-    if (array_value->array_is_dynamic) {
+    if (ARRAY_IS_DYNAMIC(*array_value)) {
         new_refcount = (uint32_t*)malloc(sizeof(uint32_t));
         if (!new_refcount) {
             runtimeError(vm, "SetLength: memory allocation failed for dynamic array metadata.");
@@ -3471,17 +3471,17 @@ static bool resizeDynamicArrayValue(VM* vm,
         free(old_upper_bounds);
     }
 
-    array_value->lower_bounds = new_lower;
-    array_value->upper_bounds = new_upper;
+    ARRAY_LOWER_BOUNDS(*array_value) = new_lower;
+    ARRAY_UPPER_BOUNDS(*array_value) = new_upper;
     AS_ARRAY(*array_value) = new_elements;
     AS_ARRAY_RAW(*array_value) = new_raw;
-    array_value->array_is_packed = use_packed;
-    array_value->array_refcount = new_refcount;
-    array_value->dimensions = dimension_count;
-    array_value->lower_bound = (dimension_count >= 1) ? new_lower[0] : 0;
-    array_value->upper_bound = (dimension_count >= 1) ? new_upper[0] : -1;
-    array_value->element_type = element_type;
-    array_value->element_type_def = element_type_def;
+    ARRAY_IS_PACKED(*array_value) = use_packed;
+    ARRAY_REFCOUNT(*array_value) = new_refcount;
+    ARRAY_DIMENSIONS(*array_value) = dimension_count;
+    ARRAY_LOWER_BOUND(*array_value) = (dimension_count >= 1) ? new_lower[0] : 0;
+    ARRAY_UPPER_BOUND(*array_value) = (dimension_count >= 1) ? new_upper[0] : -1;
+    ARRAY_ELEMENT_TYPE(*array_value) = element_type;
+    ARRAY_ELEMENT_TYPE_DEF(*array_value) = element_type_def;
 
     if (new_total == 0) {
         AS_ARRAY(*array_value) = NULL;
@@ -3584,22 +3584,22 @@ Value vmBuiltinSetlength(VM* vm, int arg_count, Value* args) {
         new_buf[copy_len] = '\0';
 
         AS_STRING(*target) = new_buf;
-        target->max_length = -1;
+        STRING_MAX_LENGTH(*target) = -1;
         return makeVoid();
     }
 
-    if ((target->element_type == TYPE_UNKNOWN || target->element_type == TYPE_VOID ||
-         target->element_type_def == NULL) &&
-        args[0].base_type_node != NULL) {
-        Value typed_template = makeValueForType(TYPE_ARRAY, args[0].base_type_node, NULL);
+    if ((ARRAY_ELEMENT_TYPE(*target) == TYPE_UNKNOWN || ARRAY_ELEMENT_TYPE(*target) == TYPE_VOID ||
+         ARRAY_ELEMENT_TYPE_DEF(*target) == NULL) &&
+        PTR_BASE_TYPE_NODE(args[0]) != NULL) {
+        Value typed_template = makeValueForType(TYPE_ARRAY, PTR_BASE_TYPE_NODE(args[0]), NULL);
         if (VALUE_TYPE(typed_template) == TYPE_ARRAY) {
-            if (target->element_type == TYPE_UNKNOWN || target->element_type == TYPE_VOID) {
-                target->element_type = typed_template.element_type;
+            if (ARRAY_ELEMENT_TYPE(*target) == TYPE_UNKNOWN || ARRAY_ELEMENT_TYPE(*target) == TYPE_VOID) {
+                ARRAY_ELEMENT_TYPE(*target) = ARRAY_ELEMENT_TYPE(typed_template);
             }
-            if (target->element_type_def == NULL) {
-                target->element_type_def = typed_template.element_type_def;
+            if (ARRAY_ELEMENT_TYPE_DEF(*target) == NULL) {
+                ARRAY_ELEMENT_TYPE_DEF(*target) = ARRAY_ELEMENT_TYPE_DEF(typed_template);
             }
-            target->array_is_packed = typed_template.array_is_packed;
+            ARRAY_IS_PACKED(*target) = ARRAY_IS_PACKED(typed_template);
         }
         freeValue(&typed_template);
     }
@@ -6309,11 +6309,11 @@ Value vmBuiltinRewrite(VM* vm, int arg_count, Value* args) {
     Value* fileVarLValue = (Value*)AS_POINTER(args[0]); // Dereference the pointer
 
     if (VALUE_TYPE(*fileVarLValue) != TYPE_FILE) { runtimeError(vm, "Argument to Rewrite must be a file variable."); return makeVoid(); }
-    if (fileVarLValue->filename == NULL) { runtimeError(vm, "File variable not assigned a name before Rewrite."); return makeVoid(); }
+    if (FILE_FILENAME(*fileVarLValue) == NULL) { runtimeError(vm, "File variable not assigned a name before Rewrite."); return makeVoid(); }
     vmMaybeCloseFileValue(fileVarLValue);
 
     bool has_record_size_arg = (arg_count == 2);
-    int new_record_size = fileVarLValue->record_size;
+    int new_record_size = FILE_RECORD_SIZE(*fileVarLValue);
     if (has_record_size_arg) {
         if (!IS_INTLIKE(args[1])) {
             runtimeError(vm, "Rewrite: Record size must be an integer value.");
@@ -6325,18 +6325,18 @@ Value vmBuiltinRewrite(VM* vm, int arg_count, Value* args) {
             return makeVoid();
         }
         new_record_size = (int)size_val;
-        fileVarLValue->record_size_explicit = true;
+        FILE_RECORD_SIZE_EXPLICIT(*fileVarLValue) = true;
     } else if (new_record_size <= 0) {
         new_record_size = PSCAL_DEFAULT_FILE_RECORD_SIZE;
-        fileVarLValue->record_size_explicit = false;
+        FILE_RECORD_SIZE_EXPLICIT(*fileVarLValue) = false;
     }
-    fileVarLValue->record_size = new_record_size;
+    FILE_RECORD_SIZE(*fileVarLValue) = new_record_size;
 
-    bool use_binary_mode = has_record_size_arg || fileVarLValue->record_size_explicit ||
-                           fileVarLValue->element_type != TYPE_VOID;
+    bool use_binary_mode = has_record_size_arg || FILE_RECORD_SIZE_EXPLICIT(*fileVarLValue) ||
+                           ARRAY_ELEMENT_TYPE(*fileVarLValue) != TYPE_VOID;
     const char* mode = use_binary_mode ? "wb" : "w";
 
-    FILE* f = fopen(fileVarLValue->filename, mode);
+    FILE* f = fopen(FILE_FILENAME(*fileVarLValue), mode);
     if (f == NULL) {
         last_io_error = errno ? errno : 1;
     } else {
@@ -6836,12 +6836,12 @@ static ArrayBoundsResult resolveFirstDimBounds(Value* arg) {
         if (VALUE_TYPE(*current) == TYPE_ARRAY) {
             int lower = 0;
             int upper = -1;
-            if (current->dimensions > 0 && current->lower_bounds && current->upper_bounds) {
-                lower = current->lower_bounds[0];
-                upper = current->upper_bounds[0];
+            if (ARRAY_DIMENSIONS(*current) > 0 && ARRAY_LOWER_BOUNDS(*current) && ARRAY_UPPER_BOUNDS(*current)) {
+                lower = ARRAY_LOWER_BOUNDS(*current)[0];
+                upper = ARRAY_UPPER_BOUNDS(*current)[0];
             } else {
-                lower = current->lower_bound;
-                upper = current->upper_bound;
+                lower = ARRAY_LOWER_BOUND(*current);
+                upper = ARRAY_UPPER_BOUND(*current);
             }
             result.hasBounds = true;
             result.lower = lower;
@@ -7019,7 +7019,7 @@ Value vmBuiltinNew(VM* vm, int arg_count, Value* args) {
         return makeVoid();
     }
 
-    AST *baseTypeNode = pointerVarValuePtr->base_type_node;
+    AST *baseTypeNode = PTR_BASE_TYPE_NODE(*pointerVarValuePtr);
     // (debug logging removed)
     // Determine base type. Default to INTEGER if metadata is unavailable.
     VarType baseVarType = baseTypeNode ? TYPE_VOID : TYPE_INT32;
@@ -7067,12 +7067,12 @@ Value vmBuiltinNew(VM* vm, int arg_count, Value* args) {
     SET_VALUE_TYPE(pointerVarValuePtr, TYPE_POINTER);
 
     // Safety: if base type metadata is unknown, treat as integer for subsequent dereferences
-    if (!pointerVarValuePtr->base_type_node) {
+    if (!PTR_BASE_TYPE_NODE(*pointerVarValuePtr)) {
         Token* baseTok = newToken(TOKEN_IDENTIFIER, "integer", 0, 0);
         AST* baseNode = newASTNode(AST_VARIABLE, baseTok);
         setTypeAST(baseNode, TYPE_INT32);
         freeToken(baseTok);
-        pointerVarValuePtr->base_type_node = baseNode;
+        PTR_BASE_TYPE_NODE(*pointerVarValuePtr) = baseNode;
     }
     // (debug logging removed)
 
@@ -7098,7 +7098,7 @@ Value vmBuiltinNewObj(VM* vm, int arg_count, Value* args) {
     Value ret = makeVoid();
     SET_VALUE_TYPE(&ret, TYPE_POINTER);
     AS_POINTER(ret) = allocated;
-    ret.base_type_node = typeDef;
+    PTR_BASE_TYPE_NODE(ret) = typeDef;
     return ret;
 }
 
@@ -7176,13 +7176,13 @@ Value vmBuiltinAssign(VM* vm, int arg_count, Value* args) {
         return makeVoid();
     }
 
-    if (fileVarLValue->filename) {
-        free(fileVarLValue->filename);
+    if (FILE_FILENAME(*fileVarLValue)) {
+        free(FILE_FILENAME(*fileVarLValue));
     }
 
     // Use strdup to create a persistent copy of the filename
-    fileVarLValue->filename = AS_STRING(fileNameVal) ? strdup(AS_STRING(fileNameVal)) : NULL;
-    if (AS_STRING(fileNameVal) && !fileVarLValue->filename) {
+    FILE_FILENAME(*fileVarLValue) = AS_STRING(fileNameVal) ? strdup(AS_STRING(fileNameVal)) : NULL;
+    if (AS_STRING(fileNameVal) && !FILE_FILENAME(*fileVarLValue)) {
         runtimeError(vm, "Memory allocation failed for filename in assign.");
     }
 
@@ -7202,11 +7202,11 @@ Value vmBuiltinReset(VM* vm, int arg_count, Value* args) {
     Value* fileVarLValue = (Value*)AS_POINTER(args[0]); // Dereference the pointer
 
     if (VALUE_TYPE(*fileVarLValue) != TYPE_FILE) { runtimeError(vm, "Argument to Reset must be a file variable."); return makeVoid(); }
-    if (fileVarLValue->filename == NULL) { runtimeError(vm, "File variable not assigned a name before Reset."); return makeVoid(); }
+    if (FILE_FILENAME(*fileVarLValue) == NULL) { runtimeError(vm, "File variable not assigned a name before Reset."); return makeVoid(); }
     vmMaybeCloseFileValue(fileVarLValue);
 
     bool has_record_size_arg = (arg_count == 2);
-    int new_record_size = fileVarLValue->record_size;
+    int new_record_size = FILE_RECORD_SIZE(*fileVarLValue);
     if (has_record_size_arg) {
         if (!IS_INTLIKE(args[1])) {
             runtimeError(vm, "Reset: Record size must be an integer value.");
@@ -7218,18 +7218,18 @@ Value vmBuiltinReset(VM* vm, int arg_count, Value* args) {
             return makeVoid();
         }
         new_record_size = (int)size_val;
-        fileVarLValue->record_size_explicit = true;
+        FILE_RECORD_SIZE_EXPLICIT(*fileVarLValue) = true;
     } else if (new_record_size <= 0) {
         new_record_size = PSCAL_DEFAULT_FILE_RECORD_SIZE;
-        fileVarLValue->record_size_explicit = false;
+        FILE_RECORD_SIZE_EXPLICIT(*fileVarLValue) = false;
     }
-    fileVarLValue->record_size = new_record_size;
+    FILE_RECORD_SIZE(*fileVarLValue) = new_record_size;
 
-    bool use_binary_mode = has_record_size_arg || fileVarLValue->record_size_explicit ||
-                           fileVarLValue->element_type != TYPE_VOID;
+    bool use_binary_mode = has_record_size_arg || FILE_RECORD_SIZE_EXPLICIT(*fileVarLValue) ||
+                           ARRAY_ELEMENT_TYPE(*fileVarLValue) != TYPE_VOID;
     const char* mode = use_binary_mode ? "rb" : "r";
 
-    FILE* f = fopen(fileVarLValue->filename, mode);
+    FILE* f = fopen(FILE_FILENAME(*fileVarLValue), mode);
     if (f == NULL) {
         last_io_error = errno ? errno : 1;
     } else {
@@ -7249,10 +7249,10 @@ Value vmBuiltinAppend(VM* vm, int arg_count, Value* args) {
     Value* fileVarLValue = (Value*)AS_POINTER(args[0]);
 
     if (VALUE_TYPE(*fileVarLValue) != TYPE_FILE) { runtimeError(vm, "Argument to Append must be a file variable."); return makeVoid(); }
-    if (fileVarLValue->filename == NULL) { runtimeError(vm, "File variable not assigned a name before Append."); return makeVoid(); }
+    if (FILE_FILENAME(*fileVarLValue) == NULL) { runtimeError(vm, "File variable not assigned a name before Append."); return makeVoid(); }
     vmMaybeCloseFileValue(fileVarLValue);
 
-    FILE* f = fopen(fileVarLValue->filename, "a");
+    FILE* f = fopen(FILE_FILENAME(*fileVarLValue), "a");
     if (f == NULL) {
         last_io_error = errno ? errno : 1;
     } else {
@@ -7287,18 +7287,18 @@ Value vmBuiltinRename(VM* vm, int arg_count, Value* args) {
     Value* fileVarLValue = (Value*)AS_POINTER(args[0]);
 
     if (VALUE_TYPE(*fileVarLValue) != TYPE_FILE) { runtimeError(vm, "First argument to Rename must be a file variable."); return makeVoid(); }
-    if (fileVarLValue->filename == NULL) { runtimeError(vm, "File variable not assigned a name before Rename."); return makeVoid(); }
+    if (FILE_FILENAME(*fileVarLValue) == NULL) { runtimeError(vm, "File variable not assigned a name before Rename."); return makeVoid(); }
     if (!isPascalStringType(VALUE_TYPE(args[1]))) { runtimeError(vm, "Second argument to Rename must be a string."); return makeVoid(); }
     vmMaybeCloseFileValue(fileVarLValue);
 
-    int res = rename(fileVarLValue->filename, AS_STRING(args[1]));
+    int res = rename(FILE_FILENAME(*fileVarLValue), AS_STRING(args[1]));
     if (res != 0) {
         last_io_error = errno ? errno : 1;
     } else {
         last_io_error = 0;
-        free(fileVarLValue->filename);
-        fileVarLValue->filename = AS_STRING(args[1]) ? strdup(AS_STRING(args[1])) : NULL;
-        if (AS_STRING(args[1]) && !fileVarLValue->filename) {
+        free(FILE_FILENAME(*fileVarLValue));
+        FILE_FILENAME(*fileVarLValue) = AS_STRING(args[1]) ? strdup(AS_STRING(args[1])) : NULL;
+        if (AS_STRING(args[1]) && !FILE_FILENAME(*fileVarLValue)) {
             runtimeError(vm, "Memory allocation failed for filename in Rename.");
         }
     }
@@ -7315,10 +7315,10 @@ Value vmBuiltinErase(VM* vm, int arg_count, Value* args) {
     Value* fileVarLValue = (Value*)AS_POINTER(args[0]);
 
     if (VALUE_TYPE(*fileVarLValue) != TYPE_FILE) { runtimeError(vm, "Argument to Erase must be a file variable."); return makeVoid(); }
-    if (fileVarLValue->filename == NULL) { runtimeError(vm, "File variable not assigned a name before Erase."); return makeVoid(); }
+    if (FILE_FILENAME(*fileVarLValue) == NULL) { runtimeError(vm, "File variable not assigned a name before Erase."); return makeVoid(); }
     vmMaybeCloseFileValue(fileVarLValue);
 
-    int res = remove(fileVarLValue->filename);
+    int res = remove(FILE_FILENAME(*fileVarLValue));
     if (res != 0) {
         last_io_error = errno ? errno : 1;
     } else {
@@ -7384,9 +7384,9 @@ Value vmBuiltinFilesize(VM* vm, int arg_count, Value* args) {
             }
 #endif
         }
-    } else if (fileValue->filename) {
+    } else if (FILE_FILENAME(*fileValue)) {
         struct stat st;
-        if (stat(fileValue->filename, &st) == 0) {
+        if (stat(FILE_FILENAME(*fileValue), &st) == 0) {
             sizeBytes = (long long)st.st_size;
         }
     }
@@ -7399,8 +7399,8 @@ Value vmBuiltinFilesize(VM* vm, int arg_count, Value* args) {
     last_io_error = 0;
 
     long long result = sizeBytes;
-    int recordSize = fileValue->record_size;
-    if (recordSize > 0 && (fileValue->record_size_explicit || fileValue->element_type != TYPE_VOID)) {
+    int recordSize = FILE_RECORD_SIZE(*fileValue);
+    if (recordSize > 0 && (FILE_RECORD_SIZE_EXPLICIT(*fileValue) || ARRAY_ELEMENT_TYPE(*fileValue) != TYPE_VOID)) {
         result = sizeBytes / recordSize;
     }
 
@@ -7527,17 +7527,17 @@ Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
         goto cleanup;
     }
 
-    if (args[1].base_type_node == STRING_CHAR_PTR_SENTINEL ||
-        args[1].base_type_node == SERIALIZED_CHAR_PTR_SENTINEL ||
-        args[1].base_type_node == BYTE_ARRAY_PTR_SENTINEL) {
+    if (PTR_BASE_TYPE_NODE(args[1]) == STRING_CHAR_PTR_SENTINEL ||
+        PTR_BASE_TYPE_NODE(args[1]) == SERIALIZED_CHAR_PTR_SENTINEL ||
+        PTR_BASE_TYPE_NODE(args[1]) == BYTE_ARRAY_PTR_SENTINEL) {
         bufferIsRawPointer = true;
         rawPointer = (unsigned char*)AS_POINTER(args[1]);
     } else {
         bufferValue = (Value*)AS_POINTER(args[1]);
         if (bufferValue && VALUE_TYPE(*bufferValue) == TYPE_POINTER &&
-            (bufferValue->base_type_node == STRING_CHAR_PTR_SENTINEL ||
-             bufferValue->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL ||
-             bufferValue->base_type_node == BYTE_ARRAY_PTR_SENTINEL)) {
+            (PTR_BASE_TYPE_NODE(*bufferValue) == STRING_CHAR_PTR_SENTINEL ||
+             PTR_BASE_TYPE_NODE(*bufferValue) == SERIALIZED_CHAR_PTR_SENTINEL ||
+             PTR_BASE_TYPE_NODE(*bufferValue) == BYTE_ARRAY_PTR_SENTINEL)) {
             bufferIsRawPointer = true;
             rawPointer = (unsigned char*)AS_POINTER(*bufferValue);
         }
@@ -7552,7 +7552,7 @@ Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
         }
     }
 
-    int recordSize = fileValue->record_size > 0 ? fileValue->record_size : PSCAL_DEFAULT_FILE_RECORD_SIZE;
+    int recordSize = FILE_RECORD_SIZE(*fileValue) > 0 ? FILE_RECORD_SIZE(*fileValue) : PSCAL_DEFAULT_FILE_RECORD_SIZE;
     if (recordSize <= 0) {
         recordSize = 1;
     }
@@ -7576,7 +7576,7 @@ Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
         }
     } else {
         size_t available = 0;
-        if (bufferValue->dimensions > 1) {
+        if (ARRAY_DIMENSIONS(*bufferValue) > 1) {
             runtimeError(vm, "BlockRead: multidimensional arrays are not supported.");
             last_io_error = 1;
             parameterError = true;
@@ -7599,11 +7599,11 @@ Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
         }
         if (bytesToRead > 0) {
             bool elementByteCompatible =
-                bufferValue->element_type == TYPE_BYTE ||
-                bufferValue->element_type == TYPE_UINT8 ||
-                bufferValue->element_type == TYPE_INT8 ||
-                bufferValue->element_type == TYPE_CHAR ||
-                bufferValue->element_type == TYPE_BOOLEAN;
+                ARRAY_ELEMENT_TYPE(*bufferValue) == TYPE_BYTE ||
+                ARRAY_ELEMENT_TYPE(*bufferValue) == TYPE_UINT8 ||
+                ARRAY_ELEMENT_TYPE(*bufferValue) == TYPE_INT8 ||
+                ARRAY_ELEMENT_TYPE(*bufferValue) == TYPE_CHAR ||
+                ARRAY_ELEMENT_TYPE(*bufferValue) == TYPE_BOOLEAN;
             if (!elementByteCompatible && AS_ARRAY(*bufferValue) && available > 0) {
                 elementByteCompatible = valueIsByteCompatible(&AS_ARRAY(*bufferValue)[0]);
             }
@@ -7613,7 +7613,7 @@ Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
                 parameterError = true;
                 goto cleanup;
             }
-            if (bufferValue->array_is_packed && bufferValue->element_type == TYPE_BYTE) {
+            if (ARRAY_IS_PACKED(*bufferValue) && ARRAY_ELEMENT_TYPE(*bufferValue) == TYPE_BYTE) {
                 if (!AS_ARRAY_RAW(*bufferValue) && bytesToRead > 0) {
                     runtimeError(vm, "BlockRead: packed byte buffer is NULL.");
                     last_io_error = 1;
@@ -7747,17 +7747,17 @@ Value vmBuiltinBlockwrite(VM* vm, int arg_count, Value* args) {
         goto cleanup;
     }
 
-    if (args[1].base_type_node == STRING_CHAR_PTR_SENTINEL ||
-        args[1].base_type_node == SERIALIZED_CHAR_PTR_SENTINEL ||
-        args[1].base_type_node == BYTE_ARRAY_PTR_SENTINEL) {
+    if (PTR_BASE_TYPE_NODE(args[1]) == STRING_CHAR_PTR_SENTINEL ||
+        PTR_BASE_TYPE_NODE(args[1]) == SERIALIZED_CHAR_PTR_SENTINEL ||
+        PTR_BASE_TYPE_NODE(args[1]) == BYTE_ARRAY_PTR_SENTINEL) {
         bufferIsRawPointer = true;
         rawPointer = (unsigned char*)AS_POINTER(args[1]);
     } else {
         bufferValue = (Value*)AS_POINTER(args[1]);
         if (bufferValue && VALUE_TYPE(*bufferValue) == TYPE_POINTER &&
-            (bufferValue->base_type_node == STRING_CHAR_PTR_SENTINEL ||
-             bufferValue->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL ||
-             bufferValue->base_type_node == BYTE_ARRAY_PTR_SENTINEL)) {
+            (PTR_BASE_TYPE_NODE(*bufferValue) == STRING_CHAR_PTR_SENTINEL ||
+             PTR_BASE_TYPE_NODE(*bufferValue) == SERIALIZED_CHAR_PTR_SENTINEL ||
+             PTR_BASE_TYPE_NODE(*bufferValue) == BYTE_ARRAY_PTR_SENTINEL)) {
             bufferIsRawPointer = true;
             rawPointer = (unsigned char*)AS_POINTER(*bufferValue);
         }
@@ -7772,7 +7772,7 @@ Value vmBuiltinBlockwrite(VM* vm, int arg_count, Value* args) {
         }
     }
 
-    int recordSize = fileValue->record_size > 0 ? fileValue->record_size : PSCAL_DEFAULT_FILE_RECORD_SIZE;
+    int recordSize = FILE_RECORD_SIZE(*fileValue) > 0 ? FILE_RECORD_SIZE(*fileValue) : PSCAL_DEFAULT_FILE_RECORD_SIZE;
     if (recordSize <= 0) {
         recordSize = 1;
     }
@@ -7796,7 +7796,7 @@ Value vmBuiltinBlockwrite(VM* vm, int arg_count, Value* args) {
         }
     } else {
         size_t available = 0;
-        if (bufferValue->dimensions > 1) {
+        if (ARRAY_DIMENSIONS(*bufferValue) > 1) {
             runtimeError(vm, "BlockWrite: multidimensional arrays are not supported.");
             last_io_error = 1;
             parameterError = true;
@@ -7819,11 +7819,11 @@ Value vmBuiltinBlockwrite(VM* vm, int arg_count, Value* args) {
         }
         if (bytesToWrite > 0) {
             bool elementByteCompatible =
-                bufferValue->element_type == TYPE_BYTE ||
-                bufferValue->element_type == TYPE_UINT8 ||
-                bufferValue->element_type == TYPE_INT8 ||
-                bufferValue->element_type == TYPE_CHAR ||
-                bufferValue->element_type == TYPE_BOOLEAN;
+                ARRAY_ELEMENT_TYPE(*bufferValue) == TYPE_BYTE ||
+                ARRAY_ELEMENT_TYPE(*bufferValue) == TYPE_UINT8 ||
+                ARRAY_ELEMENT_TYPE(*bufferValue) == TYPE_INT8 ||
+                ARRAY_ELEMENT_TYPE(*bufferValue) == TYPE_CHAR ||
+                ARRAY_ELEMENT_TYPE(*bufferValue) == TYPE_BOOLEAN;
             if (!elementByteCompatible && AS_ARRAY(*bufferValue) && available > 0) {
                 elementByteCompatible = valueIsByteCompatible(&AS_ARRAY(*bufferValue)[0]);
             }
@@ -7833,7 +7833,7 @@ Value vmBuiltinBlockwrite(VM* vm, int arg_count, Value* args) {
                 parameterError = true;
                 goto cleanup;
             }
-            if (bufferValue->array_is_packed && bufferValue->element_type == TYPE_BYTE) {
+            if (ARRAY_IS_PACKED(*bufferValue) && ARRAY_ELEMENT_TYPE(*bufferValue) == TYPE_BYTE) {
                 if (!AS_ARRAY_RAW(*bufferValue) && bytesToWrite > 0) {
                     runtimeError(vm, "BlockWrite: packed byte buffer is NULL.");
                     last_io_error = 1;
@@ -8285,14 +8285,14 @@ Value vmBuiltinWrite(VM* vm, int arg_count, Value* args) {
             start_index = 2;
             if (VALUE_TYPE(args[1]) == TYPE_FILE) first_arg_is_file_by_value = true;
             file_value = first;
-            if (file_value->element_type != TYPE_VOID && file_value->element_type != TYPE_UNKNOWN) {
-                bool has_typed_metadata = file_value->record_size_explicit || file_value->element_type_def != NULL;
+            if (ARRAY_ELEMENT_TYPE(*file_value) != TYPE_VOID && ARRAY_ELEMENT_TYPE(*file_value) != TYPE_UNKNOWN) {
+                bool has_typed_metadata = FILE_RECORD_SIZE_EXPLICIT(*file_value) || ARRAY_ELEMENT_TYPE_DEF(*file_value) != NULL;
                 if (has_typed_metadata) {
                     long long size_bytes = 0;
-                    if (builtinSizeForVarType(file_value->element_type, &size_bytes) && size_bytes > 0 &&
+                    if (builtinSizeForVarType(ARRAY_ELEMENT_TYPE(*file_value), &size_bytes) && size_bytes > 0 &&
                         (size_t)size_bytes <= sizeof(long double)) {
                         binary_file = true;
-                        binary_element_type = file_value->element_type;
+                        binary_element_type = ARRAY_ELEMENT_TYPE(*file_value);
                         binary_element_size = (size_t)size_bytes;
                     }
                 }
@@ -9155,7 +9155,7 @@ Value vmBuiltinStr(VM* vm, int arg_count, Value* args) {
     freeValue(dest);
     SET_VALUE_TYPE(dest, dest_type);
     AS_STRING(*dest) = new_buf;
-    dest->max_length = -1;
+    STRING_MAX_LENGTH(*dest) = -1;
     return makeVoid();
 }
 
@@ -9670,14 +9670,14 @@ static bool jsonAppendArrayRecursive(JsonBuffer *buffer, const Value *array,
     if (!jsonBufferAppendFormat(buffer, "[")) {
         return false;
     }
-    int lower = array->lower_bounds[dimension];
-    int upper = array->upper_bounds[dimension];
+    int lower = ARRAY_LOWER_BOUNDS(*array)[dimension];
+    int upper = ARRAY_UPPER_BOUNDS(*array)[dimension];
     for (int idx = lower; idx <= upper; ++idx) {
         if (idx > lower && !jsonBufferAppendFormat(buffer, ", ")) {
             return false;
         }
         indices[dimension] = idx;
-        if (dimension + 1 >= array->dimensions) {
+        if (dimension + 1 >= ARRAY_DIMENSIONS(*array)) {
             int offset = computeFlatOffset((Value *)array, indices);
             if (arrayUsesPackedBytes(array)) {
                 if (!AS_ARRAY_RAW(*array)) {
@@ -9702,12 +9702,12 @@ static bool jsonAppendArrayRecursive(JsonBuffer *buffer, const Value *array,
 }
 
 static bool jsonAppendArray(JsonBuffer *buffer, const Value *array) {
-    if (!array || array->dimensions <= 0 ||
+    if (!array || ARRAY_DIMENSIONS(*array) <= 0 ||
         (!AS_ARRAY(*array) && !arrayUsesPackedBytes(array)) ||
-        !array->lower_bounds || !array->upper_bounds) {
+        !ARRAY_LOWER_BOUNDS(*array) || !ARRAY_UPPER_BOUNDS(*array)) {
         return jsonBufferAppendFormat(buffer, "[]");
     }
-    int *indices = (int *)malloc(sizeof(int) * array->dimensions);
+    int *indices = (int *)malloc(sizeof(int) * ARRAY_DIMENSIONS(*array));
     if (!indices) {
         return false;
     }

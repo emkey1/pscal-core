@@ -415,12 +415,12 @@ void insertGlobalSymbol(const char *name, VarType type, AST *type_def) {
             }
             AS_ENUM(*new_symbol->value).enum_name = strdup(def->token->value);
             AS_ENUM(*new_symbol->value).ordinal = 0;
-            new_symbol->value->base_type_node = def;
+            PTR_BASE_TYPE_NODE(*new_symbol->value) = def;
         }
     }
 
     DEBUG_PRINT("[DEBUG SYMBOL] Created Symbol '%s' at %p (Value @ %p, base_type_node @ %p).\n",
-                new_symbol->name, (void*)new_symbol, (void*)new_symbol->value, (void*)(new_symbol->value ? new_symbol->value->base_type_node : NULL));
+                new_symbol->name, (void*)new_symbol, (void*)new_symbol->value, (void*)(new_symbol->value ? PTR_BASE_TYPE_NODE(*new_symbol->value) : NULL));
 
     if (!ensureGlobalSymbolsTable()) {
         if (new_symbol->value) {
@@ -731,7 +731,7 @@ Symbol *insertLocalSymbol(const char *name, VarType type, AST* type_def, bool is
     *(sym->value) = makeValueForType(type, type_def, sym); // Initialize using helper
 
     DEBUG_PRINT("[DEBUG SYMBOL] Created Symbol '%s' at %p (Value @ %p, base_type_node @ %p).\n",
-                sym->name, (void*)sym, (void*)sym->value, (void*)(sym->value ? sym->value->base_type_node : NULL));
+                sym->name, (void*)sym, (void*)sym->value, (void*)(sym->value ? PTR_BASE_TYPE_NODE(*sym->value) : NULL));
 
 
     // Set flags
@@ -1095,7 +1095,7 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
     // **CRITICAL EXCEPTION**: Do NOT free the buffer for a fixed-length string,
     // as we are about to write into it. For all other types, freeing the
     // old contents before assigning new ones is correct.
-    if (!(sym->type == TYPE_STRING && sym->value->max_length > 0)) {
+    if (!(sym->type == TYPE_STRING && STRING_MAX_LENGTH(*sym->value) > 0)) {
         freeValue(sym->value);
     }
 
@@ -1237,9 +1237,9 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
             }
             if (!source_str) source_str = "";
 
-            if (sym->value->max_length > 0) { // Target is a fixed-length string.
-                strncpy(AS_STRING(*sym->value), source_str, sym->value->max_length);
-                AS_STRING(*sym->value)[sym->value->max_length] = '\0';
+            if (STRING_MAX_LENGTH(*sym->value) > 0) { // Target is a fixed-length string.
+                strncpy(AS_STRING(*sym->value), source_str, STRING_MAX_LENGTH(*sym->value));
+                AS_STRING(*sym->value)[STRING_MAX_LENGTH(*sym->value)] = '\0';
             } else { // Target is a dynamic string.
                 if (AS_STRING(*sym->value)) {
                     free(AS_STRING(*sym->value));
@@ -1270,10 +1270,10 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
                     }
                 }
                 AS_FILE(*sym->value) = AS_FILE(val);
-                if (sym->value->filename) free(sym->value->filename);
-                sym->value->filename = val.filename ? strdup(val.filename) : NULL;
+                if (FILE_FILENAME(*sym->value)) free(FILE_FILENAME(*sym->value));
+                FILE_FILENAME(*sym->value) = FILE_FILENAME(val) ? strdup(FILE_FILENAME(val)) : NULL;
                 AS_FILE(val) = NULL;
-                val.filename = NULL;
+                FILE_FILENAME(val) = NULL;
             }
             break;
 
