@@ -1865,6 +1865,54 @@ static bool readValue(Cursor* in, Value* out) {
     return true;
 }
 
+/* VM 2.0 Phase 6 (Docs/pscal_vm2_plan.md §6.3): self-framed (varint
+ * length-prefixed) single-Value records for the record/replay journal.
+ * Reuses writeValue/readValue verbatim -- same codec as the PSB3 constant
+ * pool -- rather than inventing a second Value serialization scheme. */
+bool pscalCacheWriteValueFramed(FILE* out, const Value* v) {
+    if (!out || !v) return false;
+    ByteBuf buf;
+    bufInit(&buf);
+    bool ok = writeValue(&buf, v);
+    if (ok) {
+        ByteBuf framed;
+        bufInit(&framed);
+        bufLenPrefixedBytes(&framed, buf.data, buf.len);
+        if (fwrite(framed.data, 1, framed.len, out) != framed.len) ok = false;
+        bufFree(&framed);
+    }
+    bufFree(&buf);
+    return ok;
+}
+
+bool pscalCacheReadValueFramed(FILE* in, Value* out) {
+    if (!in || !out) return false;
+    /* Varint length prefix, byte at a time (frames are small: single
+     * builtin-call results/writebacks, not bulk data). */
+    uint64_t len = 0;
+    int shift = 0;
+    for (;;) {
+        int byte = fgetc(in);
+        if (byte == EOF) return false;
+        len |= (uint64_t)(byte & 0x7F) << shift;
+        if (!(byte & 0x80)) break;
+        shift += 7;
+        if (shift > 63) return false;
+    }
+    if (len > (64u * 1024 * 1024)) return false; /* sanity ceiling */
+    uint8_t* bytes = (uint8_t*)malloc(len > 0 ? len : 1);
+    if (!bytes) return false;
+    if (len > 0 && fread(bytes, 1, (size_t)len, in) != len) {
+        free(bytes);
+        return false;
+    }
+    Cursor cur;
+    curInit(&cur, bytes, (size_t)len);
+    bool ok = readValue(&cur, out) && !cur.error;
+    free(bytes);
+    return ok;
+}
+
 typedef struct {
     Symbol* symbol;
     Symbol* parent;

@@ -32,6 +32,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h> // For the operand stack's mmap/mprotect-backed growable storage (VM 2.0 Phase 3)
 #include "backend_ast/builtin.h"
+#include "vm/vm_fx_policy.h"
 #ifdef SDL
 #include "backend_ast/pscal_sdl_runtime.h"
 #endif
@@ -6019,6 +6020,56 @@ static BuiltinRoutineType vmBuiltinTypeCached(int builtin_id, const char* fallba
     return fallback_name ? getBuiltinType(fallback_name) : BUILTIN_TYPE_NONE;
 }
 
+/* VM 2.0 Phase 6 (Docs/pscal_vm2_plan.md §6.3): shared enforce/replay gate for
+ * both builtin-call opcodes (CALL_BUILTIN_PROC and CALL_BUILTIN), called
+ * right before the handler would otherwise run. pscalFxPolicyActive() is a
+ * cheap check (no mutex, no per-id lookup) that short-circuits to INTERPRET_OK
+ * with *out_mask left at FX_PURE when neither a deny-list nor record/replay
+ * is active -- this is the "zero cost when no policy is set" path.
+ *
+ * On a denied builtin or a replay journal mismatch, calls runtimeError()
+ * itself and returns INTERPRET_RUNTIME_ERROR; the caller still owns stack/arg
+ * cleanup (identical to the existing "unknown builtin" error paths) since the
+ * cleanup shape differs slightly between the two opcodes. On a successful
+ * replay substitution, fills *out_result and sets *out_replayed so the caller
+ * skips invoking the real handler. *out_mask is filled either way so the
+ * caller can decide whether to journal the result after a live call. */
+static InterpretResult vmApplyFxPolicy(VM* vm, int effective_id, const char* effective_name,
+                                        int arg_count, Value* args,
+                                        Value* out_result, bool* out_replayed, EffectMask* out_mask) {
+    *out_replayed = false;
+    *out_mask = FX_PURE;
+    if (!pscalFxPolicyActive()) return INTERPRET_OK;
+
+    EffectMask fx_mask = getVmBuiltinEffectMaskById(effective_id);
+    *out_mask = fx_mask;
+    if (fx_mask == FX_PURE) return INTERPRET_OK;
+
+    EffectMask denied = pscalFxEffectiveDeniedMask();
+    if (denied & fx_mask) {
+        runtimeError(vm, "VM Error: builtin '%s' denied by --deny/PSCAL_VM_DENY policy (effect mask 0x%x intersects denied 0x%x).",
+                     effective_name ? effective_name : "?", (unsigned)fx_mask, (unsigned)denied);
+        return INTERPRET_RUNTIME_ERROR;
+    }
+
+    if (pscalFxReplayActive()) {
+        char mismatch[256];
+        PscalFxReplayOutcome outcome = pscalFxReplayCall(vm, effective_name ? effective_name : "?", arg_count, args,
+                                                         out_result, mismatch, sizeof(mismatch));
+        if (outcome == PSCAL_FX_REPLAY_MISMATCH) {
+            runtimeError(vm, "VM Error: fx replay journal mismatch calling '%s': %s",
+                         effective_name ? effective_name : "?", mismatch);
+            return INTERPRET_RUNTIME_ERROR;
+        }
+        /* PSCAL_FX_REPLAY_RUN_LIVE: this call wasn't substitutable when
+         * recorded (e.g. a file/handle writeback) -- leave *out_replayed
+         * false so the caller invokes the real handler, exactly as happened
+         * during recording. */
+        *out_replayed = (outcome == PSCAL_FX_REPLAY_SUBSTITUTED);
+    }
+    return INTERPRET_OK;
+}
+
 // --- Main Interpretation Loop ---
 InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globals, HashTable* const_globals, HashTable* procedures, uint32_t entry) {
     if (!vm || !chunk) return INTERPRET_RUNTIME_ERROR;
@@ -9615,7 +9666,29 @@ comparison_error_label:
                 const char* previous_builtin_name = vm->current_builtin_name;
                 vm->current_builtin_name = context_name;
 
-                Value result = handler(vm, arg_count, args);
+                Value result;
+                bool fx_replayed = false;
+                EffectMask fx_mask = FX_PURE;
+                InterpretResult fx_status = vmApplyFxPolicy(vm, effective_id, effective_name, arg_count, args,
+                                                            &result, &fx_replayed, &fx_mask);
+                if (fx_status != INTERPRET_OK) {
+                    if (needs_lock) pthread_mutex_unlock(&globals_mutex);
+                    vm->current_builtin_name = previous_builtin_name;
+                    vm->stackTop -= arg_count;
+                    for (int i = 0; i < arg_count; i++) {
+                        if (VALUE_TYPE(args[i]) == TYPE_POINTER || VALUE_TYPE(args[i]) == TYPE_FILE) {
+                            continue;
+                        }
+                        freeValue(&args[i]);
+                    }
+                    return fx_status;
+                }
+                if (!fx_replayed) {
+                    result = handler(vm, arg_count, args);
+                    if (fx_mask != FX_PURE && pscalFxRecordActive()) {
+                        pscalFxRecordCall(effective_name, arg_count, args, &result);
+                    }
+                }
 
                 if (needs_lock) pthread_mutex_unlock(&globals_mutex);
                 vm->current_builtin_name = previous_builtin_name;
@@ -9733,7 +9806,29 @@ comparison_error_label:
                     const char* previous_builtin_name = vm->current_builtin_name;
                     vm->current_builtin_name = context_name;
 
-                    Value result = handler(vm, arg_count, args);
+                    Value result;
+                    bool fx_replayed = false;
+                    EffectMask fx_mask = FX_PURE;
+                    InterpretResult fx_status = vmApplyFxPolicy(vm, mapped_builtin_id, context_name, arg_count, args,
+                                                                &result, &fx_replayed, &fx_mask);
+                    if (fx_status != INTERPRET_OK) {
+                        if (needs_lock) pthread_mutex_unlock(&globals_mutex);
+                        vm->current_builtin_name = previous_builtin_name;
+                        vm->stackTop -= arg_count;
+                        for (int i = 0; i < arg_count; i++) {
+                            if (VALUE_TYPE(args[i]) == TYPE_POINTER || VALUE_TYPE(args[i]) == TYPE_FILE) {
+                                continue;
+                            }
+                            freeValue(&args[i]);
+                        }
+                        return fx_status;
+                    }
+                    if (!fx_replayed) {
+                        result = handler(vm, arg_count, args);
+                        if (fx_mask != FX_PURE && pscalFxRecordActive()) {
+                            pscalFxRecordCall(context_name, arg_count, args, &result);
+                        }
+                    }
 
                     if (needs_lock) pthread_mutex_unlock(&globals_mutex);
                     vm->current_builtin_name = previous_builtin_name;

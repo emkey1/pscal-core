@@ -35,5 +35,5 @@ static Value vmBuiltinGetCurrentDir(struct VM_s* vm, int arg_count, Value* args)
 
 void registerGetCurrentDirBuiltin(void) {
     registerVmBuiltin("getcurrentdir", vmBuiltinGetCurrentDir,
-                      BUILTIN_TYPE_FUNCTION, "GetCurrentDir");
+                      BUILTIN_TYPE_FUNCTION, "GetCurrentDir", FX_IO);
 }

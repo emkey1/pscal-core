@@ -335,5 +335,5 @@ static Value vmBuiltinOpenAIChatCompletions(struct VM_s *vm, int arg_count,
 
 void registerOpenAIChatCompletionsBuiltin(void) {
     registerVmBuiltin("openaichatcompletions", vmBuiltinOpenAIChatCompletions,
-                      BUILTIN_TYPE_FUNCTION, "OpenAIChatCompletions");
+                      BUILTIN_TYPE_FUNCTION, "OpenAIChatCompletions", FX_NET);
 }

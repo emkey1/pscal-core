@@ -2,6 +2,7 @@
 #define PSCAL_CACHE_H
 
 #include <stdbool.h>
+#include <stdio.h>
 #include "compiler/bytecode.h"
 #include "symbol/symbol.h"
 
@@ -32,5 +33,15 @@ char* buildCachePath(const char* source_path, const char* compiler_id);
 // Rebuild constructor aliases in procedure tables so fresh-compile and
 // cache-loaded execution paths share identical callable symbol aliases.
 void restoreProcedureConstructorAliases(HashTable* table);
+
+// VM 2.0 Phase 6 (Docs/pscal_vm2_plan.md §6.3): expose the PSB3 value codec
+// (writeValue/readValue) as a self-framed (length-prefixed) record for the
+// record/replay journal, so the journal reuses the same Value serialization
+// as the bytecode cache instead of inventing a second scheme. Returns false
+// on an unsupported Value variant (write) or a truncated/corrupt frame
+// (read); the caller decides how to degrade (record: skip journaling this
+// call's result; replay: abort cleanly).
+bool pscalCacheWriteValueFramed(FILE* out, const Value* v);
+bool pscalCacheReadValueFramed(FILE* in, Value* out);
 
 #endif // PSCAL_CACHE_H

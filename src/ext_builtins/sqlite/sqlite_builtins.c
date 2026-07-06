@@ -659,7 +659,7 @@ static void registerSqliteFunction(const char *group,
                                    const char *vm_name,
                                    VmBuiltinFn fn) {
     extBuiltinRegisterFunction("sqlite", group, display_name);
-    registerVmBuiltin(vm_name, fn, BUILTIN_TYPE_FUNCTION, display_name);
+    registerVmBuiltin(vm_name, fn, BUILTIN_TYPE_FUNCTION, display_name, FX_IO);
 }
 
 void registerSqliteBuiltins(void) {

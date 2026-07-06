@@ -1638,18 +1638,18 @@ void cleanupBalls3DRenderingResources(void) {
 
 void registerBalls3DBuiltins(void) {
     registerVmBuiltin("bouncingballs3dstep", vmBuiltinBouncingBalls3DStep,
-                      BUILTIN_TYPE_PROCEDURE, "BouncingBalls3DStep");
+                      BUILTIN_TYPE_PROCEDURE, "BouncingBalls3DStep", FX_PURE);
     registerVmBuiltin("bouncingballs3dstepultra", vmBuiltinBouncingBalls3DStepUltra,
-                      BUILTIN_TYPE_PROCEDURE, "BouncingBalls3DStepUltra");
+                      BUILTIN_TYPE_PROCEDURE, "BouncingBalls3DStepUltra", FX_PURE);
     registerVmBuiltin("bouncingballs3dstepadvanced",
                       vmBuiltinBouncingBalls3DStepAdvanced, BUILTIN_TYPE_PROCEDURE,
-                      "BouncingBalls3DStepAdvanced");
+                      "BouncingBalls3DStepAdvanced", FX_PURE);
     registerVmBuiltin("bouncingballs3dstepultraadvanced",
                       vmBuiltinBouncingBalls3DStepUltraAdvanced,
-                      BUILTIN_TYPE_PROCEDURE, "BouncingBalls3DStepUltraAdvanced");
+                      BUILTIN_TYPE_PROCEDURE, "BouncingBalls3DStepUltraAdvanced", FX_PURE);
     registerVmBuiltin("bouncingballs3daccelerate", vmBuiltinBouncingBalls3DAccelerate,
-                      BUILTIN_TYPE_PROCEDURE, "BouncingBalls3DAccelerate");
+                      BUILTIN_TYPE_PROCEDURE, "BouncingBalls3DAccelerate", FX_PURE);
     registerVmBuiltin("bouncingballs3ddrawunitspherefast",
                       vmBuiltinBouncingBalls3DDrawUnitSphereFast,
-                      BUILTIN_TYPE_PROCEDURE, "BouncingBalls3DDrawUnitSphereFast");
+                      BUILTIN_TYPE_PROCEDURE, "BouncingBalls3DDrawUnitSphereFast", FX_IO);
 }

@@ -208,7 +208,7 @@ Value vmBuiltinSierpinskiReleaseWorkers(VM *vm, int arg_count, Value *args) {
 
 void registerSierpinskiBuiltins(void) {
     registerVmBuiltin("SierpinskiSpawnWorker", vmBuiltinSierpinskiSpawnWorker,
-                      BUILTIN_TYPE_FUNCTION, NULL);
+                      BUILTIN_TYPE_FUNCTION, NULL, FX_PROC);
     registerVmBuiltin("SierpinskiReleaseWorkers", vmBuiltinSierpinskiReleaseWorkers,
-                      BUILTIN_TYPE_PROCEDURE, NULL);
+                      BUILTIN_TYPE_PROCEDURE, NULL, FX_PROC);
 }

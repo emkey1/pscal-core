@@ -1656,27 +1656,27 @@ static Value vmBuiltinLandscapeDrawSkyDome(VM* vm, int arg_count, Value* args) {
 
 void registerLandscapeBuiltins(void) {
     registerVmBuiltin("landscapeconfigureprocedural", vmBuiltinLandscapeConfigureProcedural,
-                      BUILTIN_TYPE_PROCEDURE, "LandscapeConfigureProcedural");
+                      BUILTIN_TYPE_PROCEDURE, "LandscapeConfigureProcedural", FX_PURE);
     registerVmBuiltin("landscapedrawterrain", vmBuiltinLandscapeDrawTerrain,
-                      BUILTIN_TYPE_PROCEDURE, "LandscapeDrawTerrain");
+                      BUILTIN_TYPE_PROCEDURE, "LandscapeDrawTerrain", FX_IO);
     registerVmBuiltin("landscapedrawwater", vmBuiltinLandscapeDrawWater,
-                      BUILTIN_TYPE_PROCEDURE, "LandscapeDrawWater");
+                      BUILTIN_TYPE_PROCEDURE, "LandscapeDrawWater", FX_IO);
     registerVmBuiltin("landscapeprecomputeworldcoords", vmBuiltinLandscapePrecomputeWorldCoords,
-                      BUILTIN_TYPE_PROCEDURE, "LandscapePrecomputeWorldCoords");
+                      BUILTIN_TYPE_PROCEDURE, "LandscapePrecomputeWorldCoords", FX_PURE);
     registerVmBuiltin("landscapeprecomputewateroffsets", vmBuiltinLandscapePrecomputeWaterOffsets,
-                      BUILTIN_TYPE_PROCEDURE, "LandscapePrecomputeWaterOffsets");
+                      BUILTIN_TYPE_PROCEDURE, "LandscapePrecomputeWaterOffsets", FX_PURE);
     registerVmBuiltin("landscapebuildheightfield", vmBuiltinLandscapeBuildHeightField,
-                      BUILTIN_TYPE_PROCEDURE, "LandscapeBuildHeightField");
+                      BUILTIN_TYPE_PROCEDURE, "LandscapeBuildHeightField", FX_PURE);
     registerVmBuiltin("landscapebakevertexdata", vmBuiltinLandscapeBakeVertexData,
-                      BUILTIN_TYPE_PROCEDURE, "LandscapeBakeVertexData");
+                      BUILTIN_TYPE_PROCEDURE, "LandscapeBakeVertexData", FX_PURE);
     registerVmBuiltin("landscapesetpalettepreset", vmBuiltinLandscapeSetPalettePreset,
-                      BUILTIN_TYPE_PROCEDURE, "LandscapeSetPalettePreset");
+                      BUILTIN_TYPE_PROCEDURE, "LandscapeSetPalettePreset", FX_PURE);
     registerVmBuiltin("landscapesetlightingpreset", vmBuiltinLandscapeSetLightingPreset,
-                      BUILTIN_TYPE_PROCEDURE, "LandscapeSetLightingPreset");
+                      BUILTIN_TYPE_PROCEDURE, "LandscapeSetLightingPreset", FX_PURE);
 #ifdef SDL
     registerVmBuiltin("landscapedrawskydome", vmBuiltinLandscapeDrawSkyDome,
-                      BUILTIN_TYPE_PROCEDURE, "LandscapeDrawSkyDome");
+                      BUILTIN_TYPE_PROCEDURE, "LandscapeDrawSkyDome", FX_IO);
     registerVmBuiltin("landscapedrawcloudlayer", vmBuiltinLandscapeDrawCloudLayer,
-                      BUILTIN_TYPE_PROCEDURE, "LandscapeDrawCloudLayer");
+                      BUILTIN_TYPE_PROCEDURE, "LandscapeDrawCloudLayer", FX_IO);
 #endif
 }

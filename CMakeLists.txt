@@ -90,6 +90,7 @@ set(PSCAL_CORE_SOURCES
     ${SRC}/common/frontend_kind.c ${SRC}/common/runtime_paths.c ${SRC}/common/pascal_state.c
     ${SRC}/core/diagmap.c
     ${SRC}/vm/vm.c
+    ${SRC}/vm/vm_fx_policy.c
     ${CMAKE_CURRENT_SOURCE_DIR}/lib/noise/noise.c
     ${SRC}/runtime/terrain/terrain_generator.c ${SRC}/runtime/shaders/shader_common.c
     ${SRC}/runtime/shaders/terrain/terrain_shader.c ${SRC}/runtime/shaders/sky/sky_dome.c

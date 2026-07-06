@@ -8,6 +8,7 @@
 #include "backend_ast/builtin_network_api.h"
 #include "vm/vm.h"
 #include "vm/string_sentinels.h"
+#include "vm/vm_fx_policy.h"
 
 // Standard library includes remain the same
 #include <math.h>
@@ -1964,6 +1965,51 @@ static size_t num_extra_vm_builtins = 0;
 static pthread_mutex_t builtin_registry_mutex;
 static pthread_once_t builtin_registry_once = PTHREAD_ONCE_INIT;
 
+/* VM 2.0 Phase 6 (Docs/pscal_vm2_plan.md §6.3): per-id effect-mask overrides.
+ * Sparse, indexed by builtin id (core ids included, since registerVmBuiltin
+ * can replace a core dispatch-table placeholder, e.g. SDL graphics). Grown
+ * lazily; g_effect_override_set[id] tells whether g_effect_overrides[id] is
+ * meaningful, since FX_PURE (0) is itself a valid mask. Ids without an
+ * override fall back to name-based classification (core builtins) or FX_IO
+ * (extra builtins registered without ever calling the new registerVmBuiltin
+ * mask parameter -- shouldn't happen, but conservative if it does). */
+static EffectMask *g_effect_overrides = NULL;
+static bool *g_effect_override_set = NULL;
+static size_t g_effect_overrides_cap = 0;
+
+static bool ensureEffectOverrideCapacityUnlocked(size_t id) {
+    if (id < g_effect_overrides_cap) {
+        return true;
+    }
+    size_t new_cap = g_effect_overrides_cap ? g_effect_overrides_cap * 2 : 64;
+    while (new_cap <= id) {
+        new_cap *= 2;
+    }
+    EffectMask *new_masks = realloc(g_effect_overrides, sizeof(EffectMask) * new_cap);
+    if (!new_masks) return false;
+    g_effect_overrides = new_masks;
+    bool *new_set = realloc(g_effect_override_set, sizeof(bool) * new_cap);
+    if (!new_set) return false;
+    g_effect_override_set = new_set;
+    for (size_t i = g_effect_overrides_cap; i < new_cap; ++i) {
+        g_effect_overrides[i] = FX_PURE;
+        g_effect_override_set[i] = false;
+    }
+    g_effect_overrides_cap = new_cap;
+    return true;
+}
+
+static void setEffectOverrideUnlocked(size_t id, EffectMask mask) {
+    if (!ensureEffectOverrideCapacityUnlocked(id)) return;
+    g_effect_overrides[id] = mask;
+    g_effect_override_set[id] = true;
+}
+
+/* Lazily-computed per-core-builtin masks, classified by name (see
+ * pscalBuiltinNameEffectMask below). Populated once so getVmBuiltinEffectMaskById
+ * is O(1) even under an active --deny policy. */
+static EffectMask *g_core_builtin_masks = NULL;
+
 typedef struct {
     Symbol symbol;
     size_t id;
@@ -2134,74 +2180,134 @@ static void initBuiltinRegistryMutex(void) {
     }
 }
 
-bool pscalBuiltinNameIsEffectful(const char *name) {
-    if (!name) return false;
-    /* Single source of truth for builtin effectfulness. Anything that touches
-     * the outside world, is nondeterministic, or observes concurrent state.
-     * Pure builtins (math, string, conversion, in-memory streams, TOON reads,
-     * type predicates) are deliberately absent. Includes both raw VM names and
-     * the Aether-spelling aliases (ai_chat, sleep, task_*) so a single check
-     * serves every front end and the introspection metadata. */
-    static const char *kEffectfulNames[] = {
-        /* output / stdio */
-        "print", "printf", "println", "fprintf", "write", "writeln",
-        "read", "readln", "flush",
-        /* process control */
-        "exit", "halt", "store", "swap", "fetch",
-        /* timing (raw + Aether alias) */
-        "delay", "sleep",
-        /* AI (raw + Aether alias) */
-        "openaichatcompletions", "ai_chat",
-        /* tasks / threads (Aether aliases + raw) */
-        "task_spawn", "task_queue", "task_wait", "task_lookup", "task_status",
-        "task_result", "task_stats", "task_cancel", "task_pause", "task_resume",
-        "task_set_name",
-        "thread_spawn_named", "thread_pool_submit", "thread_set_name",
-        "thread_cancel", "thread_pause", "thread_resume", "thread_get_result",
-        "thread_get_status", "thread_lookup", "thread_stats",
-        "threadspawnbuiltin", "waitforthread",
-        /* filesystem + file-handle I/O */
-        "fileexists", "getcurrentdir", "mkdir", "rmdir", "rename", "erase",
-        "findfirst", "findnext", "getfattr", "fopen", "fclose", "fflush",
-        "filesize", "blockread", "blockwrite", "ioresult", "eof", "assignfile",
-        "closefile", "mstreamloadfromfile", "mstreamsavetofile", "toon_parse_file",
-        "yyjsonreadfile", /* canonical lowering of toon_parse_file */
-        /* environment / process / CLI */
-        "getenv", "getenvint", "paramstr", "paramcount", "getpid", "exec", "beep",
-        "dosexec", "dosgetenv", "dosfindfirst", "dosfindnext", "dosgetdate",
-        "dosgettime", "dosgetfattr", "dosmkdir", "dosrmdir",
-        /* nondeterminism */
-        "random", "randomize",
-        /* external clock */
-        "gettime", "getdate", "realtimeclock",
-        /* console input */
-        "readkey", "keypressed",
-        /* network */
-        "dnslookup", "apisend", "apireceive",
-        "httpsession", "httpclose", "httperrorcode", "httpgetlastheaders",
-        "httpgetheader", "httpsetheader", "httpclearheaders", "httpsetoption",
-        "httprequest", "httprequesttofile", "httprequestasync",
-        "httprequestasynctofile", "httpisdone", "httptryawait", "httpcancel",
-        "httpgetasyncprogress", "httpgetasynctotal", "httpawait", "httplasterror",
-        /* database (sqlite) */
-        "sqliteopen", "sqliteclose", "sqliteexec", "sqliteprepare",
-        "sqlitefinalize", "sqlitestep", "sqlitereset", "sqlitecolumncount",
-        "sqlitecolumntype", "sqlitecolumnname", "sqlitecolumnint",
-        "sqlitecolumndouble", "sqlitecolumntext", "sqlitebindtext",
-        "sqlitebindint", "sqlitebinddouble", "sqlitebindnull",
-        "sqliteclearbindings", "sqliteerrmsg", "sqlitelastinsertrowid",
-        "sqlitechanges",
-    };
-    for (size_t i = 0; i < sizeof(kEffectfulNames) / sizeof(kEffectfulNames[0]); ++i) {
-        if (strcasecmp(kEffectfulNames[i], name) == 0) {
-            return true;
+/* Single source of truth for builtin effectfulness/effect-class, shared by
+ * the Aether FX-001 gate, the builtin-introspection metadata (builtins_json /
+ * builtin_info), and the VM 2.0 Phase 6 --deny sandbox + record/replay
+ * machinery (Docs/pscal_vm2_plan.md §6.3). Anything that touches the outside
+ * world, is nondeterministic, or observes concurrent state gets a nonzero
+ * mask; pure builtins (math, string, conversion, in-memory streams, TOON
+ * reads, type predicates) are deliberately absent (FX_PURE). Includes both
+ * raw VM names and the Aether-spelling aliases (ai_chat, sleep, task_*) so a
+ * single check serves every front end. This is the seed classification for
+ * core dispatch-table builtins (see getVmBuiltinEffectMaskById); ext_builtins
+ * categories additionally pass an explicit mask to registerVmBuiltin(). */
+typedef struct {
+    const char *name;
+    EffectMask mask;
+} EffectClassification;
+
+static const EffectClassification kEffectClassifiedNames[] = {
+    /* output / stdio */
+    {"print", FX_IO}, {"printf", FX_IO}, {"println", FX_IO}, {"fprintf", FX_IO},
+    {"write", FX_IO}, {"writeln", FX_IO}, {"read", FX_IO}, {"readln", FX_IO},
+    {"flush", FX_IO},
+    /* process control */
+    {"exit", FX_PROC}, {"halt", FX_PROC}, {"store", FX_PROC}, {"swap", FX_PROC},
+    {"fetch", FX_PROC},
+    /* timing (raw + Aether alias) */
+    {"delay", FX_CLOCK}, {"sleep", FX_CLOCK},
+    /* AI (raw + Aether alias) -- goes over the network */
+    {"openaichatcompletions", FX_NET}, {"ai_chat", FX_NET},
+    /* tasks / threads (Aether aliases + raw) */
+    {"task_spawn", FX_PROC}, {"task_queue", FX_PROC}, {"task_wait", FX_PROC},
+    {"task_lookup", FX_PROC}, {"task_status", FX_PROC}, {"task_result", FX_PROC},
+    {"task_stats", FX_PROC}, {"task_cancel", FX_PROC}, {"task_pause", FX_PROC},
+    {"task_resume", FX_PROC}, {"task_set_name", FX_PROC},
+    {"thread_spawn_named", FX_PROC}, {"thread_pool_submit", FX_PROC},
+    {"thread_set_name", FX_PROC}, {"thread_cancel", FX_PROC},
+    {"thread_pause", FX_PROC}, {"thread_resume", FX_PROC},
+    {"thread_get_result", FX_PROC}, {"thread_get_status", FX_PROC},
+    {"thread_lookup", FX_PROC}, {"thread_stats", FX_PROC},
+    {"threadspawnbuiltin", FX_PROC}, {"waitforthread", FX_PROC},
+    /* filesystem + file-handle I/O */
+    {"fileexists", FX_IO}, {"getcurrentdir", FX_IO}, {"mkdir", FX_IO},
+    {"rmdir", FX_IO}, {"rename", FX_IO}, {"erase", FX_IO}, {"findfirst", FX_IO},
+    {"findnext", FX_IO}, {"getfattr", FX_IO}, {"fopen", FX_IO}, {"fclose", FX_IO},
+    {"fflush", FX_IO}, {"filesize", FX_IO}, {"blockread", FX_IO},
+    {"blockwrite", FX_IO}, {"ioresult", FX_IO}, {"eof", FX_IO},
+    {"assignfile", FX_IO}, {"closefile", FX_IO}, {"mstreamloadfromfile", FX_IO},
+    {"mstreamsavetofile", FX_IO}, {"toon_parse_file", FX_IO},
+    {"yyjsonreadfile", FX_IO}, /* canonical lowering of toon_parse_file */
+    /* environment / process / CLI */
+    {"getenv", FX_IO}, {"getenvint", FX_IO}, {"paramstr", FX_IO},
+    {"paramcount", FX_IO}, {"getpid", FX_PROC}, {"exec", FX_PROC}, {"beep", FX_IO},
+    {"dosexec", FX_PROC}, {"dosgetenv", FX_IO}, {"dosfindfirst", FX_IO},
+    {"dosfindnext", FX_IO}, {"dosgetdate", FX_CLOCK}, {"dosgettime", FX_CLOCK},
+    {"dosgetfattr", FX_IO}, {"dosmkdir", FX_IO}, {"dosrmdir", FX_IO},
+    /* nondeterminism */
+    {"random", FX_RANDOM}, {"randomize", FX_RANDOM},
+    /* external clock */
+    {"gettime", FX_CLOCK}, {"getdate", FX_CLOCK}, {"realtimeclock", FX_CLOCK},
+    /* console input */
+    {"readkey", FX_IO}, {"keypressed", FX_IO},
+    /* network */
+    {"dnslookup", FX_NET}, {"apisend", FX_NET}, {"apireceive", FX_NET},
+    {"httpsession", FX_NET}, {"httpclose", FX_NET}, {"httperrorcode", FX_NET},
+    {"httpgetlastheaders", FX_NET}, {"httpgetheader", FX_NET},
+    {"httpsetheader", FX_NET}, {"httpclearheaders", FX_NET},
+    {"httpsetoption", FX_NET}, {"httprequest", FX_NET},
+    {"httprequesttofile", FX_NET}, {"httprequestasync", FX_NET},
+    {"httprequestasynctofile", FX_NET}, {"httpisdone", FX_NET},
+    {"httptryawait", FX_NET}, {"httpcancel", FX_NET},
+    {"httpgetasyncprogress", FX_NET}, {"httpgetasynctotal", FX_NET},
+    {"httpawait", FX_NET}, {"httplasterror", FX_NET},
+    /* database (sqlite) */
+    {"sqliteopen", FX_IO}, {"sqliteclose", FX_IO}, {"sqliteexec", FX_IO},
+    {"sqliteprepare", FX_IO}, {"sqlitefinalize", FX_IO}, {"sqlitestep", FX_IO},
+    {"sqlitereset", FX_IO}, {"sqlitecolumncount", FX_IO},
+    {"sqlitecolumntype", FX_IO}, {"sqlitecolumnname", FX_IO},
+    {"sqlitecolumnint", FX_IO}, {"sqlitecolumndouble", FX_IO},
+    {"sqlitecolumntext", FX_IO}, {"sqlitebindtext", FX_IO},
+    {"sqlitebindint", FX_IO}, {"sqlitebinddouble", FX_IO},
+    {"sqlitebindnull", FX_IO}, {"sqliteclearbindings", FX_IO},
+    {"sqliteerrmsg", FX_IO}, {"sqlitelastinsertrowid", FX_IO},
+    {"sqlitechanges", FX_IO},
+};
+
+EffectMask pscalBuiltinNameEffectMask(const char *name) {
+    if (!name) return FX_PURE;
+    for (size_t i = 0; i < sizeof(kEffectClassifiedNames) / sizeof(kEffectClassifiedNames[0]); ++i) {
+        if (strcasecmp(kEffectClassifiedNames[i].name, name) == 0) {
+            return kEffectClassifiedNames[i].mask;
         }
     }
-    return false;
+    return FX_PURE;
+}
+
+bool pscalBuiltinNameIsEffectful(const char *name) {
+    return pscalBuiltinNameEffectMask(name) != FX_PURE;
+}
+
+EffectMask getVmBuiltinEffectMaskById(int id) {
+    if (id < 0) return FX_PURE;
+    pthread_once(&builtin_registry_once, initBuiltinRegistryMutex);
+    pthread_mutex_lock(&builtin_registry_mutex);
+    EffectMask result = FX_PURE;
+    size_t uid = (size_t)id;
+    if (uid < g_effect_overrides_cap && g_effect_override_set[uid]) {
+        result = g_effect_overrides[uid];
+    } else if (uid < num_vm_builtins) {
+        if (!g_core_builtin_masks) {
+            g_core_builtin_masks = calloc(num_vm_builtins, sizeof(EffectMask));
+            if (g_core_builtin_masks) {
+                for (size_t i = 0; i < num_vm_builtins; ++i) {
+                    g_core_builtin_masks[i] = pscalBuiltinNameEffectMask(vmBuiltinDispatchTable[i].name);
+                }
+            }
+        }
+        result = g_core_builtin_masks ? g_core_builtin_masks[uid] : pscalBuiltinNameEffectMask(vmBuiltinDispatchTable[uid].name);
+    } else {
+        /* Extra builtin id with no recorded mask: registerVmBuiltin always
+         * records one now, so this is defensive only. Conservative default
+         * per Docs/pscal_vm2_plan.md §6.3. */
+        result = FX_IO;
+    }
+    pthread_mutex_unlock(&builtin_registry_mutex);
+    return result;
 }
 
 void registerVmBuiltin(const char *name, VmBuiltinFn handler,
-        BuiltinRoutineType type, const char *display_name) {
+        BuiltinRoutineType type, const char *display_name, EffectMask effect_mask) {
     if (!name || !handler) return;
     pthread_once(&builtin_registry_once, initBuiltinRegistryMutex);
 
@@ -2223,6 +2329,9 @@ void registerVmBuiltin(const char *name, VmBuiltinFn handler,
     VmBuiltinMapping *mapping = builtinRegistryLookupMappingUnlocked(canonical, &existing_id);
     if (mapping) {
         mapping->handler = handler;
+        if (existing_id != SIZE_MAX) {
+            setEffectOverrideUnlocked(existing_id, effect_mask);
+        }
         pthread_mutex_unlock(&builtin_registry_mutex);
         return;
     }
@@ -2238,7 +2347,9 @@ void registerVmBuiltin(const char *name, VmBuiltinFn handler,
     extra_vm_builtins[num_extra_vm_builtins].handler = handler;
     size_t new_index = num_extra_vm_builtins;
     num_extra_vm_builtins++;
-    builtinRegistryInsertUnlocked(canonical, num_vm_builtins + new_index);
+    size_t new_id = num_vm_builtins + new_index;
+    builtinRegistryInsertUnlocked(canonical, new_id);
+    setEffectOverrideUnlocked(new_id, effect_mask);
     pthread_mutex_unlock(&builtin_registry_mutex);
 }
 
@@ -4258,6 +4369,7 @@ static void vmRestoreColorState(void) {
 
 // atexit handler: restore terminal settings and ensure cursor visibility
 static void vmAtExitCleanup(void) {
+    pscalFxEndSession();
     vmRestoreTerminal();
     if (pscalRuntimeStdoutIsInteractive()) {
         const char show_cursor[] = "\x1B[?25h"; // Ensure cursor is visible
@@ -10914,15 +11026,15 @@ static void populateBuiltinRegistry(void) {
     /* Allow externally linked modules to add more builtins. */
     registerExtendedBuiltins();
     /* CLike-style cast helper synonyms to avoid keyword collisions */
-    registerVmBuiltin("toint",    vmBuiltinToInt,    BUILTIN_TYPE_FUNCTION, NULL);
-    registerVmBuiltin("todouble", vmBuiltinToDouble, BUILTIN_TYPE_FUNCTION, NULL);
-    registerVmBuiltin("tofloat",  vmBuiltinToFloat,  BUILTIN_TYPE_FUNCTION, NULL);
-    registerVmBuiltin("tochar",   vmBuiltinToChar,   BUILTIN_TYPE_FUNCTION, NULL);
-    registerVmBuiltin("tobool",   vmBuiltinToBool,   BUILTIN_TYPE_FUNCTION, NULL);
-    registerVmBuiltin("tobyte",   vmBuiltinToByte,   BUILTIN_TYPE_FUNCTION, NULL);
-    registerVmBuiltin("mstreamfromstring", vmBuiltinMstreamFromString, BUILTIN_TYPE_FUNCTION, NULL);
-    registerVmBuiltin("stringofchar", vmBuiltinStringOfChar, BUILTIN_TYPE_FUNCTION, NULL);
-    registerVmBuiltin("flush", vmBuiltinFflush, BUILTIN_TYPE_PROCEDURE, "Flush");
+    registerVmBuiltin("toint",    vmBuiltinToInt,    BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("todouble", vmBuiltinToDouble, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("tofloat",  vmBuiltinToFloat,  BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("tochar",   vmBuiltinToChar,   BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("tobool",   vmBuiltinToBool,   BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("tobyte",   vmBuiltinToByte,   BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("mstreamfromstring", vmBuiltinMstreamFromString, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("stringofchar", vmBuiltinStringOfChar, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("flush", vmBuiltinFflush, BUILTIN_TYPE_PROCEDURE, "Flush", FX_IO);
     pthread_mutex_unlock(&builtin_registry_mutex);
 }
 void registerAllBuiltins(void) {

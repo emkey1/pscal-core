@@ -127,7 +127,11 @@ void registerGraphicsBuiltins(void) {
     for (size_t i = 0; i < sizeof(graphics_builtins) / sizeof(graphics_builtins[0]); ++i) {
         const GraphicsBuiltin *entry = &graphics_builtins[i];
         extBuiltinRegisterFunction(category, entry->group, entry->display_name);
-        registerVmBuiltin(entry->vm_name, entry->handler, entry->type, entry->display_name);
+        /* Whole category (window/drawing/textures/text/input/audio/opengl)
+         * touches the screen or audio device; blanket FX_IO rather than
+         * itemizing ~70 SDL entries individually (Docs/pscal_vm2_plan.md
+         * §6.3's conservative default for ext_builtins categories). */
+        registerVmBuiltin(entry->vm_name, entry->handler, entry->type, entry->display_name, FX_IO);
     }
 #endif
 }

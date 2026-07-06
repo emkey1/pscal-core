@@ -24,5 +24,5 @@ static Value vmBuiltinFactorial(struct VM_s* vm, int arg_count, Value* args) {
 
 void registerFactorialBuiltin(void) {
     registerVmBuiltin("factorial", vmBuiltinFactorial,
-                      BUILTIN_TYPE_FUNCTION, "Factorial");
+                      BUILTIN_TYPE_FUNCTION, "Factorial", FX_PURE);
 }

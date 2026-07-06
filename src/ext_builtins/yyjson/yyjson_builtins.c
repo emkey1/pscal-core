@@ -780,65 +780,65 @@ static Value vmBuiltinYyjsonIsNull(struct VM_s *vm, int arg_count, Value *args) 
 }
 
 void registerYyjsonReadBuiltin(void) {
-    registerVmBuiltin("yyjsonread", vmBuiltinYyjsonRead, BUILTIN_TYPE_FUNCTION, "YyjsonRead");
+    registerVmBuiltin("yyjsonread", vmBuiltinYyjsonRead, BUILTIN_TYPE_FUNCTION, "YyjsonRead", FX_PURE);
 }
 
 void registerYyjsonReadFileBuiltin(void) {
-    registerVmBuiltin("yyjsonreadfile", vmBuiltinYyjsonReadFile, BUILTIN_TYPE_FUNCTION, "YyjsonReadFile");
+    registerVmBuiltin("yyjsonreadfile", vmBuiltinYyjsonReadFile, BUILTIN_TYPE_FUNCTION, "YyjsonReadFile", FX_IO);
 }
 
 void registerYyjsonDocFreeBuiltin(void) {
-    registerVmBuiltin("yyjsondocfree", vmBuiltinYyjsonDocFree, BUILTIN_TYPE_PROCEDURE, "YyjsonDocFree");
+    registerVmBuiltin("yyjsondocfree", vmBuiltinYyjsonDocFree, BUILTIN_TYPE_PROCEDURE, "YyjsonDocFree", FX_PURE);
 }
 
 void registerYyjsonFreeValueBuiltin(void) {
-    registerVmBuiltin("yyjsonfreevalue", vmBuiltinYyjsonFreeValue, BUILTIN_TYPE_PROCEDURE, "YyjsonFreeValue");
+    registerVmBuiltin("yyjsonfreevalue", vmBuiltinYyjsonFreeValue, BUILTIN_TYPE_PROCEDURE, "YyjsonFreeValue", FX_PURE);
 }
 
 void registerYyjsonGetRootBuiltin(void) {
-    registerVmBuiltin("yyjsongetroot", vmBuiltinYyjsonGetRoot, BUILTIN_TYPE_FUNCTION, "YyjsonGetRoot");
+    registerVmBuiltin("yyjsongetroot", vmBuiltinYyjsonGetRoot, BUILTIN_TYPE_FUNCTION, "YyjsonGetRoot", FX_PURE);
 }
 
 void registerYyjsonGetKeyBuiltin(void) {
-    registerVmBuiltin("yyjsongetkey", vmBuiltinYyjsonGetKey, BUILTIN_TYPE_FUNCTION, "YyjsonGetKey");
+    registerVmBuiltin("yyjsongetkey", vmBuiltinYyjsonGetKey, BUILTIN_TYPE_FUNCTION, "YyjsonGetKey", FX_PURE);
 }
 
 void registerYyjsonGetIndexBuiltin(void) {
-    registerVmBuiltin("yyjsongetindex", vmBuiltinYyjsonGetIndex, BUILTIN_TYPE_FUNCTION, "YyjsonGetIndex");
+    registerVmBuiltin("yyjsongetindex", vmBuiltinYyjsonGetIndex, BUILTIN_TYPE_FUNCTION, "YyjsonGetIndex", FX_PURE);
 }
 
 void registerYyjsonHasKeyBuiltin(void) {
-    registerVmBuiltin("yyjsonhaskey", vmBuiltinYyjsonHasKey, BUILTIN_TYPE_FUNCTION, "YyjsonHasKey");
+    registerVmBuiltin("yyjsonhaskey", vmBuiltinYyjsonHasKey, BUILTIN_TYPE_FUNCTION, "YyjsonHasKey", FX_PURE);
 }
 
 void registerYyjsonHasIndexBuiltin(void) {
-    registerVmBuiltin("yyjsonhasindex", vmBuiltinYyjsonHasIndex, BUILTIN_TYPE_FUNCTION, "YyjsonHasIndex");
+    registerVmBuiltin("yyjsonhasindex", vmBuiltinYyjsonHasIndex, BUILTIN_TYPE_FUNCTION, "YyjsonHasIndex", FX_PURE);
 }
 
 void registerYyjsonGetLengthBuiltin(void) {
-    registerVmBuiltin("yyjsongetlength", vmBuiltinYyjsonGetLength, BUILTIN_TYPE_FUNCTION, "YyjsonGetLength");
+    registerVmBuiltin("yyjsongetlength", vmBuiltinYyjsonGetLength, BUILTIN_TYPE_FUNCTION, "YyjsonGetLength", FX_PURE);
 }
 
 void registerYyjsonGetTypeBuiltin(void) {
-    registerVmBuiltin("yyjsongettype", vmBuiltinYyjsonGetType, BUILTIN_TYPE_FUNCTION, "YyjsonGetType");
+    registerVmBuiltin("yyjsongettype", vmBuiltinYyjsonGetType, BUILTIN_TYPE_FUNCTION, "YyjsonGetType", FX_PURE);
 }
 
 void registerYyjsonGetStringBuiltin(void) {
-    registerVmBuiltin("yyjsongetstring", vmBuiltinYyjsonGetString, BUILTIN_TYPE_FUNCTION, "YyjsonGetString");
+    registerVmBuiltin("yyjsongetstring", vmBuiltinYyjsonGetString, BUILTIN_TYPE_FUNCTION, "YyjsonGetString", FX_PURE);
 }
 
 void registerYyjsonGetNumberBuiltin(void) {
-    registerVmBuiltin("yyjsongetnumber", vmBuiltinYyjsonGetNumber, BUILTIN_TYPE_FUNCTION, "YyjsonGetNumber");
+    registerVmBuiltin("yyjsongetnumber", vmBuiltinYyjsonGetNumber, BUILTIN_TYPE_FUNCTION, "YyjsonGetNumber", FX_PURE);
 }
 
 void registerYyjsonGetIntBuiltin(void) {
-    registerVmBuiltin("yyjsongetint", vmBuiltinYyjsonGetInt, BUILTIN_TYPE_FUNCTION, "YyjsonGetInt");
+    registerVmBuiltin("yyjsongetint", vmBuiltinYyjsonGetInt, BUILTIN_TYPE_FUNCTION, "YyjsonGetInt", FX_PURE);
 }
 
 void registerYyjsonGetBoolBuiltin(void) {
-    registerVmBuiltin("yyjsongetbool", vmBuiltinYyjsonGetBool, BUILTIN_TYPE_FUNCTION, "YyjsonGetBool");
+    registerVmBuiltin("yyjsongetbool", vmBuiltinYyjsonGetBool, BUILTIN_TYPE_FUNCTION, "YyjsonGetBool", FX_PURE);
 }
 
 void registerYyjsonIsNullBuiltin(void) {
-    registerVmBuiltin("yyjsonisnull", vmBuiltinYyjsonIsNull, BUILTIN_TYPE_FUNCTION, "YyjsonIsNull");
+    registerVmBuiltin("yyjsonisnull", vmBuiltinYyjsonIsNull, BUILTIN_TYPE_FUNCTION, "YyjsonIsNull", FX_PURE);
 }

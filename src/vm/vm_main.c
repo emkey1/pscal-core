@@ -5,6 +5,7 @@
 #include "core/globals.h"
 #include "symbol/symbol.h"
 #include "backend_ast/builtin.h"
+#include "vm/vm_fx_policy.h"
 #include "common/frontend_kind.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,14 +55,24 @@ int pscalvm_main(int argc, char* argv[]) {
         printf("%s", PSCALVM_USAGE);
         PSCALVM_RETURN(vmExitWithCleanup(EXIT_SUCCESS));
     }
-    if (argc < 2) {
+
+    int argi = 1;
+    while (argi < argc && pscalFxIsCliFlag(argv[argi])) {
+        const char *fx_value = (argi + 1 < argc) ? argv[argi + 1] : NULL;
+        if (!pscalFxHandleCliFlag(argv[argi], fx_value)) {
+            PSCALVM_RETURN(vmExitWithCleanup(EXIT_FAILURE));
+        }
+        argi += 2;
+    }
+
+    if (argi >= argc) {
         fprintf(stderr, "%s", PSCALVM_USAGE);
         PSCALVM_RETURN(vmExitWithCleanup(EXIT_FAILURE));
     }
 
-    const char* bytecode_path = argv[1];
-    gParamCount = argc - 2;
-    gParamValues = (gParamCount > 0) ? &argv[2] : NULL;
+    const char* bytecode_path = argv[argi];
+    gParamCount = argc - (argi + 1);
+    gParamValues = (gParamCount > 0) ? &argv[argi + 1] : NULL;
 
     initSymbolSystem();
     registerAllBuiltins();

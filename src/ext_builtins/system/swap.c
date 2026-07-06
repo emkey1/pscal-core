@@ -29,6 +29,6 @@ static Value vmBuiltinSwap(struct VM_s* vm, int arg_count, Value* args) {
 
 void registerSwapBuiltin(void) {
     registerVmBuiltin("swap", vmBuiltinSwap,
-                      BUILTIN_TYPE_PROCEDURE, "Swap");
+                      BUILTIN_TYPE_PROCEDURE, "Swap", FX_PROC);
 }
 

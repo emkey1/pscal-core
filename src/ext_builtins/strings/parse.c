@@ -119,10 +119,10 @@ static Value vmBuiltinSplit(struct VM_s* vm, int arg_count, Value* args) {
 }
 
 void registerParseBuiltins(void) {
-    registerVmBuiltin("parse_int",   vmBuiltinParseInt,   BUILTIN_TYPE_FUNCTION, "parse_int");
-    registerVmBuiltin("parse_float", vmBuiltinParseFloat, BUILTIN_TYPE_FUNCTION, "parse_float");
-    registerVmBuiltin("parse_bool",  vmBuiltinParseBool,  BUILTIN_TYPE_FUNCTION, "parse_bool");
-    registerVmBuiltin("split",       vmBuiltinSplit,      BUILTIN_TYPE_FUNCTION, "split");
+    registerVmBuiltin("parse_int",   vmBuiltinParseInt,   BUILTIN_TYPE_FUNCTION, "parse_int", FX_PURE);
+    registerVmBuiltin("parse_float", vmBuiltinParseFloat, BUILTIN_TYPE_FUNCTION, "parse_float", FX_PURE);
+    registerVmBuiltin("parse_bool",  vmBuiltinParseBool,  BUILTIN_TYPE_FUNCTION, "parse_bool", FX_PURE);
+    registerVmBuiltin("split",       vmBuiltinSplit,      BUILTIN_TYPE_FUNCTION, "split", FX_PURE);
     // itoa: alias for the existing IntToStr handler (Int -> Text).
-    registerVmBuiltin("itoa",        vmBuiltinInttostr,   BUILTIN_TYPE_FUNCTION, "itoa");
+    registerVmBuiltin("itoa",        vmBuiltinInttostr,   BUILTIN_TYPE_FUNCTION, "itoa", FX_PURE);
 }

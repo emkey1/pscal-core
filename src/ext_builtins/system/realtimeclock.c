@@ -56,5 +56,5 @@ static Value vmBuiltinRealTimeClock(struct VM_s *vm, int arg_count, Value *args)
 
 void registerRealTimeClockBuiltin(void) {
   registerVmBuiltin("realtimeclock", vmBuiltinRealTimeClock,
-                    BUILTIN_TYPE_FUNCTION, "RealTimeClock");
+                    BUILTIN_TYPE_FUNCTION, "RealTimeClock", FX_CLOCK);
 }

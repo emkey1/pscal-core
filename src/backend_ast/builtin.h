@@ -4,6 +4,7 @@
 #include "core/types.h"
 #include "ast/ast.h"
 #include "core/globals.h"
+#include "core/effect_mask.h"
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -41,13 +42,24 @@ bool getVmBuiltinMapping(const char* name, VmBuiltinMapping* out_mapping, int* o
 bool getVmBuiltinMappingCanonical(const char* canonical_name, VmBuiltinMapping* out_mapping, int* out_id);
 int getVmBuiltinID(const char* name);
 void registerVmBuiltin(const char *vm_name, VmBuiltinFn handler,
-                       BuiltinRoutineType type, const char *display_name);
+                       BuiltinRoutineType type, const char *display_name,
+                       EffectMask effect_mask);
 
 /* Authoritative predicate: is this builtin effectful (touches the outside world,
  * is nondeterministic, or observes concurrent state)? Single source of truth for
  * effectfulness, shared by the Aether FX-001 gate and the builtin-introspection
  * metadata (builtins_json / builtin_info). Case-insensitive. */
 bool pscalBuiltinNameIsEffectful(const char *name);
+
+/* VM 2.0 Phase 6: effect-class mask for the --deny sandbox and record/replay
+ * (Docs/pscal_vm2_plan.md §6.3). Covers every builtin regardless of how it was
+ * registered: core dispatch-table entries are classified by name (seeded from
+ * the same data as pscalBuiltinNameIsEffectful); extra_vm_builtins entries use
+ * the mask passed to registerVmBuiltin(), defaulting to FX_IO (conservative)
+ * if the id is otherwise unknown. O(1) after first use — safe to call from
+ * the hot CALL_BUILTIN/CALL_BUILTIN_PROC dispatch path. */
+EffectMask getVmBuiltinEffectMaskById(int id);
+EffectMask pscalBuiltinNameEffectMask(const char *name);
 
 /* Optional hook for externally linked built-ins.  The weak
  * definition in builtin.c does nothing unless overridden. */

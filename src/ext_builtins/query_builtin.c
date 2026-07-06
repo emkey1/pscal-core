@@ -918,35 +918,35 @@ static Value vmBuiltinExtBuiltinGroupFunctionName(struct VM_s *vm,
 
 void registerExtBuiltinQueryBuiltins(void) {
   registerVmBuiltin("hasextbuiltin", vmBuiltinHasExtBuiltin,
-                    BUILTIN_TYPE_FUNCTION, "HasExtBuiltin");
+                    BUILTIN_TYPE_FUNCTION, "HasExtBuiltin", FX_PURE);
   registerVmBuiltin("extbuiltincategorycount",
                     vmBuiltinExtBuiltinCategoryCount, BUILTIN_TYPE_FUNCTION,
-                    "ExtBuiltinCategoryCount");
+                    "ExtBuiltinCategoryCount", FX_PURE);
   registerVmBuiltin("extbuiltincategoryname",
                     vmBuiltinExtBuiltinCategoryName, BUILTIN_TYPE_FUNCTION,
-                    "ExtBuiltinCategoryName");
+                    "ExtBuiltinCategoryName", FX_PURE);
   registerVmBuiltin("extbuiltingroupcount", vmBuiltinExtBuiltinGroupCount,
-                    BUILTIN_TYPE_FUNCTION, "ExtBuiltinGroupCount");
+                    BUILTIN_TYPE_FUNCTION, "ExtBuiltinGroupCount", FX_PURE);
   registerVmBuiltin("extbuiltingroupname", vmBuiltinExtBuiltinGroupName,
-                    BUILTIN_TYPE_FUNCTION, "ExtBuiltinGroupName");
+                    BUILTIN_TYPE_FUNCTION, "ExtBuiltinGroupName", FX_PURE);
   registerVmBuiltin("extbuiltinfunctioncount",
                     vmBuiltinExtBuiltinFunctionCount, BUILTIN_TYPE_FUNCTION,
-                    "ExtBuiltinFunctionCount");
+                    "ExtBuiltinFunctionCount", FX_PURE);
   registerVmBuiltin("extbuiltinfunctionname",
                     vmBuiltinExtBuiltinFunctionName, BUILTIN_TYPE_FUNCTION,
-                    "ExtBuiltinFunctionName");
+                    "ExtBuiltinFunctionName", FX_PURE);
   registerVmBuiltin("extbuiltingroupfunctioncount",
                     vmBuiltinExtBuiltinGroupFunctionCount,
-                    BUILTIN_TYPE_FUNCTION, "ExtBuiltinGroupFunctionCount");
+                    BUILTIN_TYPE_FUNCTION, "ExtBuiltinGroupFunctionCount", FX_PURE);
   registerVmBuiltin("extbuiltingroupfunctionname",
                     vmBuiltinExtBuiltinGroupFunctionName,
-                    BUILTIN_TYPE_FUNCTION, "ExtBuiltinGroupFunctionName");
+                    BUILTIN_TYPE_FUNCTION, "ExtBuiltinGroupFunctionName", FX_PURE);
   registerVmBuiltin("aetherbuiltinsjson", vmBuiltinAetherBuiltinsJson,
-                    BUILTIN_TYPE_FUNCTION, "AetherBuiltinsJson");
+                    BUILTIN_TYPE_FUNCTION, "AetherBuiltinsJson", FX_PURE);
   registerVmBuiltin("builtins_json", vmBuiltinAetherBuiltinsJson,
-                    BUILTIN_TYPE_FUNCTION, "builtins_json");
+                    BUILTIN_TYPE_FUNCTION, "builtins_json", FX_PURE);
   registerVmBuiltin("aetherbuiltininfo", vmBuiltinAetherBuiltinInfo,
-                    BUILTIN_TYPE_FUNCTION, "AetherBuiltinInfo");
+                    BUILTIN_TYPE_FUNCTION, "AetherBuiltinInfo", FX_PURE);
   registerVmBuiltin("builtin_info", vmBuiltinAetherBuiltinInfo,
-                    BUILTIN_TYPE_FUNCTION, "builtin_info");
+                    BUILTIN_TYPE_FUNCTION, "builtin_info", FX_PURE);
 }
