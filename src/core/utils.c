@@ -32,7 +32,13 @@
 #endif
 #include <pscal_paths.h>
 
-static pthread_mutex_t dynamic_array_refcount_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* Also guards the whole-struct copy in copyDynamicArraySnapshotValue()
+ * below, so it must be the SAME mutex the VM's replaceValueCell() takes
+ * around its whole-struct `*target = replacement` publish (vm.c). Two
+ * different mutexes here would let a reader's struct-copy interleave with
+ * a writer's in-progress multi-word store and observe a torn dynamic-array
+ * header (dims/bounds disagreeing with the data pointer). */
+pthread_mutex_t dynamic_array_refcount_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static const uint16_t kCp437ToUnicode[128] = {
     0x00C7, 0x00FC, 0x00E9, 0x00E2, 0x00E4, 0x00E0, 0x00E5, 0x00E7,
@@ -3556,6 +3562,107 @@ Value copyDynamicArraySnapshotValue(const Value *src) {
     }
     pthread_mutex_unlock(&dynamic_array_refcount_mutex);
     return snapshot;
+}
+
+/* Builds `*out` as a lower-dimensional VIEW into `src`'s existing storage,
+ * consuming `src`'s outer `consumed_dims` dimensions via `indices`. Needed
+ * because indexing always supplies one dimension per opcode (dimension_count
+ * is always 1; the parser splits `g[i][j]`/`g[i,j]` into one
+ * GET_ELEMENT_ADDRESS/LOAD_ELEMENT_VALUE per index, since it cannot know at
+ * compile time how many of an array's dimensions a single runtime Value
+ * covers), so when a caller has fewer indices than `src->dimensions`, the
+ * VM must treat them as selecting a sub-array rather than a final scalar.
+ *
+ * Two distinct storage shapes can both report dimensions > 1, and they need
+ * different handling:
+ *
+ *  - Jagged (`src->element_type == TYPE_ARRAY`, i.e. a declared
+ *    `array of array of X`): resizeDynamicArrayValue's multi-arg SetLength
+ *    cascade gives the outer array_val exactly `lengths[0]` slots, each
+ *    already an independent, fully-formed nested array Value. A partial
+ *    index here can only ever consume exactly the outer dimension (there is
+ *    no flat index space spanning jagged levels to combine further indices
+ *    into) -- the result is simply that slot, shared via the same
+ *    snapshot/refcount convention as any other read of a dynamic array
+ *    field (copyDynamicArraySnapshotValue).
+ *
+ *  - Genuinely flat multi-dimensional storage (e.g. a static
+ *    array[a..b, c..d] of Scalar): array_val is one contiguous buffer over
+ *    all dims. The view shares (does not copy) lower_bounds/upper_bounds
+ *    and array_val/array_raw with `src` via pointer arithmetic -- dims
+ *    [consumed_dims, dims) are a contiguous suffix of src's own bounds
+ *    arrays, and the sub-array's data is a contiguous sub-range of src's
+ *    own flat buffer -- and shares src's refcount (incrementing it) so the
+ *    underlying storage stays alive exactly as long as any alias of it does.
+ *
+ * Returns false if the src/out arguments are unusable, or (for the jagged
+ * case) if consumed_dims != 1 -- callers should treat either as an internal
+ * error. On a false return with *out_of_bounds set, one of the consumed
+ * indices was outside its dimension's bounds (caller should raise the
+ * normal "array index out of bounds" runtime error). */
+bool makeDynamicArraySliceValue(const Value *src, int consumed_dims, const int *indices,
+                                 Value *out, bool *out_of_bounds) {
+    if (out_of_bounds) *out_of_bounds = false;
+    if (!src || !out || !indices || consumed_dims <= 0 || consumed_dims >= src->dimensions ||
+        !src->lower_bounds || !src->upper_bounds) {
+        return false;
+    }
+
+    if (src->element_type == TYPE_ARRAY) {
+        if (consumed_dims != 1) {
+            return false;
+        }
+        if (indices[0] < src->lower_bounds[0] || indices[0] > src->upper_bounds[0]) {
+            if (out_of_bounds) *out_of_bounds = true;
+            return false;
+        }
+        if (!src->array_val) {
+            return false;
+        }
+        int slot = indices[0] - src->lower_bounds[0];
+        *out = copyDynamicArraySnapshotValue(&src->array_val[slot]);
+        return true;
+    }
+
+    long long inner_size = 1;
+    for (int i = consumed_dims; i < src->dimensions; i++) {
+        inner_size *= (long long)(src->upper_bounds[i] - src->lower_bounds[i] + 1);
+    }
+
+    long long partial_offset = 0;
+    long long multiplier = inner_size;
+    for (int i = consumed_dims - 1; i >= 0; i--) {
+        if (indices[i] < src->lower_bounds[i] || indices[i] > src->upper_bounds[i]) {
+            if (out_of_bounds) *out_of_bounds = true;
+            return false;
+        }
+        partial_offset += (long long)(indices[i] - src->lower_bounds[i]) * multiplier;
+        multiplier *= (long long)(src->upper_bounds[i] - src->lower_bounds[i] + 1);
+    }
+
+    *out = makeNil();
+    out->type = TYPE_ARRAY;
+    out->array_is_dynamic = src->array_is_dynamic;
+    out->array_is_packed = src->array_is_packed;
+    out->dimensions = src->dimensions - consumed_dims;
+    out->lower_bounds = src->lower_bounds + consumed_dims;
+    out->upper_bounds = src->upper_bounds + consumed_dims;
+    out->element_type = src->element_type;
+    out->element_type_def = src->element_type_def;
+    if (src->array_is_packed) {
+        out->array_raw = src->array_raw ? src->array_raw + partial_offset : NULL;
+        out->array_val = NULL;
+    } else {
+        out->array_val = src->array_val ? src->array_val + partial_offset : NULL;
+        out->array_raw = NULL;
+    }
+    out->array_refcount = src->array_refcount;
+    if (out->array_refcount) {
+        pthread_mutex_lock(&dynamic_array_refcount_mutex);
+        (*out->array_refcount)++;
+        pthread_mutex_unlock(&dynamic_array_refcount_mutex);
+    }
+    return true;
 }
 
 int calculateArrayTotalSize(const Value* array_val) {

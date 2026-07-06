@@ -1199,12 +1199,26 @@ static void replaceValueCell(Value* target, Value replacement, AST* preserved_ba
         return;
     }
 
+    /* The `*target = replacement` below is a whole-struct copy (Value is
+     * far bigger than a machine word), so it is not atomic with respect to
+     * a concurrent reader. copyDynamicArraySnapshotValue() (core/utils.c)
+     * takes an unsynchronized whole-struct snapshot of exactly this kind of
+     * cell -- e.g. a background thread's `Engine^.Matrix := BuildGrid(...)`
+     * racing a main-thread read of Engine^.Matrix -- guarded only by
+     * dynamic_array_refcount_mutex. Without also taking that same mutex
+     * here, the reader can observe a torn header (new dims/bounds paired
+     * with the old data pointer, or vice versa), which showed up as
+     * intermittent "Array element index out of bounds" crashes. Lock order
+     * (value_cell_mutex, then dynamic_array_refcount_mutex) matches the
+     * nesting already used by copyValueForStack -> makeCopyOfValue. */
     pthread_mutex_lock(&value_cell_mutex);
+    pthread_mutex_lock(&dynamic_array_refcount_mutex);
     Value old_value = *target;
     *target = replacement;
     if (VALUE_TYPE(*target) == TYPE_POINTER && PTR_BASE_TYPE_NODE(*target) == NULL && preserved_base_type) {
         PTR_BASE_TYPE_NODE(*target) = preserved_base_type;
     }
+    pthread_mutex_unlock(&dynamic_array_refcount_mutex);
     pthread_mutex_unlock(&value_cell_mutex);
     freeValue(&old_value);
 }
@@ -7665,6 +7679,46 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
+                // See the matching comment in LOAD_ELEMENT_VALUE: a dynamic
+                // array's true dimensionality can exceed dimension_count
+                // here (e.g. `g[i][j]` against a value from
+                // SetLength(g, 6, 6), dimensions==2). When that happens,
+                // produce a sub-array VIEW instead of a final address so the
+                // next opcode in the chain can finish the indexing. Since
+                // this opcode must return a stable pointer (the caller may
+                // write through it via SET_INDIRECT, or index further into
+                // it), the view is heap-allocated and tagged
+                // OWNED_POINTER_SENTINEL so freeValue() on the pointer Value
+                // (already called unconditionally on the TYPE_POINTER path
+                // below and by any consumer that later frees its own popped
+                // operand) releases both the wrapper allocation and this
+                // view's share of the underlying array's refcount.
+                if (dimension_count < (uint8_t)ARRAY_DIMENSIONS(*array_val_ptr)) {
+                    Value* slice = malloc(sizeof(Value));
+                    bool slice_oob = false;
+                    bool slice_ok = slice && makeDynamicArraySliceValue(array_val_ptr, dimension_count, indices, slice, &slice_oob);
+                    free(indices);
+                    if (!slice_ok) {
+                        free(slice);
+                        runtimeError(vm, "VM Error: Array element index out of bounds.");
+                        freeValue(&operand);
+                        if (using_wrapper) {
+                            free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                            free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                        }
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    push(vm, makePointer(slice, OWNED_POINTER_SENTINEL));
+                    if (VALUE_TYPE(operand) == TYPE_POINTER) {
+                        freeValue(&operand);
+                    }
+                    if (using_wrapper) {
+                        free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                        free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                    }
+                    break;
+                }
+
                 int offset = computeFlatOffset(array_val_ptr, indices);
                 free(indices);
 
@@ -7973,6 +8027,46 @@ comparison_error_label:
                     free(indices);
                     freeValue(&operand);
                     return INTERPRET_RUNTIME_ERROR;
+                }
+
+                // A dynamic array's true dimensionality (e.g. 2 for
+                // SetLength(g, 6, 6)) can exceed dimension_count here: the
+                // parser always splits `g[i][j]`/`g[i,j]` into one index per
+                // opcode, since it cannot know at compile time whether the
+                // runtime value will be jagged (each level dimensions==1) or
+                // a single flat multi-dim value. When fewer indices were
+                // supplied than the array actually has, treat them as
+                // selecting a sub-array rather than a final scalar --
+                // computeFlatOffset()/calculateArrayTotalSize() below assume
+                // dimension_count == array->dimensions and would otherwise
+                // read indices[] past its allocated length.
+                if (dimension_count < (uint8_t)ARRAY_DIMENSIONS(*array_val_ptr)) {
+                    Value sliceVal;
+                    bool slice_oob = false;
+                    bool slice_ok = makeDynamicArraySliceValue(array_val_ptr, dimension_count, indices, &sliceVal, &slice_oob);
+                    free(indices);
+                    if (!slice_ok) {
+                        runtimeError(vm, "VM Error: Array element index out of bounds.");
+                        if (VALUE_TYPE(operand) == TYPE_POINTER) freeValue(&operand);
+                        if (using_wrapper) {
+                            free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                            free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                        }
+                        if (using_snapshot) {
+                            freeValue(&shared_snapshot);
+                        }
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    push(vm, sliceVal);
+                    freeValue(&operand);
+                    if (using_wrapper) {
+                        free(ARRAY_LOWER_BOUNDS(temp_wrapper));
+                        free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                    }
+                    if (using_snapshot) {
+                        freeValue(&shared_snapshot);
+                    }
+                    break;
                 }
 
                 int offset = computeFlatOffset(array_val_ptr, indices);

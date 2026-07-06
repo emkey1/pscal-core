@@ -337,6 +337,13 @@ Value makeEmptyArray(VarType element_type, AST *type_def);
 int computeFlatOffset(Value *array, int *indices);
 Value makeCopyOfValue(const Value *src);
 Value copyDynamicArraySnapshotValue(const Value *src);
+bool makeDynamicArraySliceValue(const Value *src, int consumed_dims, const int *indices,
+                                 Value *out, bool *out_of_bounds);
+/* Shared with vm.c's replaceValueCell(): both sides of a dynamic array's
+ * fresh-publish/read race must serialize on this same mutex, or a reader's
+ * whole-struct snapshot copy can interleave with a writer's whole-struct
+ * publish and observe a torn header. See utils.c for the definition. */
+extern pthread_mutex_t dynamic_array_refcount_mutex;
 
 // Set operations
 Value setUnion(Value setA, Value setB);
