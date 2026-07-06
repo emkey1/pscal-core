@@ -278,7 +278,10 @@ Value makeRecord(FieldValue *rec);
 Value makeMStream(MStream *ms);
 Value makeVoid(void);
 Value makeValueForType(VarType type, AST *type_def, Symbol* context_symbol);
-ClosureEnvPayload* createClosureEnv(uint16_t slot_count);
+// owner_type must be TYPE_CLOSURE or TYPE_INTERFACE -- both share this
+// same payload shape; owner_type becomes the ObjHeader's type tag so it's
+// recoverable later (VM 2.0 Phase 4b, Docs/pscal_vm2_plan.md §5.10.3).
+ClosureEnvPayload* createClosureEnv(uint16_t slot_count, VarType owner_type);
 void retainClosureEnv(ClosureEnvPayload* env);
 void releaseClosureEnv(ClosureEnvPayload* env);
 Value makeClosure(uint32_t entry_offset, struct Symbol_s* symbol, ClosureEnvPayload* env);

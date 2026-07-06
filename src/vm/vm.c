@@ -4017,7 +4017,7 @@ static Value vmHostCreateClosure(VM* vm) {
         return makeNil();
     }
 
-    ClosureEnvPayload* env = createClosureEnv((uint16_t)capture_count);
+    ClosureEnvPayload* env = createClosureEnv((uint16_t)capture_count, TYPE_CLOSURE);
     env->symbol = proc_symbol;
 
     for (int i = capture_count - 1; i >= 0; --i) {
@@ -4506,7 +4506,7 @@ static Value vmHostBoxInterface(VM* vm) {
     }
     tableValuePtr = resolvedTablePtr;
 
-    ClosureEnvPayload* payload = createClosureEnv(3);
+    ClosureEnvPayload* payload = createClosureEnv(3, TYPE_INTERFACE);
     if (!payload) {
         freeValue(&classNameVal);
         freeValue(&typeNameVal);

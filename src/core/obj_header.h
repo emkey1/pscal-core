@@ -1,11 +1,14 @@
 // src/core/obj_header.h
 //
 // VM 2.0 Phase 4 Stage A foundation (Docs/pscal_vm2_plan.md, sub-phase 4a
-// of section 5.10.4). Purely additive: as of this sub-phase nothing in the
-// VM constructs an ObjHeader-based object yet, and no Value call site
-// changes. Every concrete heap shape later sub-phases introduce (StringObj
-// in 4c, ArrayObj in 4e/4f, RecordObj in 4d, ...) embeds one of these as
-// its first struct member and registers a destructor via
+// of section 5.10.4). As of 4b, ClosureEnvPayload and MStream (both
+// declared in core/types.h) embed an ObjHeader as their first member --
+// which is why this file takes VarType from the standalone core/var_type.h
+// rather than core/types.h itself: types.h includes this header (to embed
+// ObjHeader), so this header including types.h back would be circular.
+// Every concrete heap shape later sub-phases introduce (StringObj in 4c,
+// ArrayObj in 4e/4f, RecordObj in 4d, ...) embeds one of these as its
+// first struct member and registers a destructor via
 // pscalObjRegisterDestructor from its own init code -- this file only owns
 // the generic refcount/dispatch mechanism, never a concrete shape, so that
 // each sub-phase's type-family conversion stays isolated to its own files.
@@ -17,7 +20,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "core/types.h" // VarType
+#include "core/var_type.h" // VarType
 
 typedef struct ObjHeader {
     VarType type;

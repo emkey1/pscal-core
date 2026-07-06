@@ -65,6 +65,23 @@ void pscalObjRelease(ObjHeader *header) {
     // before running the destructor). This is the standard atomic-refcount
     // pattern -- see the C++ shared_ptr reference semantics this mirrors.
     uint32_t prev = atomic_fetch_sub_explicit(&header->refcount, 1u, memory_order_release);
+    if (prev == 0u) {
+        // Double-release: the refcount was already zero before this call,
+        // meaning the object was almost certainly already destroyed by an
+        // earlier (correct) release. The fetch_sub above just underflowed
+        // the counter to UINT32_MAX -- restore it rather than leave it
+        // corrupted, log loudly (this is always a real caller bug, never
+        // a legitimate case), and refuse to touch the object further:
+        // running the destructor here would be a use-after-free on top of
+        // whatever already freed it the first time.
+        atomic_fetch_add_explicit(&header->refcount, 1u, memory_order_relaxed);
+        fprintf(stderr,
+                "PSCAL VM 2.0: pscalObjRelease: double-release detected (refcount was "
+                "already zero) -- ignoring to avoid a use-after-free; this indicates a "
+                "real bug in the caller, not a case this function can fully recover "
+                "from.\n");
+        return;
+    }
     if (prev != 1u) {
         return; // still referenced elsewhere
     }

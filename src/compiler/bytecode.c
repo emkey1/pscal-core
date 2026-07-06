@@ -661,7 +661,7 @@ static void printConstantValue(const Value* value) {
                 fprintf(stderr, ", env=%p, slots=%u, ref=%u)",
                         (void*)AS_CLOSURE(*value).env,
                         (unsigned)AS_CLOSURE(*value).env->slot_count,
-                        (unsigned)AS_CLOSURE(*value).env->refcount);
+                        atomic_load(&AS_CLOSURE(*value).env->header.refcount));
             } else {
                 fprintf(stderr, ", env=NULL)");
             }

@@ -649,38 +649,45 @@ const char *astTypeToString(ASTNodeType type) {
     }
 }
 
+// VM 2.0 Phase 4b (Docs/pscal_vm2_plan.md §5.10.4/§5.10.3): MStream already
+// carried its own ad hoc refcount; this routes it through the generic
+// ObjHeader mechanism instead, reusing the same struct nearly as-is.
+static void mstreamDestroy(ObjHeader *header) {
+    MStream *ms = (MStream *)header;
+    if (ms->buffer) {
+        free(ms->buffer);
+        ms->buffer = NULL;
+    }
+    free(ms);
+}
+
+static pthread_once_t g_mstream_destructor_once = PTHREAD_ONCE_INIT;
+static void registerMStreamDestructor(void) {
+    pscalObjRegisterDestructor(TYPE_MEMORYSTREAM, mstreamDestroy);
+}
+
 MStream *createMStream(void) {
+    pthread_once(&g_mstream_destructor_once, registerMStreamDestructor);
     MStream *ms = malloc(sizeof(MStream));
     if (!ms) {
         fprintf(stderr, "Memory allocation error in create_memory_stream\n");
         EXIT_FAILURE_HANDLER();
     }
+    pscalObjHeaderInit(&ms->header, TYPE_MEMORYSTREAM);
     ms->buffer = NULL;
     ms->size = 0;
     ms->capacity = 0;
-    ms->refcount = 1;
     return ms;
 }
 
 void retainMStream(MStream* ms) {
     if (!ms) return;
-    if (ms->refcount < INT_MAX) {
-        ms->refcount++;
-    }
+    pscalObjRetain(&ms->header);
 }
 
 void releaseMStream(MStream* ms) {
     if (!ms) return;
-    if (ms->refcount > 0) {
-        ms->refcount--;
-    }
-    if (ms->refcount <= 0) {
-        if (ms->buffer) {
-            free(ms->buffer);
-            ms->buffer = NULL;
-        }
-        free(ms);
-    }
+    pscalObjRelease(&ms->header);
 }
 
 static bool ensureFieldSlotCapacity(FieldValue*** slotOwners, int* capacity, int requiredSlots) {
@@ -2018,44 +2025,16 @@ Value makePointer(void* address, AST* base_type_node) {
     return v;
 }
 
-ClosureEnvPayload* createClosureEnv(uint16_t slot_count) {
-    ClosureEnvPayload* env = (ClosureEnvPayload*)calloc(1, sizeof(ClosureEnvPayload));
-    if (!env) {
-        fprintf(stderr, "FATAL: Memory allocation failed in createClosureEnv\n");
-        EXIT_FAILURE_HANDLER();
-    }
-    env->refcount = 1;
-    env->slot_count = slot_count;
-    if (slot_count > 0) {
-        env->slots = (Value**)calloc(slot_count, sizeof(Value*));
-        if (!env->slots) {
-            fprintf(stderr, "FATAL: Memory allocation failed in createClosureEnv slots\n");
-            free(env);
-            EXIT_FAILURE_HANDLER();
-        }
-    }
-    return env;
-}
-
-void retainClosureEnv(ClosureEnvPayload* env) {
-    if (!env) {
-        return;
-    }
-    env->refcount++;
-}
-
-void releaseClosureEnv(ClosureEnvPayload* env) {
-    if (!env) {
-        return;
-    }
-    if (env->refcount == 0) {
-        return;
-    }
-    env->refcount--;
-    if (env->refcount != 0) {
-        return;
-    }
-
+// VM 2.0 Phase 4b (Docs/pscal_vm2_plan.md §5.10.4/§5.10.3): ClosureEnvPayload
+// already carried its own ad hoc refcount; this routes it through the
+// generic ObjHeader mechanism instead. One destructor, registered under
+// both TYPE_CLOSURE and TYPE_INTERFACE, since both Value variants share
+// this exact payload shape and identical teardown logic -- the
+// distinction that matters (whether a slot's cell is owned and must be
+// freed) is already carried by env->symbol, not by which VarType created
+// the payload.
+static void closureEnvPayloadDestroy(ObjHeader *header) {
+    ClosureEnvPayload *env = (ClosureEnvPayload *)header;
     if (env->slot_count > 0 && env->slots) {
         for (uint16_t i = 0; i < env->slot_count; ++i) {
             Value* cell = env->slots[i];
@@ -2074,6 +2053,46 @@ void releaseClosureEnv(ClosureEnvPayload* env) {
         free(env->slots);
     }
     free(env);
+}
+
+static pthread_once_t g_closure_env_destructor_once = PTHREAD_ONCE_INIT;
+static void registerClosureEnvDestructor(void) {
+    pscalObjRegisterDestructor(TYPE_CLOSURE, closureEnvPayloadDestroy);
+    pscalObjRegisterDestructor(TYPE_INTERFACE, closureEnvPayloadDestroy);
+}
+
+ClosureEnvPayload* createClosureEnv(uint16_t slot_count, VarType owner_type) {
+    pthread_once(&g_closure_env_destructor_once, registerClosureEnvDestructor);
+    ClosureEnvPayload* env = (ClosureEnvPayload*)calloc(1, sizeof(ClosureEnvPayload));
+    if (!env) {
+        fprintf(stderr, "FATAL: Memory allocation failed in createClosureEnv\n");
+        EXIT_FAILURE_HANDLER();
+    }
+    pscalObjHeaderInit(&env->header, owner_type);
+    env->slot_count = slot_count;
+    if (slot_count > 0) {
+        env->slots = (Value**)calloc(slot_count, sizeof(Value*));
+        if (!env->slots) {
+            fprintf(stderr, "FATAL: Memory allocation failed in createClosureEnv slots\n");
+            free(env);
+            EXIT_FAILURE_HANDLER();
+        }
+    }
+    return env;
+}
+
+void retainClosureEnv(ClosureEnvPayload* env) {
+    if (!env) {
+        return;
+    }
+    pscalObjRetain(&env->header);
+}
+
+void releaseClosureEnv(ClosureEnvPayload* env) {
+    if (!env) {
+        return;
+    }
+    pscalObjRelease(&env->header);
 }
 
 Value makeClosure(uint32_t entry_offset, struct Symbol_s* symbol, ClosureEnvPayload* env) {
@@ -2408,8 +2427,8 @@ void freeValue(Value *v) {
         case TYPE_MEMORYSTREAM:
               if (v->mstream) {
 #ifdef DEBUG
-                  fprintf(stderr, "[DEBUG freeValue] Releasing MStream for Value* %p. MStream* %p (refcount=%d)\n",
-                          (void*)v, (void*)v->mstream, v->mstream->refcount);
+                  fprintf(stderr, "[DEBUG freeValue] Releasing MStream for Value* %p. MStream* %p (refcount=%u)\n",
+                          (void*)v, (void*)v->mstream, atomic_load(&v->mstream->header.refcount));
                   fflush(stderr);
 #endif
                   releaseMStream(v->mstream);
@@ -3342,7 +3361,7 @@ void printValueToStream(Value v, FILE *stream) {
                 fprintf(stream, ", env=%p, slots=%u, ref=%u)",
                         (void*)v.closure.env,
                         (unsigned)v.closure.env->slot_count,
-                        (unsigned)v.closure.env->refcount);
+                        atomic_load(&v.closure.env->header.refcount));
             } else {
                 fprintf(stream, ", env=NULL)");
             }
@@ -3482,10 +3501,10 @@ Value makeCopyOfValue(const Value *src) {
                     fprintf(stderr, "Memory allocation failed in makeCopyOfValue (mstream)\n");
                     EXIT_FAILURE_HANDLER();
                 }
+                pscalObjHeaderInit(&v.mstream->header, TYPE_MEMORYSTREAM);
                 v.mstream->buffer = NULL;
                 v.mstream->size = src->mstream->size;
                 v.mstream->capacity = 0;
-                v.mstream->refcount = 1;
                 if (src->mstream->buffer && src->mstream->size >= 0) {
                     size_t copy_size = (size_t)src->mstream->size + 1;
                     v.mstream->buffer = malloc(copy_size);

@@ -12,6 +12,8 @@
 #include "list.h"
 #include <stdbool.h>
 #include "common/frontend_symbol_aliases.h"
+#include "core/var_type.h"
+#include "core/obj_header.h" // ObjHeader is embedded in ClosureEnvPayload/MStream below (VM 2.0 Phase 4b)
 #if defined(PSCAL_TARGET_IOS)
 #include "runtime/vproc/vproc.h"
 #include "runtime/vproc/vproc_stdio_shim.h"
@@ -36,68 +38,27 @@ struct ValueStruct;
 typedef struct FieldValue FieldValue;
 struct Symbol_s;
 
+// ObjHeader.type distinguishes TYPE_CLOSURE (a closure's captured-variable
+// environment) from TYPE_INTERFACE (the same shape reused for an
+// interface's receiver/table/class payload) -- both are set correctly at
+// construction time by createClosureEnv's caller (VM 2.0 Phase 4b,
+// Docs/pscal_vm2_plan.md §5.10.4/§5.10.3).
 typedef struct ClosureEnvPayload {
-    uint32_t refcount;
+    ObjHeader header;
     uint16_t slot_count;
     struct Symbol_s *symbol;
     struct ValueStruct **slots;
 } ClosureEnvPayload;
 
-typedef enum {
-    TYPE_UNKNOWN = 0,
-    TYPE_VOID,
-    TYPE_INT32,
-    TYPE_DOUBLE,
-    TYPE_STRING,
-    TYPE_CHAR,
-    TYPE_RECORD,
-    TYPE_FILE,
-    TYPE_BYTE,
-    TYPE_WORD,
-    TYPE_ENUM,
-    TYPE_ARRAY,
-    TYPE_BOOLEAN,
-    TYPE_MEMORYSTREAM,
-    TYPE_SET,
-    TYPE_POINTER,
-    TYPE_INTERFACE,
-    TYPE_CLOSURE,
-    /* Extended integer and floating-point types */
-    TYPE_INT8,
-    TYPE_UINT8,
-    TYPE_INT16,
-    TYPE_UINT16,
-    TYPE_UINT32,
-    TYPE_INT64,
-    TYPE_UINT64,
-    TYPE_FLOAT,
-    TYPE_LONG_DOUBLE,
-    TYPE_NIL,
-    TYPE_THREAD,
-    TYPE_WIDECHAR,
-    TYPE_UNICODE_STRING
-} VarType;
-
-/*
- * Backwards compatibility aliases.
- *
- * Pascal traditionally exposes INTEGER and REAL as its fundamental numeric
- * types.  The VM has been moving toward a more explicit naming scheme where
- * the underlying sizes are part of the type name (e.g. INT32 and DOUBLE).
- *
- * To avoid a massive churn throughout the existing front‑ends we simply map
- * the old identifiers to the new ones via macros.  This allows legacy code
- * that still uses TYPE_INTEGER/TYPE_REAL to compile unchanged while the rest
- * of the system can reason about the new INT32/DOUBLE symbols.
- */
-#define TYPE_INTEGER TYPE_INT32
-#define TYPE_REAL    TYPE_DOUBLE
+// VarType and the TYPE_INTEGER/TYPE_REAL backwards-compatibility aliases
+// live in core/var_type.h (included above), not here -- see that file's
+// header comment for why.
 
 typedef struct MStream {
+    ObjHeader header; // VM 2.0 Phase 4b: header.type is always TYPE_MEMORYSTREAM
     unsigned char *buffer;
     int size;
     int capacity;
-    int refcount;
 } MStream;
 
 // Definition of Type struct for enum metadata
