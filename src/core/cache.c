@@ -2772,6 +2772,21 @@ bool loadBytecodeFromFile(const char* file_path, BytecodeChunk* chunk) {
     return ok;
 }
 
+bool loadBytecodeFromFileUnlinked(const char* file_path, BytecodeChunk* chunk) {
+    Psb3File pf;
+    if (!psb3Load(file_path, &pf)) {
+        return false;
+    }
+
+    bool ok = psb3ReadChunk(&pf, chunk);
+    psb3FileFree(&pf);
+
+    if (!ok) {
+        initBytecodeChunk(chunk);
+    }
+    return ok;
+}
+
 static bool serializeBytecodeChunk(FILE* f,
                                    const char* source_path,
                                    const BytecodeChunk* chunk,

@@ -48,8 +48,9 @@ diff -u a.disasm b.disasm
 - `code <byte_count>` declares the final byte size of the instruction stream.
 - `inst <line> <OPCODE> ...` emits one instruction.
 - `label <name>` marks the current instruction boundary.
-- `JUMP` and `JUMP_IF_FALSE` accept either:
-  - two raw operand bytes (`inst 12 JUMP 255 244`)
+- `JUMP` and `JUMP_IF_FALSE` take a 4-byte (`int32`) relative displacement and
+  accept either:
+  - four raw operand bytes, big-endian (`inst 12 JUMP 0 0 255 244`)
   - one signed relative offset (`inst 12 JUMP -12`)
   - one symbolic label (`inst 12 JUMP @loop_start`)
 
