@@ -77,6 +77,7 @@ add_compile_definitions(
 set(PSCAL_CORE_SOURCES
     ${SRC}/core/globals.c ${SRC}/core/type_registry.c ${SRC}/core/types.c
     ${SRC}/core/utils.c ${SRC}/core/list.c ${SRC}/core/preproc.c ${SRC}/core/version.c
+    ${SRC}/core/obj_header.c
     ${SRC}/ast/ast.c ${SRC}/ast/closure_registry.c
     ${SRC}/symbol/symbol.c
     ${SRC}/lexer/lexer.c

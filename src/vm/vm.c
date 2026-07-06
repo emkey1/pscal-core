@@ -19,6 +19,7 @@
 #include "compiler/bytecode.h"
 #include "compiler/compiler.h"
 #include "core/types.h"
+#include "core/obj_header.h" // VM 2.0 Phase 4a: pointer-width startup canary
 #include "core/utils.h"    // For runtimeError, printValueToStream, makeNil, freeValue, Type helper macros
 #include "symbol/symbol.h" // For HashTable, createHashTable, hashTableLookup, hashTableInsert
 #include "core/globals.h"
@@ -5265,6 +5266,13 @@ void vmResetExecutionState(VM* vm) {
 
 void initVM(VM* vm) { // As in all.txt, with frameCount
     if (!vm) return;
+    // VM 2.0 Phase 4a (Docs/pscal_vm2_plan.md §5.10.1): one-time check that
+    // this process's heap pointers fit the 46-bit payload budget the
+    // upcoming NaN-boxed Value representation reserves. Idempotent and
+    // cheap (one malloc+free); run first so a violated assumption aborts
+    // before any other VM state is built, not partway through.
+    pscalObjRunPointerWidthCanary();
+
     vm->stack = NULL;
     vm->stackTop = NULL;
     vm->stackMappedBytes = 0;
