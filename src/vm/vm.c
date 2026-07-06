@@ -1130,6 +1130,34 @@ static bool vmResolveArraySubrangeBounds(VM* vm, AST* subrange, int* out_lower, 
     return true;
 }
 
+// VM 2.0 Phase 4e/4f: several opcode handlers below build a stack-local
+// "temp_wrapper" Value whose ArrayObj aliases a raw pointer (a Pascal
+// pointer-to-array-type dereference) as array storage without taking
+// ownership of it -- the elements/raw buffer belongs to whatever the
+// pointer points at, not to temp_wrapper. These two helpers keep that
+// lifecycle centralized: init gives temp_wrapper a real (but empty)
+// ArrayObj so the ARRAY_*/AS_ARRAY* macros are safe to use on it from the
+// start (avoiding the chicken-and-egg NULL-deref those macros would hit on
+// an uninitialized wrapper), and free tears down only what temp_wrapper
+// itself owns (the wrapper struct and the bounds arrays this code mallocs)
+// -- never the aliased elements/raw buffer, and never via
+// pscalObjRelease/arrayObjDestroy, which would wrongly try to free/
+// freeValue the borrowed storage as if temp_wrapper owned it.
+static void vmInitArrayIndexWrapper(Value* temp_wrapper) {
+    memset(temp_wrapper, 0, sizeof(Value));
+    pscalArrayEnsureObj(temp_wrapper);
+}
+
+static void vmFreeArrayIndexWrapper(Value* temp_wrapper) {
+    if (!temp_wrapper->array_val) {
+        return;
+    }
+    free(temp_wrapper->array_val->lower_bounds);
+    free(temp_wrapper->array_val->upper_bounds);
+    free(temp_wrapper->array_val);
+    temp_wrapper->array_val = NULL;
+}
+
 static bool adjustLocalByDelta(VM* vm, Value* slot, long long delta, const char* opcode_name) {
     if (!slot) {
         runtimeError(vm, "VM Error: %s encountered a null local slot pointer.", opcode_name);
@@ -5890,7 +5918,7 @@ static InterpretResult handleDefineGlobalSlot(VM* vm, uint16_t slot) {
 
         if (declaredType == TYPE_FILE && sym && sym->value) {
             if (file_element_type != TYPE_VOID && file_element_type != TYPE_UNKNOWN) {
-                ARRAY_ELEMENT_TYPE(*sym->value) = file_element_type;
+                FILE_ELEMENT_TYPE(*sym->value) = file_element_type;
                 long long bytes = 0;
                 if (vmSizeForVarType(file_element_type, &bytes) && bytes > 0 && bytes <= INT_MAX) {
                     FILE_RECORD_SIZE(*sym->value) = (int)bytes;
@@ -5902,7 +5930,7 @@ static InterpretResult handleDefineGlobalSlot(VM* vm, uint16_t slot) {
                 if (VALUE_TYPE(elem_name_val) == TYPE_STRING && AS_STRING(elem_name_val) && AS_STRING(elem_name_val)[0] != '\0') {
                     AST* elem_def = lookupType(AS_STRING(elem_name_val));
                     if (elem_def) {
-                        ARRAY_ELEMENT_TYPE_DEF(*sym->value) = elem_def;
+                        FILE_ELEMENT_TYPE_DEF(*sym->value) = elem_def;
                     }
                 }
             }
@@ -7679,6 +7707,7 @@ comparison_error_label:
 
                 Value* array_val_ptr = NULL;
                 Value temp_wrapper;
+                vmInitArrayIndexWrapper(&temp_wrapper);
                 bool using_wrapper = false;
 
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
@@ -7703,8 +7732,7 @@ comparison_error_label:
                         ARRAY_UPPER_BOUNDS(temp_wrapper) = malloc(sizeof(int) * dims);
                         if (!ARRAY_LOWER_BOUNDS(temp_wrapper) || !ARRAY_UPPER_BOUNDS(temp_wrapper)) {
                             runtimeError(vm, "VM Error: Malloc failed for temporary array wrapper bounds.");
-                            if (ARRAY_LOWER_BOUNDS(temp_wrapper)) free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                            if (ARRAY_UPPER_BOUNDS(temp_wrapper)) free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                            vmFreeArrayIndexWrapper(&temp_wrapper);
                             free(indices);
                             freeValue(&operand);
                             return INTERPRET_RUNTIME_ERROR;
@@ -7713,8 +7741,7 @@ comparison_error_label:
                             int lb = 0, ub = -1;
                             AST* sub = arrayType->children[i];
                             if (sub && !vmResolveArraySubrangeBounds(vm, sub, &lb, &ub)) {
-                                free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                                free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                                vmFreeArrayIndexWrapper(&temp_wrapper);
                                 free(indices);
                                 freeValue(&operand);
                                 return INTERPRET_RUNTIME_ERROR;
@@ -7763,8 +7790,7 @@ comparison_error_label:
                         runtimeError(vm, "VM Error: Array element index out of bounds.");
                         freeValue(&operand);
                         if (using_wrapper) {
-                            free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                            free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                            vmFreeArrayIndexWrapper(&temp_wrapper);
                         }
                         return INTERPRET_RUNTIME_ERROR;
                     }
@@ -7773,8 +7799,7 @@ comparison_error_label:
                         freeValue(&operand);
                     }
                     if (using_wrapper) {
-                        free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                        free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                        vmFreeArrayIndexWrapper(&temp_wrapper);
                     }
                     break;
                 }
@@ -7787,8 +7812,7 @@ comparison_error_label:
                     runtimeError(vm, "VM Error: Array element index out of bounds.");
                     freeValue(&operand);
                     if (using_wrapper) {
-                        free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                        free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                        vmFreeArrayIndexWrapper(&temp_wrapper);
                     }
                     return INTERPRET_RUNTIME_ERROR;
                 }
@@ -7796,7 +7820,19 @@ comparison_error_label:
                 AST* element_base_type = NULL;
                 if (ARRAY_ELEMENT_TYPE_DEF(*array_val_ptr)) {
                     element_base_type = ARRAY_ELEMENT_TYPE_DEF(*array_val_ptr);
-                } else if (PTR_BASE_TYPE_NODE(operand) && PTR_BASE_TYPE_NODE(operand)->type == AST_ARRAY_TYPE) {
+                } else if (using_wrapper && PTR_BASE_TYPE_NODE(operand) &&
+                           PTR_BASE_TYPE_NODE(operand)->type == AST_ARRAY_TYPE) {
+                    // Only trust PTR_BASE_TYPE_NODE(operand) as a real AST*
+                    // here when using_wrapper is true -- that's the same
+                    // condition under which this opcode already validated
+                    // it as a genuine AST_ARRAY_TYPE node (see the
+                    // temp_wrapper construction above). Without this guard,
+                    // a slice/view Value's element_type_def can be NULL
+                    // (inherited from an array whose own element type has
+                    // no AST def, e.g. a plain scalar) while `operand` is a
+                    // pointer whose base_type_node is one of the *_SENTINEL
+                    // fake-AST markers (OWNED_POINTER_SENTINEL etc, see
+                    // string_sentinels.h) -- dereferencing those crashes.
                     element_base_type = PTR_BASE_TYPE_NODE(operand)->right;
                 }
 
@@ -7805,8 +7841,7 @@ comparison_error_label:
                         runtimeError(vm, "VM Error: Packed array storage missing.");
                         freeValue(&operand);
                         if (using_wrapper) {
-                            free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                            free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                            vmFreeArrayIndexWrapper(&temp_wrapper);
                         }
                         return INTERPRET_RUNTIME_ERROR;
                     }
@@ -7819,8 +7854,7 @@ comparison_error_label:
                     freeValue(&operand);
                 }
                 if (using_wrapper) {
-                    free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                    free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                    vmFreeArrayIndexWrapper(&temp_wrapper);
                 }
 
                 break;
@@ -7852,8 +7886,7 @@ comparison_error_label:
 
                 Value* array_val_ptr = NULL;
                 Value temp_wrapper;
-                ARRAY_LOWER_BOUNDS(temp_wrapper) = NULL;
-                ARRAY_UPPER_BOUNDS(temp_wrapper) = NULL;
+                vmInitArrayIndexWrapper(&temp_wrapper);
                 bool using_wrapper = false;
 
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
@@ -7878,8 +7911,7 @@ comparison_error_label:
                         ARRAY_UPPER_BOUNDS(temp_wrapper) = malloc(sizeof(int) * dims);
                         if (!ARRAY_LOWER_BOUNDS(temp_wrapper) || !ARRAY_UPPER_BOUNDS(temp_wrapper)) {
                             runtimeError(vm, "VM Error: Malloc failed for temporary array wrapper bounds.");
-                            if (ARRAY_LOWER_BOUNDS(temp_wrapper)) free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                            if (ARRAY_UPPER_BOUNDS(temp_wrapper)) free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                            vmFreeArrayIndexWrapper(&temp_wrapper);
                             freeValue(&operand);
                             return INTERPRET_RUNTIME_ERROR;
                         }
@@ -7887,8 +7919,7 @@ comparison_error_label:
                             int lb = 0, ub = -1;
                             AST* sub = arrayType->children[i];
                             if (sub && !vmResolveArraySubrangeBounds(vm, sub, &lb, &ub)) {
-                                free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                                free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                                vmFreeArrayIndexWrapper(&temp_wrapper);
                                 freeValue(&operand);
                                 return INTERPRET_RUNTIME_ERROR;
                             }
@@ -7917,8 +7948,7 @@ comparison_error_label:
                         freeValue(&operand);
                     }
                     if (using_wrapper) {
-                        free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                        free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                        vmFreeArrayIndexWrapper(&temp_wrapper);
                     }
                     return INTERPRET_RUNTIME_ERROR;
                 }
@@ -7926,7 +7956,19 @@ comparison_error_label:
                 AST* element_base_type = NULL;
                 if (ARRAY_ELEMENT_TYPE_DEF(*array_val_ptr)) {
                     element_base_type = ARRAY_ELEMENT_TYPE_DEF(*array_val_ptr);
-                } else if (PTR_BASE_TYPE_NODE(operand) && PTR_BASE_TYPE_NODE(operand)->type == AST_ARRAY_TYPE) {
+                } else if (using_wrapper && PTR_BASE_TYPE_NODE(operand) &&
+                           PTR_BASE_TYPE_NODE(operand)->type == AST_ARRAY_TYPE) {
+                    // Only trust PTR_BASE_TYPE_NODE(operand) as a real AST*
+                    // here when using_wrapper is true -- that's the same
+                    // condition under which this opcode already validated
+                    // it as a genuine AST_ARRAY_TYPE node (see the
+                    // temp_wrapper construction above). Without this guard,
+                    // a slice/view Value's element_type_def can be NULL
+                    // (inherited from an array whose own element type has
+                    // no AST def, e.g. a plain scalar) while `operand` is a
+                    // pointer whose base_type_node is one of the *_SENTINEL
+                    // fake-AST markers (OWNED_POINTER_SENTINEL etc, see
+                    // string_sentinels.h) -- dereferencing those crashes.
                     element_base_type = PTR_BASE_TYPE_NODE(operand)->right;
                 }
 
@@ -7935,8 +7977,7 @@ comparison_error_label:
                         runtimeError(vm, "VM Error: Packed array storage missing.");
                         freeValue(&operand);
                         if (using_wrapper) {
-                            free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                            free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                            vmFreeArrayIndexWrapper(&temp_wrapper);
                         }
                         return INTERPRET_RUNTIME_ERROR;
                     }
@@ -7949,8 +7990,7 @@ comparison_error_label:
                     freeValue(&operand);
                 }
                 if (using_wrapper) {
-                    free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                    free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                    vmFreeArrayIndexWrapper(&temp_wrapper);
                 }
 
                 break;
@@ -8020,8 +8060,7 @@ comparison_error_label:
                 Value* array_val_ptr = NULL;
                 Value shared_snapshot = makeNil();
                 Value temp_wrapper;
-                ARRAY_LOWER_BOUNDS(temp_wrapper) = NULL;
-                ARRAY_UPPER_BOUNDS(temp_wrapper) = NULL;
+                vmInitArrayIndexWrapper(&temp_wrapper);
                 bool using_wrapper = false;
                 bool using_snapshot = false;
 
@@ -8053,8 +8092,7 @@ comparison_error_label:
                         ARRAY_UPPER_BOUNDS(temp_wrapper) = malloc(sizeof(int) * dims);
                         if (!ARRAY_LOWER_BOUNDS(temp_wrapper) || !ARRAY_UPPER_BOUNDS(temp_wrapper)) {
                             runtimeError(vm, "VM Error: Malloc failed for temporary array wrapper bounds.");
-                            if (ARRAY_LOWER_BOUNDS(temp_wrapper)) free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                            if (ARRAY_UPPER_BOUNDS(temp_wrapper)) free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                            vmFreeArrayIndexWrapper(&temp_wrapper);
                             free(indices);
                             freeValue(&operand);
                             return INTERPRET_RUNTIME_ERROR;
@@ -8063,8 +8101,7 @@ comparison_error_label:
                             int lb = 0, ub = -1;
                             AST* sub = arrayType->children[i];
                             if (sub && !vmResolveArraySubrangeBounds(vm, sub, &lb, &ub)) {
-                                free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                                free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                                vmFreeArrayIndexWrapper(&temp_wrapper);
                                 free(indices);
                                 freeValue(&operand);
                                 return INTERPRET_RUNTIME_ERROR;
@@ -8109,8 +8146,7 @@ comparison_error_label:
                         runtimeError(vm, "VM Error: Array element index out of bounds.");
                         if (VALUE_TYPE(operand) == TYPE_POINTER) freeValue(&operand);
                         if (using_wrapper) {
-                            free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                            free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                            vmFreeArrayIndexWrapper(&temp_wrapper);
                         }
                         if (using_snapshot) {
                             freeValue(&shared_snapshot);
@@ -8120,8 +8156,7 @@ comparison_error_label:
                     push(vm, sliceVal);
                     freeValue(&operand);
                     if (using_wrapper) {
-                        free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                        free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                        vmFreeArrayIndexWrapper(&temp_wrapper);
                     }
                     if (using_snapshot) {
                         freeValue(&shared_snapshot);
@@ -8137,8 +8172,7 @@ comparison_error_label:
                     runtimeError(vm, "VM Error: Array element index out of bounds.");
                     if (VALUE_TYPE(operand) == TYPE_POINTER) freeValue(&operand);
                     if (using_wrapper) {
-                        free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                        free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                        vmFreeArrayIndexWrapper(&temp_wrapper);
                     }
                     if (using_snapshot) {
                         freeValue(&shared_snapshot);
@@ -8151,8 +8185,7 @@ comparison_error_label:
                         runtimeError(vm, "VM Error: Packed array storage missing.");
                         freeValue(&operand);
                         if (using_wrapper) {
-                            free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                            free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                            vmFreeArrayIndexWrapper(&temp_wrapper);
                         }
                         if (using_snapshot) {
                             freeValue(&shared_snapshot);
@@ -8166,8 +8199,7 @@ comparison_error_label:
 
                 freeValue(&operand);
                 if (using_wrapper) {
-                    free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                    free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                    vmFreeArrayIndexWrapper(&temp_wrapper);
                 }
                 if (using_snapshot) {
                     freeValue(&shared_snapshot);
@@ -8204,8 +8236,7 @@ comparison_error_label:
                 Value* array_val_ptr = NULL;
                 Value shared_snapshot = makeNil();
                 Value temp_wrapper;
-                ARRAY_LOWER_BOUNDS(temp_wrapper) = NULL;
-                ARRAY_UPPER_BOUNDS(temp_wrapper) = NULL;
+                vmInitArrayIndexWrapper(&temp_wrapper);
                 bool using_wrapper = false;
                 bool using_snapshot = false;
 
@@ -8237,8 +8268,7 @@ comparison_error_label:
                         ARRAY_UPPER_BOUNDS(temp_wrapper) = malloc(sizeof(int) * dims);
                         if (!ARRAY_LOWER_BOUNDS(temp_wrapper) || !ARRAY_UPPER_BOUNDS(temp_wrapper)) {
                             runtimeError(vm, "VM Error: Malloc failed for temporary array wrapper bounds.");
-                            if (ARRAY_LOWER_BOUNDS(temp_wrapper)) free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                            if (ARRAY_UPPER_BOUNDS(temp_wrapper)) free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                            vmFreeArrayIndexWrapper(&temp_wrapper);
                             freeValue(&operand);
                             return INTERPRET_RUNTIME_ERROR;
                         }
@@ -8246,8 +8276,7 @@ comparison_error_label:
                             int lb = 0, ub = -1;
                             AST* sub = arrayType->children[i];
                             if (sub && !vmResolveArraySubrangeBounds(vm, sub, &lb, &ub)) {
-                                free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                                free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                                vmFreeArrayIndexWrapper(&temp_wrapper);
                                 freeValue(&operand);
                                 return INTERPRET_RUNTIME_ERROR;
                             }
@@ -8274,8 +8303,7 @@ comparison_error_label:
                     runtimeError(vm, "VM Error: Array element index out of bounds.");
                     freeValue(&operand);
                     if (using_wrapper) {
-                        free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                        free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                        vmFreeArrayIndexWrapper(&temp_wrapper);
                     }
                     if (using_snapshot) {
                         freeValue(&shared_snapshot);
@@ -8288,8 +8316,7 @@ comparison_error_label:
                         runtimeError(vm, "VM Error: Packed array storage missing.");
                         freeValue(&operand);
                         if (using_wrapper) {
-                            free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                            free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                            vmFreeArrayIndexWrapper(&temp_wrapper);
                         }
                         if (using_snapshot) {
                             freeValue(&shared_snapshot);
@@ -8303,8 +8330,7 @@ comparison_error_label:
 
                 freeValue(&operand);
                 if (using_wrapper) {
-                    free(ARRAY_LOWER_BOUNDS(temp_wrapper));
-                    free(ARRAY_UPPER_BOUNDS(temp_wrapper));
+                    vmFreeArrayIndexWrapper(&temp_wrapper);
                 }
                 if (using_snapshot) {
                     freeValue(&shared_snapshot);
@@ -9463,8 +9489,8 @@ comparison_error_label:
                 freeValue(target_slot);
                 Value file_val = makeValueForType(TYPE_FILE, NULL, NULL);
                 if (element_type != TYPE_VOID && element_type != TYPE_UNKNOWN) {
-                    ARRAY_ELEMENT_TYPE(file_val) = element_type;
-                    ARRAY_ELEMENT_TYPE_DEF(file_val) = element_type_def;
+                    FILE_ELEMENT_TYPE(file_val) = element_type;
+                    FILE_ELEMENT_TYPE_DEF(file_val) = element_type_def;
                     long long bytes = 0;
                     if (vmSizeForVarType(element_type, &bytes) && bytes > 0 && bytes <= INT_MAX) {
                         FILE_RECORD_SIZE(file_val) = (int)bytes;

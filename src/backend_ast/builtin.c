@@ -784,7 +784,12 @@ static bool writeStructuredValue(FILE* stream, const Value* rawValue) {
         }
         case TYPE_ARRAY: {
             int total = calculateArrayTotalSize(value);
-            if (total < 0 || !AS_ARRAY(*value)) {
+            // arrayUsesPackedBytes must be checked before AS_ARRAY(*value):
+            // raw/elements are a union inside ArrayObj (VM 2.0 Phase 4e/4f),
+            // so AS_ARRAY(*value) is non-NULL for a packed array too (same
+            // bits as .raw) -- a plain truthiness check can no longer tell
+            // packed and non-packed storage apart.
+            if (total < 0 || arrayUsesPackedBytes(value) || !AS_ARRAY(*value)) {
                 return false;
             }
             for (int i = 0; i < total; ++i) {
@@ -891,7 +896,10 @@ static bool readStructuredValue(FILE* stream, Value* rawValue) {
         }
         case TYPE_ARRAY: {
             int total = calculateArrayTotalSize(value);
-            if (total < 0 || !AS_ARRAY(*value)) {
+            // See writeStructuredValue's matching comment: arrayUsesPackedBytes
+            // must be checked before AS_ARRAY(*value) now that raw/elements
+            // are a union inside ArrayObj.
+            if (total < 0 || arrayUsesPackedBytes(value) || !AS_ARRAY(*value)) {
                 return false;
             }
             for (int i = 0; i < total; ++i) {
@@ -1113,7 +1121,9 @@ static bool computeValueSizeBytesInternal(const Value *value, long long *out_byt
             }
             long long elem_size = 0;
             bool have_elem = false;
-            if (AS_ARRAY(*value) && total > 0) {
+            // arrayUsesPackedBytes must be checked before AS_ARRAY(*value):
+            // raw/elements are a union inside ArrayObj (VM 2.0 Phase 4e/4f).
+            if (!arrayUsesPackedBytes(value) && AS_ARRAY(*value) && total > 0) {
                 for (int i = 0; i < total; ++i) {
                     if (computeValueSizeBytesInternal(&AS_ARRAY(*value)[i], &elem_size, depth + 1)) {
                         have_elem = true;
@@ -3331,11 +3341,27 @@ Value vmBuiltinStringOfChar(VM* vm, int arg_count, Value* args) {
     return result;
 }
 
+// Pure flat-offset arithmetic over raw bound arrays, used only by
+// resizeDynamicArrayValue's old-storage-to-new-storage copy loop below --
+// deliberately not routed through computeFlatOffset (which takes a Value*
+// and expects a fully-formed ArrayObj) since this needs to compute offsets
+// against two different bound-array pairs (old and new) that don't have
+// their own Value/ArrayObj wrappers.
+static int flatOffsetFromBounds(int dims, const int* lower, const int* upper, const int* indices) {
+    int offset = 0;
+    int multiplier = 1;
+    for (int i = dims - 1; i >= 0; i--) {
+        offset += (indices[i] - lower[i]) * multiplier;
+        multiplier *= (upper[i] - lower[i] + 1);
+    }
+    return offset;
+}
+
 static bool resizeDynamicArrayValue(VM* vm,
                                     Value* array_value,
                                     int dimension_count,
                                     const long long* lengths) {
-    if (!array_value || VALUE_TYPE(*array_value) != TYPE_ARRAY) {
+    if (!array_value || VALUE_TYPE(*array_value) != TYPE_ARRAY || !array_value->array_val) {
         runtimeError(vm, "SetLength target is not an array.");
         return false;
     }
@@ -3354,6 +3380,7 @@ static bool resizeDynamicArrayValue(VM* vm,
     VarType element_type = ARRAY_ELEMENT_TYPE(*array_value);
     AST* element_type_def = ARRAY_ELEMENT_TYPE_DEF(*array_value);
     bool use_packed = isPackedByteElementType(element_type);
+    bool is_dynamic = ARRAY_IS_DYNAMIC(*array_value);
 
     int* new_lower = (int*)malloc(sizeof(int) * dimension_count);
     int* new_upper = (int*)malloc(sizeof(int) * dimension_count);
@@ -3403,19 +3430,17 @@ static bool resizeDynamicArrayValue(VM* vm,
         new_total = 0;
     }
 
+    ArrayObj* old = array_value->array_val;
     size_t old_total = 0;
-    int* old_lower_bounds = ARRAY_LOWER_BOUNDS(*array_value);
-    int* old_upper_bounds = ARRAY_UPPER_BOUNDS(*array_value);
-    Value* old_array_val = AS_ARRAY(*array_value);
-    unsigned char* old_array_raw = AS_ARRAY_RAW(*array_value);
-    bool old_array_is_packed = ARRAY_IS_PACKED(*array_value);
-    bool old_array_is_dynamic = ARRAY_IS_DYNAMIC(*array_value);
-    uint32_t* old_array_refcount = ARRAY_REFCOUNT(*array_value);
-    if (ARRAY_DIMENSIONS(*array_value) > 0 &&
-        ARRAY_LOWER_BOUNDS(*array_value) && ARRAY_UPPER_BOUNDS(*array_value)) {
+    int* old_lower_bounds = old->lower_bounds;
+    int* old_upper_bounds = old->upper_bounds;
+    Value* old_array_val = old->elements;
+    unsigned char* old_array_raw = old->raw;
+    bool old_array_is_packed = old->is_packed;
+    if (old->dimensions > 0 && old_lower_bounds && old_upper_bounds) {
         old_total = 1;
-        for (int i = 0; i < ARRAY_DIMENSIONS(*array_value); ++i) {
-            int span = ARRAY_UPPER_BOUNDS(*array_value)[i] - ARRAY_LOWER_BOUNDS(*array_value)[i] + 1;
+        for (int i = 0; i < old->dimensions; ++i) {
+            int span = old_upper_bounds[i] - old_lower_bounds[i] + 1;
             if (span <= 0) {
                 old_total = 0;
                 break;
@@ -3426,7 +3451,6 @@ static bool resizeDynamicArrayValue(VM* vm,
 
     Value* new_elements = NULL;
     unsigned char* new_raw = NULL;
-    uint32_t* new_refcount = NULL;
     int* copy_lower = NULL;
     int* copy_upper = NULL;
     int* copy_indices = NULL;
@@ -3449,10 +3473,10 @@ static bool resizeDynamicArrayValue(VM* vm,
             }
         }
 
-        if (old_total > 0 && ARRAY_LOWER_BOUNDS(*array_value) &&
-            ARRAY_UPPER_BOUNDS(*array_value) && ARRAY_DIMENSIONS(*array_value) == dimension_count &&
-            ((use_packed && (AS_ARRAY_RAW(*array_value) || AS_ARRAY(*array_value))) ||
-             (!use_packed && AS_ARRAY(*array_value)))) {
+        if (old_total > 0 && old_lower_bounds && old_upper_bounds &&
+            old->dimensions == dimension_count &&
+            ((use_packed && (old_array_raw || old_array_val)) ||
+             (!use_packed && old_array_val))) {
             copy_lower = (int*)malloc(sizeof(int) * dimension_count);
             copy_upper = (int*)malloc(sizeof(int) * dimension_count);
             if (!copy_lower || !copy_upper) {
@@ -3462,10 +3486,10 @@ static bool resizeDynamicArrayValue(VM* vm,
 
             bool has_overlap = true;
             for (int i = 0; i < dimension_count; ++i) {
-                int overlap_low = ARRAY_LOWER_BOUNDS(*array_value)[i] > new_lower[i] ?
-                                  ARRAY_LOWER_BOUNDS(*array_value)[i] : new_lower[i];
-                int overlap_high = ARRAY_UPPER_BOUNDS(*array_value)[i] < new_upper[i] ?
-                                   ARRAY_UPPER_BOUNDS(*array_value)[i] : new_upper[i];
+                int overlap_low = old_lower_bounds[i] > new_lower[i] ?
+                                  old_lower_bounds[i] : new_lower[i];
+                int overlap_high = old_upper_bounds[i] < new_upper[i] ?
+                                   old_upper_bounds[i] : new_upper[i];
                 if (overlap_high < overlap_low) {
                     has_overlap = false;
                     break;
@@ -3481,32 +3505,24 @@ static bool resizeDynamicArrayValue(VM* vm,
                     goto setlength_cleanup_failure;
                 }
 
-                Value old_array_stub = *array_value;
-                Value new_array_stub;
-                memset(&new_array_stub, 0, sizeof(Value));
-                SET_VALUE_TYPE(&new_array_stub, TYPE_ARRAY);
-                ARRAY_DIMENSIONS(new_array_stub) = dimension_count;
-                ARRAY_LOWER_BOUNDS(new_array_stub) = new_lower;
-                ARRAY_UPPER_BOUNDS(new_array_stub) = new_upper;
-
                 for (int i = 0; i < dimension_count; ++i) {
                     copy_indices[i] = copy_lower[i];
                 }
 
                 while (true) {
-                    int old_offset = computeFlatOffset(&old_array_stub, copy_indices);
-                    int new_offset = computeFlatOffset(&new_array_stub, copy_indices);
+                    int old_offset = flatOffsetFromBounds(dimension_count, old_lower_bounds, old_upper_bounds, copy_indices);
+                    int new_offset = flatOffsetFromBounds(dimension_count, new_lower, new_upper, copy_indices);
                     if (use_packed) {
                         unsigned char byte = 0;
-                        if (ARRAY_IS_PACKED(*array_value) && AS_ARRAY_RAW(*array_value)) {
-                            byte = AS_ARRAY_RAW(*array_value)[old_offset];
-                        } else if (AS_ARRAY(*array_value)) {
-                            byte = valueToByte(&AS_ARRAY(*array_value)[old_offset]);
+                        if (old_array_is_packed && old_array_raw) {
+                            byte = old_array_raw[old_offset];
+                        } else if (old_array_val) {
+                            byte = valueToByte(&old_array_val[old_offset]);
                         }
                         new_raw[new_offset] = byte;
                     } else {
                         freeValue(&new_elements[new_offset]);
-                        new_elements[new_offset] = makeCopyOfValue(&AS_ARRAY(*array_value)[old_offset]);
+                        new_elements[new_offset] = makeCopyOfValue(&old_array_val[old_offset]);
                     }
 
                     int dim = dimension_count - 1;
@@ -3534,15 +3550,6 @@ static bool resizeDynamicArrayValue(VM* vm,
         }
     }
 
-    if (ARRAY_IS_DYNAMIC(*array_value)) {
-        new_refcount = (uint32_t*)malloc(sizeof(uint32_t));
-        if (!new_refcount) {
-            runtimeError(vm, "SetLength: memory allocation failed for dynamic array metadata.");
-            goto setlength_cleanup_failure;
-        }
-        *new_refcount = 1;
-    }
-
     if (copy_indices) {
         free(copy_indices);
         copy_indices = NULL;
@@ -3556,48 +3563,34 @@ static bool resizeDynamicArrayValue(VM* vm,
         copy_upper = NULL;
     }
 
-    bool release_old_storage = true;
-    if (old_array_is_dynamic && old_array_refcount) {
-        if (*old_array_refcount > 1) {
-            (*old_array_refcount)--;
-            release_old_storage = false;
+    // Always allocate a fresh ArrayObj wrapper rather than mutating `old`
+    // in place: a dynamic array's ArrayObj can be shared (refcount > 1)
+    // with other Values holding the SAME pointer, and mutating it in
+    // place would make this SetLength visible through every alias instead
+    // of just this one. pscalObjRelease below reproduces the pre-4e/4f
+    // "decrement if shared, actually free storage if this was the last
+    // owner" behavior without this function needing to know which case
+    // applies -- see core/types.h's ArrayObj comment.
+    ArrayObj* new_obj = pscalArrayObjCreate();
+    new_obj->element_type = element_type;
+    new_obj->element_type_def = element_type_def;
+    new_obj->is_packed = use_packed;
+    new_obj->is_dynamic = is_dynamic;
+    new_obj->dimensions = dimension_count;
+    new_obj->lower_bounds = new_lower;
+    new_obj->upper_bounds = new_upper;
+    new_obj->lower_bound = (dimension_count >= 1) ? new_lower[0] : 0;
+    new_obj->upper_bound = (dimension_count >= 1) ? new_upper[0] : -1;
+    if (new_total > 0) {
+        if (use_packed) {
+            new_obj->raw = new_raw;
         } else {
-            free(old_array_refcount);
-            old_array_refcount = NULL;
+            new_obj->elements = new_elements;
         }
     }
 
-    if (release_old_storage) {
-        if (old_array_is_packed) {
-            free(old_array_raw);
-            old_array_raw = NULL;
-        } else if (old_array_val) {
-            for (size_t i = 0; i < old_total; ++i) {
-                freeValue(&old_array_val[i]);
-            }
-            free(old_array_val);
-            old_array_val = NULL;
-        }
-        free(old_lower_bounds);
-        free(old_upper_bounds);
-    }
-
-    ARRAY_LOWER_BOUNDS(*array_value) = new_lower;
-    ARRAY_UPPER_BOUNDS(*array_value) = new_upper;
-    AS_ARRAY(*array_value) = new_elements;
-    AS_ARRAY_RAW(*array_value) = new_raw;
-    ARRAY_IS_PACKED(*array_value) = use_packed;
-    ARRAY_REFCOUNT(*array_value) = new_refcount;
-    ARRAY_DIMENSIONS(*array_value) = dimension_count;
-    ARRAY_LOWER_BOUND(*array_value) = (dimension_count >= 1) ? new_lower[0] : 0;
-    ARRAY_UPPER_BOUND(*array_value) = (dimension_count >= 1) ? new_upper[0] : -1;
-    ARRAY_ELEMENT_TYPE(*array_value) = element_type;
-    ARRAY_ELEMENT_TYPE_DEF(*array_value) = element_type_def;
-
-    if (new_total == 0) {
-        AS_ARRAY(*array_value) = NULL;
-        AS_ARRAY_RAW(*array_value) = NULL;
-    }
+    pscalObjRelease(&old->header);
+    array_value->array_val = new_obj;
 
     return true;
 
@@ -3619,9 +3612,6 @@ setlength_cleanup_failure:
     }
     if (new_raw) {
         free(new_raw);
-    }
-    if (new_refcount) {
-        free(new_refcount);
     }
     free(new_lower);
     free(new_upper);
@@ -6445,7 +6435,7 @@ Value vmBuiltinRewrite(VM* vm, int arg_count, Value* args) {
     FILE_RECORD_SIZE(*fileVarLValue) = new_record_size;
 
     bool use_binary_mode = has_record_size_arg || FILE_RECORD_SIZE_EXPLICIT(*fileVarLValue) ||
-                           ARRAY_ELEMENT_TYPE(*fileVarLValue) != TYPE_VOID;
+                           FILE_ELEMENT_TYPE(*fileVarLValue) != TYPE_VOID;
     const char* mode = use_binary_mode ? "wb" : "w";
 
     FILE* f = fopen(FILE_FILENAME(*fileVarLValue), mode);
@@ -7338,7 +7328,7 @@ Value vmBuiltinReset(VM* vm, int arg_count, Value* args) {
     FILE_RECORD_SIZE(*fileVarLValue) = new_record_size;
 
     bool use_binary_mode = has_record_size_arg || FILE_RECORD_SIZE_EXPLICIT(*fileVarLValue) ||
-                           ARRAY_ELEMENT_TYPE(*fileVarLValue) != TYPE_VOID;
+                           FILE_ELEMENT_TYPE(*fileVarLValue) != TYPE_VOID;
     const char* mode = use_binary_mode ? "rb" : "r";
 
     FILE* f = fopen(FILE_FILENAME(*fileVarLValue), mode);
@@ -7512,7 +7502,7 @@ Value vmBuiltinFilesize(VM* vm, int arg_count, Value* args) {
 
     long long result = sizeBytes;
     int recordSize = FILE_RECORD_SIZE(*fileValue);
-    if (recordSize > 0 && (FILE_RECORD_SIZE_EXPLICIT(*fileValue) || ARRAY_ELEMENT_TYPE(*fileValue) != TYPE_VOID)) {
+    if (recordSize > 0 && (FILE_RECORD_SIZE_EXPLICIT(*fileValue) || FILE_ELEMENT_TYPE(*fileValue) != TYPE_VOID)) {
         result = sizeBytes / recordSize;
     }
 
@@ -8399,14 +8389,14 @@ Value vmBuiltinWrite(VM* vm, int arg_count, Value* args) {
             start_index = 2;
             if (VALUE_TYPE(args[1]) == TYPE_FILE) first_arg_is_file_by_value = true;
             file_value = first;
-            if (ARRAY_ELEMENT_TYPE(*file_value) != TYPE_VOID && ARRAY_ELEMENT_TYPE(*file_value) != TYPE_UNKNOWN) {
-                bool has_typed_metadata = FILE_RECORD_SIZE_EXPLICIT(*file_value) || ARRAY_ELEMENT_TYPE_DEF(*file_value) != NULL;
+            if (FILE_ELEMENT_TYPE(*file_value) != TYPE_VOID && FILE_ELEMENT_TYPE(*file_value) != TYPE_UNKNOWN) {
+                bool has_typed_metadata = FILE_RECORD_SIZE_EXPLICIT(*file_value) || FILE_ELEMENT_TYPE_DEF(*file_value) != NULL;
                 if (has_typed_metadata) {
                     long long size_bytes = 0;
-                    if (builtinSizeForVarType(ARRAY_ELEMENT_TYPE(*file_value), &size_bytes) && size_bytes > 0 &&
+                    if (builtinSizeForVarType(FILE_ELEMENT_TYPE(*file_value), &size_bytes) && size_bytes > 0 &&
                         (size_t)size_bytes <= sizeof(long double)) {
                         binary_file = true;
-                        binary_element_type = ARRAY_ELEMENT_TYPE(*file_value);
+                        binary_element_type = FILE_ELEMENT_TYPE(*file_value);
                         binary_element_size = (size_t)size_bytes;
                     }
                 }

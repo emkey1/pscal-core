@@ -790,6 +790,72 @@ RecordObj *pscalRecordObjCreate(FieldValue *fields) {
     return r;
 }
 
+// VM 2.0 Phase 4e/4f: ArrayObj replaces the pre-4e/f Value-level array
+// metadata fields plus the separately-malloc'd `array_refcount`. Mirrors
+// freeValue's pre-4e/f TYPE_ARRAY case exactly (element-by-element free
+// for non-packed storage, raw-buffer free for packed, then bounds arrays)
+// -- this only runs when the refcount reaches zero, which pscalObjRelease
+// already handles identically for both the "last dynamic-array reference"
+// and "static array being destroyed" cases (see core/types.h's ArrayObj
+// comment for why the mutex-protected critical sections around this are
+// unchanged, only the counter mechanism moved to ObjHeader).
+static void arrayObjDestroy(ObjHeader *header) {
+    ArrayObj *a = (ArrayObj *)header;
+    if (a->view_of) {
+        // A view owns none of its raw/elements/lower_bounds/upper_bounds
+        // pointers (they alias view_of's own buffers) -- releasing
+        // view_of is what actually tears storage down, once every alias
+        // of it (view or otherwise) has let go.
+        pscalObjRelease(&a->view_of->header);
+        free(a);
+        return;
+    }
+    if (a->is_packed) {
+        if (a->raw) {
+            free(a->raw);
+        }
+    } else if (a->elements) {
+        int total = 1;
+        if (a->dimensions > 0 && a->lower_bounds && a->upper_bounds) {
+            for (int i = 0; i < a->dimensions; i++) {
+                total *= (a->upper_bounds[i] - a->lower_bounds[i] + 1);
+            }
+        } else {
+            total = 0;
+        }
+        for (int i = 0; i < total; i++) {
+            freeValue(&a->elements[i]);
+        }
+        free(a->elements);
+    }
+    free(a->lower_bounds);
+    free(a->upper_bounds);
+    free(a);
+}
+
+static pthread_once_t g_array_obj_destructor_once = PTHREAD_ONCE_INIT;
+static void registerArrayObjDestructor(void) {
+    pscalObjRegisterDestructor(TYPE_ARRAY, arrayObjDestroy);
+}
+
+ArrayObj *pscalArrayObjCreate(void) {
+    pthread_once(&g_array_obj_destructor_once, registerArrayObjDestructor);
+    ArrayObj *a = calloc(1, sizeof(ArrayObj));
+    if (!a) {
+        fprintf(stderr, "FATAL: Memory allocation failed in pscalArrayObjCreate\n");
+        EXIT_FAILURE_HANDLER();
+    }
+    pscalObjHeaderInit(&a->header, TYPE_ARRAY);
+    return a;
+}
+
+void pscalArrayEnsureObj(Value *v) {
+    if (!v || v->array_val) {
+        return;
+    }
+    v->array_val = pscalArrayObjCreate();
+}
+
 static bool ensureFieldSlotCapacity(FieldValue*** slotOwners, int* capacity, int requiredSlots) {
     if (!slotOwners || !capacity || requiredSlots <= *capacity) {
         return true;
@@ -1583,14 +1649,13 @@ Value makeRecord(FieldValue *rec) {
 
 Value makeArrayND(int dimensions, int *lower_bounds, int *upper_bounds, VarType element_type, AST *type_def) {
     Value v = makeEmptyArray(element_type, type_def);
-    v.dimensions = dimensions;
+    ArrayObj *arr = v.array_val;
+    arr->dimensions = dimensions;
     bool use_packed = isPackedByteElementType(element_type);
-    v.array_is_packed = use_packed;
-    v.array_is_dynamic = false;
-    if (v.array_refcount) {
-        free(v.array_refcount);
-        v.array_refcount = NULL;
-    }
+    arr->is_packed = use_packed;
+    arr->is_dynamic = false;
+    // No separate array_refcount to free anymore -- the refcount lives in
+    // ObjHeader (already 1, set by pscalArrayObjCreate via makeEmptyArray).
 
     if (dimensions <= 0) {
          fprintf(stderr, "Warning: makeArrayND called with zero or negative dimensions.\n");
@@ -1598,12 +1663,12 @@ Value makeArrayND(int dimensions, int *lower_bounds, int *upper_bounds, VarType 
     }
 
     // Allocate bounds arrays
-    v.lower_bounds = malloc(sizeof(int) * dimensions);
-    v.upper_bounds = malloc(sizeof(int) * dimensions);
-    if (!v.lower_bounds || !v.upper_bounds) {
+    arr->lower_bounds = malloc(sizeof(int) * dimensions);
+    arr->upper_bounds = malloc(sizeof(int) * dimensions);
+    if (!arr->lower_bounds || !arr->upper_bounds) {
         fprintf(stderr, "Memory allocation error for bounds in makeArrayND.\n");
-        free(v.lower_bounds);
-        free(v.upper_bounds);
+        free(arr->lower_bounds);
+        free(arr->upper_bounds);
         EXIT_FAILURE_HANDLER();
         goto fail;
     }
@@ -1623,8 +1688,8 @@ Value makeArrayND(int dimensions, int *lower_bounds, int *upper_bounds, VarType 
     }
 
     for (int i = 0; i < dimensions; i++) {
-        v.lower_bounds[i] = lower_bounds[i];
-        v.upper_bounds[i] = upper_bounds[i];
+        arr->lower_bounds[i] = lower_bounds[i];
+        arr->upper_bounds[i] = upper_bounds[i];
         int size_i = (upper_bounds[i] - lower_bounds[i] + 1);
         if (size_i <= 0) {
             fprintf(stderr, "Error: Invalid array dimension size (%d..%d) in makeArrayND.\n", lower_bounds[i], upper_bounds[i]);
@@ -1647,16 +1712,16 @@ Value makeArrayND(int dimensions, int *lower_bounds, int *upper_bounds, VarType 
     }
 
     if (use_packed) {
-        v.array_raw = calloc(total_size, sizeof(uint8_t));
-        if (!v.array_raw) {
+        arr->raw = calloc(total_size, sizeof(uint8_t));
+        if (!arr->raw) {
             fprintf(stderr, "Memory allocation error for packed array data in makeArrayND.\n");
             EXIT_FAILURE_HANDLER();
             goto fail;
         }
     } else {
         // Allocate array for Value elements
-        v.array_val = malloc(sizeof(Value) * total_size);
-        if (!v.array_val) {
+        arr->elements = malloc(sizeof(Value) * total_size);
+        if (!arr->elements) {
             fprintf(stderr, "Memory allocation error for array data in makeArrayND.\n");
             EXIT_FAILURE_HANDLER();
             goto fail;
@@ -1671,28 +1736,32 @@ Value makeArrayND(int dimensions, int *lower_bounds, int *upper_bounds, VarType 
                          element_type == TYPE_INT64 || element_type == TYPE_UINT64 ||
                          element_type == TYPE_FLOAT || element_type == TYPE_LONG_DOUBLE);
         if (isSimple && total_size > 0) {
-            memset(v.array_val, 0, sizeof(Value) * total_size);
+            memset(arr->elements, 0, sizeof(Value) * total_size);
             for (size_t i = 0; i < total_size; i++) {
-                v.array_val[i].type = element_type;
+                arr->elements[i].type = element_type;
             }
         } else {
             for (size_t i = 0; i < total_size; i++) {
                 // Pass the element type definition node for complex types like records
-                v.array_val[i] = makeValueForType(element_type, type_def, NULL);
+                arr->elements[i] = makeValueForType(element_type, type_def, NULL);
             }
         }
     }
 
     return v;
 fail:
-    if (v.array_val) {
-        free(v.array_val);
+    // Discarding this ArrayObj entirely in favor of a fresh empty one --
+    // free everything it owns, including the struct itself (not just its
+    // buffers), then let makeEmptyArray allocate an unrelated replacement.
+    if (arr->elements) {
+        free(arr->elements);
     }
-    if (v.array_raw) {
-        free(v.array_raw);
+    if (arr->raw) {
+        free(arr->raw);
     }
-    free(v.lower_bounds);
-    free(v.upper_bounds);
+    free(arr->lower_bounds);
+    free(arr->upper_bounds);
+    free(arr);
     return makeEmptyArray(element_type, type_def);
 }
 
@@ -1700,23 +1769,14 @@ Value makeEmptyArray(VarType element_type, AST *type_def) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_ARRAY;
-    v.element_type = element_type;
-    v.element_type_def = type_def;
-    v.dimensions = 0;
-    v.lower_bounds = NULL;
-    v.upper_bounds = NULL;
-    v.array_val = NULL;
-    v.array_raw = NULL;
-    v.array_is_packed = isPackedByteElementType(element_type);
-    v.array_is_dynamic = true;
-    v.array_refcount = (uint32_t*)malloc(sizeof(uint32_t));
-    if (!v.array_refcount) {
-        fprintf(stderr, "Memory allocation error for dynamic array refcount.\n");
-        EXIT_FAILURE_HANDLER();
-    }
-    *v.array_refcount = 1;
-    v.lower_bound = 0;
-    v.upper_bound = -1;
+    v.array_val = pscalArrayObjCreate(); // refcount=1 already, via ObjHeader
+    v.array_val->element_type = element_type;
+    v.array_val->element_type_def = type_def;
+    v.array_val->dimensions = 0;
+    v.array_val->is_packed = isPackedByteElementType(element_type);
+    v.array_val->is_dynamic = true;
+    v.array_val->lower_bound = 0;
+    v.array_val->upper_bound = -1;
     return v;
 }
 
@@ -1948,12 +2008,7 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
             v.record_val = pscalRecordObjCreate(node_to_inspect ? createEmptyRecord(node_to_inspect) : NULL);
             break;
         case TYPE_ARRAY: {
-            v.dimensions = 0;
-            v.lower_bounds = NULL;
-            v.upper_bounds = NULL;
             v.array_val = NULL;
-            v.element_type = TYPE_VOID;
-            v.element_type_def = NULL;
 
             AST* definition_node_for_array = node_to_inspect ? resolveTypeAliasForRecord(node_to_inspect) : NULL;
 
@@ -2066,7 +2121,8 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
             }
 
             #ifdef DEBUG
-            fprintf(stderr, "[DEBUG makeValueForType - ARRAY CASE EXIT] Returning Value: type=%s, dimensions=%d\n", varTypeToString(v.type), v.dimensions);
+            fprintf(stderr, "[DEBUG makeValueForType - ARRAY CASE EXIT] Returning Value: type=%s, dimensions=%d\n",
+                    varTypeToString(v.type), v.array_val ? ARRAY_DIMENSIONS(v) : 0);
             #endif
             break;
         }
@@ -2439,77 +2495,28 @@ void freeValue(Value *v) {
             break;
         }
         case TYPE_ARRAY: {
+             // VM 2.0 Phase 4e/4f: pscalObjRelease unifies what used to be
+             // two separate paths here (decrement-or-free for a dynamic
+             // array's shared refcount vs. unconditionally free for a
+             // static one) -- arrayObjDestroy only runs once the refcount
+             // actually reaches zero, which is exactly the same outcome
+             // for both cases. Safe without additional locking here
+             // specifically because freeValue only ever runs on a Value
+             // this thread already exclusively owns (e.g. replaceValueCell
+             // in vm.c calls it on a local copy *after* releasing
+             // value_cell_mutex/dynamic_array_refcount_mutex, not on the
+             // shared cell itself) -- the torn-whole-struct race those
+             // mutexes guard against is a concern for concurrent readers
+             // of a *shared* cell, not for tearing down a value nothing
+             // else can see anymore.
 #ifdef DEBUG
-             fprintf(stderr, "[DEBUG]   Processing array for Value* at %p (array_val=%p)\n", (void*)v, (void*)v->array_val);
+             fprintf(stderr, "[DEBUG]   Releasing ArrayObj at %p for Value* at %p\n", (void*)v->array_val, (void*)v);
              fflush(stderr);
 #endif
-             if (v->array_is_dynamic && v->array_refcount) {
-                 bool release_storage = false;
-                 pthread_mutex_lock(&dynamic_array_refcount_mutex);
-                 if (*v->array_refcount > 1) {
-                     (*v->array_refcount)--;
-                     pthread_mutex_unlock(&dynamic_array_refcount_mutex);
-                     v->array_val = NULL;
-                     v->array_raw = NULL;
-                     v->lower_bounds = NULL;
-                     v->upper_bounds = NULL;
-                     v->array_refcount = NULL;
-                     v->array_is_packed = false;
-                     v->array_is_dynamic = false;
-                     v->dimensions = 0;
-                     break;
-                 }
-                 release_storage = true;
-                 pthread_mutex_unlock(&dynamic_array_refcount_mutex);
-                 if (release_storage) {
-                     free(v->array_refcount);
-                 }
-                 v->array_refcount = NULL;
+             if (v->array_val) {
+                 pscalObjRelease(&v->array_val->header);
              }
-             if (v->array_is_packed) {
-                 if (v->array_raw) {
-                     free(v->array_raw);
-                 }
-                 v->array_raw = NULL;
-             } else if (v->array_val) {
-                 int total = 1;
-                 if(v->dimensions > 0 && v->lower_bounds && v->upper_bounds) {
-                   for (int i = 0; i < v->dimensions; i++)
-                       total *= (v->upper_bounds[i] - v->lower_bounds[i] + 1);
-                 } else {
-                   total = 0;
-#ifdef DEBUG
-                   fprintf(stderr, "[DEBUG]     Warning: Array bounds missing or zero dimensions for Value* %p.\n", (void*)v);
-                   fflush(stderr);
-#endif
-                 }
-
-                 for (int i = 0; i < total; i++) {
-#ifdef DEBUG
-                    fprintf(stderr, "[DEBUG]     Freeing array element %d for Value* %p\n", i, (void*)v);
-                    fflush(stderr);
-#endif
-                    freeValue(&v->array_val[i]);
-                 }
-#ifdef DEBUG
-                 fprintf(stderr, "[DEBUG]   Freeing array data buffer at %p for Value* %p\n", (void*)v->array_val, (void*)v);
-                 fflush(stderr);
-#endif
-                 free(v->array_val);
-             }
-#ifdef DEBUG
-             fprintf(stderr, "[DEBUG]   Freeing array bounds at %p and %p for Value* %p\n", (void*)v->lower_bounds, (void*)v->upper_bounds, (void*)v);
-             fflush(stderr);
-#endif
-             free(v->lower_bounds);
-             free(v->upper_bounds);
              v->array_val = NULL;
-             v->array_raw = NULL;
-             v->array_is_packed = false;
-             v->array_is_dynamic = false;
-             v->lower_bounds = NULL;
-             v->upper_bounds = NULL;
-             v->dimensions = 0; // Reset dimensions
              break;
         }
         case TYPE_FILE:
@@ -2614,14 +2621,15 @@ void dumpSymbol(Symbol *sym) {
                 printf("Enumerated Type '%s', Ordinal: %d", sym->value->enum_val.enum_name, sym->value->enum_val.ordinal);
                 break;
             case TYPE_ARRAY: {
+                ArrayObj *a = sym->value->array_val;
                 printf("Array[");
-                for (int i = 0; i < sym->value->dimensions; i++) {
-                    printf("%d..%d", sym->value->lower_bounds[i], sym->value->upper_bounds[i]);
-                    if (i < sym->value->dimensions - 1) {
+                for (int i = 0; a && i < a->dimensions; i++) {
+                    printf("%d..%d", a->lower_bounds[i], a->upper_bounds[i]);
+                    if (i < a->dimensions - 1) {
                         printf(", ");
                     }
                 }
-                printf("] of %s", varTypeToString(sym->value->element_type));
+                printf("] of %s", varTypeToString(a ? a->element_type : TYPE_VOID));
                 break;
             }
             case TYPE_RECORD: {
@@ -3369,12 +3377,12 @@ void printValueToStream(Value v, FILE *stream) {
             break;
         }
         case TYPE_ARRAY:
-            // Your `v.array_val` is a `Value*` pointing to the first element.
-            // The other array metadata (dimensions, bounds, element_type) is directly in `v`.
+            // VM 2.0 Phase 4e/4f: array metadata now lives in the ArrayObj
+            // wrapper (v.array_val), not directly on v -- see core/types.h.
             fprintf(stream, "ARRAY(dims:%d, base_type:%s, elements_at:%p)",
-                    v.dimensions,
-                    varTypeToString(v.element_type), // Using v.element_type directly
-                    (void*)v.array_val); // v.array_val is the pointer to elements
+                    v.array_val ? ARRAY_DIMENSIONS(v) : 0,
+                    varTypeToString(v.array_val ? ARRAY_ELEMENT_TYPE(v) : TYPE_VOID),
+                    (void*)(v.array_val ? AS_ARRAY(v) : NULL));
             // For a more detailed print, you'd iterate based on dimensions and bounds.
             break;
         case TYPE_RECORD:
@@ -3532,69 +3540,87 @@ Value makeCopyOfValue(const Value *src) {
             break;
         }
         case TYPE_ARRAY: {
-            v.dimensions = src->dimensions;
-            v.array_is_packed = src->array_is_packed;
-            v.array_is_dynamic = src->array_is_dynamic;
-            v.element_type_def = src->element_type_def;
-            v.element_type = src->element_type;
-            v.lower_bound = src->lower_bound;
-            v.upper_bound = src->upper_bound;
-
-            if (src->array_is_dynamic) {
-                v.lower_bounds = src->lower_bounds;
-                v.upper_bounds = src->upper_bounds;
-                v.array_val = src->array_val;
-                v.array_raw = src->array_raw;
-                v.array_refcount = src->array_refcount;
-                if (v.array_refcount) {
-                    pthread_mutex_lock(&dynamic_array_refcount_mutex);
-                    (*v.array_refcount)++;
-                    pthread_mutex_unlock(&dynamic_array_refcount_mutex);
-                }
+            // `v = *src` above left v.array_val ALIASING src->array_val.
+            // For the dynamic (shared) case that's exactly what we want --
+            // just retain it below. For the static (deep-copy) case,
+            // overwrite it with a fresh ArrayObj before touching anything,
+            // same pattern as TYPE_STRING/TYPE_SET above.
+            ArrayObj *s = src->array_val;
+            if (!s) {
+                v.array_val = NULL;
                 break;
             }
 
-            int total = 1;
-            if (v.dimensions > 0 && src->lower_bounds && src->upper_bounds) {
-                v.lower_bounds = malloc(sizeof(int) * src->dimensions);
-                v.upper_bounds = malloc(sizeof(int) * src->dimensions);
-                if (!v.lower_bounds || !v.upper_bounds) { /* Handle error */ }
+            if (s->is_dynamic) {
+                // Reference semantics: share the same ArrayObj. Still
+                // taken under dynamic_array_refcount_mutex -- see
+                // core/types.h's ArrayObj comment for why this pairing
+                // with replaceValueCell/copyDynamicArraySnapshotValue's
+                // locking isn't retired yet; only the counter mechanism
+                // (now atomic, via pscalObjRetain) replaces the old
+                // manual (*array_refcount)++.
+                pthread_mutex_lock(&dynamic_array_refcount_mutex);
+                pscalObjRetain(&s->header);
+                pthread_mutex_unlock(&dynamic_array_refcount_mutex);
+                v.array_val = s;
+                break;
+            }
 
-                for (int i = 0; i < src->dimensions; i++) {
-                    v.lower_bounds[i] = src->lower_bounds[i];
-                    v.upper_bounds[i] = src->upper_bounds[i];
-                    int size_i = (v.upper_bounds[i] - v.lower_bounds[i] + 1);
+            ArrayObj *out = pscalArrayObjCreate();
+            v.array_val = out;
+            out->element_type = s->element_type;
+            out->element_type_def = s->element_type_def;
+            out->is_packed = s->is_packed;
+            out->is_dynamic = false;
+            out->dimensions = s->dimensions;
+            out->lower_bound = s->lower_bound;
+            out->upper_bound = s->upper_bound;
+
+            int total = 1;
+            if (out->dimensions > 0 && s->lower_bounds && s->upper_bounds) {
+                out->lower_bounds = malloc(sizeof(int) * s->dimensions);
+                out->upper_bounds = malloc(sizeof(int) * s->dimensions);
+                if (!out->lower_bounds || !out->upper_bounds) {
+                    fprintf(stderr, "Memory allocation failed in makeCopyOfValue (array bounds)\n");
+                    EXIT_FAILURE_HANDLER();
+                }
+
+                for (int i = 0; i < s->dimensions; i++) {
+                    out->lower_bounds[i] = s->lower_bounds[i];
+                    out->upper_bounds[i] = s->upper_bounds[i];
+                    int size_i = (out->upper_bounds[i] - out->lower_bounds[i] + 1);
                     if (size_i <= 0) { total = 0; break; }
                     if (__builtin_mul_overflow(total, size_i, &total)) { total = -1; break; }
                 }
             } else {
                 total = 0;
-                v.lower_bounds = NULL;
-                v.upper_bounds = NULL;
             }
 
-            v.array_val = NULL;
-            v.array_raw = NULL;
-            v.array_refcount = NULL;
             if (total > 0) {
-                if (v.array_is_packed) {
-                    v.array_raw = (uint8_t*)calloc((size_t)total, sizeof(uint8_t));
-                    if (!v.array_raw) { /* Handle error */ }
-                    if (src->array_raw) {
-                        memcpy(v.array_raw, src->array_raw, (size_t)total);
+                if (out->is_packed) {
+                    out->raw = (uint8_t*)calloc((size_t)total, sizeof(uint8_t));
+                    if (!out->raw) {
+                        fprintf(stderr, "Memory allocation failed in makeCopyOfValue (array raw)\n");
+                        EXIT_FAILURE_HANDLER();
                     }
-                } else if (src->array_val) {
-                    v.array_val = malloc(sizeof(Value) * total);
-                    if (!v.array_val) { /* Handle error */ }
+                    if (s->raw) {
+                        memcpy(out->raw, s->raw, (size_t)total);
+                    }
+                } else if (s->elements) {
+                    out->elements = malloc(sizeof(Value) * (size_t)total);
+                    if (!out->elements) {
+                        fprintf(stderr, "Memory allocation failed in makeCopyOfValue (array elements)\n");
+                        EXIT_FAILURE_HANDLER();
+                    }
                     for (int i = 0; i < total; i++) {
-                        v.array_val[i] = makeCopyOfValue(&src->array_val[i]);
+                        out->elements[i] = makeCopyOfValue(&s->elements[i]);
                     }
                 }
             } else if (total < 0) {
                 fprintf(stderr, "Error: Array size overflow during copy.\n");
-                v.dimensions = 0;
-                free(v.lower_bounds); v.lower_bounds = NULL;
-                free(v.upper_bounds); v.upper_bounds = NULL;
+                out->dimensions = 0;
+                free(out->lower_bounds); out->lower_bounds = NULL;
+                free(out->upper_bounds); out->upper_bounds = NULL;
             }
             break;
         }
@@ -3685,8 +3711,8 @@ Value copyDynamicArraySnapshotValue(const Value *src) {
 
     pthread_mutex_lock(&dynamic_array_refcount_mutex);
     Value snapshot = *src;
-    if (snapshot.type == TYPE_ARRAY && snapshot.array_is_dynamic && snapshot.array_refcount) {
-        (*snapshot.array_refcount)++;
+    if (snapshot.type == TYPE_ARRAY && snapshot.array_val && snapshot.array_val->is_dynamic) {
+        pscalObjRetain(&snapshot.array_val->header);
     }
     pthread_mutex_unlock(&dynamic_array_refcount_mutex);
     return snapshot;
@@ -3731,100 +3757,110 @@ Value copyDynamicArraySnapshotValue(const Value *src) {
 bool makeDynamicArraySliceValue(const Value *src, int consumed_dims, const int *indices,
                                  Value *out, bool *out_of_bounds) {
     if (out_of_bounds) *out_of_bounds = false;
-    if (!src || !out || !indices || consumed_dims <= 0 || consumed_dims >= src->dimensions ||
-        !src->lower_bounds || !src->upper_bounds) {
+    if (!src || !out || !indices || consumed_dims <= 0 || !src->array_val ||
+        consumed_dims >= src->array_val->dimensions ||
+        !src->array_val->lower_bounds || !src->array_val->upper_bounds) {
         return false;
     }
 
-    if (src->element_type == TYPE_ARRAY) {
+    ArrayObj *s = src->array_val;
+
+    if (s->element_type == TYPE_ARRAY) {
         if (consumed_dims != 1) {
             return false;
         }
-        if (indices[0] < src->lower_bounds[0] || indices[0] > src->upper_bounds[0]) {
+        if (indices[0] < s->lower_bounds[0] || indices[0] > s->upper_bounds[0]) {
             if (out_of_bounds) *out_of_bounds = true;
             return false;
         }
-        if (!src->array_val) {
+        if (!s->elements) {
             return false;
         }
-        int slot = indices[0] - src->lower_bounds[0];
-        *out = copyDynamicArraySnapshotValue(&src->array_val[slot]);
+        int slot = indices[0] - s->lower_bounds[0];
+        *out = copyDynamicArraySnapshotValue(&s->elements[slot]);
         return true;
     }
 
     long long inner_size = 1;
-    for (int i = consumed_dims; i < src->dimensions; i++) {
-        inner_size *= (long long)(src->upper_bounds[i] - src->lower_bounds[i] + 1);
+    for (int i = consumed_dims; i < s->dimensions; i++) {
+        inner_size *= (long long)(s->upper_bounds[i] - s->lower_bounds[i] + 1);
     }
 
     long long partial_offset = 0;
     long long multiplier = inner_size;
     for (int i = consumed_dims - 1; i >= 0; i--) {
-        if (indices[i] < src->lower_bounds[i] || indices[i] > src->upper_bounds[i]) {
+        if (indices[i] < s->lower_bounds[i] || indices[i] > s->upper_bounds[i]) {
             if (out_of_bounds) *out_of_bounds = true;
             return false;
         }
-        partial_offset += (long long)(indices[i] - src->lower_bounds[i]) * multiplier;
-        multiplier *= (long long)(src->upper_bounds[i] - src->lower_bounds[i] + 1);
+        partial_offset += (long long)(indices[i] - s->lower_bounds[i]) * multiplier;
+        multiplier *= (long long)(s->upper_bounds[i] - s->lower_bounds[i] + 1);
     }
 
+    // Genuinely flat multi-dimensional storage: build a lightweight VIEW
+    // ArrayObj that aliases s's own buffers via pointer arithmetic
+    // (mirroring the pre-4e/4f design, which pointed a bare Value's
+    // array_val/lower_bounds/etc directly into src's own arrays) and keeps
+    // s alive via a retained header reference instead of a shared flat
+    // refcount pointer -- see core/types.h's ArrayObj.view_of comment.
     *out = makeNil();
     out->type = TYPE_ARRAY;
-    out->array_is_dynamic = src->array_is_dynamic;
-    out->array_is_packed = src->array_is_packed;
-    out->dimensions = src->dimensions - consumed_dims;
-    out->lower_bounds = src->lower_bounds + consumed_dims;
-    out->upper_bounds = src->upper_bounds + consumed_dims;
-    out->element_type = src->element_type;
-    out->element_type_def = src->element_type_def;
-    if (src->array_is_packed) {
-        out->array_raw = src->array_raw ? src->array_raw + partial_offset : NULL;
-        out->array_val = NULL;
+    ArrayObj *view = pscalArrayObjCreate();
+    out->array_val = view;
+    view->is_dynamic = s->is_dynamic;
+    view->is_packed = s->is_packed;
+    view->dimensions = s->dimensions - consumed_dims;
+    view->lower_bounds = s->lower_bounds + consumed_dims;
+    view->upper_bounds = s->upper_bounds + consumed_dims;
+    view->element_type = s->element_type;
+    view->element_type_def = s->element_type_def;
+    if (s->is_packed) {
+        view->raw = s->raw ? s->raw + partial_offset : NULL;
     } else {
-        out->array_val = src->array_val ? src->array_val + partial_offset : NULL;
-        out->array_raw = NULL;
+        view->elements = s->elements ? s->elements + partial_offset : NULL;
     }
-    out->array_refcount = src->array_refcount;
-    if (out->array_refcount) {
-        pthread_mutex_lock(&dynamic_array_refcount_mutex);
-        (*out->array_refcount)++;
-        pthread_mutex_unlock(&dynamic_array_refcount_mutex);
-    }
+    pthread_mutex_lock(&dynamic_array_refcount_mutex);
+    pscalObjRetain(&s->header);
+    view->view_of = s;
+    pthread_mutex_unlock(&dynamic_array_refcount_mutex);
     return true;
 }
 
 int calculateArrayTotalSize(const Value* array_val) {
-    if (!array_val || array_val->type != TYPE_ARRAY || array_val->dimensions == 0) {
+    if (!array_val || array_val->type != TYPE_ARRAY || !array_val->array_val ||
+        array_val->array_val->dimensions == 0) {
         return 0;
     }
-    if (!array_val->lower_bounds || !array_val->upper_bounds) {
+    ArrayObj *a = array_val->array_val;
+    if (!a->lower_bounds || !a->upper_bounds) {
         return 0;
     }
     int total_size = 1;
-    for (int i = 0; i < array_val->dimensions; i++) {
-        total_size *= (array_val->upper_bounds[i] - array_val->lower_bounds[i] + 1);
+    for (int i = 0; i < a->dimensions; i++) {
+        total_size *= (a->upper_bounds[i] - a->lower_bounds[i] + 1);
     }
     return total_size;
 }
 
 int computeFlatOffset(Value *array, int *indices) {
+    ArrayObj *a = array->array_val;
     int offset = 0;
     int multiplier = 1;
 
-    for (int i = array->dimensions - 1; i >= 0; i--) {
+    for (int i = a->dimensions - 1; i >= 0; i--) {
         // Bounds check for the current dimension
-        if (indices[i] < array->lower_bounds[i] || indices[i] > array->upper_bounds[i]) {
+        if (indices[i] < a->lower_bounds[i] || indices[i] > a->upper_bounds[i]) {
             fprintf(stderr, "Runtime error: Index %d out of bounds [%d..%d] in dimension %lld.\n",
-                    indices[i], array->lower_bounds[i], array->upper_bounds[i],
+                    indices[i], a->lower_bounds[i], a->upper_bounds[i],
                     (long long)i + 1);
             EXIT_FAILURE_HANDLER();
         }
-        
+
         // Add the contribution of the current dimension to the total offset
-        offset += (indices[i] - array->lower_bounds[i]) * multiplier;
-        
+        offset += (indices[i] - a->lower_bounds[i]) * multiplier;
+
         // Update the multiplier for the next (more significant) dimension
-        multiplier *= (array->upper_bounds[i] - array->lower_bounds[i] + 1);
+        multiplier *= (a->upper_bounds[i] - a->lower_bounds[i] + 1);
     }
     return offset;
 }

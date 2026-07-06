@@ -112,6 +112,70 @@ typedef struct RecordObj {
     FieldValue *fields;
 } RecordObj;
 
+// VM 2.0 Phase 4e/4f (Docs/pscal_vm2_plan.md §5.10.4/§5.10.3): the
+// highest-risk type family in Stage A, per the plan's own risk register.
+// `raw`/`elements` are plain owned pointers (matching StringObj/SetObj's
+// precedent, not the flexible-array-member sketch) -- a real audit found
+// the same whole-buffer-reassignment idiom here too (AS_ARRAY(v)=X /
+// AS_ARRAY_RAW(v)=X, ~20 sites across vm.c/builtin.c).
+//
+// `is_dynamic` keeps its full pre-4e/4f semantic weight, not just a
+// storage-strategy flag: dynamic (SetLength-managed) arrays have
+// reference semantics today (multiple Values legitimately alias one
+// ArrayObj, refcounted) while static arrays have Pascal value semantics
+// (always deep-copied). This distinction lives in the copy logic
+// (makeCopyOfValue), not in this struct's shape, and must survive
+// unchanged -- Stage A only changes storage representation, not
+// observable behavior (see plan §5.10.6).
+//
+// `lower_bound`/`upper_bound` (singular) are kept as their own fields,
+// deliberately NOT folded into `lower_bounds[0]`/`upper_bounds[0]` even
+// though the plan's §5.10.3 flags that fold as a decided-but-gated
+// simplification -- bundling it into this already-highest-risk sub-phase
+// was judged not worth the extra surface area; revisit as a separate,
+// low-risk cleanup once arrays are otherwise stable.
+//
+// The refcount lives in the embedded ObjHeader (atomic, from Phase 4a),
+// replacing the old separately-malloc'd `uint32_t *array_refcount` +
+// `dynamic_array_refcount_mutex`-protected manual increment/decrement.
+// IMPORTANT: during Stage A (this sub-phase), the mutex itself is NOT
+// retired -- `value_cell_mutex`/`dynamic_array_refcount_mutex`'s pairing
+// in `replaceValueCell`/`copyDynamicArraySnapshotValue` (vm.c/utils.c)
+// still protects against a concurrent reader observing a torn multi-field
+// `Value` struct, which remains a real hazard until Value itself shrinks
+// to one atomically-storable word in Stage B (4i/4j) -- see the plan's
+// §5.10.5 reasoning, which only applies once that precondition holds.
+// Only the *counter mechanism* moves to the atomic ObjHeader refcount
+// here; the mutex-protected critical sections around it are unchanged.
+typedef struct ArrayObj {
+    ObjHeader header; // header.type is always TYPE_ARRAY
+    VarType element_type;
+    struct AST *element_type_def; // AST typedef not yet visible this early in the file
+    bool is_packed;
+    bool is_dynamic;
+    int dimensions;
+    int lower_bound;   // single-dim convenience field; see comment above
+    int upper_bound;
+    int *lower_bounds;
+    int *upper_bounds;
+    union {
+        uint8_t *raw;               // packed-byte storage
+        struct ValueStruct *elements; // flat buffer of Value elements
+    };
+    // VM 2.0 Phase 4e/4f: non-NULL marks this ArrayObj as a lightweight
+    // VIEW produced by makeDynamicArraySliceValue's flat-multi-dimensional
+    // case (a partial index into a static array[..,..] yields a sub-array
+    // rather than a scalar). A view's lower_bounds/upper_bounds/raw/
+    // elements point *into* view_of's own buffers via pointer arithmetic
+    // (mirroring the pre-4e/4f design, which shared src's raw pointers +
+    // refcount directly) -- it owns none of them. Keeping view_of alive
+    // via a retained ObjHeader reference is what keeps those pointers
+    // valid; arrayObjDestroy checks this field first and, when set,
+    // releases view_of and frees only the view struct itself instead of
+    // running the normal full teardown.
+    struct ArrayObj *view_of;
+} ArrayObj;
+
 // Definition of Type struct for enum metadata
 typedef struct EnumType {
     char *name;         // Name of the enum type
@@ -135,7 +199,7 @@ typedef struct ValueStruct {
         int c_val;
         RecordObj *record_val; // VM 2.0 Phase 4d: was a plain FieldValue*
         FILE *f_val;
-        struct ValueStruct *array_val;
+        ArrayObj *array_val; // VM 2.0 Phase 4e/4f: was a plain struct ValueStruct*
         MStream *mstream;
         struct {
             char *enum_name; // Name of the enumerated type
@@ -223,7 +287,13 @@ typedef struct ValueStruct {
 // exist (verified), but the expansion is still a valid lvalue if one ever
 // shows up, since `.fields` is a plain reassignable pointer field.
 #define AS_RECORD(v)     (PSCAL_VALUE_FIELD(v, record_val)->fields)
-#define AS_ARRAY(v)      PSCAL_VALUE_FIELD(v, array_val)
+// VM 2.0 Phase 4e/4f: array_val is now an ArrayObj*; AS_ARRAY/AS_ARRAY_RAW
+// dereference to its element/raw-byte buffer so existing
+// `AS_ARRAY(v) = X` / `AS_ARRAY_RAW(v) = X` whole-buffer-reassignment call
+// sites (~20 of them, the same idiom found in 4c for strings) keep working
+// unchanged, given the wrapper already exists (see pscalArrayEnsureObj for
+// the sites where it doesn't yet).
+#define AS_ARRAY(v)      (PSCAL_VALUE_FIELD(v, array_val)->elements)
 #define AS_FILE(v)       PSCAL_VALUE_FIELD(v, f_val)
 #define AS_MSTREAM(v)    PSCAL_VALUE_FIELD(v, mstream)
 #define AS_POINTER(v)    PSCAL_VALUE_FIELD(v, ptr_val)
@@ -236,21 +306,38 @@ typedef struct ValueStruct {
 // embedded struct's on purpose -- see core/types.h's SetObj comment).
 #define AS_SET(v)        (*PSCAL_VALUE_FIELD(v, set_val))
 #define SET_CAPACITY(v)  (PSCAL_VALUE_FIELD(v, set_val)->capacity)
-#define AS_ARRAY_RAW(v)  PSCAL_VALUE_FIELD(v, array_raw)
+#define AS_ARRAY_RAW(v)  (PSCAL_VALUE_FIELD(v, array_val)->raw)
 
-/* Array/string/file/pointer metadata accessors.  Phase 4 Stage A moves
- * these fields into the heap array/string objects; until then they are
- * exact aliases like the payload accessors above. */
-#define ARRAY_LOWER_BOUND(v)       PSCAL_VALUE_FIELD(v, lower_bound)
-#define ARRAY_UPPER_BOUND(v)       PSCAL_VALUE_FIELD(v, upper_bound)
-#define ARRAY_LOWER_BOUNDS(v)      PSCAL_VALUE_FIELD(v, lower_bounds)
-#define ARRAY_UPPER_BOUNDS(v)      PSCAL_VALUE_FIELD(v, upper_bounds)
-#define ARRAY_DIMENSIONS(v)        PSCAL_VALUE_FIELD(v, dimensions)
-#define ARRAY_ELEMENT_TYPE(v)      PSCAL_VALUE_FIELD(v, element_type)
-#define ARRAY_ELEMENT_TYPE_DEF(v)  PSCAL_VALUE_FIELD(v, element_type_def)
-#define ARRAY_IS_PACKED(v)         PSCAL_VALUE_FIELD(v, array_is_packed)
-#define ARRAY_IS_DYNAMIC(v)        PSCAL_VALUE_FIELD(v, array_is_dynamic)
-#define ARRAY_REFCOUNT(v)          PSCAL_VALUE_FIELD(v, array_refcount)
+/* Array/string/file/pointer metadata accessors. VM 2.0 Phase 4e/4f moves
+ * the array ones into ArrayObj; string ones already moved into StringObj
+ * in 4c. All of these require v.array_val/.s_val to already be a valid
+ * wrapper -- see pscalArrayEnsureObj/pscalStringEnsureObj for where that
+ * isn't guaranteed yet by construction order alone. */
+#define ARRAY_LOWER_BOUND(v)       (PSCAL_VALUE_FIELD(v, array_val)->lower_bound)
+#define ARRAY_UPPER_BOUND(v)       (PSCAL_VALUE_FIELD(v, array_val)->upper_bound)
+#define ARRAY_LOWER_BOUNDS(v)      (PSCAL_VALUE_FIELD(v, array_val)->lower_bounds)
+#define ARRAY_UPPER_BOUNDS(v)      (PSCAL_VALUE_FIELD(v, array_val)->upper_bounds)
+#define ARRAY_DIMENSIONS(v)        (PSCAL_VALUE_FIELD(v, array_val)->dimensions)
+#define ARRAY_ELEMENT_TYPE(v)      (PSCAL_VALUE_FIELD(v, array_val)->element_type)
+#define ARRAY_ELEMENT_TYPE_DEF(v)  (PSCAL_VALUE_FIELD(v, array_val)->element_type_def)
+#define ARRAY_IS_PACKED(v)         (PSCAL_VALUE_FIELD(v, array_val)->is_packed)
+#define ARRAY_IS_DYNAMIC(v)        (PSCAL_VALUE_FIELD(v, array_val)->is_dynamic)
+// VM 2.0 Phase 4e/4f: `element_type`/`element_type_def` are dual-purpose
+// pre-4e/4f Value-level fields -- TYPE_FILE legitimately still uses them
+// directly (a typed file's element type, e.g. `file of integer`) and was
+// NEVER migrated into ArrayObj, since only TYPE_ARRAY moved this sub-phase.
+// Now that ARRAY_ELEMENT_TYPE(v)/ARRAY_ELEMENT_TYPE_DEF(v) dereference
+// v.array_val (a TYPE_ARRAY-only union member), calling them on a TYPE_FILE
+// Value reinterprets its f_val (FILE*) as an ArrayObj* -- undefined
+// behavior. Use these instead for TYPE_FILE values.
+#define FILE_ELEMENT_TYPE(v)      PSCAL_VALUE_FIELD(v, element_type)
+#define FILE_ELEMENT_TYPE_DEF(v)  PSCAL_VALUE_FIELD(v, element_type_def)
+// ARRAY_REFCOUNT is intentionally removed (VM 2.0 Phase 4e/4f): the old
+// uint32_t* scheme is gone. Every former call site now uses
+// pscalObjRetain/pscalObjRelease on &v.array_val->header instead, inside
+// the SAME mutex-protected critical sections as before -- see
+// core/types.h's ArrayObj comment for why the mutex itself isn't retired
+// yet (that's Stage B/4j's job, once Value itself is a single atomic word).
 // VM 2.0 Phase 4c: max_length now lives inside StringObj, not directly on
 // Value (the old Value.max_length field is dead weight until Phase 4i's
 // struct shrink deletes it -- nothing should read it directly anymore).

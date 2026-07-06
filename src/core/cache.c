@@ -1106,34 +1106,36 @@ static bool writeValue(ByteBuf* out, const Value* v) {
             break;
         }
         case TYPE_ARRAY: {
-            int32_t dims = v->dimensions;
+            int32_t dims = v->array_val ? ARRAY_DIMENSIONS(*v) : 0;
             bufI32LE(out, dims);
-            bufU32LE(out, (uint32_t)v->element_type);
+            bufU32LE(out, (uint32_t)(v->array_val ? ARRAY_ELEMENT_TYPE(*v) : TYPE_VOID));
+            int *lb_arr = v->array_val ? ARRAY_LOWER_BOUNDS(*v) : NULL;
+            int *ub_arr = v->array_val ? ARRAY_UPPER_BOUNDS(*v) : NULL;
             for (int i = 0; i < dims; i++) {
-                int32_t lb = v->lower_bounds ? v->lower_bounds[i] : 0;
-                int32_t ub = v->upper_bounds ? v->upper_bounds[i] : -1;
+                int32_t lb = lb_arr ? lb_arr[i] : 0;
+                int32_t ub = ub_arr ? ub_arr[i] : -1;
                 bufI32LE(out, lb);
                 bufI32LE(out, ub);
             }
             int total = 1;
-            if (!v->lower_bounds || !v->upper_bounds) {
+            if (!lb_arr || !ub_arr) {
                 total = 0;
             } else {
                 for (int i = 0; i < dims; i++) {
-                    int span = (v->upper_bounds[i] - v->lower_bounds[i] + 1);
+                    int span = (ub_arr[i] - lb_arr[i] + 1);
                     if (span <= 0) { total = 0; break; }
                     total *= span;
                 }
             }
             if (total > 0 && arrayUsesPackedBytes(v)) {
-                if (!v->array_raw) return false;
+                if (!AS_ARRAY_RAW(*v)) return false;
                 for (int i = 0; i < total; i++) {
-                    Value temp = makeByte(v->array_raw[i]);
+                    Value temp = makeByte(AS_ARRAY_RAW(*v)[i]);
                     if (!writeValue(out, &temp)) return false;
                 }
             } else {
                 for (int i = 0; i < total; i++) {
-                    if (!writeValue(out, &v->array_val[i])) return false;
+                    if (!writeValue(out, &AS_ARRAY(*v)[i])) return false;
                 }
             }
             break;
@@ -1656,30 +1658,38 @@ static void hashValue(uint64_t* hash, const Value* v, ChunkHashContext* ctx) {
             break;
         }
         case TYPE_ARRAY: {
-            int dims = v->dimensions;
+            int dims = v->array_val ? ARRAY_DIMENSIONS(*v) : 0;
             fnv1aUpdateInt(hash, dims);
-            fnv1aUpdateInt(hash, v->element_type);
+            fnv1aUpdateInt(hash, v->array_val ? ARRAY_ELEMENT_TYPE(*v) : TYPE_VOID);
+            int *lb_arr = v->array_val ? ARRAY_LOWER_BOUNDS(*v) : NULL;
+            int *ub_arr = v->array_val ? ARRAY_UPPER_BOUNDS(*v) : NULL;
             for (int i = 0; i < dims; ++i) {
-                int lb = v->lower_bounds ? v->lower_bounds[i] : 0;
-                int ub = v->upper_bounds ? v->upper_bounds[i] : -1;
+                int lb = lb_arr ? lb_arr[i] : 0;
+                int ub = ub_arr ? ub_arr[i] : -1;
                 fnv1aUpdateInt(hash, lb);
                 fnv1aUpdateInt(hash, ub);
             }
             int total = 0;
-            if (dims > 0 && v->lower_bounds && v->upper_bounds) {
+            if (dims > 0 && lb_arr && ub_arr) {
                 total = 1;
                 for (int i = 0; i < dims; ++i) {
-                    int span = v->upper_bounds[i] - v->lower_bounds[i] + 1;
+                    int span = ub_arr[i] - lb_arr[i] + 1;
                     if (span <= 0) { total = 0; break; }
                     total *= span;
                 }
             }
-            if (total > 0 && v->array_val) {
+            // Must check arrayUsesPackedBytes() FIRST: raw/elements are a
+            // union inside ArrayObj (VM 2.0 Phase 4e/4f), so AS_ARRAY(*v)
+            // is non-NULL for a packed array too (same bits as .raw) --
+            // unlike the pre-4e/4f representation, where array_val/
+            // array_raw were separate fields and a NULL-pointer check could
+            // tell them apart.
+            if (total > 0 && arrayUsesPackedBytes(v) && AS_ARRAY_RAW(*v)) {
+                fnv1aUpdate(hash, AS_ARRAY_RAW(*v), (size_t)total);
+            } else if (total > 0 && v->array_val && AS_ARRAY(*v)) {
                 for (int i = 0; i < total; ++i) {
-                    hashValue(hash, &v->array_val[i], ctx);
+                    hashValue(hash, &AS_ARRAY(*v)[i], ctx);
                 }
-            } else if (total > 0 && arrayUsesPackedBytes(v) && v->array_raw) {
-                fnv1aUpdate(hash, v->array_raw, (size_t)total);
             }
             break;
         }
@@ -1812,48 +1822,49 @@ static bool readValue(Cursor* in, Value* out) {
         case TYPE_ARRAY: {
             int32_t dims = curI32LE(in);
             if (in->error || dims < 0) return false;
-            out->dimensions = dims;
-            out->element_type = (VarType)curU32LE(in);
+            pscalArrayEnsureObj(out);
+            ArrayObj *a = out->array_val;
+            a->dimensions = dims;
+            a->element_type = (VarType)curU32LE(in);
             if (in->error) return false;
-            out->array_is_packed = isPackedByteElementType(out->element_type);
+            a->is_packed = isPackedByteElementType(a->element_type);
+            a->is_dynamic = false;
             if (dims > 0) {
-                out->lower_bounds = (int*)malloc(sizeof(int) * (size_t)dims);
-                out->upper_bounds = (int*)malloc(sizeof(int) * (size_t)dims);
-                if (!out->lower_bounds || !out->upper_bounds) return false;
+                a->lower_bounds = (int*)malloc(sizeof(int) * (size_t)dims);
+                a->upper_bounds = (int*)malloc(sizeof(int) * (size_t)dims);
+                if (!a->lower_bounds || !a->upper_bounds) return false;
                 for (int i = 0; i < dims; i++) {
-                    out->lower_bounds[i] = curI32LE(in);
-                    out->upper_bounds[i] = curI32LE(in);
+                    a->lower_bounds[i] = curI32LE(in);
+                    a->upper_bounds[i] = curI32LE(in);
                 }
                 if (in->error) return false;
-                out->lower_bound = out->lower_bounds[0];
-                out->upper_bound = out->upper_bounds[0];
+                a->lower_bound = a->lower_bounds[0];
+                a->upper_bound = a->upper_bounds[0];
             } else {
-                out->lower_bounds = out->upper_bounds = NULL;
-                out->lower_bound = out->upper_bound = 0;
+                a->lower_bounds = a->upper_bounds = NULL;
+                a->lower_bound = a->upper_bound = 0;
             }
             int total = 1;
             for (int i = 0; i < dims; i++) {
-                int span = (out->upper_bounds[i] - out->lower_bounds[i] + 1);
+                int span = (a->upper_bounds[i] - a->lower_bounds[i] + 1);
                 if (span <= 0) { total = 0; break; }
                 total *= span;
             }
-            out->array_val = NULL;
-            out->array_raw = NULL;
             if (total > 0) {
-                if (out->array_is_packed) {
-                    out->array_raw = (uint8_t*)calloc((size_t)total, sizeof(uint8_t));
-                    if (!out->array_raw) return false;
+                if (a->is_packed) {
+                    a->raw = (uint8_t*)calloc((size_t)total, sizeof(uint8_t));
+                    if (!a->raw) return false;
                     for (int i = 0; i < total; i++) {
                         Value temp;
                         if (!readValue(in, &temp)) return false;
-                        out->array_raw[i] = (unsigned char)AS_INTEGER(temp);
+                        a->raw[i] = (unsigned char)AS_INTEGER(temp);
                         freeValue(&temp);
                     }
                 } else {
-                    out->array_val = (Value*)calloc((size_t)total, sizeof(Value));
-                    if (!out->array_val) return false;
+                    a->elements = (Value*)calloc((size_t)total, sizeof(Value));
+                    if (!a->elements) return false;
                     for (int i = 0; i < total; i++) {
-                        if (!readValue(in, &out->array_val[i])) return false;
+                        if (!readValue(in, &a->elements[i])) return false;
                     }
                 }
             }

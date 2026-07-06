@@ -253,6 +253,18 @@ void pscalStringEnsureObj(Value *v);
 // wrapper itself is never NULL once created, matching StringObj/SetObj.
 RecordObj *pscalRecordObjCreate(FieldValue *fields);
 
+// VM 2.0 Phase 4e/4f. Returns a fresh ArrayObj with refcount=1 and every
+// field zeroed/NULL; callers set element_type/dimensions/bounds/etc.
+// themselves afterward (mirroring how makeArrayND/makeEmptyArray/the
+// pointer-to-array-type opcode handlers already build array metadata up
+// field-by-field). pscalArrayEnsureObj lazily allocates one via this if
+// v->array_val is NULL -- needed at the handful of sites (the
+// pointer-to-array-type "temp_wrapper" pattern in vm.c) that build a
+// TYPE_ARRAY Value's payload from scratch rather than through
+// makeArrayND/makeEmptyArray.
+ArrayObj *pscalArrayObjCreate(void);
+void pscalArrayEnsureObj(Value *v);
+
 MStream *createMStream(void);
 void retainMStream(MStream* ms);
 void releaseMStream(MStream* ms);
