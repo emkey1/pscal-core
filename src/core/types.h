@@ -97,6 +97,21 @@ typedef struct StringObj {
     char *buffer;     // owned, NUL-terminated, or NULL; reassignable in place
 } StringObj;
 
+// VM 2.0 Phase 4d (Docs/pscal_vm2_plan.md §5.10.4/§5.10.3): thin wrapper
+// only -- FieldValue itself is unchanged, still a linked list, still
+// supports the owns_storage/aliased-storage trick OOP field-address-taking
+// depends on (copyRecord/freeFieldValue operate entirely on FieldValue*,
+// never touching this wrapper). Verified before assuming: zero external
+// `AS_RECORD(v) = X` whole-pointer-reassignment sites and zero external
+// `SET_VALUE_TYPE(v, TYPE_RECORD)` field-by-field construction sites exist
+// anywhere in the tree -- record construction always goes through
+// makeRecord/makeValueForType/makeCopyOfValue, unlike strings (4c), so
+// this sub-phase needed no pscalStringEnsureObj-style lazy-init helper.
+typedef struct RecordObj {
+    ObjHeader header; // header.type is always TYPE_RECORD
+    FieldValue *fields;
+} RecordObj;
+
 // Definition of Type struct for enum metadata
 typedef struct EnumType {
     char *name;         // Name of the enum type
@@ -118,7 +133,7 @@ typedef struct ValueStruct {
     union {
         StringObj *s_val; // VM 2.0 Phase 4c: was a plain owned char*
         int c_val;
-        FieldValue *record_val;
+        RecordObj *record_val; // VM 2.0 Phase 4d: was a plain FieldValue*
         FILE *f_val;
         struct ValueStruct *array_val;
         MStream *mstream;
@@ -202,7 +217,12 @@ typedef struct ValueStruct {
 #define VAL_REAL_LD(v)   PSCAL_VALUE_FIELD(v, real.r_val)
 
 /* Heap/pointer payload accessors (lvalue-capable). */
-#define AS_RECORD(v)     PSCAL_VALUE_FIELD(v, record_val)
+// VM 2.0 Phase 4d: record_val is now a RecordObj*; AS_RECORD dereferences
+// to its fields so existing `AS_RECORD(v)` reads keep returning a
+// FieldValue* unchanged. No known assignment-through-AS_RECORD call sites
+// exist (verified), but the expansion is still a valid lvalue if one ever
+// shows up, since `.fields` is a plain reassignable pointer field.
+#define AS_RECORD(v)     (PSCAL_VALUE_FIELD(v, record_val)->fields)
 #define AS_ARRAY(v)      PSCAL_VALUE_FIELD(v, array_val)
 #define AS_FILE(v)       PSCAL_VALUE_FIELD(v, f_val)
 #define AS_MSTREAM(v)    PSCAL_VALUE_FIELD(v, mstream)

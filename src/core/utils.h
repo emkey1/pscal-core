@@ -249,6 +249,9 @@ void dumpSymbol(Symbol *sym);
 // might not exist yet.
 StringObj *pscalStringObjCreate(int max_length, VarType owner_type);
 void pscalStringEnsureObj(Value *v);
+// VM 2.0 Phase 4d. `fields` may be NULL (no known content yet); the
+// wrapper itself is never NULL once created, matching StringObj/SetObj.
+RecordObj *pscalRecordObjCreate(FieldValue *fields);
 
 MStream *createMStream(void);
 void retainMStream(MStream* ms);

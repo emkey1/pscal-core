@@ -760,6 +760,36 @@ void pscalStringEnsureObj(Value *v) {
     v->s_val = pscalStringObjCreate(-1, owner_type);
 }
 
+// VM 2.0 Phase 4d: RecordObj is a thin wrapper only -- FieldValue's own
+// linked-list body, ownership rules, and the owns_storage/aliased-storage
+// trick are entirely unchanged (see core/types.h's RecordObj comment).
+// Unlike StringObj, the wrapper must tolerate `fields == NULL` (a
+// record Value with no type info available, e.g. makeValueForType's
+// "no node_to_inspect" branch) rather than ever leaving `record_val`
+// itself NULL -- AS_RECORD(v) unconditionally dereferences the wrapper.
+static void recordObjDestroy(ObjHeader *header) {
+    RecordObj *r = (RecordObj *)header;
+    freeFieldValue(r->fields);
+    free(r);
+}
+
+static pthread_once_t g_record_obj_destructor_once = PTHREAD_ONCE_INIT;
+static void registerRecordObjDestructor(void) {
+    pscalObjRegisterDestructor(TYPE_RECORD, recordObjDestroy);
+}
+
+RecordObj *pscalRecordObjCreate(FieldValue *fields) {
+    pthread_once(&g_record_obj_destructor_once, registerRecordObjDestructor);
+    RecordObj *r = malloc(sizeof(RecordObj));
+    if (!r) {
+        fprintf(stderr, "FATAL: Memory allocation failed in pscalRecordObjCreate\n");
+        EXIT_FAILURE_HANDLER();
+    }
+    pscalObjHeaderInit(&r->header, TYPE_RECORD);
+    r->fields = fields;
+    return r;
+}
+
 static bool ensureFieldSlotCapacity(FieldValue*** slotOwners, int* capacity, int requiredSlots) {
     if (!slotOwners || !capacity || requiredSlots <= *capacity) {
         return true;
@@ -1547,7 +1577,7 @@ Value makeRecord(FieldValue *rec) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_RECORD;
-    v.record_val = rec; // Takes ownership of the FieldValue list
+    v.record_val = pscalRecordObjCreate(rec); // Takes ownership of the FieldValue list
     return v;
 }
 
@@ -1912,11 +1942,10 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
             break;
         }
         case TYPE_RECORD:
-            if (node_to_inspect) {
-                v.record_val = createEmptyRecord(node_to_inspect);
-            } else {
-                v.record_val = NULL;
-            }
+            // The wrapper itself is never NULL (AS_RECORD dereferences it
+            // unconditionally); only .fields can be NULL, matching the old
+            // "no node_to_inspect" behavior exactly.
+            v.record_val = pscalRecordObjCreate(node_to_inspect ? createEmptyRecord(node_to_inspect) : NULL);
             break;
         case TYPE_ARRAY: {
             v.dimensions = 0;
@@ -2399,12 +2428,13 @@ void freeValue(Value *v) {
             break;
 
         case TYPE_RECORD: {
-            FieldValue *f = v->record_val;
 #ifdef DEBUG
-            fprintf(stderr, "[DEBUG]   Processing record fields for Value* at %p (record_val=%p)\n", (void*)v, (void*)f);
+            fprintf(stderr, "[DEBUG]   Releasing RecordObj at %p for Value* at %p\n", (void*)v->record_val, (void*)v);
             fflush(stderr);
 #endif
-            freeFieldValue(f);
+            if (v->record_val) {
+                pscalObjRelease(&v->record_val->header);
+            }
             v->record_val = NULL;
             break;
         }
@@ -2596,7 +2626,7 @@ void dumpSymbol(Symbol *sym) {
             }
             case TYPE_RECORD: {
                 printf("Record { ");
-                FieldValue *fv = sym->value->record_val;
+                FieldValue *fv = sym->value->record_val ? sym->value->record_val->fields : NULL;
                 while (fv) {
                     const Value *fieldValue = fieldValueStorageConst(fv);
                     printf("%s: %s", fv->name, varTypeToString(fieldValue->type));
@@ -3349,7 +3379,7 @@ void printValueToStream(Value v, FILE *stream) {
             break;
         case TYPE_RECORD:
             fprintf(stream, "RECORD{");
-            FieldValue *field = v.record_val;
+            FieldValue *field = v.record_val ? v.record_val->fields : NULL;
             bool first_field = true;
             while (field) {
                 if (!first_field) {
@@ -3494,7 +3524,11 @@ Value makeCopyOfValue(const Value *src) {
             }
             break;
         case TYPE_RECORD: {
-            v.record_val = copyRecord(src->record_val);
+            // `v = *src` above left v.record_val ALIASING src->record_val --
+            // read src's fields before overwriting v.record_val with a
+            // fresh wrapper, never mutate the aliased pointer in place.
+            FieldValue *src_fields = src->record_val ? src->record_val->fields : NULL;
+            v.record_val = pscalRecordObjCreate(copyRecord(src_fields));
             break;
         }
         case TYPE_ARRAY: {
