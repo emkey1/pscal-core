@@ -1456,7 +1456,7 @@ static bool closureLiteralEscapesCurrentRoutine(AST *expr_node) {
 static void markClosureLiteralEscapes(Symbol *psym) {
     if (!psym) return;
     psym->closure_escapes = true;
-    if (psym->real_symbol) {
+    if (psym->is_alias && psym->real_symbol) {
         psym->real_symbol->closure_escapes = true;
     }
 }
