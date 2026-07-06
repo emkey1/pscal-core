@@ -11202,9 +11202,13 @@ Value vmBuiltinShellFg(VM *vm, int arg_count, Value *args) {
         Value eval_arg;
         memset(&eval_arg, 0, sizeof(eval_arg));
         SET_VALUE_TYPE(&eval_arg, TYPE_STRING);
+        pscalStringEnsureObj(&eval_arg); // no wrapper yet after memset
         AS_STRING(eval_arg) = resume_command;
         (void)vmBuiltinShellEval(vm, 1, &eval_arg);
-        free(resume_command);
+        // freeValue (not a raw free(resume_command)) so the StringObj
+        // wrapper pscalStringEnsureObj allocated above is released too,
+        // not just the buffer it owns.
+        freeValue(&eval_arg);
         return makeVoid();
     }
     if (shellJobIsVirtualStoppedWithoutThread(job)) {

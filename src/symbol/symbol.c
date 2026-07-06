@@ -1097,6 +1097,12 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
     // old contents before assigning new ones is correct.
     if (!(sym->type == TYPE_STRING && STRING_MAX_LENGTH(*sym->value) > 0)) {
         freeValue(sym->value);
+        if (isPascalStringType(sym->type)) {
+            // freeValue just set sym->value->s_val to NULL; the TYPE_STRING/
+            // TYPE_UNICODE_STRING case in the switch below immediately reads
+            // STRING_MAX_LENGTH(*sym->value) again, which dereferences it.
+            pscalStringEnsureObj(sym->value);
+        }
     }
 
 

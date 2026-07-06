@@ -8102,6 +8102,7 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
             case TYPE_STRING:
             case TYPE_NIL: {
                 SET_VALUE_TYPE(dst, TYPE_STRING);
+                pscalStringEnsureObj(dst); // dst may have arrived as TYPE_NIL with no wrapper
                 if (AS_STRING(*dst)) { free(AS_STRING(*dst)); }
                 AS_STRING(*dst) = strdup(buffer);
                 if (!AS_STRING(*dst)) { io_error = 1; }
@@ -8200,6 +8201,7 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
         // semantics where uninitialised strings can be read into directly.
         if (VALUE_TYPE(*dst) == TYPE_NIL) {
             SET_VALUE_TYPE(dst, TYPE_STRING);
+            pscalStringEnsureObj(dst); // was TYPE_NIL, no wrapper yet
             AS_STRING(*dst) = NULL;
         }
 
@@ -9266,6 +9268,7 @@ Value vmBuiltinStr(VM* vm, int arg_count, Value* args) {
     VarType dest_type = isPascalStringType(VALUE_TYPE(*dest)) ? VALUE_TYPE(*dest) : TYPE_STRING;
     freeValue(dest);
     SET_VALUE_TYPE(dest, dest_type);
+    pscalStringEnsureObj(dest); // freeValue left dest->s_val NULL
     AS_STRING(*dest) = new_buf;
     STRING_MAX_LENGTH(*dest) = -1;
     return makeVoid();

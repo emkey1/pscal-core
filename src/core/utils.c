@@ -690,6 +690,76 @@ void releaseMStream(MStream* ms) {
     pscalObjRelease(&ms->header);
 }
 
+// VM 2.0 Phase 4c (Docs/pscal_vm2_plan.md §5.10.4/§5.10.3): SetObj replaces
+// the old embedded `Value.set_val{set_size,set_values}` struct. Straight
+// deep-copy-by-value semantics preserved exactly (no sharing/aliasing --
+// TYPE_SET never had reference semantics, unlike dynamic arrays).
+static void setObjDestroy(ObjHeader *header) {
+    SetObj *s = (SetObj *)header;
+    if (s->set_values) {
+        free(s->set_values);
+    }
+    free(s);
+}
+
+static pthread_once_t g_set_obj_destructor_once = PTHREAD_ONCE_INIT;
+static void registerSetObjDestructor(void) {
+    pscalObjRegisterDestructor(TYPE_SET, setObjDestroy);
+}
+
+SetObj *pscalSetObjCreate(void) {
+    pthread_once(&g_set_obj_destructor_once, registerSetObjDestructor);
+    SetObj *s = malloc(sizeof(SetObj));
+    if (!s) {
+        fprintf(stderr, "FATAL: Memory allocation failed in pscalSetObjCreate\n");
+        EXIT_FAILURE_HANDLER();
+    }
+    pscalObjHeaderInit(&s->header, TYPE_SET);
+    s->set_size = 0;
+    s->capacity = 0;
+    s->set_values = NULL;
+    return s;
+}
+
+// VM 2.0 Phase 4c: StringObj replaces the pre-4c pair of independent
+// Value-level fields (s_val char*, max_length int). See core/types.h's
+// StringObj comment for why buffer is a plain pointer, not a flexible
+// array member.
+static void stringObjDestroy(ObjHeader *header) {
+    StringObj *s = (StringObj *)header;
+    if (s->buffer) {
+        free(s->buffer);
+    }
+    free(s);
+}
+
+static pthread_once_t g_string_obj_destructor_once = PTHREAD_ONCE_INIT;
+static void registerStringObjDestructor(void) {
+    pscalObjRegisterDestructor(TYPE_STRING, stringObjDestroy);
+    pscalObjRegisterDestructor(TYPE_UNICODE_STRING, stringObjDestroy);
+}
+
+StringObj *pscalStringObjCreate(int max_length, VarType owner_type) {
+    pthread_once(&g_string_obj_destructor_once, registerStringObjDestructor);
+    StringObj *s = malloc(sizeof(StringObj));
+    if (!s) {
+        fprintf(stderr, "FATAL: Memory allocation failed in pscalStringObjCreate\n");
+        EXIT_FAILURE_HANDLER();
+    }
+    pscalObjHeaderInit(&s->header, owner_type);
+    s->max_length = max_length;
+    s->buffer = NULL;
+    return s;
+}
+
+void pscalStringEnsureObj(Value *v) {
+    if (!v || v->s_val) {
+        return;
+    }
+    VarType owner_type = (v->type == TYPE_UNICODE_STRING) ? TYPE_UNICODE_STRING : TYPE_STRING;
+    v->s_val = pscalStringObjCreate(-1, owner_type);
+}
+
 static bool ensureFieldSlotCapacity(FieldValue*** slotOwners, int* capacity, int requiredSlots) {
     if (!slotOwners || !capacity || requiredSlots <= *capacity) {
         return true;
@@ -1391,21 +1461,14 @@ Value makeString(const char *val) {
     Value v;
     memset(&v, 0, sizeof(Value)); // Initialize all fields
     v.type = TYPE_STRING;
-    v.max_length = -1; // Indicate dynamic string (no fixed limit relevant here)
+    // -1 = dynamic string (no fixed limit relevant here)
+    v.s_val = pscalStringObjCreate(-1, TYPE_STRING);
 
-    if (val != NULL) {
-        v.s_val = strdup(val); // Use strdup for clean duplication
-        if (!v.s_val) {
-            fprintf(stderr, "FATAL: Memory allocation failed in makeString (strdup)\n");
-            EXIT_FAILURE_HANDLER();
-        }
-    } else {
-        // Handle NULL input -> create an empty string
-        v.s_val = strdup("");
-        if (!v.s_val) {
-            fprintf(stderr, "FATAL: Memory allocation failed in makeString (strdup empty)\n");
-            EXIT_FAILURE_HANDLER();
-        }
+    // strdup("") for a NULL input -> an empty string, same as before.
+    v.s_val->buffer = strdup(val != NULL ? val : "");
+    if (!v.s_val->buffer) {
+        fprintf(stderr, "FATAL: Memory allocation failed in makeString (strdup)\n");
+        EXIT_FAILURE_HANDLER();
     }
     return v;
 }
@@ -1414,18 +1477,18 @@ Value makeStringLen(const char *val, size_t len) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_STRING;
-    v.max_length = (int)len;
+    v.s_val = pscalStringObjCreate((int)len, TYPE_STRING);
     if (val && len > 0) {
-        v.s_val = (char*)malloc(len + 1);
-        if (!v.s_val) {
+        v.s_val->buffer = (char*)malloc(len + 1);
+        if (!v.s_val->buffer) {
             fprintf(stderr, "FATAL: Memory allocation failed in makeStringLen\n");
             EXIT_FAILURE_HANDLER();
         }
-        memcpy(v.s_val, val, len);
-        v.s_val[len] = '\0';
+        memcpy(v.s_val->buffer, val, len);
+        v.s_val->buffer[len] = '\0';
     } else {
-        v.s_val = strdup("");
-        if (!v.s_val) {
+        v.s_val->buffer = strdup("");
+        if (!v.s_val->buffer) {
             fprintf(stderr, "FATAL: Memory allocation failed in makeStringLen (empty)\n");
             EXIT_FAILURE_HANDLER();
         }
@@ -1436,12 +1499,14 @@ Value makeStringLen(const char *val, size_t len) {
 Value makeUnicodeString(const char *val) {
     Value v = makeString(val);
     v.type = TYPE_UNICODE_STRING;
+    v.s_val->header.type = TYPE_UNICODE_STRING; // keep ObjHeader.type accurate
     return v;
 }
 
 Value makeUnicodeStringLen(const char *val, size_t len) {
     Value v = makeStringLen(val, len);
     v.type = TYPE_UNICODE_STRING;
+    v.s_val->header.type = TYPE_UNICODE_STRING; // keep ObjHeader.type accurate
     return v;
 }
 
@@ -1749,8 +1814,11 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
             break;
         case TYPE_STRING:
         case TYPE_UNICODE_STRING: {
-            v.s_val = NULL;
-            v.max_length = -1;
+            // Decide the fixed-vs-dynamic length using plain locals first,
+            // then construct the StringObj exactly once at the end --
+            // avoids the chicken-and-egg problem of writing into
+            // v.s_val->max_length / v.s_val->buffer before v.s_val exists.
+            int computed_max_length = -1;
             long long parsed_len = -1;
 
             if (actual_type_def && actual_type_def->type == AST_VARIABLE && actual_type_def->token &&
@@ -1783,25 +1851,27 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
 
                  if (parsed_len != -1) {
                       if (parsed_len > 0 && parsed_len <= 255) {
-                          v.max_length = (int)parsed_len;
-                          v.s_val = calloc(v.max_length + 1, 1);
-                          if (!v.s_val) { fprintf(stderr, "FATAL: calloc failed for fixed string\n"); EXIT_FAILURE_HANDLER(); }
+                          computed_max_length = (int)parsed_len;
                           #ifdef DEBUG
-                          fprintf(stderr, "[DEBUG makeValueForType] Allocated fixed string (max_length=%d).\n", v.max_length);
+                          fprintf(stderr, "[DEBUG makeValueForType] Allocated fixed string (max_length=%d).\n", computed_max_length);
                           #endif
                       } else {
                           fprintf(stderr, "Warning: Fixed string length %lld invalid or too large. Using dynamic.\n", parsed_len);
-                          v.max_length = -1;
+                          computed_max_length = -1;
                       }
                  }
             }
 
-            if (v.max_length == -1 && !v.s_val) {
-                 v.s_val = strdup("");
-                 if (!v.s_val) { fprintf(stderr, "FATAL: strdup failed for dynamic string\n"); EXIT_FAILURE_HANDLER(); }
-                 #ifdef DEBUG
-                 fprintf(stderr, "[DEBUG makeValueForType] Allocated dynamic string.\n");
-                 #endif
+            v.s_val = pscalStringObjCreate(computed_max_length, type);
+            if (computed_max_length > 0) {
+                v.s_val->buffer = calloc(computed_max_length + 1, 1);
+                if (!v.s_val->buffer) { fprintf(stderr, "FATAL: calloc failed for fixed string\n"); EXIT_FAILURE_HANDLER(); }
+            } else {
+                v.s_val->buffer = strdup("");
+                if (!v.s_val->buffer) { fprintf(stderr, "FATAL: strdup failed for dynamic string\n"); EXIT_FAILURE_HANDLER(); }
+                #ifdef DEBUG
+                fprintf(stderr, "[DEBUG makeValueForType] Allocated dynamic string.\n");
+                #endif
             }
             break;
         }
@@ -1980,7 +2050,7 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
              if (!v.enum_val.enum_name) { /* Malloc error */ EXIT_FAILURE_HANDLER(); }
              v.base_type_node = actual_type_def;
              break;
-        case TYPE_SET:     v.set_val.set_size = 0; v.set_val.set_values = NULL; v.max_length = 0; break;
+        case TYPE_SET:     v.set_val = pscalSetObjCreate(); break;
         case TYPE_POINTER:
             v.ptr_val = NULL;
             break;
@@ -2314,15 +2384,15 @@ void freeValue(Value *v) {
         case TYPE_UNICODE_STRING:
             if (v->s_val) {
 #ifdef DEBUG
-                fprintf(stderr, "[DEBUG]   Attempting to free string content at %p (value was '%s') for Value* %p\n",
-                        (void*)v->s_val, v->s_val ? v->s_val : "<INVALID_OR_FREED>", (void*)v);
+                fprintf(stderr, "[DEBUG]   Releasing StringObj at %p (buffer '%s') for Value* %p\n",
+                        (void*)v->s_val, v->s_val->buffer ? v->s_val->buffer : "<NULL>", (void*)v);
                 fflush(stderr);
 #endif
-                free(v->s_val);
+                pscalObjRelease(&v->s_val->header);
                 v->s_val = NULL;
             } else {
 #ifdef DEBUG
-                fprintf(stderr, "[DEBUG]   String content pointer is NULL for Value* %p, nothing to free.\n", (void*)v);
+                fprintf(stderr, "[DEBUG]   StringObj pointer is NULL for Value* %p, nothing to free.\n", (void*)v);
                 fflush(stderr);
 #endif
             }
@@ -2435,18 +2505,15 @@ void freeValue(Value *v) {
                   v->mstream = NULL;
               }
               break;
-        case TYPE_SET: // Added case for freeing set values
-            if (v->set_val.set_values) {
+        case TYPE_SET: // VM 2.0 Phase 4c: SetObj carries its own ObjHeader
+            if (v->set_val) {
 #ifdef DEBUG
-                fprintf(stderr, "[DEBUG]   Freeing set_val.set_values at %p for Value* %p\n", (void*)v->set_val.set_values, (void*)v);
+                fprintf(stderr, "[DEBUG]   Releasing SetObj at %p for Value* %p\n", (void*)v->set_val, (void*)v);
                 fflush(stderr);
 #endif
-                free(v->set_val.set_values);
-                v->set_val.set_values = NULL;
+                pscalObjRelease(&v->set_val->header);
+                v->set_val = NULL;
             }
-            v->set_val.set_size = 0;
-            // v.max_length for sets was used for capacity tracking by addOrdinalToResultSet,
-            // not a dynamically allocated string, so no free needed for max_length itself.
             break;
         case TYPE_INTERFACE:
             if (v->interface.payload) {
@@ -2498,7 +2565,7 @@ void dumpSymbol(Symbol *sym) {
                 break;
             case TYPE_STRING:
             case TYPE_UNICODE_STRING:
-                printf("\"%s\"", sym->value->s_val ? sym->value->s_val : "(null)");
+                printf("\"%s\"", (sym->value->s_val && sym->value->s_val->buffer) ? sym->value->s_val->buffer : "(null)");
                 break;
             case TYPE_CHAR:
             case TYPE_WIDECHAR:
@@ -2536,7 +2603,7 @@ void dumpSymbol(Symbol *sym) {
                     if (fieldValue->type == TYPE_ENUM) {
                         printf(" ('%s', Ordinal: %d)", fieldValue->enum_val.enum_name, fieldValue->enum_val.ordinal);
                     } else if (fieldValue->type == TYPE_STRING) {
-                        printf(" (\"%s\")", fieldValue->s_val ? fieldValue->s_val : "(null)");
+                        printf(" (\"%s\")", (fieldValue->s_val && fieldValue->s_val->buffer) ? fieldValue->s_val->buffer : "(null)");
                     }
                     fv = fv->next;
                     if (fv) {
@@ -3245,8 +3312,8 @@ void printValueToStream(Value v, FILE *stream) {
         }
         case TYPE_STRING:
         case TYPE_UNICODE_STRING:
-            if (v.s_val) {
-                writePascalText(stream, v.s_val, strlen(v.s_val));
+            if (v.s_val && v.s_val->buffer) {
+                writePascalText(stream, v.s_val->buffer, strlen(v.s_val->buffer));
             } else {
                 fprintf(stream, "(null string)");
             }
@@ -3321,10 +3388,13 @@ void printValueToStream(Value v, FILE *stream) {
             break;
         }
         case TYPE_SET:
-            // Corrected access to set_val and its members
-            fprintf(stream, "SET(size:%d, values:[", v.set_val.set_size);
-            for(int i = 0; i < v.set_val.set_size; ++i) {
-                fprintf(stream, "%lld%s", v.set_val.set_values[i], (i == v.set_val.set_size - 1) ? "" : ", ");
+            if (!v.set_val) {
+                fprintf(stream, "SET(size:0, values:[])");
+                break;
+            }
+            fprintf(stream, "SET(size:%d, values:[", v.set_val->set_size);
+            for(int i = 0; i < v.set_val->set_size; ++i) {
+                fprintf(stream, "%lld%s", v.set_val->set_values[i], (i == v.set_val->set_size - 1) ? "" : ", ");
             }
             fprintf(stream, "])");
             break;
@@ -3384,32 +3454,38 @@ Value makeCopyOfValue(const Value *src) {
 
     switch (src->type) {
         case TYPE_STRING:
-        case TYPE_UNICODE_STRING:
-            if (src->max_length > 0) {
-                v.s_val = malloc(src->max_length + 1);
-                if (!v.s_val) {
+        case TYPE_UNICODE_STRING: {
+            // `v = *src` above left v.s_val ALIASING src->s_val -- capture
+            // what's needed from src's StringObj before overwriting v.s_val
+            // with a fresh one; never mutate the aliased pointer in place.
+            int src_max_length = src->s_val ? src->s_val->max_length : -1;
+            const char *src_buffer = src->s_val ? src->s_val->buffer : NULL;
+            v.s_val = pscalStringObjCreate(src_max_length, src->type);
+            if (src_max_length > 0) {
+                v.s_val->buffer = malloc((size_t)src_max_length + 1);
+                if (!v.s_val->buffer) {
                     fprintf(stderr, "Memory allocation failed in makeCopyOfValue (string)\n");
                     EXIT_FAILURE_HANDLER();
                 }
-                if (src->s_val) {
-                    strncpy(v.s_val, src->s_val, src->max_length);
-                    v.s_val[src->max_length] = '\0';
+                if (src_buffer) {
+                    strncpy(v.s_val->buffer, src_buffer, (size_t)src_max_length);
+                    v.s_val->buffer[src_max_length] = '\0';
                 } else {
-                    v.s_val[0] = '\0';
+                    v.s_val->buffer[0] = '\0';
                 }
-                v.max_length = src->max_length;
-            } else if (src->s_val) {
-                size_t len = strlen(src->s_val);
-                v.s_val = malloc(len + 1);
-                if (!v.s_val) {
+            } else if (src_buffer) {
+                size_t len = strlen(src_buffer);
+                v.s_val->buffer = malloc(len + 1);
+                if (!v.s_val->buffer) {
                     fprintf(stderr, "Memory allocation failed in makeCopyOfValue (string)\n");
                     EXIT_FAILURE_HANDLER();
                 }
-                strcpy(v.s_val, src->s_val);
+                strcpy(v.s_val->buffer, src_buffer);
             } else {
-                v.s_val = NULL;
+                v.s_val->buffer = NULL;
             }
             break;
+        }
         case TYPE_ENUM:
             v.enum_val.enum_name = src->enum_val.enum_name ? strdup(src->enum_val.enum_name) : NULL;
             if (src->enum_val.enum_name && !v.enum_val.enum_name) {
@@ -3519,24 +3595,23 @@ Value makeCopyOfValue(const Value *src) {
             }
             break;
         case TYPE_SET:
-            v.set_val.set_values = NULL;
-            v.set_val.set_size = 0;
-
-            if (src->set_val.set_size > 0 && src->set_val.set_values != NULL) {
-                size_t array_size_bytes = sizeof(long long) * src->set_val.set_size;
-                v.set_val.set_values = malloc(array_size_bytes);
-                if (!v.set_val.set_values) {
+            // `v = *src` above left v.set_val ALIASING src->set_val -- must
+            // replace it with a fresh SetObj before touching anything,
+            // never mutate the aliased pointer in place (that would
+            // corrupt src's own SetObj).
+            v.set_val = pscalSetObjCreate();
+            if (src->set_val && src->set_val->set_size > 0 && src->set_val->set_values != NULL) {
+                size_t array_size_bytes = sizeof(long long) * (size_t)src->set_val->set_size;
+                v.set_val->set_values = malloc(array_size_bytes);
+                if (!v.set_val->set_values) {
                     freeValue(&v);
                     fprintf(stderr,
                             "Memory allocation failed in makeCopyOfValue (set)\n");
                     EXIT_FAILURE_HANDLER();
                 }
-                if (!v.set_val.set_values) {
-                    fprintf(stderr, "Memory allocation failed in makeCopyOfValue (set values)\n");
-                    EXIT_FAILURE_HANDLER();
-                }
-                memcpy(v.set_val.set_values, src->set_val.set_values, array_size_bytes);
-                v.set_val.set_size = src->set_val.set_size;
+                memcpy(v.set_val->set_values, src->set_val->set_values, array_size_bytes);
+                v.set_val->set_size = src->set_val->set_size;
+                v.set_val->capacity = src->set_val->set_size; // exact-fit copy
             }
             break;
         case TYPE_INTERFACE:
@@ -3722,11 +3797,11 @@ int computeFlatOffset(Value *array, int *indices) {
 
 // --- Set utility helpers (internal) ---
 static bool setContainsOrdinalUtil(const Value* setVal, long long ordinal) {
-    if (!setVal || setVal->type != TYPE_SET || !setVal->set_val.set_values) {
+    if (!setVal || setVal->type != TYPE_SET || !setVal->set_val || !setVal->set_val->set_values) {
         return false;
     }
-    for (int i = 0; i < setVal->set_val.set_size; i++) {
-        if (setVal->set_val.set_values[i] == ordinal) {
+    for (int i = 0; i < setVal->set_val->set_size; i++) {
+        if (setVal->set_val->set_values[i] == ordinal) {
             return true;
         }
     }
@@ -3734,25 +3809,26 @@ static bool setContainsOrdinalUtil(const Value* setVal, long long ordinal) {
 }
 
 static void addOrdinalToResultSetUtil(Value* resultVal, long long ordinal) {
-    if (!resultVal || resultVal->type != TYPE_SET) return;
+    if (!resultVal || resultVal->type != TYPE_SET || !resultVal->set_val) return;
 
     if (setContainsOrdinalUtil(resultVal, ordinal)) {
         return;
     }
 
-    if (resultVal->set_val.set_size >= resultVal->max_length) {
-        int new_capacity = (resultVal->max_length == 0) ? 8 : resultVal->max_length * 2;
-        long long* new_values = realloc(resultVal->set_val.set_values, sizeof(long long) * new_capacity);
+    SetObj *s = resultVal->set_val;
+    if (s->set_size >= s->capacity) {
+        int new_capacity = (s->capacity == 0) ? 8 : s->capacity * 2;
+        long long* new_values = realloc(s->set_values, sizeof(long long) * new_capacity);
         if (!new_values) {
             fprintf(stderr, "FATAL: realloc failed in addOrdinalToResultSetUtil\n");
             EXIT_FAILURE_HANDLER();
         }
-        resultVal->set_val.set_values = new_values;
-        resultVal->max_length = new_capacity;
+        s->set_values = new_values;
+        s->capacity = new_capacity;
     }
 
-    resultVal->set_val.set_values[resultVal->set_val.set_size] = ordinal;
-    resultVal->set_val.set_size++;
+    s->set_values[s->set_size] = ordinal;
+    s->set_size++;
 }
 
 // --- Set operations exported via utils.h ---
@@ -3763,27 +3839,25 @@ Value setUnion(Value setA, Value setB) {
     }
 
     Value result = makeValueForType(TYPE_SET, NULL, NULL);
-    result.max_length = setA.set_val.set_size + setB.set_val.set_size;
-    if (result.max_length > 0) {
-        result.set_val.set_values = malloc(sizeof(long long) * result.max_length);
-        if (!result.set_val.set_values) {
+    int estimated_capacity = (setA.set_val ? setA.set_val->set_size : 0) +
+                              (setB.set_val ? setB.set_val->set_size : 0);
+    if (estimated_capacity > 0) {
+        result.set_val->set_values = malloc(sizeof(long long) * (size_t)estimated_capacity);
+        if (!result.set_val->set_values) {
             fprintf(stderr, "Malloc failed for set union result\n");
-            result.max_length = 0;
             EXIT_FAILURE_HANDLER();
         }
-    } else {
-        result.set_val.set_values = NULL;
+        result.set_val->capacity = estimated_capacity;
     }
-    result.set_val.set_size = 0;
 
-    if (setA.set_val.set_values) {
-        for (int i = 0; i < setA.set_val.set_size; i++) {
-            addOrdinalToResultSetUtil(&result, setA.set_val.set_values[i]);
+    if (setA.set_val && setA.set_val->set_values) {
+        for (int i = 0; i < setA.set_val->set_size; i++) {
+            addOrdinalToResultSetUtil(&result, setA.set_val->set_values[i]);
         }
     }
-    if (setB.set_val.set_values) {
-        for (int i = 0; i < setB.set_val.set_size; i++) {
-            addOrdinalToResultSetUtil(&result, setB.set_val.set_values[i]);
+    if (setB.set_val && setB.set_val->set_values) {
+        for (int i = 0; i < setB.set_val->set_size; i++) {
+            addOrdinalToResultSetUtil(&result, setB.set_val->set_values[i]);
         }
     }
 
@@ -3796,22 +3870,19 @@ Value setDifference(Value setA, Value setB) {
     }
 
     Value result = makeValueForType(TYPE_SET, NULL, NULL);
-    result.max_length = setA.set_val.set_size;
-    if (result.max_length > 0) {
-        result.set_val.set_values = malloc(sizeof(long long) * result.max_length);
-        if (!result.set_val.set_values) {
-            result.max_length = 0;
+    int estimated_capacity = setA.set_val ? setA.set_val->set_size : 0;
+    if (estimated_capacity > 0) {
+        result.set_val->set_values = malloc(sizeof(long long) * (size_t)estimated_capacity);
+        if (!result.set_val->set_values) {
             EXIT_FAILURE_HANDLER();
         }
-    } else {
-        result.set_val.set_values = NULL;
+        result.set_val->capacity = estimated_capacity;
     }
-    result.set_val.set_size = 0;
 
-    if (setA.set_val.set_values) {
-        for (int i = 0; i < setA.set_val.set_size; i++) {
-            if (!setContainsOrdinalUtil(&setB, setA.set_val.set_values[i])) {
-                addOrdinalToResultSetUtil(&result, setA.set_val.set_values[i]);
+    if (setA.set_val && setA.set_val->set_values) {
+        for (int i = 0; i < setA.set_val->set_size; i++) {
+            if (!setContainsOrdinalUtil(&setB, setA.set_val->set_values[i])) {
+                addOrdinalToResultSetUtil(&result, setA.set_val->set_values[i]);
             }
         }
     }
@@ -3824,22 +3895,21 @@ Value setIntersection(Value setA, Value setB) {
     }
 
     Value result = makeValueForType(TYPE_SET, NULL, NULL);
-    result.max_length = (setA.set_val.set_size < setB.set_val.set_size) ? setA.set_val.set_size : setB.set_val.set_size;
-    if (result.max_length > 0) {
-        result.set_val.set_values = malloc(sizeof(long long) * result.max_length);
-        if (!result.set_val.set_values) {
-            result.max_length = 0;
+    int sizeA = setA.set_val ? setA.set_val->set_size : 0;
+    int sizeB = setB.set_val ? setB.set_val->set_size : 0;
+    int estimated_capacity = (sizeA < sizeB) ? sizeA : sizeB;
+    if (estimated_capacity > 0) {
+        result.set_val->set_values = malloc(sizeof(long long) * (size_t)estimated_capacity);
+        if (!result.set_val->set_values) {
             EXIT_FAILURE_HANDLER();
         }
-    } else {
-        result.set_val.set_values = NULL;
+        result.set_val->capacity = estimated_capacity;
     }
-    result.set_val.set_size = 0;
 
-    if (setA.set_val.set_values) {
-        for (int i = 0; i < setA.set_val.set_size; i++) {
-            if (setContainsOrdinalUtil(&setB, setA.set_val.set_values[i])) {
-                addOrdinalToResultSetUtil(&result, setA.set_val.set_values[i]);
+    if (setA.set_val && setA.set_val->set_values) {
+        for (int i = 0; i < setA.set_val->set_size; i++) {
+            if (setContainsOrdinalUtil(&setB, setA.set_val->set_values[i])) {
+                addOrdinalToResultSetUtil(&result, setA.set_val->set_values[i]);
             }
         }
     }

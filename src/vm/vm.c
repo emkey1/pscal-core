@@ -1056,6 +1056,7 @@ static Value makeOwnedString(char* data, size_t len) {
     Value v;
     memset(&v, 0, sizeof(Value));
     SET_VALUE_TYPE(&v, TYPE_STRING);
+    pscalStringEnsureObj(&v); // v.s_val has no wrapper yet after memset
     AS_STRING(v) = data;
     STRING_MAX_LENGTH(v) = -1;
     if (data) {
@@ -3408,14 +3409,14 @@ static bool vmAddOrdinalToSet(Value* setVal, long long ordinal) {
             return true;
         }
     }
-    if (AS_SET(*setVal).set_size >= STRING_MAX_LENGTH(*setVal)) {
-        int new_capacity = (STRING_MAX_LENGTH(*setVal) == 0) ? 8 : STRING_MAX_LENGTH(*setVal) * 2;
+    if (AS_SET(*setVal).set_size >= SET_CAPACITY(*setVal)) {
+        int new_capacity = (SET_CAPACITY(*setVal) == 0) ? 8 : SET_CAPACITY(*setVal) * 2;
         long long* new_values = realloc(AS_SET(*setVal).set_values, sizeof(long long) * new_capacity);
         if (!new_values) {
             return false;
         }
         AS_SET(*setVal).set_values = new_values;
-        STRING_MAX_LENGTH(*setVal) = new_capacity;
+        SET_CAPACITY(*setVal) = new_capacity;
     }
     AS_SET(*setVal).set_values[AS_SET(*setVal).set_size++] = ordinal;
     return true;
@@ -8463,7 +8464,11 @@ comparison_error_label:
                     // (Your existing logic for handling fixed-length strings, pointers, reals, etc. goes here)
                     if (isPascalStringType(VALUE_TYPE(*target_lvalue_ptr)) && STRING_MAX_LENGTH(*target_lvalue_ptr) <= 0) {
                         if (VALUE_TYPE(value_to_set) == TYPE_CHAR || VALUE_TYPE(value_to_set) == TYPE_WIDECHAR) {
+                            VarType destType = VALUE_TYPE(*target_lvalue_ptr) == TYPE_UNICODE_STRING
+                                                   ? TYPE_UNICODE_STRING
+                                                   : TYPE_STRING;
                             freeValue(target_lvalue_ptr);
+                            pscalStringEnsureObj(target_lvalue_ptr); // freeValue left s_val NULL
                             char encoded[5] = {0};
                             size_t encoded_len = 0;
                             if (VALUE_TYPE(value_to_set) == TYPE_CHAR) {
@@ -8479,17 +8484,19 @@ comparison_error_label:
                                 memcpy(AS_STRING(*target_lvalue_ptr), encoded, encoded_len);
                                 AS_STRING(*target_lvalue_ptr)[encoded_len] = '\0';
                             }
-                            SET_VALUE_TYPE(target_lvalue_ptr,
-                                           VALUE_TYPE(*target_lvalue_ptr) == TYPE_UNICODE_STRING
-                                               ? TYPE_UNICODE_STRING
-                                               : TYPE_STRING);
+                            SET_VALUE_TYPE(target_lvalue_ptr, destType);
                             STRING_MAX_LENGTH(*target_lvalue_ptr) = -1;
                         } else if (isPascalStringType(VALUE_TYPE(value_to_set)) && AS_STRING(value_to_set)) {
                             VarType destType = VALUE_TYPE(*target_lvalue_ptr);
                             freeValue(target_lvalue_ptr);
-                            /* Optimization: Steal buffer from temporary value on stack */
-                            AS_STRING(*target_lvalue_ptr) = AS_STRING(value_to_set);
-                            AS_STRING(value_to_set) = NULL; /* Prevent double-free */
+                            /* Optimization: steal the whole StringObj from the
+                             * temporary value on the stack (not just its
+                             * buffer) -- simpler than allocating a fresh
+                             * wrapper at the destination and copying the
+                             * buffer pointer into it, and avoids needing
+                             * pscalStringEnsureObj here at all. */
+                            target_lvalue_ptr->s_val = value_to_set.s_val;
+                            value_to_set.s_val = NULL; /* Prevent double-free */
                             SET_VALUE_TYPE(target_lvalue_ptr, destType);
                             STRING_MAX_LENGTH(*target_lvalue_ptr) = -1;
                         } else {
@@ -9014,6 +9021,7 @@ comparison_error_label:
                     }
 
                     freeValue(target_slot);
+                    pscalStringEnsureObj(target_slot); // freeValue left target_slot->s_val NULL
                     AS_STRING(*target_slot) = strdup(source_str);
                     if (!AS_STRING(*target_slot)) {
                         runtimeError(vm, "VM Error: strdup failed for dynamic string assignment.");
@@ -9525,6 +9533,7 @@ comparison_error_label:
                 Value* target_slot = &frame->slots[slot];
                 freeValue(target_slot);
                 SET_VALUE_TYPE(target_slot, TYPE_STRING);
+                pscalStringEnsureObj(target_slot); // freeValue left target_slot->s_val NULL
                 STRING_MAX_LENGTH(*target_slot) = length;
                 AS_STRING(*target_slot) = (char*)calloc(length + 1, 1);
                 if (!AS_STRING(*target_slot)) {

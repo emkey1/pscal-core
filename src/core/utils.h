@@ -45,7 +45,13 @@
 #define IS_REAL(value)    (isRealType(VALUE_TYPE(value)))
 #define AS_REAL(value)    (asLd(value))
 #define IS_STRING(value)  (isPascalStringType(VALUE_TYPE(value)))
-#define AS_STRING(value)  PSCAL_VALUE_FIELD(value, s_val)
+// VM 2.0 Phase 4c: s_val is now a StringObj*; AS_STRING dereferences to its
+// buffer so existing `AS_STRING(v)`/`AS_STRING(v) = X` call sites keep
+// working -- but callers doing the latter must ensure v->s_val is already
+// non-NULL first (see pscalStringEnsureObj) since dereferencing a NULL
+// StringObj* to assign its buffer crashes exactly like any other NULL
+// deref would.
+#define AS_STRING(value)  (PSCAL_VALUE_FIELD(value, s_val)->buffer)
 #define IS_CHAR(value)    (isPascalCharType(VALUE_TYPE(value)))
 #define AS_CHAR(value)    PSCAL_VALUE_FIELD(value, c_val)
 
@@ -226,9 +232,28 @@ const char *astTypeToString(ASTNodeType type);
 void dumpSymbolTable(void);
 void dumpSymbol(Symbol *sym);
 
+// VM 2.0 Phase 4c. pscalStringObjCreate: refcount=1, buffer=NULL.
+// owner_type must be TYPE_STRING or TYPE_UNICODE_STRING -- both share this
+// payload shape; owner_type becomes the ObjHeader's type tag, matching the
+// same discipline createClosureEnv established in Phase 4b (load-bearing
+// once ObjHeader.type becomes the sole record of a boxed Value's type in
+// Phase 4i, not just a destructor-dispatch key today).
+// pscalStringEnsureObj: if v->s_val is already non-NULL, a no-op; if NULL
+// (a Value that's been memset+type-tagged but never had a string
+// constructor run for it -- a common idiom in this codebase, e.g.
+// building a temporary string Value by hand rather than calling
+// makeString), allocates a fresh wrapper via
+// pscalStringObjCreate(-1, VALUE_TYPE(*v)) (falling back to TYPE_STRING if
+// v isn't yet tagged as either string type). Call this before any
+// `AS_STRING(v) = X` / `STRING_MAX_LENGTH(v) = X` write where v->s_val
+// might not exist yet.
+StringObj *pscalStringObjCreate(int max_length, VarType owner_type);
+void pscalStringEnsureObj(Value *v);
+
 MStream *createMStream(void);
 void retainMStream(MStream* ms);
 void releaseMStream(MStream* ms);
+SetObj *pscalSetObjCreate(void); // VM 2.0 Phase 4c: refcount=1, empty
 FieldValue *copyRecord(FieldValue *orig);
 FieldValue *createEmptyRecord(AST *recordType);
 void freeFieldValue(FieldValue *fv);

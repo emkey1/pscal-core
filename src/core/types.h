@@ -61,6 +61,42 @@ typedef struct MStream {
     int capacity;
 } MStream;
 
+// VM 2.0 Phase 4c (Docs/pscal_vm2_plan.md §5.10.4/§5.10.3): field names
+// (set_size, set_values) intentionally match the pre-4c embedded
+// `Value.set_val` struct's field names, so `AS_SET(v).set_size`/
+// `.set_values` call sites keep working unchanged once AS_SET dereferences
+// a SetObj* instead of returning the embedded struct by value. `capacity`
+// is new -- previously this codebase borrowed the unrelated
+// `Value.max_length` field (via STRING_MAX_LENGTH) for set growth capacity
+// (see vmAddOrdinalToSet in vm.c), which stops working once
+// STRING_MAX_LENGTH is redefined to reach into StringObj instead; sets now
+// get a proper field of their own via SET_CAPACITY.
+typedef struct SetObj {
+    ObjHeader header; // header.type is always TYPE_SET
+    int set_size;
+    int capacity;
+    long long *set_values;
+} SetObj;
+
+// VM 2.0 Phase 4c: StringObj replaces the pre-4c pair of independent
+// Value-level fields (`s_val` char*, `max_length` int). `buffer` is a
+// PLAIN OWNED POINTER, not a flexible array member fused into the same
+// allocation as the header -- deliberately, because the existing codebase
+// has a widespread idiom of reassigning the whole buffer in place
+// (`AS_STRING(v) = new_buf;`, used ~15 times across vm.c/builtin.c/
+// symbol.c/exsh's shell_builtins.inc for string growth/concatenation/
+// mutation), which a flexible array member cannot support (you cannot
+// reassign a flexible array member as a whole, only index into it). This
+// costs one extra allocation+indirection versus the single-allocation
+// design originally sketched in the plan, but preserves every one of
+// those call sites without rewriting the growth/mutation logic itself --
+// only construction-order matters now (see pscalStringEnsureObj).
+typedef struct StringObj {
+    ObjHeader header; // header.type is TYPE_STRING or TYPE_UNICODE_STRING
+    int max_length;   // -1 = unbounded (dynamic string); >0 = Pascal string[N]
+    char *buffer;     // owned, NUL-terminated, or NULL; reassignable in place
+} StringObj;
+
 // Definition of Type struct for enum metadata
 typedef struct EnumType {
     char *name;         // Name of the enum type
@@ -80,7 +116,7 @@ typedef struct ValueStruct {
     unsigned long long u_val;
     RealValue real;
     union {
-        char *s_val;
+        StringObj *s_val; // VM 2.0 Phase 4c: was a plain owned char*
         int c_val;
         FieldValue *record_val;
         FILE *f_val;
@@ -119,11 +155,7 @@ typedef struct ValueStruct {
     int *lower_bounds;    // array of lower bounds for each dimension
     int *upper_bounds;    // array of upper bounds for each dimension
     AST *element_type_def; // AST node defining the element type
-    struct {
-        int set_size;
-        long long *set_values; // Store ordinal values (int/char)
-        // Potentially add base_type if needed later VarType set_base_type;
-    } set_val;
+    SetObj *set_val; // VM 2.0 Phase 4c: was an embedded struct, now a heap pointer
 } Value;
 
 /* Helpers to initialise numeric fields consistently. */
@@ -178,7 +210,12 @@ typedef struct ValueStruct {
 #define AS_ENUM(v)       PSCAL_VALUE_FIELD(v, enum_val)
 #define AS_CLOSURE(v)    PSCAL_VALUE_FIELD(v, closure)
 #define AS_INTERFACE(v)  PSCAL_VALUE_FIELD(v, interface)
-#define AS_SET(v)        PSCAL_VALUE_FIELD(v, set_val)
+// VM 2.0 Phase 4c: set_val is now a SetObj* (was an embedded struct); AS_SET
+// dereferences it so existing `AS_SET(v).set_size`/`.set_values` call sites
+// keep working with `.` unchanged (SetObj's field names match the old
+// embedded struct's on purpose -- see core/types.h's SetObj comment).
+#define AS_SET(v)        (*PSCAL_VALUE_FIELD(v, set_val))
+#define SET_CAPACITY(v)  (PSCAL_VALUE_FIELD(v, set_val)->capacity)
 #define AS_ARRAY_RAW(v)  PSCAL_VALUE_FIELD(v, array_raw)
 
 /* Array/string/file/pointer metadata accessors.  Phase 4 Stage A moves
@@ -194,7 +231,12 @@ typedef struct ValueStruct {
 #define ARRAY_IS_PACKED(v)         PSCAL_VALUE_FIELD(v, array_is_packed)
 #define ARRAY_IS_DYNAMIC(v)        PSCAL_VALUE_FIELD(v, array_is_dynamic)
 #define ARRAY_REFCOUNT(v)          PSCAL_VALUE_FIELD(v, array_refcount)
-#define STRING_MAX_LENGTH(v)       PSCAL_VALUE_FIELD(v, max_length)
+// VM 2.0 Phase 4c: max_length now lives inside StringObj, not directly on
+// Value (the old Value.max_length field is dead weight until Phase 4i's
+// struct shrink deletes it -- nothing should read it directly anymore).
+// Requires v.s_val to already be a valid StringObj*; see AS_STRING's
+// comment (core/utils.h) and pscalStringEnsureObj for why/when that holds.
+#define STRING_MAX_LENGTH(v)       (PSCAL_VALUE_FIELD(v, s_val)->max_length)
 #define PTR_BASE_TYPE_NODE(v)      PSCAL_VALUE_FIELD(v, base_type_node)
 #define FILE_FILENAME(v)           PSCAL_VALUE_FIELD(v, filename)
 #define FILE_RECORD_SIZE(v)        PSCAL_VALUE_FIELD(v, record_size)

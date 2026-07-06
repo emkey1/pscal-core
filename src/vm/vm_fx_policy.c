@@ -306,13 +306,13 @@ PscalFxReplayOutcome pscalFxReplayCall(struct VM_s *vm, const char *name, int ar
         return PSCAL_FX_REPLAY_MISMATCH;
     }
 
-    bool name_ok = journaled_name.s_val && strcasecmp(journaled_name.s_val, name) == 0;
+    bool name_ok = AS_STRING(journaled_name) && strcasecmp(AS_STRING(journaled_name), name) == 0;
     bool count_ok = (int)journaled_count.i_val == arg_count;
     if (!name_ok || !count_ok) {
         if (mismatch_msg && mismatch_msg_size) {
             snprintf(mismatch_msg, mismatch_msg_size,
                      "journal expected call to '%s' (%d args), program called '%s' (%d args)",
-                     journaled_name.s_val ? journaled_name.s_val : "?",
+                     AS_STRING(journaled_name) ? AS_STRING(journaled_name) : "?",
                      (int)journaled_count.i_val, name, arg_count);
         }
         freeValue(&journaled_name);

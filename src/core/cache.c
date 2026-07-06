@@ -1083,9 +1083,10 @@ static bool writeValue(ByteBuf* out, const Value* v) {
         case TYPE_STRING: {
             /* varint length prefix; NULL vs empty string distinguished by a
              * leading presence byte (varint length alone can't represent -1). */
-            uint8_t present = v->s_val ? 1 : 0;
+            const char *buf = (v->s_val && v->s_val->buffer) ? v->s_val->buffer : NULL;
+            uint8_t present = buf ? 1 : 0;
             bufU8(out, present);
-            if (present) bufLenPrefixedBytes(out, v->s_val, strlen(v->s_val));
+            if (present) bufLenPrefixedBytes(out, buf, strlen(buf));
             break;
         }
         case TYPE_NIL:
@@ -1097,10 +1098,10 @@ static bool writeValue(ByteBuf* out, const Value* v) {
             break;
         }
         case TYPE_SET: {
-            int32_t sz = v->set_val.set_size;
+            int32_t sz = v->set_val ? v->set_val->set_size : 0;
             bufI32LE(out, sz);
-            for (int i = 0; i < sz && v->set_val.set_values; i++) {
-                bufU64LE(out, (uint64_t)v->set_val.set_values[i]);
+            for (int i = 0; i < sz && v->set_val->set_values; i++) {
+                bufU64LE(out, (uint64_t)v->set_val->set_values[i]);
             }
             break;
         }
@@ -1629,10 +1630,11 @@ static void hashValue(uint64_t* hash, const Value* v, ChunkHashContext* ctx) {
             fnv1aUpdate(hash, &v->c_val, sizeof(v->c_val));
             break;
         case TYPE_STRING: {
-            int len = v->s_val ? (int)strlen(v->s_val) : -1;
+            const char *buf = (v->s_val && v->s_val->buffer) ? v->s_val->buffer : NULL;
+            int len = buf ? (int)strlen(buf) : -1;
             fnv1aUpdateInt(hash, len);
             if (len > 0) {
-                fnv1aUpdate(hash, v->s_val, (size_t)len);
+                fnv1aUpdate(hash, buf, (size_t)len);
             }
             break;
         }
@@ -1646,10 +1648,10 @@ static void hashValue(uint64_t* hash, const Value* v, ChunkHashContext* ctx) {
             break;
         }
         case TYPE_SET: {
-            int sz = v->set_val.set_size;
+            int sz = v->set_val ? v->set_val->set_size : 0;
             fnv1aUpdateInt(hash, sz);
-            if (sz > 0 && v->set_val.set_values) {
-                fnv1aUpdate(hash, v->set_val.set_values, sizeof(long long) * (size_t)sz);
+            if (sz > 0 && v->set_val->set_values) {
+                fnv1aUpdate(hash, v->set_val->set_values, sizeof(long long) * (size_t)sz);
             }
             break;
         }
@@ -1770,14 +1772,14 @@ static bool readValue(Cursor* in, Value* out) {
         case TYPE_STRING: {
             uint8_t present = curU8(in);
             if (in->error) return false;
+            out->s_val = pscalStringObjCreate(-1, TYPE_STRING);
             if (present) {
                 size_t len = 0;
-                out->s_val = curLenPrefixedString(in, &len);
-                if (in->error || !out->s_val) return false;
+                out->s_val->buffer = curLenPrefixedString(in, &len);
+                if (in->error || !out->s_val->buffer) return false;
             } else {
-                out->s_val = NULL;
+                out->s_val->buffer = NULL;
             }
-            out->max_length = -1;
             break;
         }
         case TYPE_NIL:
@@ -1794,16 +1796,16 @@ static bool readValue(Cursor* in, Value* out) {
         case TYPE_SET: {
             int32_t sz = curI32LE(in);
             if (in->error || sz < 0) return false;
-            out->set_val.set_size = sz;
+            out->set_val = pscalSetObjCreate();
+            out->set_val->set_size = sz;
             if (sz > 0) {
-                out->set_val.set_values = (long long*)malloc(sizeof(long long) * (size_t)sz);
-                if (!out->set_val.set_values) return false;
+                out->set_val->set_values = (long long*)malloc(sizeof(long long) * (size_t)sz);
+                if (!out->set_val->set_values) return false;
                 for (int i = 0; i < sz; i++) {
-                    out->set_val.set_values[i] = (long long)curU64LE(in);
+                    out->set_val->set_values[i] = (long long)curU64LE(in);
                 }
                 if (in->error) return false;
-            } else {
-                out->set_val.set_values = NULL;
+                out->set_val->capacity = sz;
             }
             break;
         }
