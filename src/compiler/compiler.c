@@ -5807,16 +5807,25 @@ static bool computeConstantArrayAccess(AST* node, ConstArrayAccessInfo* info) {
     int dims_count = 0;
     int dims_capacity = 0;
     bool success = true;
+    // Dimensions already consumed within current_type's own subrange list.
+    // A bracket-chain segment (e.g. the `[1]` in `f[1][2]`) may consume
+    // fewer indices than a flat multi-dim array level declares (e.g.
+    // `array[1..2,1..3] of integer` has child_count 2), so this cursor must
+    // persist across segments -- only advance to the element type once a
+    // level's declared dimensions are *fully* consumed, however many
+    // segments that took.
+    int dim_cursor = 0;
 
     for (int seg = chain_len - 1; seg >= 0 && success; --seg) {
         AST* segment = chain[seg];
-        AST* array_type = resolveTypeAlias(current_type);
-        if (!array_type || array_type->type != AST_ARRAY_TYPE) {
-            success = false;
-            break;
-        }
 
-        for (int idx = 0; idx < segment->child_count; ++idx) {
+        for (int idx = 0; idx < segment->child_count && success; ++idx) {
+            AST* array_type = resolveTypeAlias(current_type);
+            if (!array_type || array_type->type != AST_ARRAY_TYPE || dim_cursor >= array_type->child_count) {
+                success = false;
+                break;
+            }
+
             AST* idx_expr = segment->children[idx];
             Value idx_val = evaluateCompileTimeValue(idx_expr);
             long long idx_num = 0;
@@ -5827,12 +5836,7 @@ static bool computeConstantArrayAccess(AST* node, ConstArrayAccessInfo* info) {
                 break;
             }
 
-            if (idx >= array_type->child_count) {
-                success = false;
-                break;
-            }
-
-            AST* subrange = resolveTypeAlias(array_type->children[idx]);
+            AST* subrange = resolveTypeAlias(array_type->children[dim_cursor]);
             if (!subrange || subrange->type != AST_SUBRANGE || !subrange->left || !subrange->right) {
                 success = false;
                 break;
@@ -5859,12 +5863,21 @@ static bool computeConstantArrayAccess(AST* node, ConstArrayAccessInfo* info) {
                 success = false;
                 break;
             }
-        }
 
-        current_type = resolveTypeAlias(array_type->right);
+            dim_cursor++;
+            if (dim_cursor >= array_type->child_count) {
+                current_type = resolveTypeAlias(array_type->right);
+                dim_cursor = 0;
+            }
+        }
     }
 
-    if (!success || dims_count == 0) {
+    // A nonzero cursor here means the chain ended mid-level -- e.g. a bare
+    // `f[1]` slice of a flat 2-dim array -- which is a sub-array, not a
+    // complete scalar offset. The *_CONST opcodes have no notion of a
+    // partial/sliced offset, so bail to the dimension_count-aware dynamic
+    // path (GET_ELEMENT_ADDRESS/LOAD_ELEMENT_VALUE) for that case.
+    if (!success || dims_count == 0 || dim_cursor != 0) {
         free(dims);
         return false;
     }
