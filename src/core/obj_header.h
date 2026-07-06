@@ -102,17 +102,28 @@ static inline double pscalUnboxDouble(uint64_t bits) {
 
 // --- Pointer-width startup canary (plan §5.10.1) ---
 //
-// Phase 4's tagged-word design reserves 46 bits for a boxed pointer
-// payload -- comfortably above what malloc/mmap-without-a-high-hint return
-// in practice on every targeted platform, but that is an empirical
-// assumption about allocator behavior, not a language guarantee.
+// Phase 4's tagged-word design reserves a 50-bit pointer payload (a
+// single discriminant bit at bit 50 of the reserved region separates
+// "pointer, all 50 remaining bits are address" from "other inline
+// immediate, needs its own sub-kind+payload split" -- see plan §5.10.1
+// for the corrected encoding). This budget was revised from an initial
+// 46-bit design the moment the canary caught a real violation on first
+// deploy: Linux/ARM64 (the claw fleet's GB10 Sparks) returns heap and
+// stack addresses using close to the full 48-bit address space (observed:
+// a malloc'd pointer needing 48 bits, a stack address at 0xfffffc...,
+// both comfortably fitting 50 bits with margin to spare) -- 46 bits was
+// an assumption grounded in this developer's own machine (macOS/ARM64,
+// which does stay under 46 bits) generalized to "every targeted platform"
+// without actually checking Linux/ARM64. 50 bits is still an empirical
+// assumption, not a language guarantee, which is exactly why this canary
+// exists rather than trusting the assumption silently.
 
-// True if `ptr` fits in the 46-bit payload budget. Exposed separately from
-// the canary so later sub-phases (and this sub-phase's own unit tests) can
-// check arbitrary pointers, not just the canary's own throwaway
-// allocation.
+// True if `ptr` fits in the 50-bit pointer payload budget. Exposed
+// separately from the canary so later sub-phases (and this sub-phase's
+// own unit tests) can check arbitrary pointers, not just the canary's own
+// throwaway allocation.
 static inline bool pscalObjPointerFitsPayload(const void *ptr) {
-    return ((uintptr_t)ptr >> 46) == 0;
+    return ((uintptr_t)ptr >> 50) == 0;
 }
 
 // Runs a one-time canary allocation and aborts cleanly ("PSCAL VM 2.0:

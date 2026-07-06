@@ -101,7 +101,7 @@ void pscalObjRunPointerWidthCanary(void) {
     if (!fits) {
         fprintf(stderr,
                 "PSCAL VM 2.0: tagged-pointer address-space assumption violated "
-                "(heap pointer %p exceeds the 46-bit payload budget). Refusing to "
+                "(heap pointer %p exceeds the 50-bit payload budget). Refusing to "
                 "start rather than silently corrupt references.\n",
                 probe);
         free(probe);
