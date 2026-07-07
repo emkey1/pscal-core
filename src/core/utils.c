@@ -856,6 +856,118 @@ void pscalArrayEnsureObj(Value *v) {
     v->array_val = pscalArrayObjCreate();
 }
 
+// VM 2.0 Phase 4g: EnumObj destructor only owns enum_name (strdup'd);
+// enum_meta is a non-owned, shared/interned pointer (see core/types.h's
+// EnumObj comment) and must never be freed here.
+static void enumObjDestroy(ObjHeader *header) {
+    EnumObj *e = (EnumObj *)header;
+    free(e->enum_name);
+    free(e);
+}
+
+static pthread_once_t g_enum_obj_destructor_once = PTHREAD_ONCE_INIT;
+static void registerEnumObjDestructor(void) {
+    pscalObjRegisterDestructor(TYPE_ENUM, enumObjDestroy);
+}
+
+EnumObj *pscalEnumObjCreate(void) {
+    pthread_once(&g_enum_obj_destructor_once, registerEnumObjDestructor);
+    EnumObj *e = calloc(1, sizeof(EnumObj));
+    if (!e) {
+        fprintf(stderr, "FATAL: Memory allocation failed in pscalEnumObjCreate\n");
+        EXIT_FAILURE_HANDLER();
+    }
+    pscalObjHeaderInit(&e->header, TYPE_ENUM);
+    return e;
+}
+
+void pscalEnumEnsureObj(Value *v) {
+    if (!v || v->enum_val) {
+        return;
+    }
+    v->enum_val = pscalEnumObjCreate();
+}
+
+// VM 2.0 Phase 4g: mirrors freeValue's pre-4g TYPE_FILE case exactly
+// (pscalRuntimeVmIsSharedFileStream distinguishes a runtime-owned stdio
+// wrapper -- never fclose()'d, only flushed -- from a real owned handle).
+// Also fixes a pre-existing leak found by 4g's research pass: `filename`
+// was never freed here before.
+static void fileObjDestroy(ObjHeader *header) {
+    FileObj *fo = (FileObj *)header;
+    if (fo->f) {
+        if (!pscalRuntimeVmIsSharedFileStream(fo->f)) {
+            fclose(fo->f);
+        } else {
+            fflush(fo->f);
+        }
+    }
+    free(fo->filename);
+    free(fo);
+}
+
+static pthread_once_t g_file_obj_destructor_once = PTHREAD_ONCE_INIT;
+static void registerFileObjDestructor(void) {
+    pscalObjRegisterDestructor(TYPE_FILE, fileObjDestroy);
+}
+
+FileObj *pscalFileObjCreate(void) {
+    pthread_once(&g_file_obj_destructor_once, registerFileObjDestructor);
+    FileObj *fo = calloc(1, sizeof(FileObj));
+    if (!fo) {
+        fprintf(stderr, "FATAL: Memory allocation failed in pscalFileObjCreate\n");
+        EXIT_FAILURE_HANDLER();
+    }
+    pscalObjHeaderInit(&fo->header, TYPE_FILE);
+    return fo;
+}
+
+void pscalFileEnsureObj(Value *v) {
+    if (!v || v->f_val) {
+        return;
+    }
+    v->f_val = pscalFileObjCreate();
+}
+
+// VM 2.0 Phase 4g: PointerObj only ever holds `.address` (base_type_node
+// stays an unboxed top-level Value field -- see PointerObj's comment for
+// why). The sentinel-dependent decision to free what `.address` points to
+// (OWNED_POINTER_SENTINEL/SERIALIZED_CHAR_PTR_SENTINEL) needs the
+// enclosing Value's own base_type_node copy, which this generic
+// ObjHeader-dispatched destructor structurally cannot see (multiple
+// Values can share one PointerObj by the time the last reference lets
+// go, with no single "owning Value" to consult) -- so freeValue's own
+// TYPE_POINTER case does that check itself, exactly as it always has,
+// before ever calling pscalObjRelease. This destructor only ever tears
+// down the wrapper struct itself.
+static void pointerObjDestroy(ObjHeader *header) {
+    PointerObj *po = (PointerObj *)header;
+    free(po);
+}
+
+static pthread_once_t g_pointer_obj_destructor_once = PTHREAD_ONCE_INIT;
+static void registerPointerObjDestructor(void) {
+    pscalObjRegisterDestructor(TYPE_POINTER, pointerObjDestroy);
+}
+
+PointerObj *pscalPointerObjCreate(void) {
+    pthread_once(&g_pointer_obj_destructor_once, registerPointerObjDestructor);
+    PointerObj *po = calloc(1, sizeof(PointerObj));
+    if (!po) {
+        fprintf(stderr, "FATAL: Memory allocation failed in pscalPointerObjCreate\n");
+        EXIT_FAILURE_HANDLER();
+    }
+    pscalObjHeaderInit(&po->header, TYPE_POINTER);
+    return po;
+}
+
+void pscalPointerEnsureObj(Value *v) {
+    if (!v || v->ptr_val) {
+        return;
+    }
+    v->ptr_val = pscalPointerObjCreate();
+}
+
 static bool ensureFieldSlotCapacity(FieldValue*** slotOwners, int* capacity, int requiredSlots) {
     if (!slotOwners || !capacity || requiredSlots <= *capacity) {
         return true;
@@ -1634,8 +1746,9 @@ Value makeFile(FILE *f) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_FILE;
-    v.f_val = f;
-    v.filename = NULL; // Filename is associated via assign()
+    v.f_val = pscalFileObjCreate();
+    v.f_val->f = f;
+    // Filename is associated via assign()
     return v;
 }
 
@@ -1972,12 +2085,13 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
             break;
         case TYPE_BOOLEAN: v.i_val = 0; break;
         case TYPE_FILE: {
-            v.f_val = NULL;
-            v.filename = NULL;
-            v.record_size = PSCAL_DEFAULT_FILE_RECORD_SIZE;
-            v.record_size_explicit = false;
-            v.element_type = TYPE_VOID;
-            v.element_type_def = NULL;
+            v.f_val = pscalFileObjCreate();
+            v.f_val->f = NULL;
+            v.f_val->filename = NULL;
+            v.f_val->record_size = PSCAL_DEFAULT_FILE_RECORD_SIZE;
+            v.f_val->record_size_explicit = false;
+            v.f_val->element_type = TYPE_VOID;
+            v.f_val->element_type_def = NULL;
 
             AST *fileTypeNode = node_to_inspect ? resolveTypeAliasForRecord(node_to_inspect) : NULL;
             if (fileTypeNode && fileTypeNode->type == AST_TYPE_REFERENCE && fileTypeNode->right) {
@@ -1989,13 +2103,13 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
                 AST *elementNode = fileTypeNode->right;
                 VarType elementType = resolveValueTypeNode(&elementNode);
                 if (elementType != TYPE_VOID && elementType != TYPE_UNKNOWN) {
-                    v.element_type = elementType;
-                    v.element_type_def = elementNode;
+                    v.f_val->element_type = elementType;
+                    v.f_val->element_type_def = elementNode;
 
                     long long elementBytes = 0;
                     if (pascalVarTypeSize(elementType, &elementBytes) && elementBytes > 0 && elementBytes <= INT_MAX) {
-                        v.record_size = (int)elementBytes;
-                        v.record_size_explicit = true;
+                        v.f_val->record_size = (int)elementBytes;
+                        v.f_val->record_size_explicit = true;
                     }
                 }
             }
@@ -2128,16 +2242,22 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
         }
         case TYPE_MEMORYSTREAM: v.mstream = createMStream(); break;
         case TYPE_ENUM:
-             v.enum_val.ordinal = 0;
-             v.enum_val.enum_name = (actual_type_def && actual_type_def->token && actual_type_def->token->value)
+             v.enum_val = pscalEnumObjCreate();
+             v.enum_val->ordinal = 0;
+             v.enum_val->enum_name = (actual_type_def && actual_type_def->token && actual_type_def->token->value)
                                       ? strdup(actual_type_def->token->value)
                                       : strdup("<unknown_enum>");
-             if (!v.enum_val.enum_name) { /* Malloc error */ EXIT_FAILURE_HANDLER(); }
+             if (!v.enum_val->enum_name) { /* Malloc error */ EXIT_FAILURE_HANDLER(); }
              v.base_type_node = actual_type_def;
              break;
         case TYPE_SET:     v.set_val = pscalSetObjCreate(); break;
         case TYPE_POINTER:
-            v.ptr_val = NULL;
+            // A nil-valued pointer variable still gets a wrapper (never a
+            // NULL v.ptr_val itself) -- "nil" is address==NULL inside a
+            // real PointerObj, matching every other boxed type's "wrapper
+            // always present" invariant. AS_POINTER(v) dereferences
+            // v.ptr_val unconditionally, same as AS_FILE/AS_ARRAY/etc.
+            v.ptr_val = pscalPointerObjCreate();
             break;
         case TYPE_THREAD:
             SET_INT_VALUE(&v, -1);
@@ -2175,8 +2295,9 @@ Value makePointer(void* address, AST* base_type_node) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_POINTER; // The type of the value is POINTER
-    v.ptr_val = address;     // The actual memory address it points to
-    v.base_type_node = base_type_node; // Link to the definition of the type being pointed to
+    v.ptr_val = pscalPointerObjCreate();
+    v.ptr_val->address = (Value*)address; // The actual memory address it points to
+    v.base_type_node = base_type_node; // Link to the definition of the type being pointed to (unboxed, see PointerObj's comment)
     return v;
 }
 
@@ -2425,37 +2546,35 @@ void freeValue(Value *v) {
 //#endif
             break;
         case TYPE_ENUM:
-            if (v->enum_val.enum_name) {
-//#ifdef DEBUG
- //               fprintf(stderr, "[DEBUG]   Attempting to free enum name '%s' at %p for Value* %p\n",
-   //                     v->enum_val.enum_name, (void*)v->enum_val.enum_name, (void*)v);
-  //              fflush(stderr);
-//#endif
-                free(v->enum_val.enum_name);
-                v->enum_val.enum_name = NULL;
-            } else {
-//#ifdef DEBUG
- //               fprintf(stderr, "[DEBUG]   Enum name pointer is NULL for Value* %p, nothing to free.\n", (void*)v);
-  //              fflush(stderr);
-//#endif
+            if (v->enum_val) {
+                pscalObjRelease(&v->enum_val->header);
             }
+            v->enum_val = NULL;
             break;
         case TYPE_POINTER:
             // For a Value struct of TYPE_POINTER, freeValue should NOT free the memory
-            // that v->ptr_val points to. That's the job of dispose/FreeMem.
-            // We only nullify the pointer here to indicate this Value struct no longer points.
-            // The base_type_node is also part of the type definition, not data to be freed here.
+            // that the pointer's address points to, in general -- that's the job of
+            // dispose/FreeMem. Sentinel-tagged flavors are the deliberate exception:
+            // OWNED_POINTER_SENTINEL/SERIALIZED_CHAR_PTR_SENTINEL DO own their target.
+            // This check reads v->base_type_node (the Value's own unboxed copy, per
+            // PointerObj's comment) and must live here, not in pointerObjDestroy's
+            // generic ObjHeader dispatch, since multiple Values can share one
+            // PointerObj by the time the last reference lets go, with no single
+            // "owning Value" for a generic destructor to consult.
 #ifdef DEBUG
-            fprintf(stderr, "[DEBUG]   Resetting ptr_val for POINTER Value* at %p. Base type node (%p) is preserved. Pointed-to memory NOT freed by this call.\n",
+            fprintf(stderr, "[DEBUG]   Releasing ptr_val for POINTER Value* at %p. Base type node (%p) is preserved. Pointed-to memory freed only for owning sentinels.\n",
                     (void*)v, (void*)v->base_type_node);
             fflush(stderr);
 #endif
-            if (v->ptr_val && v->base_type_node == OWNED_POINTER_SENTINEL) {
-                Value* owned = (Value*)v->ptr_val;
-                freeValue(owned);
-                free(owned);
-            } else if (v->ptr_val && v->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
-                free((char*)v->ptr_val);
+            if (v->ptr_val) {
+                if (AS_POINTER(*v) && v->base_type_node == OWNED_POINTER_SENTINEL) {
+                    Value* owned = AS_POINTER(*v);
+                    freeValue(owned);
+                    free(owned);
+                } else if (AS_POINTER(*v) && v->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
+                    free((char*)AS_POINTER(*v));
+                }
+                pscalObjRelease(&v->ptr_val->header);
             }
             v->ptr_val = NULL;
             if (v->base_type_node == OWNED_POINTER_SENTINEL) {
@@ -2520,16 +2639,14 @@ void freeValue(Value *v) {
              break;
         }
         case TYPE_FILE:
+            // Teardown (including the runtime-owned-stdio-wrapper check)
+            // now lives in fileObjDestroy, run by pscalObjRelease only
+            // once the last reference lets go -- matches freeValue's
+            // treatment of every other boxed type this phase.
             if (v->f_val) {
-                // Runtime-owned stdio wrappers must not be fclose()'d by generic
-                // value cleanup; they are owned by the active runtime context.
-                if (!pscalRuntimeVmIsSharedFileStream(v->f_val)) {
-                    fclose(v->f_val);
-                } else {
-                    fflush(v->f_val);
-                }
-                v->f_val = NULL;
+                pscalObjRelease(&v->f_val->header);
             }
+            v->f_val = NULL;
             break; // Break from the switch statement
         case TYPE_MEMORYSTREAM:
               if (v->mstream) {
@@ -2618,7 +2735,9 @@ void dumpSymbol(Symbol *sym) {
                 printf("Word %u", (unsigned int)sym->value->i_val);
                 break;
             case TYPE_ENUM:
-                printf("Enumerated Type '%s', Ordinal: %d", sym->value->enum_val.enum_name, sym->value->enum_val.ordinal);
+                printf("Enumerated Type '%s', Ordinal: %d",
+                       (sym->value->enum_val && sym->value->enum_val->enum_name) ? sym->value->enum_val->enum_name : "?",
+                       sym->value->enum_val ? sym->value->enum_val->ordinal : 0);
                 break;
             case TYPE_ARRAY: {
                 ArrayObj *a = sym->value->array_val;
@@ -2639,7 +2758,9 @@ void dumpSymbol(Symbol *sym) {
                     const Value *fieldValue = fieldValueStorageConst(fv);
                     printf("%s: %s", fv->name, varTypeToString(fieldValue->type));
                     if (fieldValue->type == TYPE_ENUM) {
-                        printf(" ('%s', Ordinal: %d)", fieldValue->enum_val.enum_name, fieldValue->enum_val.ordinal);
+                        printf(" ('%s', Ordinal: %d)",
+                               (fieldValue->enum_val && fieldValue->enum_val->enum_name) ? fieldValue->enum_val->enum_name : "?",
+                               fieldValue->enum_val ? fieldValue->enum_val->ordinal : 0);
                     } else if (fieldValue->type == TYPE_STRING) {
                         printf(" (\"%s\")", (fieldValue->s_val && fieldValue->s_val->buffer) ? fieldValue->s_val->buffer : "(null)");
                     }
@@ -2823,8 +2944,8 @@ static void ensureEnumMemberExported(AST* enum_type_node, AST* value_node, const
 
             if (conflict) {
                 const char* other_enum_name = NULL;
-                if (resolved->value && resolved->value->enum_val.enum_name) {
-                    other_enum_name = resolved->value->enum_val.enum_name;
+                if (resolved->value && resolved->value->enum_val && resolved->value->enum_val->enum_name) {
+                    other_enum_name = resolved->value->enum_val->enum_name;
                 }
                 fprintf(stderr,
                         "Error: Enum member '%s' from unit '%s' conflicts with existing symbol from %s%s%s.\n",
@@ -2861,16 +2982,17 @@ static void ensureEnumMemberExported(AST* enum_type_node, AST* value_node, const
     sym->type = TYPE_ENUM;
     sym->is_const = true;
     sym->value->type = TYPE_ENUM;
-    sym->value->enum_val.ordinal = value_node->i_val;
+    pscalEnumEnsureObj(sym->value);
+    sym->value->enum_val->ordinal = value_node->i_val;
     sym->value->base_type_node = enum_type_node;
 
     const char* enum_name = enum_type_node->token ? enum_type_node->token->value : NULL;
     if (enum_name) {
-        if (sym->value->enum_val.enum_name) {
-            free(sym->value->enum_val.enum_name);
+        if (sym->value->enum_val->enum_name) {
+            free(sym->value->enum_val->enum_name);
         }
-        sym->value->enum_val.enum_name = strdup(enum_name);
-        if (!sym->value->enum_val.enum_name) {
+        sym->value->enum_val->enum_name = strdup(enum_name);
+        if (!sym->value->enum_val->enum_name) {
             fprintf(stderr, "Memory allocation failure while duplicating enum name for '%s'.\n", member_name);
             EXIT_FAILURE_HANDLER();
         }
@@ -3215,12 +3337,13 @@ Value makeEnum(const char *enum_name, int ordinal) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_ENUM;
-    v.enum_val.enum_name = enum_name ? strdup(enum_name) : NULL; // Duplicate the name
-     if (enum_name && !v.enum_val.enum_name) { // Check strdup result
+    v.enum_val = pscalEnumObjCreate();
+    v.enum_val->enum_name = enum_name ? strdup(enum_name) : NULL; // Duplicate the name
+     if (enum_name && !v.enum_val->enum_name) { // Check strdup result
          fprintf(stderr, "FATAL: strdup failed for enum_name in makeEnum\n");
          EXIT_FAILURE_HANDLER();
      }
-    v.enum_val.ordinal = ordinal;
+    v.enum_val->ordinal = ordinal;
     return v;
 }
 
@@ -3360,9 +3483,9 @@ void printValueToStream(Value v, FILE *stream) {
             fprintf(stream, "nil");
             break;
         case TYPE_POINTER:
-            fprintf(stream, "POINTER(@%p -> ", (void*)v.ptr_val);
-            if (v.ptr_val) { // If it's not a nil pointer, try to print what it points to
-                printValueToStream(*(v.ptr_val), stream); // Recursive call
+            fprintf(stream, "POINTER(@%p -> ", (void*)(v.ptr_val ? AS_POINTER(v) : NULL));
+            if (v.ptr_val && AS_POINTER(v)) { // If it's not a nil pointer, try to print what it points to
+                printValueToStream(*AS_POINTER(v), stream); // Recursive call
             } else {
                 fprintf(stream, "NIL_TARGET");
             }
@@ -3401,17 +3524,19 @@ void printValueToStream(Value v, FILE *stream) {
             fprintf(stream, "}");
             break;
         case TYPE_ENUM: {
-            const char *type_name = v.enum_val.enum_name ?
-                v.enum_val.enum_name : (v.enum_meta ? v.enum_meta->name : NULL);
+            const char *type_name = (v.enum_val && v.enum_val->enum_name) ?
+                v.enum_val->enum_name :
+                ((v.enum_val && v.enum_val->enum_meta) ? v.enum_val->enum_meta->name : NULL);
             const char *member_name = NULL;
             AST *enum_ast = v.base_type_node;
             if (!enum_ast && type_name) {
                 enum_ast = lookupType(type_name);
             }
+            int ordinal = v.enum_val ? v.enum_val->ordinal : 0;
             if (enum_ast && enum_ast->type == AST_ENUM_TYPE &&
-                v.enum_val.ordinal >= 0 &&
-                v.enum_val.ordinal < enum_ast->child_count) {
-                AST *val_node = enum_ast->children[v.enum_val.ordinal];
+                ordinal >= 0 &&
+                ordinal < enum_ast->child_count) {
+                AST *val_node = enum_ast->children[ordinal];
                 if (val_node && val_node->token && val_node->token->value) {
                     member_name = val_node->token->value;
                 }
@@ -3421,7 +3546,7 @@ void printValueToStream(Value v, FILE *stream) {
             } else {
                 fprintf(stream, "ENUM(%s, ord: %d)",
                         type_name ? type_name : "<type_unknown>",
-                        v.enum_val.ordinal);
+                        ordinal);
             }
             break;
         }
@@ -3437,8 +3562,8 @@ void printValueToStream(Value v, FILE *stream) {
             fprintf(stream, "])");
             break;
         case TYPE_FILE:
-            if (v.filename) {
-                fprintf(stream, "FILE(%s, handle: %p)", v.filename, (void*)v.f_val);
+            if (v.f_val && v.f_val->filename) {
+                fprintf(stream, "FILE(%s, handle: %p)", v.f_val->filename, (void*)v.f_val);
             } else {
                 fprintf(stream, "FILE(UNNAMED, handle: %p)", (void*)v.f_val);
             }
@@ -3524,13 +3649,23 @@ Value makeCopyOfValue(const Value *src) {
             }
             break;
         }
-        case TYPE_ENUM:
-            v.enum_val.enum_name = src->enum_val.enum_name ? strdup(src->enum_val.enum_name) : NULL;
-            if (src->enum_val.enum_name && !v.enum_val.enum_name) {
+        case TYPE_ENUM: {
+            // `v = *src` above left v.enum_val ALIASING src->enum_val --
+            // capture what's needed from src's EnumObj before overwriting
+            // v.enum_val with a fresh one; never mutate the aliased
+            // pointer in place. enum_meta is copied as-is (a non-owned,
+            // shared/interned pointer -- see EnumObj's comment).
+            EnumObj *src_enum = src->enum_val;
+            v.enum_val = pscalEnumObjCreate();
+            v.enum_val->enum_meta = src_enum ? src_enum->enum_meta : NULL;
+            v.enum_val->ordinal = src_enum ? src_enum->ordinal : 0;
+            v.enum_val->enum_name = (src_enum && src_enum->enum_name) ? strdup(src_enum->enum_name) : NULL;
+            if (src_enum && src_enum->enum_name && !v.enum_val->enum_name) {
                  fprintf(stderr, "Memory allocation failed in makeCopyOfValue (enum name strdup)\n");
                  EXIT_FAILURE_HANDLER();
             }
             break;
+        }
         case TYPE_RECORD: {
             // `v = *src` above left v.record_val ALIASING src->record_val --
             // read src's fields before overwriting v.record_val with a
@@ -3684,9 +3819,30 @@ Value makeCopyOfValue(const Value *src) {
                 retainClosureEnv(v.closure.env);
             }
             break;
-        case TYPE_POINTER:
-            if (src->ptr_val && src->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
-                const char *text = (const char *)src->ptr_val;
+        case TYPE_POINTER: {
+            // `v = *src` above left v.ptr_val ALIASING src->ptr_val --
+            // corrected from an earlier draft that kept this a bare,
+            // unretained alias (matching TYPE_FILE's pattern). That draft
+            // was wrong for pointers specifically: unlike TYPE_FILE
+            // arguments (which CALL_BUILTIN's cleanup always skips
+            // freeValue for), a transient TYPE_POINTER copy gets
+            // freeValue'd directly and unconditionally by plenty of other
+            // opcodes (SET_INDIRECT among them) that have no such skip --
+            // confirmed by hitting exactly this: `px := @x; px^ := 99;`
+            // crashed because px^'s read pushed a bare-aliased copy of
+            // px's own PointerObj, and freeValue on that transient copy
+            // released px's real, persistent wrapper out from under it.
+            // Every copy must therefore be a genuinely independent
+            // PointerObj (refcount 1, never shared) -- matching the
+            // original design note's "copy-on-construct" mandate, which
+            // this reinstates. SERIALIZED_CHAR_PTR_SENTINEL additionally
+            // deep-copies the string itself (it always has), since that
+            // flavor owns its target the same way OWNED_POINTER_SENTINEL
+            // owns its pointee.
+            void *src_address = (src->ptr_val && AS_POINTER(*src)) ? (void*)AS_POINTER(*src) : NULL;
+            v.ptr_val = pscalPointerObjCreate();
+            if (src_address && src->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
+                const char *text = (const char *)src_address;
                 size_t len = strlen(text);
                 char *dup = (char *)malloc(len + 1u);
                 if (!dup) {
@@ -3694,8 +3850,26 @@ Value makeCopyOfValue(const Value *src) {
                     EXIT_FAILURE_HANDLER();
                 }
                 memcpy(dup, text, len + 1u);
-                v.ptr_val = (Value *)dup;
+                v.ptr_val->address = (Value*)dup;
+            } else {
+                v.ptr_val->address = (Value*)src_address;
             }
+            break;
+        }
+        case TYPE_FILE:
+            // `v = *src` above left v.f_val ALIASING src->f_val -- and,
+            // deliberately, that alias is NOT retained. This exactly
+            // reproduces pre-4g behavior (a bare, untracked raw-FILE*
+            // alias) rather than "fixing" it into a refcounted share,
+            // because CALL_BUILTIN's argument cleanup (vm.c) has always
+            // skipped freeValue for TYPE_FILE args specifically *because*
+            // copies were untracked aliases nothing ever released -- the
+            // real owning reference is exactly one symbol slot at a time,
+            // transferred (never copied) by updateSymbolInternal's
+            // dedicated TYPE_FILE move logic in symbol.c. Retaining here
+            // would add one reference per stack-argument push that
+            // CALL_BUILTIN's skip guarantees is never matched by a
+            // release -- a permanent leak, not a fix.
             break;
         default:
             break;

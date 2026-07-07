@@ -1092,9 +1092,10 @@ static bool writeValue(ByteBuf* out, const Value* v) {
         case TYPE_NIL:
             break;
         case TYPE_ENUM: {
-            size_t len = v->enum_val.enum_name ? strlen(v->enum_val.enum_name) : 0;
-            bufLenPrefixedBytes(out, v->enum_val.enum_name, len);
-            bufI32LE(out, (int32_t)v->enum_val.ordinal);
+            const char *name = v->enum_val ? v->enum_val->enum_name : NULL;
+            size_t len = name ? strlen(name) : 0;
+            bufLenPrefixedBytes(out, name, len);
+            bufI32LE(out, (int32_t)(v->enum_val ? v->enum_val->ordinal : 0));
             break;
         }
         case TYPE_SET: {
@@ -1641,12 +1642,13 @@ static void hashValue(uint64_t* hash, const Value* v, ChunkHashContext* ctx) {
             break;
         }
         case TYPE_ENUM: {
-            int len = v->enum_val.enum_name ? (int)strlen(v->enum_val.enum_name) : 0;
+            const char *name = v->enum_val ? v->enum_val->enum_name : NULL;
+            int len = name ? (int)strlen(name) : 0;
             fnv1aUpdateInt(hash, len);
             if (len > 0) {
-                fnv1aUpdate(hash, v->enum_val.enum_name, (size_t)len);
+                fnv1aUpdate(hash, name, (size_t)len);
             }
-            fnv1aUpdateInt(hash, v->enum_val.ordinal);
+            fnv1aUpdateInt(hash, v->enum_val ? v->enum_val->ordinal : 0);
             break;
         }
         case TYPE_SET: {
@@ -1795,11 +1797,12 @@ static bool readValue(Cursor* in, Value* out) {
         case TYPE_NIL:
             break;
         case TYPE_ENUM: {
+            pscalEnumEnsureObj(out);
             size_t len = 0;
-            out->enum_val.enum_name = curLenPrefixedString(in, &len);
+            out->enum_val->enum_name = curLenPrefixedString(in, &len);
             if (in->error) return false;
-            if (len == 0) { free(out->enum_val.enum_name); out->enum_val.enum_name = NULL; }
-            out->enum_val.ordinal = curI32LE(in);
+            if (len == 0) { free(out->enum_val->enum_name); out->enum_val->enum_name = NULL; }
+            out->enum_val->ordinal = curI32LE(in);
             if (in->error) return false;
             break;
         }

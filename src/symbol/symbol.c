@@ -1102,6 +1102,11 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
             // TYPE_UNICODE_STRING case in the switch below immediately reads
             // STRING_MAX_LENGTH(*sym->value) again, which dereferences it.
             pscalStringEnsureObj(sym->value);
+        } else if (sym->type == TYPE_POINTER) {
+            // freeValue just dropped sym->value's PointerObj wrapper entirely
+            // (ptr_val == NULL); the TYPE_POINTER case in the switch below
+            // writes through AS_POINTER(*sym->value) unconditionally.
+            pscalPointerEnsureObj(sym->value);
         }
     }
 
@@ -1278,8 +1283,14 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
                 AS_FILE(*sym->value) = AS_FILE(val);
                 if (FILE_FILENAME(*sym->value)) free(FILE_FILENAME(*sym->value));
                 FILE_FILENAME(*sym->value) = FILE_FILENAME(val) ? strdup(FILE_FILENAME(val)) : NULL;
-                AS_FILE(val) = NULL;
-                FILE_FILENAME(val) = NULL;
+                // VM 2.0 Phase 4g: `val` (the RHS of `f2 := f1`) is a bare,
+                // untracked alias of f1's own FileObj (see makeCopyOfValue's
+                // TYPE_FILE comment) -- val.f_val IS f1's wrapper, not an
+                // independent copy. Detach val's own pointer to it (so
+                // val's eventual freeValue is a no-op) WITHOUT writing
+                // through AS_FILE/FILE_FILENAME, which would mutate f1's
+                // real, still-live FileObj in place.
+                val.f_val = NULL;
             }
             break;
 

@@ -7726,6 +7726,7 @@ static void compileDefinedFunction(AST* func_decl_node, BytecodeChunk* chunk, in
                 Value *v = (Value *)calloc(1, sizeof(Value));
                 if (v) {
                     SET_VALUE_TYPE(v, TYPE_POINTER);
+                    pscalPointerEnsureObj(v);
                     AS_POINTER(*v) = (Value *)func_decl_node;
                     proc_symbol->value = v;
                 }

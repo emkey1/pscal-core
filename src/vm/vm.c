@@ -2129,7 +2129,14 @@ static void* threadStart(void* arg) {
                     int limit = job->argc;
                     if (limit > 8) limit = 8;
                     for (int i = 0; i < expected && i < limit; i++) {
-                        Value v = job->args ? job->args[i] : makeNil();
+                        // VM 2.0 Phase 4g: must be an independent copy, not a
+                        // bare struct alias -- job->args[i] is later freed by
+                        // vmThreadJobDestroy, and a bare `Value v = job->args[i]`
+                        // would alias job->args[i]'s own boxed wrapper (e.g. a
+                        // TYPE_POINTER's PointerObj), double-releasing it once
+                        // both this pushed copy and the job's own copy get
+                        // freed independently.
+                        Value v = job->args ? makeCopyOfValue(&job->args[i]) : makeNil();
                         if (proc_symbol && proc_symbol->type_def) {
                             AST* param_ast = proc_symbol->type_def->children[i];
                             if (param_ast) {
@@ -3868,9 +3875,18 @@ static Value pop(VM* vm) {
     vm->stackTop--;
     Value result = *vm->stackTop; // Make a copy of the value to return.
 
-    // Mark the slot as vacant without incurring the cost of makeNil().
+    // Mark the slot as vacant without incurring the cost of makeNil(). This
+    // needs a raw union-member write, not AS_POINTER(*vm->stackTop) = NULL:
+    // that macro now dereferences ptr_val as a PointerObj* (VM 2.0 Phase
+    // 4g), but the vacated slot's union member could have held ANY type
+    // before this (an EnumObj*, ArrayObj*, etc, now stale garbage) --
+    // dereferencing it as a pointer wrapper would crash. The actual intent
+    // here has always been "zero the raw union bits," which pre-4g
+    // happened to be spelled the same as "clear the pointer payload"
+    // (ptr_val was a plain field then); post-boxing those are different
+    // operations, and this one wants the former.
     SET_VALUE_TYPE(vm->stackTop, TYPE_VOID);
-    AS_POINTER(*vm->stackTop) = NULL;
+    vm->stackTop->ptr_val = NULL;
 
     return result; // Return the copy, which the caller is now responsible for.
 }
@@ -9687,7 +9703,7 @@ comparison_error_label:
                     }
                     vm->stackTop -= arg_count;
                     for (int i = 0; i < arg_count; i++) {
-                        if (VALUE_TYPE(args[i]) == TYPE_POINTER || VALUE_TYPE(args[i]) == TYPE_FILE) {
+                        if (VALUE_TYPE(args[i]) == TYPE_FILE) {
                             continue;
                         }
                         freeValue(&args[i]);
@@ -9719,7 +9735,7 @@ comparison_error_label:
                     vm->current_builtin_name = previous_builtin_name;
                     vm->stackTop -= arg_count;
                     for (int i = 0; i < arg_count; i++) {
-                        if (VALUE_TYPE(args[i]) == TYPE_POINTER || VALUE_TYPE(args[i]) == TYPE_FILE) {
+                        if (VALUE_TYPE(args[i]) == TYPE_FILE) {
                             continue;
                         }
                         freeValue(&args[i]);
@@ -9738,7 +9754,7 @@ comparison_error_label:
 
                 vm->stackTop -= arg_count;
                 for (int i = 0; i < arg_count; i++) {
-                    if (VALUE_TYPE(args[i]) == TYPE_POINTER || VALUE_TYPE(args[i]) == TYPE_FILE) {
+                    if (VALUE_TYPE(args[i]) == TYPE_FILE) {
                         continue;
                     }
                     freeValue(&args[i]);
@@ -9859,7 +9875,7 @@ comparison_error_label:
                         vm->current_builtin_name = previous_builtin_name;
                         vm->stackTop -= arg_count;
                         for (int i = 0; i < arg_count; i++) {
-                            if (VALUE_TYPE(args[i]) == TYPE_POINTER || VALUE_TYPE(args[i]) == TYPE_FILE) {
+                            if (VALUE_TYPE(args[i]) == TYPE_FILE) {
                                 continue;
                             }
                             freeValue(&args[i]);
@@ -9878,7 +9894,7 @@ comparison_error_label:
 
                     vm->stackTop -= arg_count;
                     for (int i = 0; i < arg_count; i++) {
-                        if (VALUE_TYPE(args[i]) == TYPE_POINTER || VALUE_TYPE(args[i]) == TYPE_FILE) {
+                        if (VALUE_TYPE(args[i]) == TYPE_FILE) {
                             continue;
                         }
                         freeValue(&args[i]);
@@ -9899,7 +9915,7 @@ comparison_error_label:
                     runtimeError(vm, "VM Error: Unimplemented or unknown built-in '%s' called.", builtin_name_original_case);
                     vm->stackTop -= arg_count;
                     for (int i = 0; i < arg_count; i++) {
-                        if (VALUE_TYPE(args[i]) == TYPE_POINTER || VALUE_TYPE(args[i]) == TYPE_FILE) {
+                        if (VALUE_TYPE(args[i]) == TYPE_FILE) {
                             continue;
                         }
                         freeValue(&args[i]);

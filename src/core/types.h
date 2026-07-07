@@ -183,6 +183,97 @@ typedef struct EnumType {
     int member_count;   // Number of members
 } Type;
 
+// VM 2.0 Phase 4g (Docs/pscal_vm2_plan.md sec 5.10.4/5.10.3): deliberately
+// keeps `enum_name`, reversing the plan's original "drop it, derive from
+// enum_meta->name" sketch -- a research pass (not assumption) found
+// `enum_meta` is populated in only two places in the whole tree (both pure
+// copy-forward from an already-set operand, never a fresh lookup/registry
+// populate), while `enum_name` is load-bearing for actual logic (enum-type
+// equality/compatibility checks via strcmp, Low()/High()'s lookupType() by
+// name), not just display. Dropping it would need a real interned
+// Type/EnumType registry this codebase doesn't have yet -- out of scope
+// for a representation-only sub-phase. `enum_meta` moves in alongside it
+// (non-owned, shared/interned elsewhere -- see the poison-pragma listing
+// in utils.h, already treating it as boxing-adjacent before this sub-phase
+// touched it).
+typedef struct EnumObj {
+    ObjHeader header; // header.type is always TYPE_ENUM
+    Type *enum_meta;
+    int32_t ordinal;
+    char *enum_name;
+} EnumObj;
+
+// VM 2.0 Phase 4g (Docs/pscal_vm2_plan.md sec 5.10.4/5.10.3): revised
+// before implementation by 4g's own research pass -- the original sketch
+// omitted `element_type`/`element_type_def`, but those are legitimately
+// part of a typed file's (`file of X`) state, not dead weight, and are
+// exactly the pair whose *array*-side collision already broke TYPE_FILE
+// once in 4e/4f (see FILE_ELEMENT_TYPE/FILE_ELEMENT_TYPE_DEF's history
+// below). Folding them in now closes that loose end. Exempt from Stage
+// B's CoW/uniqueness path entirely (a file's OS handle has identity that
+// must never be cloned); makeCopyOfValue's TYPE_FILE case retains the
+// same FileObj rather than deep-copying, consistent with that exemption.
+typedef struct FileObj {
+    ObjHeader header; // header.type is always TYPE_FILE
+    FILE *f;
+    char *filename;
+    int record_size;
+    bool record_size_explicit;
+    VarType element_type;
+    struct AST *element_type_def; // AST typedef not yet visible this early in the file
+} FileObj;
+
+// VM 2.0 Phase 4g (Docs/pscal_vm2_plan.md sec 5.10.4/5.10.3): boxes ONLY
+// `address` -- deliberately, and revised from an earlier draft that also
+// boxed `base_type_node`. A dedicated audit pass (looking for every
+// PTR_BASE_TYPE_NODE/AS_POINTER call site not already guarded by a
+// VALUE_TYPE==TYPE_POINTER check) found `base_type_node` is genuinely
+// TYPE-AGNOSTIC in this codebase, not pointer-specific: it's read/written
+// on TYPE_ENUM values (vm.c's Succ/Pred-family arithmetic macro smuggles
+// enum metadata through it), TYPE_RECORD values (a record's own class-AST
+// pointer), and as generic "preserve this AST across an arbitrary
+// reassignment" scratch storage in the VM's general assignment path --
+// none of which are TYPE_POINTER. Boxing it into a TYPE_POINTER-only union
+// member would have reintroduced the exact "dual-purpose field now reached
+// through a type-specific union member" crash class already found twice
+// this sub-phase (TYPE_FILE's element_type collision in 4e/4f; the packed-
+// array-union truthiness bug). `base_type_node` therefore stays a plain,
+// unboxed top-level Value field, completely unchanged by this sub-phase --
+// PTR_BASE_TYPE_NODE's macro body is untouched. The `mode` field replacing
+// the sentinel-in-base_type_node overload is separately deferred anyway (a
+// different audit found the proposed 4-value enum covers only 3 of 7 real
+// sentinels across ~90 call sites) -- Stage A ships the sentinel scheme
+// unchanged regardless of where base_type_node lives.
+//
+// Because base_type_node stays unboxed and independently per-Value-copied
+// (exactly as today), `copyInterfaceReceiverAlias`'s in-place
+// `PTR_BASE_TYPE_NODE(alias) = NULL` (vm.c) and its two siblings remain
+// exactly as safe as they always were -- mutating each Value's own
+// scalar field, never a shared box.
+//
+// **Copy-on-construct, not copy-on-write -- confirmed necessary, not just
+// theoretical.** makeCopyOfValue/copyValueForStack must always allocate a
+// FRESH, independent PointerObj per copy (never pscalObjRetain an
+// existing one). An earlier draft of this file tried a bare, unretained
+// alias instead (reasoning by analogy from FileObj, where CALL_BUILTIN's
+// argument cleanup always skips freeValue for TYPE_FILE specifically) --
+// that reasoning does NOT transfer to pointers: unlike file arguments,
+// transient TYPE_POINTER copies get freeValue'd directly and
+// unconditionally by plenty of opcodes that carry no such skip (found by
+// actually running `px := @x; px^ := 99;`, which crashed -- px^'s read
+// pushed a bare-aliased copy of px's own PointerObj via GET_GSLOT, and
+// SET_INDIRECT's ordinary freeValue on that transient copy released px's
+// real, persistent wrapper out from under it). Every copy must therefore
+// be genuinely independent (refcount 1, never shared) -- which in turn
+// means CALL_BUILTIN's argument cleanup (vm.c) must NOT skip freeValue
+// for TYPE_POINTER the way it still does for TYPE_FILE, since a fresh,
+// unshared wrapper needs exactly one release to avoid leaking, and
+// nothing else will ever provide it.
+typedef struct PointerObj {
+    ObjHeader header; // header.type is always TYPE_POINTER
+    struct ValueStruct *address;
+} PointerObj;
+
 // Forward declaration of AST
 typedef struct AST AST;
 
@@ -198,14 +289,11 @@ typedef struct ValueStruct {
         StringObj *s_val; // VM 2.0 Phase 4c: was a plain owned char*
         int c_val;
         RecordObj *record_val; // VM 2.0 Phase 4d: was a plain FieldValue*
-        FILE *f_val;
+        FileObj *f_val; // VM 2.0 Phase 4g: was a plain FILE*
         ArrayObj *array_val; // VM 2.0 Phase 4e/4f: was a plain struct ValueStruct*
         MStream *mstream;
-        struct {
-            char *enum_name; // Name of the enumerated type
-            int ordinal;     // Ordinal value
-        } enum_val;
-        struct ValueStruct *ptr_val; // Pointer to another Value (for heap data)
+        EnumObj *enum_val; // VM 2.0 Phase 4g: was an embedded struct, now a heap pointer
+        PointerObj *ptr_val; // VM 2.0 Phase 4g: was a plain struct ValueStruct*
         struct {
             uint32_t entry_offset;
             struct Symbol_s *symbol;
@@ -294,10 +382,22 @@ typedef struct ValueStruct {
 // unchanged, given the wrapper already exists (see pscalArrayEnsureObj for
 // the sites where it doesn't yet).
 #define AS_ARRAY(v)      (PSCAL_VALUE_FIELD(v, array_val)->elements)
-#define AS_FILE(v)       PSCAL_VALUE_FIELD(v, f_val)
+// VM 2.0 Phase 4g: f_val is now a FileObj* (was a plain FILE*); AS_FILE
+// dereferences it so existing `AS_FILE(v)` reads/writes (a FILE*) keep
+// working unchanged, given the wrapper already exists (see
+// pscalFileEnsureObj for the one site where it doesn't yet).
+#define AS_FILE(v)       (PSCAL_VALUE_FIELD(v, f_val)->f)
 #define AS_MSTREAM(v)    PSCAL_VALUE_FIELD(v, mstream)
-#define AS_POINTER(v)    PSCAL_VALUE_FIELD(v, ptr_val)
-#define AS_ENUM(v)       PSCAL_VALUE_FIELD(v, enum_val)
+// VM 2.0 Phase 4g: ptr_val is now a PointerObj* (was a plain struct
+// ValueStruct*); AS_POINTER dereferences it so existing `AS_POINTER(v)`
+// reads/writes (an address) keep working unchanged, given the wrapper
+// already exists (see pscalPointerEnsureObj for chicken-egg sites).
+#define AS_POINTER(v)    (PSCAL_VALUE_FIELD(v, ptr_val)->address)
+// VM 2.0 Phase 4g: enum_val is now an EnumObj* (was an embedded struct);
+// AS_ENUM dereferences it so existing `AS_ENUM(v).enum_name`/`.ordinal`
+// call sites keep working with `.` unchanged (EnumObj's field names match
+// the old embedded struct's on purpose, same trick as AS_SET/SetObj).
+#define AS_ENUM(v)       (*PSCAL_VALUE_FIELD(v, enum_val))
 #define AS_CLOSURE(v)    PSCAL_VALUE_FIELD(v, closure)
 #define AS_INTERFACE(v)  PSCAL_VALUE_FIELD(v, interface)
 // VM 2.0 Phase 4c: set_val is now a SetObj* (was an embedded struct); AS_SET
@@ -322,16 +422,12 @@ typedef struct ValueStruct {
 #define ARRAY_ELEMENT_TYPE_DEF(v)  (PSCAL_VALUE_FIELD(v, array_val)->element_type_def)
 #define ARRAY_IS_PACKED(v)         (PSCAL_VALUE_FIELD(v, array_val)->is_packed)
 #define ARRAY_IS_DYNAMIC(v)        (PSCAL_VALUE_FIELD(v, array_val)->is_dynamic)
-// VM 2.0 Phase 4e/4f: `element_type`/`element_type_def` are dual-purpose
-// pre-4e/4f Value-level fields -- TYPE_FILE legitimately still uses them
-// directly (a typed file's element type, e.g. `file of integer`) and was
-// NEVER migrated into ArrayObj, since only TYPE_ARRAY moved this sub-phase.
-// Now that ARRAY_ELEMENT_TYPE(v)/ARRAY_ELEMENT_TYPE_DEF(v) dereference
-// v.array_val (a TYPE_ARRAY-only union member), calling them on a TYPE_FILE
-// Value reinterprets its f_val (FILE*) as an ArrayObj* -- undefined
-// behavior. Use these instead for TYPE_FILE values.
-#define FILE_ELEMENT_TYPE(v)      PSCAL_VALUE_FIELD(v, element_type)
-#define FILE_ELEMENT_TYPE_DEF(v)  PSCAL_VALUE_FIELD(v, element_type_def)
+// VM 2.0 Phase 4g: element_type/element_type_def moved inside FileObj
+// (folded in during file boxing, closing the loose end 4e/4f's postmortem
+// flagged -- see FileObj's comment). Requires v.f_val to already be a
+// valid FileObj*.
+#define FILE_ELEMENT_TYPE(v)      (PSCAL_VALUE_FIELD(v, f_val)->element_type)
+#define FILE_ELEMENT_TYPE_DEF(v)  (PSCAL_VALUE_FIELD(v, f_val)->element_type_def)
 // ARRAY_REFCOUNT is intentionally removed (VM 2.0 Phase 4e/4f): the old
 // uint32_t* scheme is gone. Every former call site now uses
 // pscalObjRetain/pscalObjRelease on &v.array_val->header instead, inside
@@ -344,11 +440,25 @@ typedef struct ValueStruct {
 // Requires v.s_val to already be a valid StringObj*; see AS_STRING's
 // comment (core/utils.h) and pscalStringEnsureObj for why/when that holds.
 #define STRING_MAX_LENGTH(v)       (PSCAL_VALUE_FIELD(v, s_val)->max_length)
+// VM 2.0 Phase 4g: base_type_node deliberately stays a plain, unboxed
+// top-level Value field -- see PointerObj's comment (core/types.h) for
+// why (it's genuinely type-agnostic: used by TYPE_ENUM/TYPE_RECORD too,
+// not just TYPE_POINTER, so boxing it into a TYPE_POINTER-only union
+// member would have been unsafe). Unchanged from pre-4g.
 #define PTR_BASE_TYPE_NODE(v)      PSCAL_VALUE_FIELD(v, base_type_node)
-#define FILE_FILENAME(v)           PSCAL_VALUE_FIELD(v, filename)
-#define FILE_RECORD_SIZE(v)        PSCAL_VALUE_FIELD(v, record_size)
-#define FILE_RECORD_SIZE_EXPLICIT(v) PSCAL_VALUE_FIELD(v, record_size_explicit)
-#define ENUM_META(v)               PSCAL_VALUE_FIELD(v, enum_meta)
+// VM 2.0 Phase 4g: filename/record_size/record_size_explicit moved inside
+// FileObj; the old top-level Value fields are dead weight until Phase
+// 4i's struct shrink deletes them. Requires v.f_val to already be a valid
+// FileObj*.
+#define FILE_FILENAME(v)           (PSCAL_VALUE_FIELD(v, f_val)->filename)
+#define FILE_RECORD_SIZE(v)        (PSCAL_VALUE_FIELD(v, f_val)->record_size)
+#define FILE_RECORD_SIZE_EXPLICIT(v) (PSCAL_VALUE_FIELD(v, f_val)->record_size_explicit)
+// VM 2.0 Phase 4g: enum_meta moved inside EnumObj; the old top-level
+// Value.enum_meta field is dead weight until Phase 4i's struct shrink
+// deletes it -- nothing should read it directly anymore. Requires
+// v.enum_val to already be a valid EnumObj* (always true once a Value is
+// TYPE_ENUM, matching StringObj/SetObj/RecordObj precedent).
+#define ENUM_META(v)               (PSCAL_VALUE_FIELD(v, enum_val)->enum_meta)
 
 typedef struct FieldValue {
     char *name;

@@ -3161,6 +3161,7 @@ Value vmBuiltinFopen(VM* vm, int arg_count, Value* args) {
     }
     Value v = makeVoid();
     SET_VALUE_TYPE(&v, TYPE_FILE);
+    pscalFileEnsureObj(&v);
     AS_FILE(v) = f;
     FILE_FILENAME(v) = strdup(path);
     return v;
@@ -7165,8 +7166,9 @@ Value vmBuiltinNew(VM* vm, int arg_count, Value* args) {
     // (debug logging removed)
 
     // Update the pointer variable that was passed by reference
-    AS_POINTER(*pointerVarValuePtr) = allocated_memory;
     SET_VALUE_TYPE(pointerVarValuePtr, TYPE_POINTER);
+    pscalPointerEnsureObj(pointerVarValuePtr);
+    AS_POINTER(*pointerVarValuePtr) = allocated_memory;
 
     // Safety: if base type metadata is unknown, treat as integer for subsequent dereferences
     if (!PTR_BASE_TYPE_NODE(*pointerVarValuePtr)) {
@@ -7199,6 +7201,7 @@ Value vmBuiltinNewObj(VM* vm, int arg_count, Value* args) {
     *allocated = makeValueForType(vt, typeDef, NULL);
     Value ret = makeVoid();
     SET_VALUE_TYPE(&ret, TYPE_POINTER);
+    pscalPointerEnsureObj(&ret);
     AS_POINTER(ret) = allocated;
     PTR_BASE_TYPE_NODE(ret) = typeDef;
     return ret;
@@ -8109,7 +8112,7 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
     if (!io_error && ferror(input_stream)) io_error = 1;
     else if (io_error != 1) io_error = 0;
 
-    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); AS_FILE(args[0]) = NULL; }
+    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); args[0].f_val = NULL; }
 
     if (input_stream == stdin) {
         vmEnableRawMode();
@@ -8165,7 +8168,7 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
                     vm ? (int)vm->suspend_unwind_requested : -1);
         }
         // ***NEW***: prevent VM cleanup from closing the stream we used
-        if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); AS_FILE(args[0]) = NULL; }  // ***NEW***
+        if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); args[0].f_val = NULL; }  // ***NEW***
         if (input_stream == stdin) vmEnableRawMode();
         vmCommitLastIoError(io_error);
         return makeVoid();
@@ -8291,7 +8294,7 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
     else if (io_error != 1) io_error = 0;
 
     // ***NEW***: neuter FILE-by-value arg so VM cleanup won’t fclose()
-    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); AS_FILE(args[0]) = NULL; }  // ***NEW***
+    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); args[0].f_val = NULL; }  // ***NEW***
 
     if (input_stream == stdin) {
         vmEnableRawMode();
@@ -8513,7 +8516,7 @@ Value vmBuiltinWrite(VM* vm, int arg_count, Value* args) {
     if (output_stream != stdout) {
         fflush(output_stream);
     }
-    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[1], TYPE_NIL); AS_FILE(args[1]) = NULL; }
+    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[1], TYPE_NIL); args[1].f_val = NULL; }
 
     return makeVoid();
 }

@@ -163,7 +163,7 @@ static inline bool tryValueToOrdinal(const Value* v, long long* out) {
             *out = v->c_val;
             return true;
         case TYPE_ENUM:
-            *out = v->enum_val.ordinal;
+            *out = v->enum_val ? v->enum_val->ordinal : 0;
             return true;
         default:
             return false;
@@ -264,6 +264,32 @@ RecordObj *pscalRecordObjCreate(FieldValue *fields);
 // makeArrayND/makeEmptyArray.
 ArrayObj *pscalArrayObjCreate(void);
 void pscalArrayEnsureObj(Value *v);
+
+// VM 2.0 Phase 4g. Returns a fresh EnumObj (refcount=1, enum_meta/
+// enum_name NULL, ordinal 0); callers set fields afterward, same pattern
+// as pscalArrayObjCreate. pscalEnumEnsureObj lazily allocates one via this
+// if v->enum_val is NULL.
+EnumObj *pscalEnumObjCreate(void);
+void pscalEnumEnsureObj(Value *v);
+
+// VM 2.0 Phase 4g. Returns a fresh FileObj (refcount=1, every field
+// zeroed/NULL); callers set f/filename/record_size/etc afterward, same
+// pattern as pscalArrayObjCreate. pscalFileEnsureObj lazily allocates one
+// via this if v->f_val is NULL -- needed at vmBuiltinFopen (builtin.c),
+// which flips a TYPE_VOID Value to TYPE_FILE and writes through
+// AS_FILE/FILE_FILENAME without going through makeFile()/
+// makeValueForType() first.
+FileObj *pscalFileObjCreate(void);
+void pscalFileEnsureObj(Value *v);
+
+// VM 2.0 Phase 4g. Returns a fresh PointerObj (refcount=1, address/
+// base_type_node NULL); callers set fields afterward, same pattern as
+// pscalArrayObjCreate. Unlike FileObj's ensure-helper, copies of a
+// TYPE_POINTER Value must always call this to allocate an INDEPENDENT
+// PointerObj (never pscalObjRetain an existing one) -- see PointerObj's
+// comment in core/types.h for why.
+PointerObj *pscalPointerObjCreate(void);
+void pscalPointerEnsureObj(Value *v);
 
 MStream *createMStream(void);
 void retainMStream(MStream* ms);
