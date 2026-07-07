@@ -1731,6 +1731,11 @@ Value makeChar(int c) {
 Value makeWideChar(int c) {
     Value v = makeChar(c);
     v.type = TYPE_WIDECHAR;
+    // makeChar's SET_INT_VALUE call above tagged .bits with CHAR kind
+    // (the only type it knew about at the time) -- re-tag now that the
+    // type has changed, or pscalValueBitsConsistent would flag a stale
+    // CHAR-kind tag on a WIDECHAR value.
+    v.bits = pscalTagWideChar((uint32_t)c);
     return v;
 }
 
@@ -1738,7 +1743,7 @@ Value makeBoolean(int b) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_BOOLEAN;
-    v.i_val = b ? 1 : 0; // Store as 0 or 1
+    SET_INT_VALUE(&v, b ? 1 : 0); // Store as 0 or 1
     return v;
 }
 
@@ -1900,6 +1905,7 @@ Value makeNil(void) {
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_NIL; // <<< Set type to TYPE_NIL
     v.ptr_val = NULL; // A nil pointer's value is NULL
+    v.bits = pscalTagNil();
     return v;
 }
 
@@ -1907,6 +1913,7 @@ Value makeVoid(void) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_VOID;
+    v.bits = pscalTagVoid();
     return v;
 }
 
@@ -2087,10 +2094,10 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
         }
         case TYPE_CHAR:
         case TYPE_WIDECHAR:
-            v.c_val = '\0';
+            SET_CHAR_VALUE(&v, '\0');
             v.max_length = 1;
             break;
-        case TYPE_BOOLEAN: v.i_val = 0; break;
+        case TYPE_BOOLEAN: SET_INT_VALUE(&v, 0); break;
         case TYPE_FILE: {
             v.f_val = pscalFileObjCreate();
             v.f_val->f = NULL;
@@ -2277,6 +2284,7 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
         case TYPE_NIL:
             return makeNil();
         case TYPE_VOID:
+            v.bits = pscalTagVoid();
             break;
         default:
             fprintf(stderr, "Warning: makeValueForType called with unhandled type %d (%s)\n", type, varTypeToString(type));
@@ -2527,8 +2535,71 @@ void freeTypeTable(void) {
     type_table = NULL;
 }
 
+// VM 2.0 Phase 4i checkpoint 2: see utils.h for the full contract. Only
+// checks the scalar kinds checkpoint 2 actually maintains a bits mirror
+// for; every other type returns true vacuously (deferred to checkpoint
+// 3, where bits becomes the ONLY representation and this function is
+// deleted along with the fields it's comparing against).
+bool pscalValueBitsConsistent(const Value *v) {
+    if (!v) return true;
+    switch (v->type) {
+        case TYPE_VOID:
+            return pscalTaggedWordKind(v->bits) == PSCAL_TAG_VOID;
+        case TYPE_NIL:
+            return pscalTaggedWordKind(v->bits) == PSCAL_TAG_NIL;
+        case TYPE_BOOLEAN:
+            return pscalUntagBoolean(v->bits) == (v->i_val != 0);
+        case TYPE_CHAR:
+            return pscalUntagChar(v->bits) == (char)v->c_val;
+        case TYPE_WIDECHAR:
+            return pscalUntagWideChar(v->bits) == (uint32_t)v->c_val;
+        case TYPE_BYTE:
+            return pscalUntagByte(v->bits) == (uint8_t)v->i_val;
+        case TYPE_WORD:
+            return pscalUntagWord(v->bits) == (uint16_t)v->i_val;
+        case TYPE_INT8:
+            return pscalUntagInt8(v->bits) == (int8_t)v->i_val;
+        case TYPE_UINT8:
+            return pscalUntagUInt8(v->bits) == (uint8_t)v->i_val;
+        case TYPE_INT16:
+            return pscalUntagInt16(v->bits) == (int16_t)v->i_val;
+        case TYPE_UINT16:
+            return pscalUntagUInt16(v->bits) == (uint16_t)v->i_val;
+        case TYPE_INT32:
+            return pscalUntagInt32(v->bits) == (int32_t)v->i_val;
+        case TYPE_UINT32:
+            return pscalUntagUInt32(v->bits) == (uint32_t)v->u_val;
+        case TYPE_THREAD:
+            return pscalUntagInt32(v->bits) == (int32_t)v->i_val;
+        case TYPE_FLOAT: {
+            float fromBits = pscalUntagFloat(v->bits);
+            float fromField = v->real.f32_val;
+            if (isnan(fromField)) return isnan(fromBits);
+            return fromBits == fromField;
+        }
+        case TYPE_DOUBLE: {
+            if (pscalWordIsNanBoxTag(v->bits)) return false; // must never collide with the reserved header
+            double fromBits = pscalUnboxDouble(v->bits);
+            double fromField = v->real.d_val;
+            if (isnan(fromField)) return isnan(fromBits);
+            return fromBits == fromField;
+        }
+        default:
+            return true; // deferred to checkpoint 3: heap-pointer types, INT64/UINT64/LONG_DOUBLE
+    }
+}
+
 void freeValue(Value *v) {
     if (!v) return;
+
+    if (!pscalValueBitsConsistent(v)) {
+        fprintf(stderr,
+                "PSCAL VM 2.0: tagged-word bits mismatch for type %s (VM 2.0 Phase 4i "
+                "checkpoint 2 verification) -- the new tagged-word encoding disagrees "
+                "with the legacy discrete fields for this Value.\n",
+                varTypeToString(v->type));
+        abort();
+    }
 
 //#ifdef DEBUG
 //    fprintf(stderr, "[DEBUG] freeValue called for Value* at %p, type=%s\n",

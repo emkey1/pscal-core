@@ -9990,6 +9990,10 @@ static Value threadSpawnOrSubmitCommon(VM* vm, int arg_count, Value* args, bool 
 
     Value thread_value = makeInt(thread_id);
     SET_VALUE_TYPE(&thread_value, TYPE_THREAD);
+    // SET_VALUE_TYPE resets .bits to a zero placeholder for the new type
+    // (it can't know the real value belongs with the type change) --
+    // re-tag with the actual thread_id now that the type is correct.
+    SET_INT_VALUE(&thread_value, thread_id);
     return thread_value;
 }
 
@@ -10291,6 +10295,9 @@ Value vmBuiltinThreadLookup(VM* vm, int arg_count, Value* args) {
     }
     Value result = makeInt(thread_id);
     SET_VALUE_TYPE(&result, TYPE_THREAD);
+    // SET_VALUE_TYPE resets .bits to a zero placeholder for the new type --
+    // re-tag with the actual thread_id now that the type is correct.
+    SET_INT_VALUE(&result, thread_id);
     return result;
 }
 

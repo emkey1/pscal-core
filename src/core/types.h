@@ -356,18 +356,131 @@ typedef struct ValueStruct {
     int *upper_bounds;    // array of upper bounds for each dimension
     AST *element_type_def; // AST node defining the element type
     SetObj *set_val; // VM 2.0 Phase 4c: was an embedded struct, now a heap pointer
+
+    // VM 2.0 Phase 4i checkpoint 2 (Docs/pscal_vm2_plan.md sec 5.10.1/
+    // 5.10.4): the tagged-word encoding from core/obj_header.h, now kept
+    // as a live MIRROR of the discrete fields above for every inline-
+    // scalar kind that needs no heap allocation to tag (VOID/NIL/
+    // BOOLEAN/CHAR/WIDECHAR/BYTE/WORD/INT8-32/UINT8-32/FLOAT/DOUBLE).
+    // `Value` stays deliberately oversized during this checkpoint --
+    // both representations coexist and are cross-checked (see
+    // pscalValueBitsConsistent in core/utils.c, called from freeValue)
+    // so a bug in the NEW encoding surfaces as an assertion failure
+    // during testing, not silent corruption or a crash the way it would
+    // if this landed at the same time as the physical struct collapse.
+    // TYPE_INT64/TYPE_UINT64/TYPE_LONG_DOUBLE (which need Int64Box/
+    // LongDoubleBox, built in 4h but not yet wired in) and every heap-
+    // pointer type (STRING/ARRAY/RECORD/FILE/ENUM/POINTER/SET/CLOSURE/
+    // INTERFACE/MEMORYSTREAM) are deferred to checkpoint 3, which
+    // combines "everything moves into bits" with the physical shrink --
+    // for those types `bits` is not yet meaningful and
+    // pscalValueBitsConsistent skips them.
+    uint64_t bits;
 } Value;
 
-/* Helpers to initialise numeric fields consistently. */
+// VM 2.0 Phase 4i checkpoint 2: dispatches on `dest->type` (already set by
+// every call site below -- every scalar constructor sets `.type` before
+// calling SET_INT_VALUE/SET_REAL_VALUE/SET_CHAR_VALUE, and SET_VALUE_TYPE
+// itself sets `.type` first thing) to compute the matching tagged word.
+// Heap-pointer types and TYPE_INT64/TYPE_UINT64/TYPE_LONG_DOUBLE are
+// deferred to checkpoint 3 (see Value's own comment) -- `default: break`
+// leaves `bits` whatever SET_VALUE_TYPE last put there for those types,
+// which pscalValueBitsConsistent knows to skip.
+static inline void pscalValueSetIntBits(Value *dest, long long val) {
+    switch (dest->type) {
+        case TYPE_BOOLEAN:  dest->bits = pscalTagBoolean(val != 0); break;
+        case TYPE_CHAR:     dest->bits = pscalTagChar((char)val); break;
+        case TYPE_WIDECHAR: dest->bits = pscalTagWideChar((uint32_t)val); break;
+        case TYPE_BYTE:     dest->bits = pscalTagByte((uint8_t)val); break;
+        case TYPE_WORD:     dest->bits = pscalTagWord((uint16_t)val); break;
+        case TYPE_INT8:     dest->bits = pscalTagInt8((int8_t)val); break;
+        case TYPE_UINT8:    dest->bits = pscalTagUInt8((uint8_t)val); break;
+        case TYPE_INT16:    dest->bits = pscalTagInt16((int16_t)val); break;
+        case TYPE_UINT16:   dest->bits = pscalTagUInt16((uint16_t)val); break;
+        case TYPE_INT32:    dest->bits = pscalTagInt32((int32_t)val); break;
+        case TYPE_UINT32:   dest->bits = pscalTagUInt32((uint32_t)val); break;
+        case TYPE_THREAD:   dest->bits = pscalTagInt32((int32_t)val); break;
+        default: break; // TYPE_INT64/TYPE_UINT64: deferred to checkpoint 3
+    }
+}
+
+static inline void pscalValueSetRealBits(Value *dest, long double val) {
+    switch (dest->type) {
+        case TYPE_FLOAT:  dest->bits = pscalTagFloat((float)val); break;
+        case TYPE_DOUBLE: dest->bits = pscalBoxDouble((double)val); break;
+        default: break; // TYPE_LONG_DOUBLE: deferred to checkpoint 3 (needs LongDoubleBox)
+    }
+}
+
+static inline void pscalValueSetCharBits(Value *dest, int val) {
+    if (dest->type == TYPE_WIDECHAR) {
+        dest->bits = pscalTagWideChar((uint32_t)val);
+    } else {
+        dest->bits = pscalTagChar((char)val);
+    }
+}
+
+// Resets `bits` to a zero-valued placeholder matching `t` -- called
+// whenever a Value's type changes, so `bits` never silently carries a
+// stale kind tag left over from whatever type the Value used to be
+// (confirmed necessary, not theoretical: makeWideChar builds on makeChar
+// and then overwrites .type, which would otherwise leave a CHAR-kind tag
+// on a WIDECHAR value). Deferred (non-scalar) types get bits=0, a
+// harmless placeholder pscalValueBitsConsistent knows to skip.
+static inline void pscalValueResetBitsForType(Value *dest, VarType t) {
+    switch (t) {
+        case TYPE_VOID:     dest->bits = pscalTagVoid(); break;
+        case TYPE_NIL:      dest->bits = pscalTagNil(); break;
+        case TYPE_BOOLEAN:  dest->bits = pscalTagBoolean(false); break;
+        case TYPE_CHAR:     dest->bits = pscalTagChar(0); break;
+        case TYPE_WIDECHAR: dest->bits = pscalTagWideChar(0); break;
+        case TYPE_BYTE:     dest->bits = pscalTagByte(0); break;
+        case TYPE_WORD:     dest->bits = pscalTagWord(0); break;
+        case TYPE_INT8:     dest->bits = pscalTagInt8(0); break;
+        case TYPE_UINT8:    dest->bits = pscalTagUInt8(0); break;
+        case TYPE_INT16:    dest->bits = pscalTagInt16(0); break;
+        case TYPE_UINT16:   dest->bits = pscalTagUInt16(0); break;
+        case TYPE_INT32:    dest->bits = pscalTagInt32(0); break;
+        case TYPE_UINT32:   dest->bits = pscalTagUInt32(0); break;
+        case TYPE_FLOAT:    dest->bits = pscalTagFloat(0.0f); break;
+        case TYPE_DOUBLE:   dest->bits = pscalBoxDouble(0.0); break;
+        case TYPE_THREAD:   dest->bits = pscalTagInt32(0); break;
+        default:            dest->bits = 0; break; // deferred types (checkpoint 3)
+    }
+}
+
+/* Helpers to initialise numeric fields consistently.
+ *
+ * Each macro captures `val` into a block-scoped local exactly ONCE before
+ * using it more than once in the expansion (i_val+u_val+bits for
+ * SET_INT_VALUE; c_val+bits for SET_CHAR_VALUE). This is not just style --
+ * `val` is substituted literally at every occurrence in a macro expansion,
+ * so a caller passing a SELF-REFERENTIAL expression that reads back
+ * through `dest` (e.g. `SET_INT_VALUE(&v, -VAL_INT(v))`) would otherwise
+ * re-evaluate against an already-mutated field partway through the
+ * expansion (the first substitution's write already changed `dest`,
+ * so the second/third substitution's read sees the NEW value, not the
+ * original) -- confirmed as a real, live bug (VM 2.0 Phase 4i checkpoint
+ * 2's bits-consistency verification caught it: a compile-time unary-minus
+ * evaluator's `SET_INT_VALUE(&v, -VAL_INT(v))`-shaped call silently
+ * corrupted u_val/bits because i_val had already flipped sign by the time
+ * the later substitutions ran). SET_REAL_VALUE already derives d_val/
+ * f32_val/bits from the just-written r_val field rather than re-reading
+ * `val`, so it doesn't need this treatment. */
 #define SET_INT_VALUE(dest, val) \
-    do { (dest)->i_val = (long long)(val); (dest)->u_val = (unsigned long long)(val); } while(0)
+    do { long long _pscal_set_int_tmp = (long long)(val); \
+         (dest)->i_val = _pscal_set_int_tmp; (dest)->u_val = (unsigned long long)_pscal_set_int_tmp; \
+         pscalValueSetIntBits((dest), _pscal_set_int_tmp); } while(0)
 #define SET_REAL_VALUE(dest, val) \
     do { (dest)->real.r_val = (long double)(val); (dest)->real.d_val = (double)(dest)->real.r_val; \
-         (dest)->real.f32_val = (float)(dest)->real.r_val; } while(0)
+         (dest)->real.f32_val = (float)(dest)->real.r_val; \
+         pscalValueSetRealBits((dest), (dest)->real.r_val); } while(0)
 #define SET_CHAR_VALUE(dest, val) \
-    do { PSCAL_VALUE_FIELD(*(dest), c_val) = (val); } while(0)
+    do { int _pscal_set_char_tmp = (val); \
+         PSCAL_VALUE_FIELD(*(dest), c_val) = _pscal_set_char_tmp; \
+         pscalValueSetCharBits((dest), _pscal_set_char_tmp); } while(0)
 #define SET_VALUE_TYPE(dest, t) \
-    do { PSCAL_VALUE_FIELD(*(dest), type) = (t); } while(0)
+    do { PSCAL_VALUE_FIELD(*(dest), type) = (t); pscalValueResetBitsForType((dest), (t)); } while(0)
 
 /*
  * Value tag and payload accessors (VM 2.0 Phase 0 accessor sweep; see

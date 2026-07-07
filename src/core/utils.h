@@ -366,6 +366,18 @@ void toLowerString(char *str);
 void debugASTFile(AST *node);
 Value makeEnum(const char *enum_name, int ordinal);
 void freeValue(Value *v);
+
+// VM 2.0 Phase 4i checkpoint 2. Returns true if `v->bits` (the tagged-
+// word mirror) decodes to the same value the discrete legacy fields
+// hold, for every scalar kind checkpoint 2 covers (VOID/NIL/BOOLEAN/
+// CHAR/WIDECHAR/BYTE/WORD/INT8-32/UINT8-32/FLOAT/DOUBLE). Returns true
+// (vacuously) for every type deferred to checkpoint 3 (heap-pointer
+// types, TYPE_INT64/TYPE_UINT64/TYPE_LONG_DOUBLE) -- there is nothing to
+// cross-check yet for those. Called unconditionally from freeValue
+// (not gated behind DEBUG) so the full test suite actually exercises
+// it; remove once checkpoint 3 makes bits the sole representation and
+// there is nothing left to compare it against.
+bool pscalValueBitsConsistent(const Value *v);
 void printValueToStream(Value v, FILE *stream);
 size_t encodeUtf8Codepoint(uint32_t codepoint, char out[5]);
 size_t encodePascalCharUtf8(int value, char out[5]);

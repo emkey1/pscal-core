@@ -5371,7 +5371,17 @@ Value evaluateCompileTimeValue(AST* node) {
                         // whole integer family here, not just TYPE_INTEGER — otherwise
                         // `-5` in a compile-time context (e.g. an array literal element)
                         // falls through to makeVoid().
-                        VAL_INT(operand_val) = -VAL_INT(operand_val);
+                        //
+                        // The negated value MUST be captured into a plain local
+                        // before calling SET_INT_VALUE: that macro's body refers to
+                        // its `val` argument multiple times (i_val, u_val, and the
+                        // VM 2.0 Phase 4i tagged-word bits dispatch), so passing a
+                        // self-referential expression that reads *dest directly
+                        // (VAL_INT(operand_val) where operand_val IS *dest) would
+                        // re-evaluate against an already-mutated field partway
+                        // through the macro, silently corrupting u_val/bits.
+                        long long negated = -VAL_INT(operand_val);
+                        SET_INT_VALUE(&operand_val, negated);
                         return operand_val; // Return the modified value
                     } else if (isRealType(operand_val.type)) {
                         double tmp = -(double)AS_REAL(operand_val);

@@ -1770,16 +1770,15 @@ static bool readValue(Cursor* in, Value* out) {
         case TYPE_INT8:
         case TYPE_INT16:
         case TYPE_INT64:
-            out->i_val = (long long)curU64LE(in);
-            out->u_val = (unsigned long long)out->i_val;
+            SET_INT_VALUE(out, (long long)curU64LE(in));
             break;
         case TYPE_UINT8:
         case TYPE_UINT16:
         case TYPE_UINT32:
         case TYPE_UINT64: {
             unsigned long long tmp = curU64LE(in);
-            out->u_val = tmp;
-            out->i_val = (long long)tmp;
+            SET_INT_VALUE(out, (long long)tmp);
+            out->u_val = tmp; // preserve the full unsigned range SET_INT_VALUE's (long long) cast can't
             break;
         }
         case TYPE_FLOAT: {
@@ -1812,6 +1811,7 @@ static bool readValue(Cursor* in, Value* out) {
             break;
         }
         case TYPE_NIL:
+            out->bits = pscalTagNil();
             break;
         case TYPE_ENUM: {
             pscalEnumEnsureObj(out);
