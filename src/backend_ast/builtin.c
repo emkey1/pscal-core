@@ -2576,7 +2576,7 @@ Value vmBuiltinSucc(VM* vm, int arg_count, Value* args) {
             }
             Value result = makeEnum(AS_ENUM(arg).enum_name, ordinal + 1);
             ENUM_META(result) = ENUM_META(arg);
-            PTR_BASE_TYPE_NODE(result) = PTR_BASE_TYPE_NODE(arg);
+            ENUM_TYPE_DEF(result) = ENUM_TYPE_DEF(arg);
             return result;
         }
         default:

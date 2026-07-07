@@ -11266,7 +11266,7 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                             tv == TYPE_CHAR  || tv == TYPE_BOOLEAN || tv == TYPE_BYTE || tv == TYPE_WORD) {
                             Value av;
                             memset(&av, 0, sizeof(Value));
-                            av.type = tv;
+                            SET_VALUE_TYPE(&av, tv);
                             int cidx = addConstantToChunk(chunk, &av);
                             emitConstant(chunk, cidx, line);
                             emittedValue = true;
@@ -11278,7 +11278,7 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                         if (basic != TYPE_UNKNOWN) {
                             Value av;
                             memset(&av, 0, sizeof(Value));
-                            av.type = basic;
+                            SET_VALUE_TYPE(&av, basic);
                             int cidx = addConstantToChunk(chunk, &av);
                             emitConstant(chunk, cidx, line);
                             emittedValue = true;

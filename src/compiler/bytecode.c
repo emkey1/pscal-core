@@ -249,9 +249,9 @@ int addConstantToChunk(BytecodeChunk* chunk, const Value* value) {
     // First, check if an identical constant already exists to avoid duplicates.
     for (int i = 0; i < chunk->constants_count; i++) {
         Value* existing = &chunk->constants[i];
-        if (existing->type == value->type) {
+        if (VALUE_TYPE(*existing) == VALUE_TYPE(*value)) {
             if (VALUE_TYPE(*existing) == TYPE_INTEGER && VAL_INT(*existing) == VAL_INT(*value)) return i;
-            if (isRealType(existing->type) && AS_REAL(*existing) == AS_REAL(*value)) return i;
+            if (isRealType(VALUE_TYPE(*existing)) && AS_REAL(*existing) == AS_REAL(*value)) return i;
             if (VALUE_TYPE(*existing) == TYPE_STRING && AS_STRING(*existing) && AS_STRING(*value) && strcmp(AS_STRING(*existing), AS_STRING(*value)) == 0) return i;
             if (VALUE_TYPE(*existing) == TYPE_CHAR && AS_CHAR(*existing) == AS_CHAR(*value)) return i;
         }

@@ -295,8 +295,8 @@ PscalFxReplayOutcome pscalFxReplayCall(struct VM_s *vm, const char *name, int ar
 
     Value journaled_name = { 0 };
     Value journaled_count = { 0 };
-    if (!pscalCacheReadValueFramed(f, &journaled_name) || journaled_name.type != TYPE_STRING ||
-        !pscalCacheReadValueFramed(f, &journaled_count) || journaled_count.type != TYPE_INTEGER) {
+    if (!pscalCacheReadValueFramed(f, &journaled_name) || VALUE_TYPE(journaled_name) != TYPE_STRING ||
+        !pscalCacheReadValueFramed(f, &journaled_count) || VALUE_TYPE(journaled_count) != TYPE_INTEGER) {
         if (mismatch_msg && mismatch_msg_size) {
             snprintf(mismatch_msg, mismatch_msg_size,
                      "journal exhausted or corrupt while expecting call to '%s'", name);
@@ -307,13 +307,13 @@ PscalFxReplayOutcome pscalFxReplayCall(struct VM_s *vm, const char *name, int ar
     }
 
     bool name_ok = AS_STRING(journaled_name) && strcasecmp(AS_STRING(journaled_name), name) == 0;
-    bool count_ok = (int)journaled_count.i_val == arg_count;
+    bool count_ok = (int)VAL_INT(journaled_count) == arg_count;
     if (!name_ok || !count_ok) {
         if (mismatch_msg && mismatch_msg_size) {
             snprintf(mismatch_msg, mismatch_msg_size,
                      "journal expected call to '%s' (%d args), program called '%s' (%d args)",
                      AS_STRING(journaled_name) ? AS_STRING(journaled_name) : "?",
-                     (int)journaled_count.i_val, name, arg_count);
+                     (int)VAL_INT(journaled_count), name, arg_count);
         }
         freeValue(&journaled_name);
         freeValue(&journaled_count);
@@ -323,32 +323,32 @@ PscalFxReplayOutcome pscalFxReplayCall(struct VM_s *vm, const char *name, int ar
     freeValue(&journaled_count);
 
     Value substitutable_val = { 0 };
-    if (!pscalCacheReadValueFramed(f, &substitutable_val) || substitutable_val.type != TYPE_BOOLEAN) {
+    if (!pscalCacheReadValueFramed(f, &substitutable_val) || VALUE_TYPE(substitutable_val) != TYPE_BOOLEAN) {
         if (mismatch_msg && mismatch_msg_size) {
             snprintf(mismatch_msg, mismatch_msg_size, "journal truncated reading substitutable flag for '%s'", name);
         }
         freeValue(&substitutable_val);
         return PSCAL_FX_REPLAY_MISMATCH;
     }
-    bool substitutable = substitutable_val.i_val != 0;
+    bool substitutable = VAL_INT(substitutable_val) != 0;
     freeValue(&substitutable_val);
     if (!substitutable) {
         return PSCAL_FX_REPLAY_RUN_LIVE;
     }
 
     Value present_val = { 0 };
-    if (!pscalCacheReadValueFramed(f, &present_val) || present_val.type != TYPE_BOOLEAN) {
+    if (!pscalCacheReadValueFramed(f, &present_val) || VALUE_TYPE(present_val) != TYPE_BOOLEAN) {
         if (mismatch_msg && mismatch_msg_size) {
             snprintf(mismatch_msg, mismatch_msg_size, "journal truncated reading result presence for '%s'", name);
         }
         freeValue(&present_val);
         return PSCAL_FX_REPLAY_MISMATCH;
     }
-    bool has_result = present_val.i_val != 0;
+    bool has_result = VAL_INT(present_val) != 0;
     freeValue(&present_val);
 
     Value result = { 0 };
-    result.type = TYPE_NIL;
+    SET_VALUE_TYPE(&result, TYPE_NIL);
     if (has_result && !pscalCacheReadValueFramed(f, &result)) {
         if (mismatch_msg && mismatch_msg_size) {
             snprintf(mismatch_msg, mismatch_msg_size, "journal truncated reading result value for '%s'", name);
@@ -357,21 +357,21 @@ PscalFxReplayOutcome pscalFxReplayCall(struct VM_s *vm, const char *name, int ar
     }
 
     Value wb_count_val = { 0 };
-    if (!pscalCacheReadValueFramed(f, &wb_count_val) || wb_count_val.type != TYPE_INTEGER) {
+    if (!pscalCacheReadValueFramed(f, &wb_count_val) || VALUE_TYPE(wb_count_val) != TYPE_INTEGER) {
         if (mismatch_msg && mismatch_msg_size) {
             snprintf(mismatch_msg, mismatch_msg_size, "journal truncated reading writeback count for '%s'", name);
         }
         freeValue(&result);
         return PSCAL_FX_REPLAY_MISMATCH;
     }
-    int writeback_count = (int)wb_count_val.i_val;
+    int writeback_count = (int)VAL_INT(wb_count_val);
     freeValue(&wb_count_val);
 
     for (int w = 0; w < writeback_count; ++w) {
         Value idx_val = { 0 };
         Value kind_val = { 0 };
-        if (!pscalCacheReadValueFramed(f, &idx_val) || idx_val.type != TYPE_INTEGER ||
-            !pscalCacheReadValueFramed(f, &kind_val) || kind_val.type != TYPE_INTEGER) {
+        if (!pscalCacheReadValueFramed(f, &idx_val) || VALUE_TYPE(idx_val) != TYPE_INTEGER ||
+            !pscalCacheReadValueFramed(f, &kind_val) || VALUE_TYPE(kind_val) != TYPE_INTEGER) {
             if (mismatch_msg && mismatch_msg_size) {
                 snprintf(mismatch_msg, mismatch_msg_size, "journal truncated reading writeback %d header for '%s'", w, name);
             }
@@ -380,8 +380,8 @@ PscalFxReplayOutcome pscalFxReplayCall(struct VM_s *vm, const char *name, int ar
             freeValue(&result);
             return PSCAL_FX_REPLAY_MISMATCH;
         }
-        int idx = (int)idx_val.i_val;
-        int kind = (int)kind_val.i_val;
+        int idx = (int)VAL_INT(idx_val);
+        int kind = (int)VAL_INT(kind_val);
         freeValue(&idx_val);
         freeValue(&kind_val);
 

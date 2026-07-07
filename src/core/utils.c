@@ -1900,7 +1900,6 @@ Value makeNil(void) {
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_NIL; // <<< Set type to TYPE_NIL
     v.ptr_val = NULL; // A nil pointer's value is NULL
-    v.base_type_node = NULL; // A nil pointer doesn't point to a specific base type definition node
     return v;
 }
 
@@ -1915,7 +1914,6 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = type;
-    v.base_type_node = NULL; // Initialize
 
     // --- MODIFICATION: Use context_symbol to find type definition if not passed directly ---
     AST* node_to_inspect = type_def_param;
@@ -1940,16 +1938,25 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
         }
     }
 
-    // If the resolved type definition is an enum, ensure the value type reflects that
-    // and remember the enum's definition node for later metadata access.
+    // If the resolved type definition is an enum, ensure the value type reflects that.
+    // The enum's own definition node is stamped onto v.enum_val->enum_type_def
+    // down in the switch's TYPE_ENUM case (using this same actual_type_def),
+    // once the wrapper exists -- setting it here would be a chicken-and-egg
+    // write into a wrapper that isn't allocated yet.
     if (actual_type_def && actual_type_def->type == AST_ENUM_TYPE) {
         if (type != TYPE_ENUM) {
             type = TYPE_ENUM;
             v.type = TYPE_ENUM;
         }
-        v.base_type_node = actual_type_def;
     }
 
+    // VM 2.0 Phase 4i: base_type_node now lives inside PointerObj, which
+    // doesn't exist until the switch below creates it (case TYPE_POINTER).
+    // Compute the resolved node into this local first (avoiding the same
+    // chicken-and-egg problem the TYPE_STRING case below solves with its
+    // own locals), then stamp it onto v.ptr_val->base_type_node once the
+    // wrapper is allocated.
+    AST* resolved_pointer_base_type_node = NULL;
     if (type == TYPE_POINTER) {
         #ifdef DEBUG
         fprintf(stderr, "[DEBUG makeValueForType] Setting base type for POINTER. Processing structure starting at %p (Type: %s)\n",
@@ -1969,22 +1976,22 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
         }
 
         if (pointer_type_node && pointer_type_node->type == AST_POINTER_TYPE) {
-            v.base_type_node = pointer_type_node->right;
+            resolved_pointer_base_type_node = pointer_type_node->right;
              #ifdef DEBUG
              fprintf(stderr, "[DEBUG makeValueForType] -> Base type node set to %p (Type: %s, Token: '%s') from node %p\n",
-                     (void*)v.base_type_node,
-                     v.base_type_node ? astTypeToString(v.base_type_node->type) : "NULL",
-                     (v.base_type_node && v.base_type_node->token) ? v.base_type_node->token->value : "N/A",
+                     (void*)resolved_pointer_base_type_node,
+                     resolved_pointer_base_type_node ? astTypeToString(resolved_pointer_base_type_node->type) : "NULL",
+                     (resolved_pointer_base_type_node && resolved_pointer_base_type_node->token) ? resolved_pointer_base_type_node->token->value : "N/A",
                      (void*)pointer_type_node);
              fflush(stderr);
              #endif
         } else if (pointer_type_node && pointer_type_node->type == AST_PROC_PTR_TYPE) {
              // Procedure pointer types: treat as generic pointer with unknown base; no warning.
-             v.base_type_node = NULL;
+             resolved_pointer_base_type_node = NULL;
         } else if (pointer_type_node) {
              // If a non-pointer AST node is provided (e.g., a simple type identifier),
              // treat it as the base type directly.
-             v.base_type_node = pointer_type_node;
+             resolved_pointer_base_type_node = pointer_type_node;
         } else {
              // Unknown pointer type shape; log only in debug builds to avoid noisy stderr in tests
              #ifdef DEBUG
@@ -1993,7 +2000,7 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
                      (void*)pointer_type_node,
                      pointer_type_node ? astTypeToString(pointer_type_node->type) : "NULL");
              #endif
-             v.base_type_node = NULL;
+             resolved_pointer_base_type_node = NULL;
         }
     }
 
@@ -2248,7 +2255,7 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
                                       ? strdup(actual_type_def->token->value)
                                       : strdup("<unknown_enum>");
              if (!v.enum_val->enum_name) { /* Malloc error */ EXIT_FAILURE_HANDLER(); }
-             v.base_type_node = actual_type_def;
+             v.enum_val->enum_type_def = actual_type_def;
              break;
         case TYPE_SET:     v.set_val = pscalSetObjCreate(); break;
         case TYPE_POINTER:
@@ -2258,6 +2265,7 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
             // always present" invariant. AS_POINTER(v) dereferences
             // v.ptr_val unconditionally, same as AS_FILE/AS_ARRAY/etc.
             v.ptr_val = pscalPointerObjCreate();
+            v.ptr_val->base_type_node = resolved_pointer_base_type_node;
             break;
         case TYPE_THREAD:
             SET_INT_VALUE(&v, -1);
@@ -2297,7 +2305,7 @@ Value makePointer(void* address, AST* base_type_node) {
     v.type = TYPE_POINTER; // The type of the value is POINTER
     v.ptr_val = pscalPointerObjCreate();
     v.ptr_val->address = (Value*)address; // The actual memory address it points to
-    v.base_type_node = base_type_node; // Link to the definition of the type being pointed to (unboxed, see PointerObj's comment)
+    v.ptr_val->base_type_node = base_type_node; // Link to the definition of the type being pointed to
     return v;
 }
 
@@ -2556,32 +2564,28 @@ void freeValue(Value *v) {
             // that the pointer's address points to, in general -- that's the job of
             // dispose/FreeMem. Sentinel-tagged flavors are the deliberate exception:
             // OWNED_POINTER_SENTINEL/SERIALIZED_CHAR_PTR_SENTINEL DO own their target.
-            // This check reads v->base_type_node (the Value's own unboxed copy, per
-            // PointerObj's comment) and must live here, not in pointerObjDestroy's
-            // generic ObjHeader dispatch, since multiple Values can share one
-            // PointerObj by the time the last reference lets go, with no single
-            // "owning Value" for a generic destructor to consult.
+            // VM 2.0 Phase 4i: this check now reads v->ptr_val->base_type_node
+            // (moved inside PointerObj) and must still happen HERE, before
+            // pscalObjRelease, not in pointerObjDestroy's generic ObjHeader
+            // dispatch -- multiple Values can share one PointerObj by the
+            // time the last reference lets go, with no single "owning Value"
+            // for a generic destructor to consult.
 #ifdef DEBUG
             fprintf(stderr, "[DEBUG]   Releasing ptr_val for POINTER Value* at %p. Base type node (%p) is preserved. Pointed-to memory freed only for owning sentinels.\n",
-                    (void*)v, (void*)v->base_type_node);
+                    (void*)v, (void*)(v->ptr_val ? v->ptr_val->base_type_node : NULL));
             fflush(stderr);
 #endif
             if (v->ptr_val) {
-                if (AS_POINTER(*v) && v->base_type_node == OWNED_POINTER_SENTINEL) {
+                if (AS_POINTER(*v) && v->ptr_val->base_type_node == OWNED_POINTER_SENTINEL) {
                     Value* owned = AS_POINTER(*v);
                     freeValue(owned);
                     free(owned);
-                } else if (AS_POINTER(*v) && v->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
+                } else if (AS_POINTER(*v) && v->ptr_val->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
                     free((char*)AS_POINTER(*v));
                 }
                 pscalObjRelease(&v->ptr_val->header);
             }
             v->ptr_val = NULL;
-            if (v->base_type_node == OWNED_POINTER_SENTINEL) {
-                v->base_type_node = NULL;
-            } else if (v->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
-                v->base_type_node = NULL;
-            }
             break;
 
         case TYPE_STRING:
@@ -2935,8 +2939,9 @@ static void ensureEnumMemberExported(AST* enum_type_node, AST* value_node, const
         Symbol* resolved = resolveSymbolAlias(sym);
         if (resolved) {
             bool conflict = false;
-            if (resolved->value && resolved->value->base_type_node &&
-                resolved->value->base_type_node != enum_type_node) {
+            if (resolved->value && resolved->type == TYPE_ENUM &&
+                ENUM_TYPE_DEF(*resolved->value) &&
+                ENUM_TYPE_DEF(*resolved->value) != enum_type_node) {
                 conflict = true;
             } else if (resolved->type != TYPE_ENUM && resolved->type != TYPE_UNKNOWN) {
                 conflict = true;
@@ -2984,7 +2989,7 @@ static void ensureEnumMemberExported(AST* enum_type_node, AST* value_node, const
     sym->value->type = TYPE_ENUM;
     pscalEnumEnsureObj(sym->value);
     sym->value->enum_val->ordinal = value_node->i_val;
-    sym->value->base_type_node = enum_type_node;
+    sym->value->enum_val->enum_type_def = enum_type_node;
 
     const char* enum_name = enum_type_node->token ? enum_type_node->token->value : NULL;
     if (enum_name) {
@@ -3528,7 +3533,7 @@ void printValueToStream(Value v, FILE *stream) {
                 v.enum_val->enum_name :
                 ((v.enum_val && v.enum_val->enum_meta) ? v.enum_val->enum_meta->name : NULL);
             const char *member_name = NULL;
-            AST *enum_ast = v.base_type_node;
+            AST *enum_ast = v.enum_val ? v.enum_val->enum_type_def : NULL;
             if (!enum_ast && type_name) {
                 enum_ast = lookupType(type_name);
             }
@@ -3664,6 +3669,7 @@ Value makeCopyOfValue(const Value *src) {
                  fprintf(stderr, "Memory allocation failed in makeCopyOfValue (enum name strdup)\n");
                  EXIT_FAILURE_HANDLER();
             }
+            v.enum_val->enum_type_def = src_enum ? src_enum->enum_type_def : NULL;
             break;
         }
         case TYPE_RECORD: {
@@ -3840,8 +3846,14 @@ Value makeCopyOfValue(const Value *src) {
             // flavor owns its target the same way OWNED_POINTER_SENTINEL
             // owns its pointee.
             void *src_address = (src->ptr_val && AS_POINTER(*src)) ? (void*)AS_POINTER(*src) : NULL;
+            AST *src_base_type_node = src->ptr_val ? src->ptr_val->base_type_node : NULL;
             v.ptr_val = pscalPointerObjCreate();
-            if (src_address && src->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
+            // VM 2.0 Phase 4i: base_type_node now lives inside the fresh
+            // PointerObj above, not copied automatically by the earlier
+            // `v = *src` shallow struct copy the way the old top-level
+            // field was -- must propagate explicitly.
+            v.ptr_val->base_type_node = src_base_type_node;
+            if (src_address && src_base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
                 const char *text = (const char *)src_address;
                 size_t len = strlen(text);
                 char *dup = (char *)malloc(len + 1u);

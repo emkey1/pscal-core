@@ -1488,23 +1488,35 @@ static bool readChunkCoreInline(Cursor* in, BytecodeChunk* chunk, uint32_t versi
     return true;
 }
 
+// VM 2.0 Phase 4i fix: this pair previously read/wrote `v->ptr_val`
+// directly, which was correct pre-4g (when ptr_val WAS the raw address)
+// but has been wrong since 4g introduced the PointerObj wrapper --
+// v->ptr_val is now the wrapper itself, and the raw address/sentinel
+// payload lives at AS_POINTER(*v)/PTR_BASE_TYPE_NODE(*v). This bug was
+// latent (never caught by the full suite) because the only live caller
+// in practice is exsh's SHELL_FUNCTION_PTR_SENTINEL path (a shell
+// function literal embedded in a cached bytecode constant pool); found
+// and fixed as part of 4i's base_type_node relocation audit, which
+// required actually reading this function's body.
 static bool writePointerValue(ByteBuf* out, const Value* v) {
     if (!v || !v->ptr_val) {
         bufU8(out, 0);
         return true;
     }
 
-    if (v->base_type_node == STRING_CHAR_PTR_SENTINEL ||
-        v->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
-        const char *text = (const char *)v->ptr_val;
+    AST *base = PTR_BASE_TYPE_NODE(*v);
+    void *address = (void*)AS_POINTER(*v);
+
+    if (base == STRING_CHAR_PTR_SENTINEL || base == SERIALIZED_CHAR_PTR_SENTINEL) {
+        const char *text = (const char *)address;
         if (!text) return false;
         bufU8(out, 2);
         bufLenPrefixedBytes(out, text, strlen(text));
         return true;
     }
 
-    if (v->base_type_node == SHELL_FUNCTION_PTR_SENTINEL) {
-        ShellCompiledFunction* compiled = (ShellCompiledFunction*)v->ptr_val;
+    if (base == SHELL_FUNCTION_PTR_SENTINEL) {
+        ShellCompiledFunction* compiled = (ShellCompiledFunction*)address;
         if (!compiled || compiled->magic != SHELL_COMPILED_FUNCTION_MAGIC) {
             return false;
         }
@@ -1514,7 +1526,7 @@ static bool writePointerValue(ByteBuf* out, const Value* v) {
     }
 
     bufU8(out, 3);
-    bufU64LE(out, (uint64_t)(uintptr_t)v->ptr_val);
+    bufU64LE(out, (uint64_t)(uintptr_t)address);
     return true;
 }
 
@@ -1523,23 +1535,23 @@ static bool readPointerValue(Cursor* in, Value* out) {
     if (in->error) return false;
     if (kind == 0) {
         out->ptr_val = NULL;
-        out->base_type_node = NULL;
         return true;
     }
+    pscalPointerEnsureObj(out);
     if (kind == 2) {
         size_t len = 0;
         char* text = curLenPrefixedString(in, &len);
         if (in->error || !text) { free(text); return false; }
-        out->ptr_val = (Value*)text;
-        out->base_type_node = SERIALIZED_CHAR_PTR_SENTINEL;
+        AS_POINTER(*out) = (Value*)text;
+        PTR_BASE_TYPE_NODE(*out) = SERIALIZED_CHAR_PTR_SENTINEL;
         out->element_type = TYPE_UNKNOWN;
         return true;
     }
     if (kind == 3) {
         uint64_t raw_addr = curU64LE(in);
         if (in->error) return false;
-        out->ptr_val = (Value*)(uintptr_t)raw_addr;
-        out->base_type_node = OPAQUE_POINTER_SENTINEL;
+        AS_POINTER(*out) = (Value*)(uintptr_t)raw_addr;
+        PTR_BASE_TYPE_NODE(*out) = OPAQUE_POINTER_SENTINEL;
         out->element_type = TYPE_UNKNOWN;
         return true;
     }
@@ -1592,8 +1604,8 @@ static bool readPointerValue(Cursor* in, Value* out) {
         return false;
     }
 
-    out->ptr_val = (Value*)compiled;
-    out->base_type_node = SHELL_FUNCTION_PTR_SENTINEL;
+    AS_POINTER(*out) = (Value*)compiled;
+    PTR_BASE_TYPE_NODE(*out) = SHELL_FUNCTION_PTR_SENTINEL;
     out->element_type = TYPE_UNKNOWN;
     return true;
 }
@@ -1696,13 +1708,18 @@ static void hashValue(uint64_t* hash, const Value* v, ChunkHashContext* ctx) {
             break;
         }
         case TYPE_POINTER: {
+            // VM 2.0 Phase 4i fix: same v->ptr_val-as-raw-address bug as
+            // writePointerValue/readPointerValue above -- see that
+            // function's comment.
             if (!v->ptr_val) {
                 fnv1aUpdateUInt64(hash, 0);
                 break;
             }
-            if (v->base_type_node == STRING_CHAR_PTR_SENTINEL ||
-                v->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
-                const char *text = (const char *)v->ptr_val;
+            AST *base = PTR_BASE_TYPE_NODE(*v);
+            void *address = (void*)AS_POINTER(*v);
+            if (base == STRING_CHAR_PTR_SENTINEL ||
+                base == SERIALIZED_CHAR_PTR_SENTINEL) {
+                const char *text = (const char *)address;
                 int len = text ? (int)strlen(text) : 0;
                 fnv1aUpdateInt(hash, len);
                 if (len > 0 && text) {
@@ -1710,10 +1727,10 @@ static void hashValue(uint64_t* hash, const Value* v, ChunkHashContext* ctx) {
                 }
                 break;
             }
-            if (v->base_type_node == SHELL_FUNCTION_PTR_SENTINEL) {
-                ShellCompiledFunction* compiled = (ShellCompiledFunction*)v->ptr_val;
+            if (base == SHELL_FUNCTION_PTR_SENTINEL) {
+                ShellCompiledFunction* compiled = (ShellCompiledFunction*)address;
                 if (!compiled || compiled->magic != SHELL_COMPILED_FUNCTION_MAGIC) {
-                    fnv1aUpdateUInt64(hash, (uint64_t)(uintptr_t)v->ptr_val);
+                    fnv1aUpdateUInt64(hash, (uint64_t)(uintptr_t)address);
                     break;
                 }
                 fnv1aUpdateUInt32(hash, compiled->chunk.version);
@@ -1721,7 +1738,7 @@ static void hashValue(uint64_t* hash, const Value* v, ChunkHashContext* ctx) {
                 fnv1aUpdateUInt64(hash, nested);
                 break;
             }
-            fnv1aUpdateUInt64(hash, (uint64_t)(uintptr_t)v->ptr_val);
+            fnv1aUpdateUInt64(hash, (uint64_t)(uintptr_t)address);
             break;
         }
         case TYPE_FILE:

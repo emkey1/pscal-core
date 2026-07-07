@@ -196,11 +196,27 @@ typedef struct EnumType {
 // (non-owned, shared/interned elsewhere -- see the poison-pragma listing
 // in utils.h, already treating it as boxing-adjacent before this sub-phase
 // touched it).
+// VM 2.0 Phase 4i (Docs/pscal_vm2_plan.md sec 5.10.4/5.10.3): `enum_type_def`
+// added by 4i's own research pass -- a dedicated audit of every
+// PTR_BASE_TYPE_NODE call site (undertaken because 4i's physical struct
+// collapse leaves nowhere left for an unboxed top-level `base_type_node`
+// field to live) found TYPE_ENUM values genuinely read/write it too, not
+// just TYPE_POINTER: vm.c's Succ/Pred-family arithmetic macro copies it
+// forward from operand to result, and symbol.c/utils.c set it at enum
+// construction time. This is NOT the same data as `enum_meta` above --
+// `enum_meta` is a non-owned pointer to interned member-name metadata,
+// while `enum_type_def` is the enum's own AST_ENUM_TYPE definition node
+// (used for type-compatibility bookkeeping), a completely different
+// piece of state that happened to share one unboxed top-level field with
+// TYPE_POINTER's own AST-node/sentinel usage pre-4i. Non-owned (never
+// freed by EnumObj's destructor, exactly like enum_meta and exactly like
+// the old top-level base_type_node field was never freed for any type).
 typedef struct EnumObj {
     ObjHeader header; // header.type is always TYPE_ENUM
     Type *enum_meta;
     int32_t ordinal;
     char *enum_name;
+    struct AST *enum_type_def; // AST typedef not yet visible this early in the file
 } EnumObj;
 
 // VM 2.0 Phase 4g (Docs/pscal_vm2_plan.md sec 5.10.4/5.10.3): revised
@@ -223,33 +239,44 @@ typedef struct FileObj {
     struct AST *element_type_def; // AST typedef not yet visible this early in the file
 } FileObj;
 
-// VM 2.0 Phase 4g (Docs/pscal_vm2_plan.md sec 5.10.4/5.10.3): boxes ONLY
-// `address` -- deliberately, and revised from an earlier draft that also
-// boxed `base_type_node`. A dedicated audit pass (looking for every
-// PTR_BASE_TYPE_NODE/AS_POINTER call site not already guarded by a
-// VALUE_TYPE==TYPE_POINTER check) found `base_type_node` is genuinely
-// TYPE-AGNOSTIC in this codebase, not pointer-specific: it's read/written
-// on TYPE_ENUM values (vm.c's Succ/Pred-family arithmetic macro smuggles
-// enum metadata through it), TYPE_RECORD values (a record's own class-AST
-// pointer), and as generic "preserve this AST across an arbitrary
-// reassignment" scratch storage in the VM's general assignment path --
-// none of which are TYPE_POINTER. Boxing it into a TYPE_POINTER-only union
-// member would have reintroduced the exact "dual-purpose field now reached
-// through a type-specific union member" crash class already found twice
-// this sub-phase (TYPE_FILE's element_type collision in 4e/4f; the packed-
-// array-union truthiness bug). `base_type_node` therefore stays a plain,
-// unboxed top-level Value field, completely unchanged by this sub-phase --
-// PTR_BASE_TYPE_NODE's macro body is untouched. The `mode` field replacing
-// the sentinel-in-base_type_node overload is separately deferred anyway (a
-// different audit found the proposed 4-value enum covers only 3 of 7 real
-// sentinels across ~90 call sites) -- Stage A ships the sentinel scheme
-// unchanged regardless of where base_type_node lives.
+// VM 2.0 Phase 4g (Docs/pscal_vm2_plan.md sec 5.10.4/5.10.3): boxed ONLY
+// `address` at first -- a 4g audit pass found `base_type_node` read/
+// written on TYPE_ENUM and (apparently) TYPE_RECORD values too, not just
+// TYPE_POINTER, and concluded boxing it into a TYPE_POINTER-only union
+// member would reintroduce the "dual-purpose field reached through a
+// type-specific union member" crash class already found twice that
+// sub-phase. So `base_type_node` was left as a plain, unboxed top-level
+// `Value` field, deliberately unboxed by PointerObj.
 //
-// Because base_type_node stays unboxed and independently per-Value-copied
-// (exactly as today), `copyInterfaceReceiverAlias`'s in-place
-// `PTR_BASE_TYPE_NODE(alias) = NULL` (vm.c) and its two siblings remain
-// exactly as safe as they always were -- mutating each Value's own
-// scalar field, never a shared box.
+// **Reversed in 4i, by a follow-up audit forced by the physical struct
+// collapse (there is nowhere left for an unboxed top-level field to live
+// once `Value` becomes one `uint64_t`).** That audit found 4g's "TYPE-
+// AGNOSTIC" conclusion was broader than the evidence supported:
+// TYPE_RECORD turned out to be a red herring -- zero actual construction
+// site anywhere sets a record's own `base_type_node` (the CALL_METHOD
+// class-name lookup that reads it does so on a dereferenced record whose
+// `base_type_node` is always NULL in practice; `makeValueForType`'s
+// `TYPE_RECORD` case never touches it). Only two real users exist:
+// TYPE_POINTER (this struct) and TYPE_ENUM (which gets its own
+// `enum_type_def` field on `EnumObj` instead -- see that struct's
+// comment). Every "generic assignment-preservation" call site that used
+// to read/write `PTR_BASE_TYPE_NODE` on a value of unknown type (vm.c's
+// `replaceValueCell`/`vmStoreThreadMyself`/`SET_INDIRECT`'s fallback
+// path, `resolveRecordTypeFromBaseValue`, `CALL_METHOD`'s className
+// lookup, two `DEBUG_PRINT`s in symbol.c) is now guarded by an explicit
+// `VALUE_TYPE(v) == TYPE_POINTER` check before calling
+// `PTR_BASE_TYPE_NODE`, matching every other `PSCAL_VALUE_FIELD`-based
+// accessor's contract (valid only when the Value is actually that type).
+// `PTR_BASE_TYPE_NODE`'s macro body now dereferences `ptr_val`, so an
+// unguarded call on a non-pointer Value is a real bug (reads garbage
+// through the wrong union member), not a latent-but-harmless no-op the
+// way it was pre-4i.
+//
+// The `mode` field replacing the sentinel-in-`base_type_node` overload
+// is still separately deferred (a different audit found the proposed
+// 4-value enum covers only 3 of 7 real sentinels across ~90 call sites)
+// -- this move ships the sentinel scheme completely unchanged, just
+// relocated to live inside PointerObj instead of at Value's top level.
 //
 // **Copy-on-construct, not copy-on-write -- confirmed necessary, not just
 // theoretical.** makeCopyOfValue/copyValueForStack must always allocate a
@@ -268,10 +295,13 @@ typedef struct FileObj {
 // means CALL_BUILTIN's argument cleanup (vm.c) must NOT skip freeValue
 // for TYPE_POINTER the way it still does for TYPE_FILE, since a fresh,
 // unshared wrapper needs exactly one release to avoid leaking, and
-// nothing else will ever provide it.
+// nothing else will ever provide it. `base_type_node` is copied forward
+// into the fresh wrapper by makeCopyOfValue exactly as `address` is --
+// see that function's TYPE_POINTER case.
 typedef struct PointerObj {
     ObjHeader header; // header.type is always TYPE_POINTER
     struct ValueStruct *address;
+    struct AST *base_type_node; // AST typedef not yet visible this early in the file
 } PointerObj;
 
 // Forward declaration of AST
@@ -308,8 +338,11 @@ typedef struct ValueStruct {
     bool array_is_packed;
     bool array_is_dynamic;
     uint32_t *array_refcount;
-    AST *base_type_node; // AST node defining the type this pointer points to
-                         // Needed for new(), dispose(), dereferencing type checks.
+    // VM 2.0 Phase 4i: dead weight, like filename/record_size/etc below --
+    // moved into PointerObj.base_type_node (TYPE_POINTER) and
+    // EnumObj.enum_type_def (TYPE_ENUM). Nothing reads this field
+    // directly anymore; deleted at the flag day along with the rest.
+    AST *base_type_node;
 
     char *filename;
     int record_size;      // Active record size for untyped file operations
@@ -440,12 +473,23 @@ typedef struct ValueStruct {
 // Requires v.s_val to already be a valid StringObj*; see AS_STRING's
 // comment (core/utils.h) and pscalStringEnsureObj for why/when that holds.
 #define STRING_MAX_LENGTH(v)       (PSCAL_VALUE_FIELD(v, s_val)->max_length)
-// VM 2.0 Phase 4g: base_type_node deliberately stays a plain, unboxed
-// top-level Value field -- see PointerObj's comment (core/types.h) for
-// why (it's genuinely type-agnostic: used by TYPE_ENUM/TYPE_RECORD too,
-// not just TYPE_POINTER, so boxing it into a TYPE_POINTER-only union
-// member would have been unsafe). Unchanged from pre-4g.
-#define PTR_BASE_TYPE_NODE(v)      PSCAL_VALUE_FIELD(v, base_type_node)
+// VM 2.0 Phase 4i: moved inside PointerObj (see that struct's comment for
+// the full history -- 4g left this unboxed reasoning from an
+// over-broad "type-agnostic" audit finding; 4i's follow-up audit found
+// TYPE_RECORD was a red herring and TYPE_ENUM gets its own dedicated
+// ENUM_TYPE_DEF macro/field instead). Valid ONLY when VALUE_TYPE(v) ==
+// TYPE_POINTER, exactly like every other PSCAL_VALUE_FIELD-based
+// accessor -- callers that used to call this on a value of unknown type
+// (the "generic assignment-preservation" call sites) now check
+// VALUE_TYPE first. Requires v.ptr_val to already be a valid PointerObj*
+// (always true once a Value is TYPE_POINTER, matching every other boxed
+// type's "wrapper always present" invariant).
+#define PTR_BASE_TYPE_NODE(v)      (PSCAL_VALUE_FIELD(v, ptr_val)->base_type_node)
+// VM 2.0 Phase 4i: the enum-specific counterpart to PTR_BASE_TYPE_NODE --
+// see EnumObj's comment for why this is a separate field/macro rather
+// than sharing PointerObj's. Valid ONLY when VALUE_TYPE(v) == TYPE_ENUM.
+// Requires v.enum_val to already be a valid EnumObj*.
+#define ENUM_TYPE_DEF(v)           (PSCAL_VALUE_FIELD(v, enum_val)->enum_type_def)
 // VM 2.0 Phase 4g: filename/record_size/record_size_explicit moved inside
 // FileObj; the old top-level Value fields are dead weight until Phase
 // 4i's struct shrink deletes them. Requires v.f_val to already be a valid

@@ -813,7 +813,16 @@ static AST* resolveRecordTypeFromBaseValue(Value* base_val_ptr) {
         return NULL;
     }
 
-    type_node = PTR_BASE_TYPE_NODE(*base_val_ptr);
+    // VM 2.0 Phase 4i: PTR_BASE_TYPE_NODE now requires TYPE_POINTER.
+    // base_val_ptr can legitimately be a raw TYPE_RECORD here (a value-
+    // typed record on the stack, not accessed through a pointer) --
+    // TYPE_RECORD never populates base_type_node in practice (confirmed
+    // by a dedicated audit), so this guard preserves the pre-4i
+    // always-NULL-for-records behavior exactly while avoiding an unsafe
+    // read through the wrong union member.
+    type_node = (VALUE_TYPE(*base_val_ptr) == TYPE_POINTER)
+                    ? PTR_BASE_TYPE_NODE(*base_val_ptr)
+                    : NULL;
     type_node = vmResolveTypeAlias(type_node);
     if (type_node && type_node->type == AST_POINTER_TYPE && type_node->right) {
         type_node = vmResolveTypeAlias(type_node->right);
@@ -1289,7 +1298,13 @@ static void vmStoreThreadMyself(VM* vm, Value value) {
         freeValue(&value);
         return;
     }
-    AST* preserved_base = PTR_BASE_TYPE_NODE(vm->threadMyself);
+    // VM 2.0 Phase 4i: PTR_BASE_TYPE_NODE now requires TYPE_POINTER (the
+    // field moved inside PointerObj) -- threadMyself starts life as
+    // makeNil() (TYPE_NIL) before any receiver is ever stored, so this
+    // must be guarded rather than called unconditionally.
+    AST* preserved_base = (VALUE_TYPE(vm->threadMyself) == TYPE_POINTER)
+                               ? PTR_BASE_TYPE_NODE(vm->threadMyself)
+                               : NULL;
     Value replacement = makeCopyOfValue(&value);
     replaceValueCell(&vm->threadMyself, replacement, preserved_base);
     freeValue(&value);
@@ -6484,7 +6499,7 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
                     } \
                     result_val = makeEnum(AS_ENUM(enum_value).enum_name, new_ord); \
                     ENUM_META(result_val) = ENUM_META(enum_value); \
-                    PTR_BASE_TYPE_NODE(result_val) = PTR_BASE_TYPE_NODE(enum_value); \
+                    ENUM_TYPE_DEF(result_val) = ENUM_TYPE_DEF(enum_value); \
                     op_is_handled = true; \
                 } \
             } \
@@ -8639,7 +8654,14 @@ comparison_error_label:
                         SET_INT_VALUE(target_lvalue_ptr, AS_CHAR(*target_lvalue_ptr));
                     }
                     else {
-                        AST* preserved_base = PTR_BASE_TYPE_NODE(*target_lvalue_ptr);
+                        // VM 2.0 Phase 4i: target_lvalue_ptr's type is never
+                        // TYPE_POINTER at this point (that case is handled
+                        // by the branch above) -- guard anyway rather than
+                        // rely on that invariant holding forever, since
+                        // PTR_BASE_TYPE_NODE now requires it.
+                        AST* preserved_base = (VALUE_TYPE(*target_lvalue_ptr) == TYPE_POINTER)
+                                                   ? PTR_BASE_TYPE_NODE(*target_lvalue_ptr)
+                                                   : NULL;
                         if (VALUE_TYPE(value_to_set) == TYPE_MEMORYSTREAM) {
                             /* Transfer ownership of the MStream pointer without freeing it
                              * when the temporary value is cleaned up below. */
@@ -9120,7 +9142,13 @@ comparison_error_label:
                 } else {
                     // This is the logic for all other types, including dynamic strings,
                     // numbers, records, etc., which requires a deep copy.
-                    AST* preserved_base = PTR_BASE_TYPE_NODE(*target_slot);
+                    // VM 2.0 Phase 4i: target_slot can genuinely be
+                    // TYPE_POINTER here (unlike SET_INDIRECT's fallback
+                    // branch above) -- guard since PTR_BASE_TYPE_NODE now
+                    // requires it.
+                    AST* preserved_base = (VALUE_TYPE(*target_slot) == TYPE_POINTER)
+                                               ? PTR_BASE_TYPE_NODE(*target_slot)
+                                               : NULL;
                     Value replacement = makeCopyOfValue(&value_from_stack);
                     replaceValueCell(target_slot, replacement, preserved_base);
                 }
@@ -9239,7 +9267,13 @@ comparison_error_label:
                         return INTERPRET_RUNTIME_ERROR;
                     }
                 } else {
-                    AST* preserved_base = PTR_BASE_TYPE_NODE(*target_slot);
+                    // VM 2.0 Phase 4i: target_slot can genuinely be
+                    // TYPE_POINTER here (unlike SET_INDIRECT's fallback
+                    // branch above) -- guard since PTR_BASE_TYPE_NODE now
+                    // requires it.
+                    AST* preserved_base = (VALUE_TYPE(*target_slot) == TYPE_POINTER)
+                                               ? PTR_BASE_TYPE_NODE(*target_slot)
+                                               : NULL;
                     Value replacement = makeCopyOfValue(&value_from_stack);
                     replaceValueCell(target_slot, replacement, preserved_base);
                 }
@@ -10358,7 +10392,16 @@ comparison_error_label:
 
                 Symbol* method_symbol = NULL;
                 const char* className = NULL;
-                if (PTR_BASE_TYPE_NODE(*objVal) && PTR_BASE_TYPE_NODE(*objVal)->token) {
+                // VM 2.0 Phase 4i: objVal is the DEREFERENCED record (see
+                // AS_POINTER(receiverVal) above, confirmed TYPE_RECORD by
+                // the check preceding this block), never TYPE_POINTER --
+                // PTR_BASE_TYPE_NODE now requires TYPE_POINTER, and a
+                // dedicated audit confirmed records never populate
+                // base_type_node in practice, so this guard preserves the
+                // pre-4i always-NULL-className behavior of this path
+                // exactly (method dispatch here relies on the vtable
+                // lookup above, not this className fallback).
+                if (VALUE_TYPE(*objVal) == TYPE_POINTER && PTR_BASE_TYPE_NODE(*objVal) && PTR_BASE_TYPE_NODE(*objVal)->token) {
                     className = PTR_BASE_TYPE_NODE(*objVal)->token->value;
                 }
                 if (className) {

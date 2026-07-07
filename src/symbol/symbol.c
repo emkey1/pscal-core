@@ -415,12 +415,16 @@ void insertGlobalSymbol(const char *name, VarType type, AST *type_def) {
             }
             AS_ENUM(*new_symbol->value).enum_name = strdup(def->token->value);
             AS_ENUM(*new_symbol->value).ordinal = 0;
-            PTR_BASE_TYPE_NODE(*new_symbol->value) = def;
+            ENUM_TYPE_DEF(*new_symbol->value) = def;
         }
     }
 
+    // VM 2.0 Phase 4i: PTR_BASE_TYPE_NODE now requires TYPE_POINTER; this
+    // debug line used to read the field unconditionally for any type.
     DEBUG_PRINT("[DEBUG SYMBOL] Created Symbol '%s' at %p (Value @ %p, base_type_node @ %p).\n",
-                new_symbol->name, (void*)new_symbol, (void*)new_symbol->value, (void*)(new_symbol->value ? PTR_BASE_TYPE_NODE(*new_symbol->value) : NULL));
+                new_symbol->name, (void*)new_symbol, (void*)new_symbol->value,
+                (void*)((new_symbol->value && VALUE_TYPE(*new_symbol->value) == TYPE_POINTER)
+                            ? PTR_BASE_TYPE_NODE(*new_symbol->value) : NULL));
 
     if (!ensureGlobalSymbolsTable()) {
         if (new_symbol->value) {
@@ -730,8 +734,12 @@ Symbol *insertLocalSymbol(const char *name, VarType type, AST* type_def, bool is
     }
     *(sym->value) = makeValueForType(type, type_def, sym); // Initialize using helper
 
+    // VM 2.0 Phase 4i: PTR_BASE_TYPE_NODE now requires TYPE_POINTER; this
+    // debug line used to read the field unconditionally for any type.
     DEBUG_PRINT("[DEBUG SYMBOL] Created Symbol '%s' at %p (Value @ %p, base_type_node @ %p).\n",
-                sym->name, (void*)sym, (void*)sym->value, (void*)(sym->value ? PTR_BASE_TYPE_NODE(*sym->value) : NULL));
+                sym->name, (void*)sym, (void*)sym->value,
+                (void*)((sym->value && VALUE_TYPE(*sym->value) == TYPE_POINTER)
+                            ? PTR_BASE_TYPE_NODE(*sym->value) : NULL));
 
 
     // Set flags
