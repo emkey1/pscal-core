@@ -135,14 +135,6 @@ static void vmProcUnregister(VM* vm) {
     pthread_mutex_unlock(&gVmProcRegistryLock);
 }
 
-static bool vmProcRegistryIsEmpty(void) {
-    bool empty = false;
-    pthread_mutex_lock(&gVmProcRegistryLock);
-    empty = (gVmProcRegistryCount == 0);
-    pthread_mutex_unlock(&gVmProcRegistryLock);
-    return empty;
-}
-
 static void vmProcFillSnapshot(const VM* vm, VMProcSnapshot* out) {
     if (!vm || !out) {
         return;
@@ -1919,6 +1911,20 @@ static void vmThreadResetResult(Thread* thread) {
     if (!thread) {
         return;
     }
+    // resultValue/resultReady/resultConsumed/statusReady/statusFlag/
+    // statusConsumed/awaitingReuse are read under resultMutex by
+    // joinThreadInternal/vmThreadTakeResult (see those functions) -- reset
+    // them under the same lock rather than whatever the caller happens to
+    // hold. Pre-fix, every caller here reset these fields while holding only
+    // stateMutex, a cross-mutex race TSan confirmed
+    // (joinThreadInternal vs. this function, statusReady). Every real call
+    // site already holds stateMutex around the call to this function (or is
+    // running before the thread slot is shared with any other thread), so
+    // nesting resultMutex inside stateMutex here is the one safe nesting
+    // order in this file -- never the reverse (see vmThreadTakeResult /
+    // vmJoinThreadById, which always fully release resultMutex before
+    // acquiring stateMutex).
+    pthread_mutex_lock(&thread->resultMutex);
     if (thread->resultReady) {
         freeValue(&thread->resultValue);
     }
@@ -1928,8 +1934,10 @@ static void vmThreadResetResult(Thread* thread) {
     thread->statusReady = false;
     thread->statusFlag = false;
     thread->statusConsumed = false;
-    thread->currentJob = NULL;
     thread->awaitingReuse = false;
+    pthread_mutex_unlock(&thread->resultMutex);
+
+    thread->currentJob = NULL;
     thread->readyForReuse = false;
     thread->queuedAt = (struct timespec){0, 0};
     thread->startedAt = (struct timespec){0, 0};
@@ -1951,7 +1959,7 @@ static void vmThreadInitSlot(Thread* thread) {
         pthread_cond_init(&thread->stateCond, NULL);
         thread->stateSyncInitialized = true;
     }
-    thread->active = false;
+    atomic_store(&thread->active, false);
     thread->vm = NULL;
     thread->ownsVm = false;
     thread->inPool = false;
@@ -2038,7 +2046,7 @@ static void* threadStart(void* arg) {
         thread->queuedAt = job->queuedAt;
         thread->currentJob = job;
         thread->poolWorker = job->submitOnly;
-        thread->active = true;
+        atomic_store(&thread->active, true);
         atomic_store(&thread->cancelRequested, false);
         atomic_store(&thread->paused, false);
         pthread_mutex_unlock(&thread->stateMutex);
@@ -2256,16 +2264,27 @@ static void* threadStart(void* arg) {
         vmThreadJobAwaitConsumedAndDestroy(job);
         job = NULL;
 
-        pthread_mutex_lock(&thread->stateMutex);
+        // awaitingReuse is read under resultMutex by joinThreadInternal/
+        // vmThreadTakeResult -- toggle it under that same lock (sequentially,
+        // never nested with stateMutex below) rather than stateMutex, which
+        // only readyForReuse/stateCond need. See vmThreadResetResult's
+        // comment for the full rationale (TSan-confirmed cross-mutex race).
+        pthread_mutex_lock(&thread->resultMutex);
         thread->awaitingReuse = true;
+        pthread_mutex_unlock(&thread->resultMutex);
+
+        pthread_mutex_lock(&thread->stateMutex);
         pthread_cond_broadcast(&thread->stateCond);
         while (!thread->readyForReuse && !atomic_load(&thread->killRequested) && !atomic_load(&owner->shuttingDownWorkers)) {
             pthread_cond_wait(&thread->stateCond, &thread->stateMutex);
         }
         bool exitLoop = atomic_load(&thread->killRequested) || atomic_load(&owner->shuttingDownWorkers);
-        thread->awaitingReuse = false;
         thread->readyForReuse = false;
         pthread_mutex_unlock(&thread->stateMutex);
+
+        pthread_mutex_lock(&thread->resultMutex);
+        thread->awaitingReuse = false;
+        pthread_mutex_unlock(&thread->resultMutex);
 
         if (exitLoop) {
             break;
@@ -2273,8 +2292,8 @@ static void* threadStart(void* arg) {
 
         pthread_mutex_lock(&thread->stateMutex);
         vmThreadResetResult(thread);
-        thread->active = false;
         pthread_mutex_unlock(&thread->stateMutex);
+        atomic_store(&thread->active, false);
         workerVm = thread->vm;
     }
 
@@ -2284,8 +2303,8 @@ static void* threadStart(void* arg) {
     }
     pthread_mutex_lock(&thread->stateMutex);
     thread->idle = false;
-    thread->active = false;
     pthread_mutex_unlock(&thread->stateMutex);
+    atomic_store(&thread->active, false);
     owner->workerCount--;
     pthread_mutex_unlock(&owner->threadRegistryLock);
 
@@ -2356,7 +2375,7 @@ static int createThreadJob(VM* vm,
     if (spawnNewWorker && assignedThread) {
         int originalGeneration = assignedThread->poolGeneration;
         assignedThread->inPool = true;
-        assignedThread->active = true;
+        atomic_store(&assignedThread->active, true);
         assignedThread->idle = false;
         assignedThread->poolGeneration++;
         vm->workerCount++;
@@ -2376,7 +2395,7 @@ static int createThreadJob(VM* vm,
             vm->workerCount--;
             assignedThread->inPool = false;
             assignedThread->poolGeneration = originalGeneration;
-            assignedThread->active = false;
+            atomic_store(&assignedThread->active, false);
             assignedThread->idle = false;
             assignedThread->poolWorker = false;
             assignedThread->awaitingReuse = false;
@@ -2404,7 +2423,7 @@ static int createThreadJob(VM* vm,
             vm->workerCount--;
             assignedThread->inPool = false;
             assignedThread->poolGeneration = originalGeneration;
-            assignedThread->active = false;
+            atomic_store(&assignedThread->active, false);
             assignedThread->idle = false;
             assignedThread->poolWorker = false;
             assignedThread->awaitingReuse = false;
@@ -2701,7 +2720,7 @@ bool vmThreadTakeResult(VM* vm, int threadId, Value* outResult, bool takeValue, 
 
     pthread_mutex_lock(&thread->resultMutex);
     while (!thread->statusReady) {
-        if (!thread->active && !thread->awaitingReuse) {
+        if (!atomic_load(&thread->active) && !thread->awaitingReuse) {
             pthread_mutex_unlock(&thread->resultMutex);
             return false;
         }
@@ -2787,7 +2806,7 @@ static bool joinThreadInternal(VM* vm, int id) {
     }
     pthread_mutex_lock(&thread->resultMutex);
     while (!thread->statusReady) {
-        if (!thread->active && !thread->awaitingReuse) {
+        if (!atomic_load(&thread->active) && !thread->awaitingReuse) {
             pthread_mutex_unlock(&thread->resultMutex);
             return false;
         }
@@ -2956,7 +2975,7 @@ size_t vmSnapshotWorkerUsage(VM* vm, ThreadMetrics* outMetrics, size_t capacity)
             continue;
         }
         ThreadMetrics snapshot = thread->metrics;
-        if (thread->active) {
+        if (atomic_load(&thread->active)) {
             ThreadMetricsSample currentSample = snapshot.start;
             vmThreadMetricsCapture(&currentSample);
             snapshot.end = currentSample;
@@ -3012,7 +3031,7 @@ size_t vmSnapshotProcWorkers(uintptr_t vm_address,
     size_t count = 0;
     for (int i = 1; i < VM_MAX_THREADS && count < capacity; ++i) {
         Thread* thread = &root->threads[i];
-        bool include = thread->inPool || thread->active || thread->vm != NULL;
+        bool include = thread->inPool || atomic_load(&thread->active) || thread->vm != NULL;
         if (!include) {
             continue;
         }
@@ -3024,7 +3043,7 @@ size_t vmSnapshotProcWorkers(uintptr_t vm_address,
 
         bool locked = (pthread_mutex_trylock(&thread->stateMutex) == 0);
         snapshot.in_pool = thread->inPool;
-        snapshot.active = thread->active;
+        snapshot.active = atomic_load(&thread->active);
         snapshot.idle = thread->idle;
         snapshot.owns_vm = thread->ownsVm;
         snapshot.pool_worker = thread->poolWorker;
@@ -3040,7 +3059,7 @@ size_t vmSnapshotProcWorkers(uintptr_t vm_address,
         snapshot.started_at = thread->startedAt;
         snapshot.finished_at = thread->finishedAt;
         snapshot.metrics = thread->metrics;
-        if (thread->active && snapshot.metrics.start.valid) {
+        if (atomic_load(&thread->active) && snapshot.metrics.start.valid) {
             ThreadMetricsSample currentSample = snapshot.metrics.start;
             vmThreadMetricsCapture(&currentSample);
             snapshot.metrics.end = currentSample;
@@ -4254,11 +4273,22 @@ static void vmFreeRuntimeVTables(void) {
 }
 
 static void vmCleanupGlobalCachesIfIdle(void) {
-    if (!vmProcRegistryIsEmpty()) {
-        return;
+    // Pre-existing peek-before-lock race (TSan-confirmed, Docs/pscal_vm2_plan.md
+    // Phase 5a prerequisite fix): vmProcRegistryIsEmpty() used to check
+    // gVmProcRegistryCount==0 and release gVmProcRegistryLock before the
+    // caller acted on the answer, so two threads tearing down their VMs at
+    // nearly the same moment (e.g. two pool workers freeVM-ing concurrently
+    // at shutdown) could both observe "empty" and both free the same
+    // process-global runtimeVTables list / shell-builtin-profile arrays --
+    // same bug shape as the dynamic-array peek-before-lock races fixed just
+    // before this phase. Fix: hold the registry lock across the check *and*
+    // the frees, exactly like every other mutation of this registry does.
+    pthread_mutex_lock(&gVmProcRegistryLock);
+    if (gVmProcRegistryCount == 0) {
+        vmFreeRuntimeVTables();
+        vmFreeShellBuiltinProfiles();
     }
-    vmFreeRuntimeVTables();
-    vmFreeShellBuiltinProfiles();
+    pthread_mutex_unlock(&gVmProcRegistryLock);
 }
 
 static AST* vmResolveInterfaceAST(AST* interfaceType) {
@@ -5376,9 +5406,9 @@ void vmResetExecutionState(VM* vm) {
             atomic_store(&thread->killRequested, true);
             vmThreadWakeStateWaiters(thread);
         }
-        if (thread->active) {
+        if (atomic_load(&thread->active)) {
             pthread_join(thread->handle, NULL);
-            thread->active = false;
+            atomic_store(&thread->active, false);
         }
         if (thread->ownsVm && thread->vm) {
             freeVM(thread->vm);
@@ -5399,7 +5429,7 @@ void vmResetExecutionState(VM* vm) {
     atomic_store(&vm->shuttingDownWorkers, false);
     vm->threadCount = 1;
     vm->threadOwner = vm;
-    vm->threads[0].active = false;
+    atomic_store(&vm->threads[0].active, false);
     vm->threads[0].vm = NULL;
     vm->threads[0].vm = vm;
 
@@ -5550,14 +5580,14 @@ void freeVM(VM* vm) {
     }
     for (int i = 1; i < VM_MAX_THREADS; i++) {
         Thread* thread = &vm->threads[i];
-        bool shouldJoin = thread->inPool || thread->active;
+        bool shouldJoin = thread->inPool || atomic_load(&thread->active);
         if (thread->inPool) {
             atomic_store(&thread->killRequested, true);
             vmThreadWakeStateWaiters(thread);
         }
         if (shouldJoin) {
             pthread_join(thread->handle, NULL);
-            thread->active = false;
+            atomic_store(&thread->active, false);
         }
         if (thread->ownsVm && thread->vm) {
             freeVM(thread->vm);

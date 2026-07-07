@@ -175,7 +175,15 @@ typedef struct {
 typedef struct {
     pthread_t handle;           // OS-level thread handle
     struct VM_s* vm;            // Pointer to the VM executing on this thread
-    bool active;                // Whether this thread is running
+    atomic_bool active;         // Whether this thread is running -- read
+                                 // cross-thread without a consistent lock
+                                 // domain (freeVM vs. threadStart vs.
+                                 // joinThreadInternal all disagreed on which
+                                 // mutex, if any, guarded it; TSan-confirmed
+                                 // race, Docs/pscal_vm2_plan.md Phase 5a
+                                 // prerequisite fix), so it joins paused/
+                                 // cancelRequested/killRequested as an atomic
+                                 // flag rather than gaining a fourth lock.
 
     // Result hand-off state for builtin jobs.
     bool statusReady;           // True when a worker has published a status/result

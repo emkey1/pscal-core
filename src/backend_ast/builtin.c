@@ -9760,12 +9760,12 @@ static Value makeThreadStateRecord(int threadId, const Thread* thread) {
         return makeRecord(NULL);
     }
 
-    bool active = thread && thread->active;
+    bool active = thread && atomic_load(&thread->active);
     const bool in_pool = thread && thread->inPool;
     bool reported_idle = thread &&
         (thread->idle ||
          thread->readyForReuse ||
-         (!thread->active && !thread->awaitingReuse && thread->currentJob == NULL));
+         (!atomic_load(&thread->active) && !thread->awaitingReuse && thread->currentJob == NULL));
     const bool should_exit = thread && thread->shouldExit;
     const bool awaiting_reuse = thread && thread->awaitingReuse;
     const bool ready_for_reuse = thread && thread->readyForReuse;
@@ -10233,7 +10233,7 @@ Value vmBuiltinThreadGetResult(VM* vm, int arg_count, Value* args) {
     Thread* slot = NULL;
     if (thread_vm && thread_id > 0 && thread_id < VM_MAX_THREADS) {
         slot = &thread_vm->threads[thread_id];
-        if (slot->active && !slot->awaitingReuse) {
+        if (atomic_load(&slot->active) && !slot->awaitingReuse) {
             runtimeError(vm, "Thread %d is still running; join it before retrieving the result.", thread_id);
             return makeNil();
         }
@@ -10249,7 +10249,7 @@ Value vmBuiltinThreadGetResult(VM* vm, int arg_count, Value* args) {
         Thread* fallback_slot = NULL;
         if (thread_id > 0 && thread_id < VM_MAX_THREADS) {
             fallback_slot = &vm->threads[thread_id];
-            if (fallback_slot->active && !fallback_slot->awaitingReuse) {
+            if (atomic_load(&fallback_slot->active) && !fallback_slot->awaitingReuse) {
                 runtimeError(vm,
                              "Thread %d is still running; join it before retrieving the result.",
                              thread_id);
@@ -10305,7 +10305,7 @@ Value vmBuiltinThreadGetStatus(VM* vm, int arg_count, Value* args) {
     Thread* slot = NULL;
     if (thread_vm && thread_id > 0 && thread_id < VM_MAX_THREADS) {
         slot = &thread_vm->threads[thread_id];
-        if (slot->active && !slot->awaitingReuse) {
+        if (atomic_load(&slot->active) && !slot->awaitingReuse) {
             runtimeError(vm, "Thread %d is still running; join it before querying status.", thread_id);
             return makeBoolean(false);
         }
@@ -10341,7 +10341,7 @@ Value vmBuiltinThreadGetStatus(VM* vm, int arg_count, Value* args) {
         Thread* fallback_slot = NULL;
         if (thread_id > 0 && thread_id < VM_MAX_THREADS) {
             fallback_slot = &vm->threads[thread_id];
-            if (fallback_slot->active && !fallback_slot->awaitingReuse) {
+            if (atomic_load(&fallback_slot->active) && !fallback_slot->awaitingReuse) {
                 runtimeError(vm, "Thread %d is still running; join it before querying status.", thread_id);
                 if (drop_result) {
                     freeValue(&dropped);
@@ -10560,8 +10560,8 @@ Value vmBuiltinThreadStatsJson(VM* vm, int arg_count, Value* args) {
         const char *name = (thread->name[0] != '\0') ? thread->name : "";
         bool reported_idle = thread->idle ||
                              thread->readyForReuse ||
-                             (!thread->active && !thread->awaitingReuse && thread->currentJob == NULL);
-        bool active = thread->active;
+                             (!atomic_load(&thread->active) && !thread->awaitingReuse && thread->currentJob == NULL);
+        bool active = atomic_load(&thread->active);
         bool status_flag = thread->statusFlag;
         if ((frontendIsPascal() || frontendIsRea()) && include) {
             active = false;
