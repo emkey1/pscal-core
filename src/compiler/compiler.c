@@ -738,7 +738,12 @@ static int ensureBuiltinStringConstants(BytecodeChunk* chunk, const char* origin
 }
 
 static int addIntConstant(BytecodeChunk* chunk, long long intValue) {
-    Value val = makeInt(intValue);
+    // A literal outside INT32 range must widen to INT64 rather than
+    // silently truncate -- makeInt() always tags TYPE_INT32, whose tagged
+    // immediate is a real 32-bit budget (VM 2.0 Phase 4i checkpoint 3d
+    // made this authoritative; previously a coexisting untruncated legacy
+    // field masked the overflow).
+    Value val = (intValue > INT32_MAX || intValue < INT32_MIN) ? makeInt64(intValue) : makeInt(intValue);
     int index = addConstantToChunk(chunk, &val);
     // No need to call freeValue for simple types, but it's harmless.
     return index;
@@ -5318,33 +5323,33 @@ Value evaluateCompileTimeValue(AST* node) {
                     long long b = VAL_INT(right_val);
                     switch (node->token->type) {
                         case TOKEN_PLUS:
-                            result = makeInt(a + b);
+                            result = pscalIntResultLike2(left_val, right_val, a + b);
                             break;
                         case TOKEN_MINUS:
-                            result = makeInt(a - b);
+                            result = pscalIntResultLike2(left_val, right_val, a - b);
                             break;
                         case TOKEN_MUL:
-                            result = makeInt(a * b);
+                            result = pscalIntResultLike2(left_val, right_val, a * b);
                             break;
                         case TOKEN_SLASH:
                             if (b == 0) {
                                 fprintf(stderr, "Compile-time Error: Division by zero in constant expression.\n");
                             } else {
-                                result = makeInt(a / b);
+                                result = pscalIntResultLike2(left_val, right_val, a / b);
                             }
                             break;
                         case TOKEN_INT_DIV:
                             if (b == 0) {
                                 fprintf(stderr, "Compile-time Error: Division by zero in constant expression.\n");
                             } else {
-                                result = makeInt(a / b);
+                                result = pscalIntResultLike2(left_val, right_val, a / b);
                             }
                             break;
                         case TOKEN_MOD:
                             if (b == 0) {
                                 fprintf(stderr, "Compile-time Error: Division by zero in constant expression.\n");
                             } else {
-                                result = makeInt(a % b);
+                                result = pscalIntResultLike2(left_val, right_val, a % b);
                             }
                             break;
                         default:

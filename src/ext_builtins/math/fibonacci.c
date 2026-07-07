@@ -51,7 +51,7 @@ static Value vmBuiltinFibonacci(struct VM_s* vm, int arg_count, Value* args) {
     power(F, n - 1);
 
     // The result F(n) is in the top-left of the matrix
-    return makeInt(F[0][0]);
+    return pscalIntResultLike1(args[0], F[0][0]);
 }
 
 void registerFibonacciBuiltin(void) {

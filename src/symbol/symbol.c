@@ -1269,11 +1269,14 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
                     EXIT_FAILURE_HANDLER();
                 }
             }
+            // Capture the wrapper pointer before SET_VALUE_TYPE resets
+            // .bits to a nil-pointer placeholder for the retype below.
+            StringObj *retagged_str_obj = PSCAL_VALUE_PTR(*sym->value, StringObj);
             SET_VALUE_TYPE(sym->value, sym->type);
             // Re-tag after the retype above stomped .bits back to a
-            // nil-pointer placeholder -- sym->value->s_val is the same
+            // nil-pointer placeholder -- retagged_str_obj is the same
             // wrapper the mutations above wrote into, never reallocated.
-            pscalValueSetHeapPtrBits(sym->value, sym->value->s_val);
+            pscalValueSetHeapPtrBits(sym->value, retagged_str_obj);
             break;
         }
 
@@ -1297,12 +1300,11 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
                 FILE_FILENAME(*sym->value) = FILE_FILENAME(val) ? strdup(FILE_FILENAME(val)) : NULL;
                 // VM 2.0 Phase 4g: `val` (the RHS of `f2 := f1`) is a bare,
                 // untracked alias of f1's own FileObj (see makeCopyOfValue's
-                // TYPE_FILE comment) -- val.f_val IS f1's wrapper, not an
-                // independent copy. Detach val's own pointer to it (so
-                // val's eventual freeValue is a no-op) WITHOUT writing
-                // through AS_FILE/FILE_FILENAME, which would mutate f1's
-                // real, still-live FileObj in place.
-                val.f_val = NULL;
+                // TYPE_FILE comment) -- val's payload pointer IS f1's
+                // wrapper, not an independent copy. Detach val's own
+                // pointer to it (so val's eventual freeValue is a no-op)
+                // WITHOUT writing through AS_FILE/FILE_FILENAME, which
+                // would mutate f1's real, still-live FileObj in place.
                 pscalValueSetHeapPtrBits(&val, NULL);
             }
             break;

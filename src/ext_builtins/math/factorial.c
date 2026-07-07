@@ -19,7 +19,7 @@ static Value vmBuiltinFactorial(struct VM_s* vm, int arg_count, Value* args) {
     for (long long i = 2; i <= n; ++i) {
         result *= i;
     }
-    return makeInt(result);
+    return pscalIntResultLike1(args[0], result);
 }
 
 void registerFactorialBuiltin(void) {

@@ -178,12 +178,12 @@ static bool valueIsGenericSerializable(const Value *v) {
  * uniformly. Returns NULL if arg i isn't an MStream in either shape. */
 static MStream *fxResolveMStreamArg(Value *args, int idx) {
     if (VALUE_TYPE(args[idx]) == TYPE_MEMORYSTREAM) {
-        return args[idx].mstream;
+        return PSCAL_VALUE_PTR(args[idx], MStream);
     }
     if (VALUE_TYPE(args[idx]) == TYPE_POINTER && AS_POINTER(args[idx])) {
         Value *pointee = (Value *)AS_POINTER(args[idx]);
         if (VALUE_TYPE(*pointee) == TYPE_MEMORYSTREAM) {
-            return pointee->mstream;
+            return PSCAL_VALUE_PTR(*pointee, MStream);
         }
     }
     return NULL;

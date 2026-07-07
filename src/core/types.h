@@ -366,78 +366,35 @@ typedef struct AST AST;
 
 typedef struct RealValue { float f32_val; double d_val; long double r_val; } RealValue;
 
+// VM 2.0 Phase 4i checkpoint 3d: the physical collapse (Docs/
+// pscal_vm2_plan.md sec 5.10.1/5.10.4). `Value` shrinks from its
+// checkpoint-3c shape (176 bytes: i_val/u_val/RealValue/a union of every
+// heap-pointer type/array metadata/file metadata/etc, all coexisting with
+// `bits` purely for cross-checking) down to two fields. `bits` is now the
+// SOLE storage for every payload -- immediates decode inline via the
+// pscalUntagX family, heap-pointer types (including the checkpoint-3c
+// Int64Box/LongDoubleBox and the checkpoint-3a ClosureObj/InterfaceObj)
+// decode via pscalUntagPointer + PSCAL_VALUE_PTR. `pscalValueBitsConsistent`
+// is deleted along with every field it cross-checked -- there is nothing
+// left to compare `bits` against.
+//
+// `type` deliberately stays as an explicit field rather than being
+// inferred structurally from `bits` alone (the plan's original sketch),
+// discovered to be the right call while implementing this checkpoint:
+// every heap-pointer type's wrapper struct starts with an ObjHeader
+// carrying its own `.type` EXCEPT ClosureObj/InterfaceObj, which are
+// deliberately NOT ObjHeader-based (checkpoint 3a: giving them one would
+// collide with ClosureEnvPayload's own reuse of the TYPE_CLOSURE/
+// TYPE_INTERFACE destructor-registration tags). Retrofitting a
+// discriminant onto two structs specifically to avoid one extra 4-byte
+// field on every Value was judged not worth the complexity or the
+// pointer-dereference cost on VALUE_TYPE(v), the single most
+// frequently-read property of any Value in the VM. sizeof(Value) is 16
+// bytes (4-byte VarType + 4 bytes padding + 8-byte bits) -- an 11x
+// reduction from 176, achieving Phase 4's actual goal (a small,
+// cheap-to-copy Value) without literal single-word purity.
 typedef struct ValueStruct {
     VarType type;
-    Type *enum_meta;
-    long long i_val;
-    unsigned long long u_val;
-    RealValue real;
-    union {
-        StringObj *s_val; // VM 2.0 Phase 4c: was a plain owned char*
-        int c_val;
-        RecordObj *record_val; // VM 2.0 Phase 4d: was a plain FieldValue*
-        FileObj *f_val; // VM 2.0 Phase 4g: was a plain FILE*
-        ArrayObj *array_val; // VM 2.0 Phase 4e/4f: was a plain struct ValueStruct*
-        MStream *mstream;
-        EnumObj *enum_val; // VM 2.0 Phase 4g: was an embedded struct, now a heap pointer
-        PointerObj *ptr_val; // VM 2.0 Phase 4g: was a plain struct ValueStruct*
-        ClosureObj *closure; // VM 2.0 Phase 4i: was an embedded struct, now a heap pointer
-        InterfaceObj *interface; // VM 2.0 Phase 4i: was an embedded struct, now a heap pointer
-        // VM 2.0 Phase 4i checkpoint 3c: i_val/u_val/real.r_val (above)
-        // remain the PRIMARY storage for TYPE_INT64/TYPE_UINT64/
-        // TYPE_LONG_DOUBLE during this checkpoint -- these two boxes exist
-        // solely to give `bits` something real to tag, exactly like
-        // checkpoint 2 added `bits` as a MIRROR for inline scalars rather
-        // than replacing i_val/real outright. The box becomes the sole
-        // source of truth only at the checkpoint 3d flag day, when
-        // i_val/u_val/real are deleted. int64_box serves both TYPE_INT64
-        // and TYPE_UINT64 (bit-identical, see Int64Box's own comment in
-        // core/obj_header.h); header.type on the box always matches
-        // dest->type at the moment it was (re)allocated.
-        Int64Box *int64_box;
-        LongDoubleBox *long_double_box;
-    };
-    uint8_t *array_raw;
-    bool array_is_packed;
-    bool array_is_dynamic;
-    uint32_t *array_refcount;
-    // VM 2.0 Phase 4i: dead weight, like filename/record_size/etc below --
-    // moved into PointerObj.base_type_node (TYPE_POINTER) and
-    // EnumObj.enum_type_def (TYPE_ENUM). Nothing reads this field
-    // directly anymore; deleted at the flag day along with the rest.
-    AST *base_type_node;
-
-    char *filename;
-    int record_size;      // Active record size for untyped file operations
-    bool record_size_explicit; // Whether the record size was explicitly requested
-    int lower_bound;    // For single-dimensional arrays
-    int upper_bound;    // For single-dimensional arrays
-    int max_length;     // For fixed length strings (text: string[100];)
-    VarType element_type;
-    int dimensions;       // number of dimensions (e.g. 2 for [1..2, 1..3])
-    int *lower_bounds;    // array of lower bounds for each dimension
-    int *upper_bounds;    // array of upper bounds for each dimension
-    AST *element_type_def; // AST node defining the element type
-    SetObj *set_val; // VM 2.0 Phase 4c: was an embedded struct, now a heap pointer
-
-    // VM 2.0 Phase 4i checkpoint 2 (Docs/pscal_vm2_plan.md sec 5.10.1/
-    // 5.10.4): the tagged-word encoding from core/obj_header.h, now kept
-    // as a live MIRROR of the discrete fields above for every inline-
-    // scalar kind that needs no heap allocation to tag (VOID/NIL/
-    // BOOLEAN/CHAR/WIDECHAR/BYTE/WORD/INT8-32/UINT8-32/FLOAT/DOUBLE).
-    // `Value` stays deliberately oversized during this checkpoint --
-    // both representations coexist and are cross-checked (see
-    // pscalValueBitsConsistent in core/utils.c, called from freeValue)
-    // so a bug in the NEW encoding surfaces as an assertion failure
-    // during testing, not silent corruption or a crash the way it would
-    // if this landed at the same time as the physical struct collapse.
-    // TYPE_INT64/TYPE_UINT64/TYPE_LONG_DOUBLE (which need Int64Box/
-    // LongDoubleBox, built in 4h but not yet wired in) and every heap-
-    // pointer type (STRING/ARRAY/RECORD/FILE/ENUM/POINTER/SET/CLOSURE/
-    // INTERFACE/MEMORYSTREAM) are deferred to checkpoint 3, which
-    // combines "everything moves into bits" with the physical shrink --
-    // for those types `bits` is not yet meaningful and
-    // pscalValueBitsConsistent skips them.
     uint64_t bits;
 } Value;
 
@@ -479,14 +436,23 @@ static inline void pscalValueSetIntBits(Value *dest, long long val) {
         // changes -- exactly the same "extend the shared macro, not every
         // caller" lesson checkpoint 2 established.
         case TYPE_INT64:
-        case TYPE_UINT64:
-            if (dest->int64_box) {
-                pscalObjRelease(&dest->int64_box->header);
+        case TYPE_UINT64: {
+            // VM 2.0 Phase 4i checkpoint 3d: decode the existing box (if
+            // any) straight from `bits` -- there is no dedicated
+            // `int64_box` field anymore. A fresh Value's `bits` is 0,
+            // which decodes to a NULL pointer (correctly "no box yet");
+            // an already-INT64/UINT64 Value's `bits` already holds a
+            // real tagged pointer from an earlier call to this same
+            // function, per the invariant documented above.
+            Int64Box *existing = (Int64Box *)pscalUntagPointer(dest->bits);
+            if (existing) {
+                pscalObjRelease(&existing->header);
             }
-            dest->int64_box = pscalInt64BoxCreate(val);
-            dest->int64_box->header.type = dest->type;
-            dest->bits = pscalTagPointer(dest->int64_box);
+            Int64Box *box = pscalInt64BoxCreate(val);
+            box->header.type = dest->type;
+            dest->bits = pscalTagPointer(box);
             break;
+        }
         default: break;
     }
 }
@@ -495,15 +461,17 @@ static inline void pscalValueSetRealBits(Value *dest, long double val) {
     switch (dest->type) {
         case TYPE_FLOAT:  dest->bits = pscalTagFloat((float)val); break;
         case TYPE_DOUBLE: dest->bits = pscalBoxDouble((double)val); break;
-        // VM 2.0 Phase 4i checkpoint 3c: same release-then-allocate
+        // VM 2.0 Phase 4i checkpoint 3c/3d: same release-then-allocate
         // reasoning as TYPE_INT64/TYPE_UINT64 above.
-        case TYPE_LONG_DOUBLE:
-            if (dest->long_double_box) {
-                pscalObjRelease(&dest->long_double_box->header);
+        case TYPE_LONG_DOUBLE: {
+            LongDoubleBox *existing = (LongDoubleBox *)pscalUntagPointer(dest->bits);
+            if (existing) {
+                pscalObjRelease(&existing->header);
             }
-            dest->long_double_box = pscalLongDoubleBoxCreate(val);
-            dest->bits = pscalTagPointer(dest->long_double_box);
+            LongDoubleBox *box = pscalLongDoubleBoxCreate(val);
+            dest->bits = pscalTagPointer(box);
             break;
+        }
         default: break;
     }
 }
@@ -592,8 +560,97 @@ static inline void pscalValueResetBitsForType(Value *dest, VarType t) {
         case TYPE_INT64:
         case TYPE_UINT64:
         case TYPE_LONG_DOUBLE:
+        // VM 2.0 Phase 4i checkpoint 3d prep: closing the one bits-mirror
+        // gap left open since checkpoint 3a boxed these two types
+        // structurally without giving them a mirror (3b/3c's audits were
+        // deliberately scoped to the 8-heap-type / 3-numeric-type sets and
+        // explicitly did not cover these). Same nil-pointer-placeholder
+        // treatment as every other boxed type.
+        case TYPE_CLOSURE:
+        case TYPE_INTERFACE:
             dest->bits = pscalTagPointer(NULL); break;
         default:            dest->bits = 0; break;
+    }
+}
+
+// VM 2.0 Phase 4i checkpoint 3d: VAL_INT/VAL_UINT/VAL_REAL32/64/LD decode
+// straight from `bits`+`type` now that i_val/u_val/real are gone. Mirrors
+// pscalValueBitsConsistent's old per-type dispatch (which no longer has
+// anything to cross-check against and is deleted this checkpoint) --
+// same switch shape, now the ONLY source of truth instead of a verifier.
+// Deliberately permissive on type mismatch (returns 0/0.0) rather than
+// asserting: VAL_INT/UINT/REAL* are documented as "exact, no coercion"
+// accessors callers are expected to only use when they already know the
+// type matches (AS_INTEGER/AS_REAL in utils.h are the coercing versions).
+static inline long long pscalValueDecodeInt(Value v) {
+    switch (v.type) {
+        case TYPE_BOOLEAN:  return pscalUntagBoolean(v.bits) ? 1 : 0;
+        case TYPE_CHAR:     return (long long)(unsigned char)pscalUntagChar(v.bits);
+        case TYPE_WIDECHAR: return (long long)pscalUntagWideChar(v.bits);
+        case TYPE_BYTE:     return pscalUntagByte(v.bits);
+        case TYPE_WORD:     return pscalUntagWord(v.bits);
+        case TYPE_INT8:     return pscalUntagInt8(v.bits);
+        case TYPE_UINT8:    return pscalUntagUInt8(v.bits);
+        case TYPE_INT16:    return pscalUntagInt16(v.bits);
+        case TYPE_UINT16:   return pscalUntagUInt16(v.bits);
+        case TYPE_INT32:    return pscalUntagInt32(v.bits);
+        case TYPE_UINT32:   return (long long)pscalUntagUInt32(v.bits);
+        case TYPE_THREAD:   return pscalUntagInt32(v.bits);
+        case TYPE_INT64:
+        case TYPE_UINT64:
+            return ((Int64Box *)pscalUntagPointer(v.bits))->value;
+        default: return 0;
+    }
+}
+
+static inline unsigned long long pscalValueDecodeUInt(Value v) {
+    switch (v.type) {
+        case TYPE_BOOLEAN:  return pscalUntagBoolean(v.bits) ? 1u : 0u;
+        case TYPE_CHAR:     return (unsigned long long)(unsigned char)pscalUntagChar(v.bits);
+        case TYPE_WIDECHAR: return (unsigned long long)pscalUntagWideChar(v.bits);
+        case TYPE_BYTE:     return pscalUntagByte(v.bits);
+        case TYPE_WORD:     return pscalUntagWord(v.bits);
+        case TYPE_INT8:     return (unsigned long long)(long long)pscalUntagInt8(v.bits);
+        case TYPE_UINT8:    return pscalUntagUInt8(v.bits);
+        case TYPE_INT16:    return (unsigned long long)(long long)pscalUntagInt16(v.bits);
+        case TYPE_UINT16:   return pscalUntagUInt16(v.bits);
+        case TYPE_INT32:    return (unsigned long long)(long long)pscalUntagInt32(v.bits);
+        case TYPE_UINT32:   return pscalUntagUInt32(v.bits);
+        case TYPE_THREAD:   return (unsigned long long)(long long)pscalUntagInt32(v.bits);
+        case TYPE_INT64:
+        case TYPE_UINT64:
+            return (unsigned long long)((Int64Box *)pscalUntagPointer(v.bits))->value;
+        default: return 0;
+    }
+}
+
+static inline float pscalValueDecodeReal32(Value v) {
+    switch (v.type) {
+        case TYPE_FLOAT:  return pscalUntagFloat(v.bits);
+        case TYPE_DOUBLE: return (float)pscalUnboxDouble(v.bits);
+        case TYPE_LONG_DOUBLE:
+            return (float)((LongDoubleBox *)pscalUntagPointer(v.bits))->value;
+        default: return 0.0f;
+    }
+}
+
+static inline double pscalValueDecodeReal64(Value v) {
+    switch (v.type) {
+        case TYPE_FLOAT:  return (double)pscalUntagFloat(v.bits);
+        case TYPE_DOUBLE: return pscalUnboxDouble(v.bits);
+        case TYPE_LONG_DOUBLE:
+            return (double)((LongDoubleBox *)pscalUntagPointer(v.bits))->value;
+        default: return 0.0;
+    }
+}
+
+static inline long double pscalValueDecodeRealLD(Value v) {
+    switch (v.type) {
+        case TYPE_FLOAT:  return (long double)pscalUntagFloat(v.bits);
+        case TYPE_DOUBLE: return (long double)pscalUnboxDouble(v.bits);
+        case TYPE_LONG_DOUBLE:
+            return ((LongDoubleBox *)pscalUntagPointer(v.bits))->value;
+        default: return 0.0L;
     }
 }
 
@@ -615,18 +672,23 @@ static inline void pscalValueResetBitsForType(Value *dest, VarType t) {
  * the later substitutions ran). SET_REAL_VALUE already derives d_val/
  * f32_val/bits from the just-written r_val field rather than re-reading
  * `val`, so it doesn't need this treatment. */
+// VM 2.0 Phase 4i checkpoint 3d: `bits` is the SOLE storage now -- no more
+// i_val/u_val/real/c_val fields to keep in sync alongside it, so these
+// reduce to a single call into the matching pscalValueSetXBits dispatch
+// function. The double-evaluation hazard checkpoint 2 found (and fixed
+// with a block-scoped temp capture) is structurally gone: `val` is
+// evaluated exactly once, as a normal function-call argument, not
+// substituted textually into multiple field-write expressions the way a
+// macro body used to. The temp capture is kept anyway for SET_INT_VALUE
+// (cheap, and pins the exact evaluation-count contract in one place
+// rather than relying on "trust the callee").
 #define SET_INT_VALUE(dest, val) \
     do { long long _pscal_set_int_tmp = (long long)(val); \
-         (dest)->i_val = _pscal_set_int_tmp; (dest)->u_val = (unsigned long long)_pscal_set_int_tmp; \
          pscalValueSetIntBits((dest), _pscal_set_int_tmp); } while(0)
 #define SET_REAL_VALUE(dest, val) \
-    do { (dest)->real.r_val = (long double)(val); (dest)->real.d_val = (double)(dest)->real.r_val; \
-         (dest)->real.f32_val = (float)(dest)->real.r_val; \
-         pscalValueSetRealBits((dest), (dest)->real.r_val); } while(0)
+    do { pscalValueSetRealBits((dest), (long double)(val)); } while(0)
 #define SET_CHAR_VALUE(dest, val) \
-    do { int _pscal_set_char_tmp = (val); \
-         PSCAL_VALUE_FIELD(*(dest), c_val) = _pscal_set_char_tmp; \
-         pscalValueSetCharBits((dest), _pscal_set_char_tmp); } while(0)
+    do { pscalValueSetCharBits((dest), (val)); } while(0)
 #define SET_VALUE_TYPE(dest, t) \
     do { PSCAL_VALUE_FIELD(*(dest), type) = (t); pscalValueResetBitsForType((dest), (t)); } while(0)
 
@@ -654,13 +716,34 @@ static inline void pscalValueResetBitsForType(Value *dest, VarType t) {
 
 #define VALUE_TYPE(v)    PSCAL_VALUE_FIELD(v, type)
 
+// VM 2.0 Phase 4i checkpoint 3d: the physical collapse. `Value` no longer
+// has a dedicated struct field per heap type -- every heap-pointer type's
+// wrapper lives ONLY behind the tagged tagged-word `bits`, decoded via
+// pscalUntagPointer. PSCAL_VALUE_PTR is the one new primitive every
+// pointer-payload accessor macro below is built on: it replaces what used
+// to be `PSCAL_VALUE_FIELD(v, some_union_member)` (a dedicated struct
+// field read) with a decode-from-bits expression of the same pointer
+// type. Since C allows `(*(T*)ptr).field` as a valid lvalue, every
+// existing `MACRO(v) = X` / `MACRO(v).field = X` call site throughout the
+// tree keeps compiling and working completely unchanged -- only the
+// macro DEFINITIONS below change, not their thousands of call sites.
+#define PSCAL_VALUE_PTR(v, T) ((T *)pscalUntagPointer(PSCAL_VALUE_FIELD(v, bits)))
+
 /* Exact immediate-payload accessors (no coercion; contrast AS_INTEGER /
- * AS_REAL in core/utils.h which coerce across the numeric families). */
-#define VAL_INT(v)       PSCAL_VALUE_FIELD(v, i_val)
-#define VAL_UINT(v)      PSCAL_VALUE_FIELD(v, u_val)
-#define VAL_REAL32(v)    PSCAL_VALUE_FIELD(v, real.f32_val)
-#define VAL_REAL64(v)    PSCAL_VALUE_FIELD(v, real.d_val)
-#define VAL_REAL_LD(v)   PSCAL_VALUE_FIELD(v, real.r_val)
+ * AS_REAL in core/utils.h which coerce across the numeric families).
+ * VM 2.0 Phase 4i checkpoint 3d: these were plain field-access macros
+ * (i_val/u_val/real.*) through checkpoint 3c; now that those fields are
+ * gone, they decode from `bits`+`type` via the functions below. This
+ * makes them READ-ONLY (a function call is not an lvalue) -- the
+ * existing "writes to immediate payloads go through SET_*_VALUE" contract
+ * (this file's own doc comment above) was already the intended usage;
+ * the two known violations (assignRealToIntChecked's TYPE_UINT64 branch)
+ * were fixed to call SET_INT_VALUE/pscalValueSetIntBits directly instead. */
+#define VAL_INT(v)       pscalValueDecodeInt(v)
+#define VAL_UINT(v)      pscalValueDecodeUInt(v)
+#define VAL_REAL32(v)    pscalValueDecodeReal32(v)
+#define VAL_REAL64(v)    pscalValueDecodeReal64(v)
+#define VAL_REAL_LD(v)   pscalValueDecodeRealLD(v)
 
 /* Heap/pointer payload accessors (lvalue-capable). */
 // VM 2.0 Phase 4d: record_val is now a RecordObj*; AS_RECORD dereferences
@@ -668,60 +751,68 @@ static inline void pscalValueResetBitsForType(Value *dest, VarType t) {
 // FieldValue* unchanged. No known assignment-through-AS_RECORD call sites
 // exist (verified), but the expansion is still a valid lvalue if one ever
 // shows up, since `.fields` is a plain reassignable pointer field.
-#define AS_RECORD(v)     (PSCAL_VALUE_FIELD(v, record_val)->fields)
+#define AS_RECORD(v)     (PSCAL_VALUE_PTR(v, RecordObj)->fields)
 // VM 2.0 Phase 4e/4f: array_val is now an ArrayObj*; AS_ARRAY/AS_ARRAY_RAW
 // dereference to its element/raw-byte buffer so existing
 // `AS_ARRAY(v) = X` / `AS_ARRAY_RAW(v) = X` whole-buffer-reassignment call
 // sites (~20 of them, the same idiom found in 4c for strings) keep working
 // unchanged, given the wrapper already exists (see pscalArrayEnsureObj for
 // the sites where it doesn't yet).
-#define AS_ARRAY(v)      (PSCAL_VALUE_FIELD(v, array_val)->elements)
+#define AS_ARRAY(v)      (PSCAL_VALUE_PTR(v, ArrayObj)->elements)
 // VM 2.0 Phase 4g: f_val is now a FileObj* (was a plain FILE*); AS_FILE
 // dereferences it so existing `AS_FILE(v)` reads/writes (a FILE*) keep
 // working unchanged, given the wrapper already exists (see
 // pscalFileEnsureObj for the one site where it doesn't yet).
-#define AS_FILE(v)       (PSCAL_VALUE_FIELD(v, f_val)->f)
-#define AS_MSTREAM(v)    PSCAL_VALUE_FIELD(v, mstream)
+#define AS_FILE(v)       (PSCAL_VALUE_PTR(v, FileObj)->f)
+// VM 2.0 Phase 4i checkpoint 3d: AS_MSTREAM used to return the raw union
+// member itself (not a field inside a wrapper), so it was the one
+// accessor macro that could be assigned a NEW pointer directly
+// (`AS_MSTREAM(v) = X`) -- checkpoint 3b found and fixed the two real
+// sites doing this. `PSCAL_VALUE_PTR(v, MStream)` is a cast expression,
+// not an lvalue, so that assignment shape no longer compiles; both sites
+// were rewritten to call `pscalValueSetHeapPtrBits(&v, X)` directly,
+// which is the actual mechanism that changes `bits` anyway.
+#define AS_MSTREAM(v)    PSCAL_VALUE_PTR(v, MStream)
 // VM 2.0 Phase 4g: ptr_val is now a PointerObj* (was a plain struct
 // ValueStruct*); AS_POINTER dereferences it so existing `AS_POINTER(v)`
 // reads/writes (an address) keep working unchanged, given the wrapper
 // already exists (see pscalPointerEnsureObj for chicken-egg sites).
-#define AS_POINTER(v)    (PSCAL_VALUE_FIELD(v, ptr_val)->address)
+#define AS_POINTER(v)    (PSCAL_VALUE_PTR(v, PointerObj)->address)
 // VM 2.0 Phase 4g: enum_val is now an EnumObj* (was an embedded struct);
 // AS_ENUM dereferences it so existing `AS_ENUM(v).enum_name`/`.ordinal`
 // call sites keep working with `.` unchanged (EnumObj's field names match
 // the old embedded struct's on purpose, same trick as AS_SET/SetObj).
-#define AS_ENUM(v)       (*PSCAL_VALUE_FIELD(v, enum_val))
-#define AS_CLOSURE(v)    (*PSCAL_VALUE_FIELD(v, closure))
-#define AS_INTERFACE(v)  (*PSCAL_VALUE_FIELD(v, interface))
+#define AS_ENUM(v)       (*PSCAL_VALUE_PTR(v, EnumObj))
+#define AS_CLOSURE(v)    (*PSCAL_VALUE_PTR(v, ClosureObj))
+#define AS_INTERFACE(v)  (*PSCAL_VALUE_PTR(v, InterfaceObj))
 // VM 2.0 Phase 4c: set_val is now a SetObj* (was an embedded struct); AS_SET
 // dereferences it so existing `AS_SET(v).set_size`/`.set_values` call sites
 // keep working with `.` unchanged (SetObj's field names match the old
 // embedded struct's on purpose -- see core/types.h's SetObj comment).
-#define AS_SET(v)        (*PSCAL_VALUE_FIELD(v, set_val))
-#define SET_CAPACITY(v)  (PSCAL_VALUE_FIELD(v, set_val)->capacity)
-#define AS_ARRAY_RAW(v)  (PSCAL_VALUE_FIELD(v, array_val)->raw)
+#define AS_SET(v)        (*PSCAL_VALUE_PTR(v, SetObj))
+#define SET_CAPACITY(v)  (PSCAL_VALUE_PTR(v, SetObj)->capacity)
+#define AS_ARRAY_RAW(v)  (PSCAL_VALUE_PTR(v, ArrayObj)->raw)
 
 /* Array/string/file/pointer metadata accessors. VM 2.0 Phase 4e/4f moves
  * the array ones into ArrayObj; string ones already moved into StringObj
  * in 4c. All of these require v.array_val/.s_val to already be a valid
  * wrapper -- see pscalArrayEnsureObj/pscalStringEnsureObj for where that
  * isn't guaranteed yet by construction order alone. */
-#define ARRAY_LOWER_BOUND(v)       (PSCAL_VALUE_FIELD(v, array_val)->lower_bound)
-#define ARRAY_UPPER_BOUND(v)       (PSCAL_VALUE_FIELD(v, array_val)->upper_bound)
-#define ARRAY_LOWER_BOUNDS(v)      (PSCAL_VALUE_FIELD(v, array_val)->lower_bounds)
-#define ARRAY_UPPER_BOUNDS(v)      (PSCAL_VALUE_FIELD(v, array_val)->upper_bounds)
-#define ARRAY_DIMENSIONS(v)        (PSCAL_VALUE_FIELD(v, array_val)->dimensions)
-#define ARRAY_ELEMENT_TYPE(v)      (PSCAL_VALUE_FIELD(v, array_val)->element_type)
-#define ARRAY_ELEMENT_TYPE_DEF(v)  (PSCAL_VALUE_FIELD(v, array_val)->element_type_def)
-#define ARRAY_IS_PACKED(v)         (PSCAL_VALUE_FIELD(v, array_val)->is_packed)
-#define ARRAY_IS_DYNAMIC(v)        (PSCAL_VALUE_FIELD(v, array_val)->is_dynamic)
+#define ARRAY_LOWER_BOUND(v)       (PSCAL_VALUE_PTR(v, ArrayObj)->lower_bound)
+#define ARRAY_UPPER_BOUND(v)       (PSCAL_VALUE_PTR(v, ArrayObj)->upper_bound)
+#define ARRAY_LOWER_BOUNDS(v)      (PSCAL_VALUE_PTR(v, ArrayObj)->lower_bounds)
+#define ARRAY_UPPER_BOUNDS(v)      (PSCAL_VALUE_PTR(v, ArrayObj)->upper_bounds)
+#define ARRAY_DIMENSIONS(v)        (PSCAL_VALUE_PTR(v, ArrayObj)->dimensions)
+#define ARRAY_ELEMENT_TYPE(v)      (PSCAL_VALUE_PTR(v, ArrayObj)->element_type)
+#define ARRAY_ELEMENT_TYPE_DEF(v)  (PSCAL_VALUE_PTR(v, ArrayObj)->element_type_def)
+#define ARRAY_IS_PACKED(v)         (PSCAL_VALUE_PTR(v, ArrayObj)->is_packed)
+#define ARRAY_IS_DYNAMIC(v)        (PSCAL_VALUE_PTR(v, ArrayObj)->is_dynamic)
 // VM 2.0 Phase 4g: element_type/element_type_def moved inside FileObj
 // (folded in during file boxing, closing the loose end 4e/4f's postmortem
 // flagged -- see FileObj's comment). Requires v.f_val to already be a
 // valid FileObj*.
-#define FILE_ELEMENT_TYPE(v)      (PSCAL_VALUE_FIELD(v, f_val)->element_type)
-#define FILE_ELEMENT_TYPE_DEF(v)  (PSCAL_VALUE_FIELD(v, f_val)->element_type_def)
+#define FILE_ELEMENT_TYPE(v)      (PSCAL_VALUE_PTR(v, FileObj)->element_type)
+#define FILE_ELEMENT_TYPE_DEF(v)  (PSCAL_VALUE_PTR(v, FileObj)->element_type_def)
 // ARRAY_REFCOUNT is intentionally removed (VM 2.0 Phase 4e/4f): the old
 // uint32_t* scheme is gone. Every former call site now uses
 // pscalObjRetain/pscalObjRelease on &v.array_val->header instead, inside
@@ -733,37 +824,37 @@ static inline void pscalValueResetBitsForType(Value *dest, VarType t) {
 // struct shrink deletes it -- nothing should read it directly anymore).
 // Requires v.s_val to already be a valid StringObj*; see AS_STRING's
 // comment (core/utils.h) and pscalStringEnsureObj for why/when that holds.
-#define STRING_MAX_LENGTH(v)       (PSCAL_VALUE_FIELD(v, s_val)->max_length)
+#define STRING_MAX_LENGTH(v)       (PSCAL_VALUE_PTR(v, StringObj)->max_length)
 // VM 2.0 Phase 4i: moved inside PointerObj (see that struct's comment for
 // the full history -- 4g left this unboxed reasoning from an
 // over-broad "type-agnostic" audit finding; 4i's follow-up audit found
 // TYPE_RECORD was a red herring and TYPE_ENUM gets its own dedicated
 // ENUM_TYPE_DEF macro/field instead). Valid ONLY when VALUE_TYPE(v) ==
-// TYPE_POINTER, exactly like every other PSCAL_VALUE_FIELD-based
+// TYPE_POINTER, exactly like every other PSCAL_VALUE_PTR-based
 // accessor -- callers that used to call this on a value of unknown type
 // (the "generic assignment-preservation" call sites) now check
 // VALUE_TYPE first. Requires v.ptr_val to already be a valid PointerObj*
 // (always true once a Value is TYPE_POINTER, matching every other boxed
 // type's "wrapper always present" invariant).
-#define PTR_BASE_TYPE_NODE(v)      (PSCAL_VALUE_FIELD(v, ptr_val)->base_type_node)
+#define PTR_BASE_TYPE_NODE(v)      (PSCAL_VALUE_PTR(v, PointerObj)->base_type_node)
 // VM 2.0 Phase 4i: the enum-specific counterpart to PTR_BASE_TYPE_NODE --
 // see EnumObj's comment for why this is a separate field/macro rather
 // than sharing PointerObj's. Valid ONLY when VALUE_TYPE(v) == TYPE_ENUM.
 // Requires v.enum_val to already be a valid EnumObj*.
-#define ENUM_TYPE_DEF(v)           (PSCAL_VALUE_FIELD(v, enum_val)->enum_type_def)
+#define ENUM_TYPE_DEF(v)           (PSCAL_VALUE_PTR(v, EnumObj)->enum_type_def)
 // VM 2.0 Phase 4g: filename/record_size/record_size_explicit moved inside
 // FileObj; the old top-level Value fields are dead weight until Phase
 // 4i's struct shrink deletes them. Requires v.f_val to already be a valid
 // FileObj*.
-#define FILE_FILENAME(v)           (PSCAL_VALUE_FIELD(v, f_val)->filename)
-#define FILE_RECORD_SIZE(v)        (PSCAL_VALUE_FIELD(v, f_val)->record_size)
-#define FILE_RECORD_SIZE_EXPLICIT(v) (PSCAL_VALUE_FIELD(v, f_val)->record_size_explicit)
+#define FILE_FILENAME(v)           (PSCAL_VALUE_PTR(v, FileObj)->filename)
+#define FILE_RECORD_SIZE(v)        (PSCAL_VALUE_PTR(v, FileObj)->record_size)
+#define FILE_RECORD_SIZE_EXPLICIT(v) (PSCAL_VALUE_PTR(v, FileObj)->record_size_explicit)
 // VM 2.0 Phase 4g: enum_meta moved inside EnumObj; the old top-level
 // Value.enum_meta field is dead weight until Phase 4i's struct shrink
 // deletes it -- nothing should read it directly anymore. Requires
 // v.enum_val to already be a valid EnumObj* (always true once a Value is
 // TYPE_ENUM, matching StringObj/SetObj/RecordObj precedent).
-#define ENUM_META(v)               (PSCAL_VALUE_FIELD(v, enum_val)->enum_meta)
+#define ENUM_META(v)               (PSCAL_VALUE_PTR(v, EnumObj)->enum_meta)
 
 typedef struct FieldValue {
     char *name;

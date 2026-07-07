@@ -753,12 +753,12 @@ StringObj *pscalStringObjCreate(int max_length, VarType owner_type) {
 }
 
 void pscalStringEnsureObj(Value *v) {
-    if (!v || v->s_val) {
+    if (!v || PSCAL_VALUE_PTR(*v, StringObj)) {
         return;
     }
     VarType owner_type = (v->type == TYPE_UNICODE_STRING) ? TYPE_UNICODE_STRING : TYPE_STRING;
-    v->s_val = pscalStringObjCreate(-1, owner_type);
-    pscalValueSetHeapPtrBits(v, v->s_val);
+    StringObj *s = pscalStringObjCreate(-1, owner_type);
+    pscalValueSetHeapPtrBits(v, s);
 }
 
 // VM 2.0 Phase 4d: RecordObj is a thin wrapper only -- FieldValue's own
@@ -851,11 +851,11 @@ ArrayObj *pscalArrayObjCreate(void) {
 }
 
 void pscalArrayEnsureObj(Value *v) {
-    if (!v || v->array_val) {
+    if (!v || PSCAL_VALUE_PTR(*v, ArrayObj)) {
         return;
     }
-    v->array_val = pscalArrayObjCreate();
-    pscalValueSetHeapPtrBits(v, v->array_val);
+    ArrayObj *a = pscalArrayObjCreate();
+    pscalValueSetHeapPtrBits(v, a);
 }
 
 // VM 2.0 Phase 4g: EnumObj destructor only owns enum_name (strdup'd);
@@ -884,11 +884,11 @@ EnumObj *pscalEnumObjCreate(void) {
 }
 
 void pscalEnumEnsureObj(Value *v) {
-    if (!v || v->enum_val) {
+    if (!v || PSCAL_VALUE_PTR(*v, EnumObj)) {
         return;
     }
-    v->enum_val = pscalEnumObjCreate();
-    pscalValueSetHeapPtrBits(v, v->enum_val);
+    EnumObj *e = pscalEnumObjCreate();
+    pscalValueSetHeapPtrBits(v, e);
 }
 
 // VM 2.0 Phase 4g: mirrors freeValue's pre-4g TYPE_FILE case exactly
@@ -926,11 +926,11 @@ FileObj *pscalFileObjCreate(void) {
 }
 
 void pscalFileEnsureObj(Value *v) {
-    if (!v || v->f_val) {
+    if (!v || PSCAL_VALUE_PTR(*v, FileObj)) {
         return;
     }
-    v->f_val = pscalFileObjCreate();
-    pscalValueSetHeapPtrBits(v, v->f_val);
+    FileObj *fo = pscalFileObjCreate();
+    pscalValueSetHeapPtrBits(v, fo);
 }
 
 // VM 2.0 Phase 4g: PointerObj only ever holds `.address` (base_type_node
@@ -966,11 +966,11 @@ PointerObj *pscalPointerObjCreate(void) {
 }
 
 void pscalPointerEnsureObj(Value *v) {
-    if (!v || v->ptr_val) {
+    if (!v || PSCAL_VALUE_PTR(*v, PointerObj)) {
         return;
     }
-    v->ptr_val = pscalPointerObjCreate();
-    pscalValueSetHeapPtrBits(v, v->ptr_val);
+    PointerObj *po = pscalPointerObjCreate();
+    pscalValueSetHeapPtrBits(v, po);
 }
 
 // VM 2.0 Phase 4i checkpoint 3a: NOT ObjHeader-based -- see ClosureObj's
@@ -1699,12 +1699,12 @@ Value makeString(const char *val) {
     memset(&v, 0, sizeof(Value)); // Initialize all fields
     v.type = TYPE_STRING;
     // -1 = dynamic string (no fixed limit relevant here)
-    v.s_val = pscalStringObjCreate(-1, TYPE_STRING);
-    pscalValueSetHeapPtrBits(&v, v.s_val);
+    StringObj *s = pscalStringObjCreate(-1, TYPE_STRING);
+    pscalValueSetHeapPtrBits(&v, s);
 
     // strdup("") for a NULL input -> an empty string, same as before.
-    v.s_val->buffer = strdup(val != NULL ? val : "");
-    if (!v.s_val->buffer) {
+    s->buffer = strdup(val != NULL ? val : "");
+    if (!s->buffer) {
         fprintf(stderr, "FATAL: Memory allocation failed in makeString (strdup)\n");
         EXIT_FAILURE_HANDLER();
     }
@@ -1715,19 +1715,19 @@ Value makeStringLen(const char *val, size_t len) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_STRING;
-    v.s_val = pscalStringObjCreate((int)len, TYPE_STRING);
-    pscalValueSetHeapPtrBits(&v, v.s_val);
+    StringObj *s = pscalStringObjCreate((int)len, TYPE_STRING);
+    pscalValueSetHeapPtrBits(&v, s);
     if (val && len > 0) {
-        v.s_val->buffer = (char*)malloc(len + 1);
-        if (!v.s_val->buffer) {
+        s->buffer = (char*)malloc(len + 1);
+        if (!s->buffer) {
             fprintf(stderr, "FATAL: Memory allocation failed in makeStringLen\n");
             EXIT_FAILURE_HANDLER();
         }
-        memcpy(v.s_val->buffer, val, len);
-        v.s_val->buffer[len] = '\0';
+        memcpy(s->buffer, val, len);
+        s->buffer[len] = '\0';
     } else {
-        v.s_val->buffer = strdup("");
-        if (!v.s_val->buffer) {
+        s->buffer = strdup("");
+        if (!s->buffer) {
             fprintf(stderr, "FATAL: Memory allocation failed in makeStringLen (empty)\n");
             EXIT_FAILURE_HANDLER();
         }
@@ -1738,14 +1738,14 @@ Value makeStringLen(const char *val, size_t len) {
 Value makeUnicodeString(const char *val) {
     Value v = makeString(val);
     v.type = TYPE_UNICODE_STRING;
-    v.s_val->header.type = TYPE_UNICODE_STRING; // keep ObjHeader.type accurate
+    PSCAL_VALUE_PTR(v, StringObj)->header.type = TYPE_UNICODE_STRING; // keep ObjHeader.type accurate
     return v;
 }
 
 Value makeUnicodeStringLen(const char *val, size_t len) {
     Value v = makeStringLen(val, len);
     v.type = TYPE_UNICODE_STRING;
-    v.s_val->header.type = TYPE_UNICODE_STRING; // keep ObjHeader.type accurate
+    PSCAL_VALUE_PTR(v, StringObj)->header.type = TYPE_UNICODE_STRING; // keep ObjHeader.type accurate
     return v;
 }
 
@@ -1753,9 +1753,7 @@ Value makeChar(int c) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_CHAR;
-    v.c_val = c;
-    SET_INT_VALUE(&v, c); // Keep numeric fields in sync for ordinal ops
-    v.max_length = 1; // Character has a fixed length of 1
+    SET_INT_VALUE(&v, c);
     return v;
 }
 
@@ -1782,9 +1780,9 @@ Value makeFile(FILE *f) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_FILE;
-    v.f_val = pscalFileObjCreate();
-    pscalValueSetHeapPtrBits(&v, v.f_val);
-    v.f_val->f = f;
+    FileObj *fo = pscalFileObjCreate();
+    pscalValueSetHeapPtrBits(&v, fo);
+    fo->f = f;
     // Filename is associated via assign()
     return v;
 }
@@ -1793,14 +1791,14 @@ Value makeRecord(FieldValue *rec) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_RECORD;
-    v.record_val = pscalRecordObjCreate(rec); // Takes ownership of the FieldValue list
-    pscalValueSetHeapPtrBits(&v, v.record_val);
+    RecordObj *r = pscalRecordObjCreate(rec); // Takes ownership of the FieldValue list
+    pscalValueSetHeapPtrBits(&v, r);
     return v;
 }
 
 Value makeArrayND(int dimensions, int *lower_bounds, int *upper_bounds, VarType element_type, AST *type_def) {
     Value v = makeEmptyArray(element_type, type_def);
-    ArrayObj *arr = v.array_val;
+    ArrayObj *arr = PSCAL_VALUE_PTR(v, ArrayObj);
     arr->dimensions = dimensions;
     bool use_packed = isPackedByteElementType(element_type);
     arr->is_packed = use_packed;
@@ -1920,15 +1918,15 @@ Value makeEmptyArray(VarType element_type, AST *type_def) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_ARRAY;
-    v.array_val = pscalArrayObjCreate(); // refcount=1 already, via ObjHeader
-    pscalValueSetHeapPtrBits(&v, v.array_val);
-    v.array_val->element_type = element_type;
-    v.array_val->element_type_def = type_def;
-    v.array_val->dimensions = 0;
-    v.array_val->is_packed = isPackedByteElementType(element_type);
-    v.array_val->is_dynamic = true;
-    v.array_val->lower_bound = 0;
-    v.array_val->upper_bound = -1;
+    ArrayObj *a = pscalArrayObjCreate(); // refcount=1 already, via ObjHeader
+    pscalValueSetHeapPtrBits(&v, a);
+    a->element_type = element_type;
+    a->element_type_def = type_def;
+    a->dimensions = 0;
+    a->is_packed = isPackedByteElementType(element_type);
+    a->is_dynamic = true;
+    a->lower_bound = 0;
+    a->upper_bound = -1;
     return v;
 }
 
@@ -1938,7 +1936,6 @@ Value makeNil(void) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_NIL; // <<< Set type to TYPE_NIL
-    v.ptr_val = NULL; // A nil pointer's value is NULL
     v.bits = pscalTagNil();
     return v;
 }
@@ -2088,7 +2085,7 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
                      Symbol *constSym = lookupSymbolOptional(const_name);
 
                     if (constSym && constSym->is_const && constSym->value && constSym->value->type == TYPE_INT32) {
-                          parsed_len = constSym->value->i_val;
+                          parsed_len = VAL_INT(*constSym->value);
                           #ifdef DEBUG
                           fprintf(stderr, "[DEBUG makeValueForType] Found constant '%s' with value %lld.\n", const_name, parsed_len);
                           #endif
@@ -2113,14 +2110,14 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
                  }
             }
 
-            v.s_val = pscalStringObjCreate(computed_max_length, type);
-            pscalValueSetHeapPtrBits(&v, v.s_val);
+            StringObj *s = pscalStringObjCreate(computed_max_length, type);
+            pscalValueSetHeapPtrBits(&v, s);
             if (computed_max_length > 0) {
-                v.s_val->buffer = calloc(computed_max_length + 1, 1);
-                if (!v.s_val->buffer) { fprintf(stderr, "FATAL: calloc failed for fixed string\n"); EXIT_FAILURE_HANDLER(); }
+                s->buffer = calloc(computed_max_length + 1, 1);
+                if (!s->buffer) { fprintf(stderr, "FATAL: calloc failed for fixed string\n"); EXIT_FAILURE_HANDLER(); }
             } else {
-                v.s_val->buffer = strdup("");
-                if (!v.s_val->buffer) { fprintf(stderr, "FATAL: strdup failed for dynamic string\n"); EXIT_FAILURE_HANDLER(); }
+                s->buffer = strdup("");
+                if (!s->buffer) { fprintf(stderr, "FATAL: strdup failed for dynamic string\n"); EXIT_FAILURE_HANDLER(); }
                 #ifdef DEBUG
                 fprintf(stderr, "[DEBUG makeValueForType] Allocated dynamic string.\n");
                 #endif
@@ -2130,18 +2127,17 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
         case TYPE_CHAR:
         case TYPE_WIDECHAR:
             SET_CHAR_VALUE(&v, '\0');
-            v.max_length = 1;
             break;
         case TYPE_BOOLEAN: SET_INT_VALUE(&v, 0); break;
         case TYPE_FILE: {
-            v.f_val = pscalFileObjCreate();
-            pscalValueSetHeapPtrBits(&v, v.f_val);
-            v.f_val->f = NULL;
-            v.f_val->filename = NULL;
-            v.f_val->record_size = PSCAL_DEFAULT_FILE_RECORD_SIZE;
-            v.f_val->record_size_explicit = false;
-            v.f_val->element_type = TYPE_VOID;
-            v.f_val->element_type_def = NULL;
+            FileObj *fo = pscalFileObjCreate();
+            pscalValueSetHeapPtrBits(&v, fo);
+            fo->f = NULL;
+            fo->filename = NULL;
+            fo->record_size = PSCAL_DEFAULT_FILE_RECORD_SIZE;
+            fo->record_size_explicit = false;
+            fo->element_type = TYPE_VOID;
+            fo->element_type_def = NULL;
 
             AST *fileTypeNode = node_to_inspect ? resolveTypeAliasForRecord(node_to_inspect) : NULL;
             if (fileTypeNode && fileTypeNode->type == AST_TYPE_REFERENCE && fileTypeNode->right) {
@@ -2153,27 +2149,27 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
                 AST *elementNode = fileTypeNode->right;
                 VarType elementType = resolveValueTypeNode(&elementNode);
                 if (elementType != TYPE_VOID && elementType != TYPE_UNKNOWN) {
-                    v.f_val->element_type = elementType;
-                    v.f_val->element_type_def = elementNode;
+                    fo->element_type = elementType;
+                    fo->element_type_def = elementNode;
 
                     long long elementBytes = 0;
                     if (pascalVarTypeSize(elementType, &elementBytes) && elementBytes > 0 && elementBytes <= INT_MAX) {
-                        v.f_val->record_size = (int)elementBytes;
-                        v.f_val->record_size_explicit = true;
+                        fo->record_size = (int)elementBytes;
+                        fo->record_size_explicit = true;
                     }
                 }
             }
             break;
         }
-        case TYPE_RECORD:
+        case TYPE_RECORD: {
             // The wrapper itself is never NULL (AS_RECORD dereferences it
             // unconditionally); only .fields can be NULL, matching the old
             // "no node_to_inspect" behavior exactly.
-            v.record_val = pscalRecordObjCreate(node_to_inspect ? createEmptyRecord(node_to_inspect) : NULL);
-            pscalValueSetHeapPtrBits(&v, v.record_val);
+            RecordObj *r = pscalRecordObjCreate(node_to_inspect ? createEmptyRecord(node_to_inspect) : NULL);
+            pscalValueSetHeapPtrBits(&v, r);
             break;
+        }
         case TYPE_ARRAY: {
-            v.array_val = NULL;
 
             AST* definition_node_for_array = node_to_inspect ? resolveTypeAliasForRecord(node_to_inspect) : NULL;
 
@@ -2287,46 +2283,52 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
 
             #ifdef DEBUG
             fprintf(stderr, "[DEBUG makeValueForType - ARRAY CASE EXIT] Returning Value: type=%s, dimensions=%d\n",
-                    varTypeToString(v.type), v.array_val ? ARRAY_DIMENSIONS(v) : 0);
+                    varTypeToString(v.type), PSCAL_VALUE_PTR(v, ArrayObj) ? ARRAY_DIMENSIONS(v) : 0);
             #endif
             break;
         }
-        case TYPE_MEMORYSTREAM:
-             v.mstream = createMStream();
-             pscalValueSetHeapPtrBits(&v, v.mstream);
+        case TYPE_MEMORYSTREAM: {
+             MStream *ms = createMStream();
+             pscalValueSetHeapPtrBits(&v, ms);
              break;
-        case TYPE_ENUM:
-             v.enum_val = pscalEnumObjCreate();
-             pscalValueSetHeapPtrBits(&v, v.enum_val);
-             v.enum_val->ordinal = 0;
-             v.enum_val->enum_name = (actual_type_def && actual_type_def->token && actual_type_def->token->value)
+        }
+        case TYPE_ENUM: {
+             EnumObj *e = pscalEnumObjCreate();
+             pscalValueSetHeapPtrBits(&v, e);
+             e->ordinal = 0;
+             e->enum_name = (actual_type_def && actual_type_def->token && actual_type_def->token->value)
                                       ? strdup(actual_type_def->token->value)
                                       : strdup("<unknown_enum>");
-             if (!v.enum_val->enum_name) { /* Malloc error */ EXIT_FAILURE_HANDLER(); }
-             v.enum_val->enum_type_def = actual_type_def;
+             if (!e->enum_name) { /* Malloc error */ EXIT_FAILURE_HANDLER(); }
+             e->enum_type_def = actual_type_def;
              break;
-        case TYPE_SET:
-             v.set_val = pscalSetObjCreate();
-             pscalValueSetHeapPtrBits(&v, v.set_val);
+        }
+        case TYPE_SET: {
+             SetObj *so = pscalSetObjCreate();
+             pscalValueSetHeapPtrBits(&v, so);
              break;
-        case TYPE_POINTER:
+        }
+        case TYPE_POINTER: {
             // A nil-valued pointer variable still gets a wrapper (never a
             // NULL v.ptr_val itself) -- "nil" is address==NULL inside a
             // real PointerObj, matching every other boxed type's "wrapper
             // always present" invariant. AS_POINTER(v) dereferences
             // v.ptr_val unconditionally, same as AS_FILE/AS_ARRAY/etc.
-            v.ptr_val = pscalPointerObjCreate();
-            pscalValueSetHeapPtrBits(&v, v.ptr_val);
-            v.ptr_val->base_type_node = resolved_pointer_base_type_node;
+            PointerObj *po = pscalPointerObjCreate();
+            pscalValueSetHeapPtrBits(&v, po);
+            po->base_type_node = resolved_pointer_base_type_node;
             break;
+        }
         case TYPE_THREAD:
             SET_INT_VALUE(&v, -1);
             break;
-        case TYPE_INTERFACE:
-            v.interface = pscalInterfaceObjCreate();
-            v.interface->type_def = actual_type_def ? actual_type_def : type_def_param;
-            v.interface->payload = NULL;
+        case TYPE_INTERFACE: {
+            InterfaceObj *iface = pscalInterfaceObjCreate();
+            pscalValueSetHeapPtrBits(&v, iface);
+            iface->type_def = actual_type_def ? actual_type_def : type_def_param;
+            iface->payload = NULL;
             break;
+        }
         case TYPE_NIL:
             return makeNil();
         case TYPE_VOID:
@@ -2344,8 +2346,7 @@ Value makeMStream(MStream *ms) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_MEMORYSTREAM;
-    v.mstream = ms; // Takes ownership or shares pointer based on usage context
-    pscalValueSetHeapPtrBits(&v, v.mstream);
+    pscalValueSetHeapPtrBits(&v, ms); // Takes ownership or shares pointer based on usage context
     return v;
 }
 
@@ -2358,10 +2359,10 @@ Value makePointer(void* address, AST* base_type_node) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_POINTER; // The type of the value is POINTER
-    v.ptr_val = pscalPointerObjCreate();
-    pscalValueSetHeapPtrBits(&v, v.ptr_val);
-    v.ptr_val->address = (Value*)address; // The actual memory address it points to
-    v.ptr_val->base_type_node = base_type_node; // Link to the definition of the type being pointed to
+    PointerObj *po = pscalPointerObjCreate();
+    pscalValueSetHeapPtrBits(&v, po);
+    po->address = (Value*)address; // The actual memory address it points to
+    po->base_type_node = base_type_node; // Link to the definition of the type being pointed to
     return v;
 }
 
@@ -2439,10 +2440,11 @@ Value makeClosure(uint32_t entry_offset, struct Symbol_s* symbol, ClosureEnvPayl
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_CLOSURE;
-    v.closure = pscalClosureObjCreate();
-    v.closure->entry_offset = entry_offset;
-    v.closure->symbol = symbol;
-    v.closure->env = env;
+    ClosureObj *co = pscalClosureObjCreate();
+    pscalValueSetHeapPtrBits(&v, co);
+    co->entry_offset = entry_offset;
+    co->symbol = symbol;
+    co->env = env;
     if (env) {
         retainClosureEnv(env);
     }
@@ -2453,9 +2455,10 @@ Value makeInterface(AST* interfaceType, ClosureEnvPayload* payload) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_INTERFACE;
-    v.interface = pscalInterfaceObjCreate();
-    v.interface->type_def = interfaceType;
-    v.interface->payload = payload;
+    InterfaceObj *iface = pscalInterfaceObjCreate();
+    pscalValueSetHeapPtrBits(&v, iface);
+    iface->type_def = interfaceType;
+    iface->payload = payload;
     if (payload) {
         retainClosureEnv(payload);
     }
@@ -2585,119 +2588,8 @@ void freeTypeTable(void) {
     type_table = NULL;
 }
 
-// VM 2.0 Phase 4i checkpoint 2: see utils.h for the full contract. Only
-// checks the scalar kinds checkpoint 2 actually maintains a bits mirror
-// for; every other type returns true vacuously (deferred to checkpoint
-// 3, where bits becomes the ONLY representation and this function is
-// deleted along with the fields it's comparing against).
-bool pscalValueBitsConsistent(const Value *v) {
-    if (!v) return true;
-    switch (v->type) {
-        case TYPE_VOID:
-            return pscalTaggedWordKind(v->bits) == PSCAL_TAG_VOID;
-        case TYPE_NIL:
-            return pscalTaggedWordKind(v->bits) == PSCAL_TAG_NIL;
-        case TYPE_BOOLEAN:
-            return pscalUntagBoolean(v->bits) == (v->i_val != 0);
-        case TYPE_CHAR:
-            return pscalUntagChar(v->bits) == (char)v->c_val;
-        case TYPE_WIDECHAR:
-            return pscalUntagWideChar(v->bits) == (uint32_t)v->c_val;
-        case TYPE_BYTE:
-            return pscalUntagByte(v->bits) == (uint8_t)v->i_val;
-        case TYPE_WORD:
-            return pscalUntagWord(v->bits) == (uint16_t)v->i_val;
-        case TYPE_INT8:
-            return pscalUntagInt8(v->bits) == (int8_t)v->i_val;
-        case TYPE_UINT8:
-            return pscalUntagUInt8(v->bits) == (uint8_t)v->i_val;
-        case TYPE_INT16:
-            return pscalUntagInt16(v->bits) == (int16_t)v->i_val;
-        case TYPE_UINT16:
-            return pscalUntagUInt16(v->bits) == (uint16_t)v->i_val;
-        case TYPE_INT32:
-            return pscalUntagInt32(v->bits) == (int32_t)v->i_val;
-        case TYPE_UINT32:
-            return pscalUntagUInt32(v->bits) == (uint32_t)v->u_val;
-        case TYPE_THREAD:
-            return pscalUntagInt32(v->bits) == (int32_t)v->i_val;
-        case TYPE_FLOAT: {
-            float fromBits = pscalUntagFloat(v->bits);
-            float fromField = v->real.f32_val;
-            if (isnan(fromField)) return isnan(fromBits);
-            return fromBits == fromField;
-        }
-        case TYPE_DOUBLE: {
-            if (pscalWordIsNanBoxTag(v->bits)) return false; // must never collide with the reserved header
-            double fromBits = pscalUnboxDouble(v->bits);
-            double fromField = v->real.d_val;
-            if (isnan(fromField)) return isnan(fromBits);
-            return fromBits == fromField;
-        }
-        // VM 2.0 Phase 4i checkpoint 3b: heap-pointer types now maintain a
-        // live bits mirror too (pscalValueSetHeapPtrBits, called at every
-        // construction/copy/null-out site) -- verify it decodes back to
-        // exactly the union member actually stored, same discipline as the
-        // scalar cases above. TYPE_CLOSURE/TYPE_INTERFACE (boxed in
-        // checkpoint 3a but not yet given a bits mirror) and
-        // TYPE_INT64/TYPE_UINT64/TYPE_LONG_DOUBLE remain deferred to
-        // checkpoint 3c/3d.
-        case TYPE_STRING:
-        case TYPE_UNICODE_STRING:
-            if (!pscalWordIsNanBoxTag(v->bits) || !pscalTaggedWordIsPointer(v->bits)) return false;
-            return pscalUntagPointer(v->bits) == (const void *)v->s_val;
-        case TYPE_ARRAY:
-            if (!pscalWordIsNanBoxTag(v->bits) || !pscalTaggedWordIsPointer(v->bits)) return false;
-            return pscalUntagPointer(v->bits) == (const void *)v->array_val;
-        case TYPE_RECORD:
-            if (!pscalWordIsNanBoxTag(v->bits) || !pscalTaggedWordIsPointer(v->bits)) return false;
-            return pscalUntagPointer(v->bits) == (const void *)v->record_val;
-        case TYPE_FILE:
-            if (!pscalWordIsNanBoxTag(v->bits) || !pscalTaggedWordIsPointer(v->bits)) return false;
-            return pscalUntagPointer(v->bits) == (const void *)v->f_val;
-        case TYPE_ENUM:
-            if (!pscalWordIsNanBoxTag(v->bits) || !pscalTaggedWordIsPointer(v->bits)) return false;
-            return pscalUntagPointer(v->bits) == (const void *)v->enum_val;
-        case TYPE_POINTER:
-            if (!pscalWordIsNanBoxTag(v->bits) || !pscalTaggedWordIsPointer(v->bits)) return false;
-            return pscalUntagPointer(v->bits) == (const void *)v->ptr_val;
-        case TYPE_SET:
-            if (!pscalWordIsNanBoxTag(v->bits) || !pscalTaggedWordIsPointer(v->bits)) return false;
-            return pscalUntagPointer(v->bits) == (const void *)v->set_val;
-        case TYPE_MEMORYSTREAM:
-            if (!pscalWordIsNanBoxTag(v->bits) || !pscalTaggedWordIsPointer(v->bits)) return false;
-            return pscalUntagPointer(v->bits) == (const void *)v->mstream;
-        // VM 2.0 Phase 4i checkpoint 3c: int64_box/long_double_box mirror
-        // i_val/u_val/real.r_val (still the primary storage this
-        // checkpoint) -- verify both the tag decodes to the live box AND
-        // the box's own value still matches the legacy field.
-        case TYPE_INT64:
-        case TYPE_UINT64:
-            if (!pscalWordIsNanBoxTag(v->bits) || !pscalTaggedWordIsPointer(v->bits)) return false;
-            if (pscalUntagPointer(v->bits) != (const void *)v->int64_box) return false;
-            return v->int64_box && (uint64_t)v->int64_box->value == v->u_val;
-        case TYPE_LONG_DOUBLE:
-            if (!pscalWordIsNanBoxTag(v->bits) || !pscalTaggedWordIsPointer(v->bits)) return false;
-            if (pscalUntagPointer(v->bits) != (const void *)v->long_double_box) return false;
-            if (!v->long_double_box) return false;
-            if (isnan((double)v->real.r_val)) return isnan((double)v->long_double_box->value);
-            return v->long_double_box->value == v->real.r_val;
-        default:
-            return true; // deferred: TYPE_CLOSURE/TYPE_INTERFACE
-    }
-}
-
 void freeValue(Value *v) {
     if (!v) return;
-
-    if (!pscalValueBitsConsistent(v)) {
-        fprintf(stderr,
-                "PSCAL VM 2.0: tagged-word bits mismatch for type %s (VM 2.0 Phase 4i "
-                "checkpoint 2 verification) -- the new tagged-word encoding disagrees "
-                "with the legacy discrete fields for this Value.\n",
-                varTypeToString(v->type));
-        abort();
-    }
 
 //#ifdef DEBUG
 //    fprintf(stderr, "[DEBUG] freeValue called for Value* at %p, type=%s\n",
@@ -2727,67 +2619,71 @@ void freeValue(Value *v) {
         // stay valid (they're not heap pointers) but are otherwise inert
         // once freeValue tears the Value down.
         case TYPE_INT64:
-        case TYPE_UINT64:
-            if (v->int64_box) {
-                pscalObjRelease(&v->int64_box->header);
+        case TYPE_UINT64: {
+            Int64Box *box = PSCAL_VALUE_PTR(*v, Int64Box);
+            if (box) {
+                pscalObjRelease(&box->header);
             }
-            v->int64_box = NULL;
             v->bits = pscalTagPointer(NULL);
             break;
-        case TYPE_LONG_DOUBLE:
-            if (v->long_double_box) {
-                pscalObjRelease(&v->long_double_box->header);
+        }
+        case TYPE_LONG_DOUBLE: {
+            LongDoubleBox *box = PSCAL_VALUE_PTR(*v, LongDoubleBox);
+            if (box) {
+                pscalObjRelease(&box->header);
             }
-            v->long_double_box = NULL;
             v->bits = pscalTagPointer(NULL);
             break;
-        case TYPE_ENUM:
-            if (v->enum_val) {
-                pscalObjRelease(&v->enum_val->header);
+        }
+        case TYPE_ENUM: {
+            EnumObj *e = PSCAL_VALUE_PTR(*v, EnumObj);
+            if (e) {
+                pscalObjRelease(&e->header);
             }
-            v->enum_val = NULL;
             pscalValueSetHeapPtrBits(v, NULL);
             break;
-        case TYPE_POINTER:
+        }
+        case TYPE_POINTER: {
             // For a Value struct of TYPE_POINTER, freeValue should NOT free the memory
             // that the pointer's address points to, in general -- that's the job of
             // dispose/FreeMem. Sentinel-tagged flavors are the deliberate exception:
             // OWNED_POINTER_SENTINEL/SERIALIZED_CHAR_PTR_SENTINEL DO own their target.
-            // VM 2.0 Phase 4i: this check now reads v->ptr_val->base_type_node
+            // VM 2.0 Phase 4i: this check now reads ptr_val->base_type_node
             // (moved inside PointerObj) and must still happen HERE, before
             // pscalObjRelease, not in pointerObjDestroy's generic ObjHeader
             // dispatch -- multiple Values can share one PointerObj by the
             // time the last reference lets go, with no single "owning Value"
             // for a generic destructor to consult.
+            PointerObj *po = PSCAL_VALUE_PTR(*v, PointerObj);
 #ifdef DEBUG
             fprintf(stderr, "[DEBUG]   Releasing ptr_val for POINTER Value* at %p. Base type node (%p) is preserved. Pointed-to memory freed only for owning sentinels.\n",
-                    (void*)v, (void*)(v->ptr_val ? v->ptr_val->base_type_node : NULL));
+                    (void*)v, (void*)(po ? po->base_type_node : NULL));
             fflush(stderr);
 #endif
-            if (v->ptr_val) {
-                if (AS_POINTER(*v) && v->ptr_val->base_type_node == OWNED_POINTER_SENTINEL) {
+            if (po) {
+                if (AS_POINTER(*v) && po->base_type_node == OWNED_POINTER_SENTINEL) {
                     Value* owned = AS_POINTER(*v);
                     freeValue(owned);
                     free(owned);
-                } else if (AS_POINTER(*v) && v->ptr_val->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
+                } else if (AS_POINTER(*v) && po->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
                     free((char*)AS_POINTER(*v));
                 }
-                pscalObjRelease(&v->ptr_val->header);
+                pscalObjRelease(&po->header);
             }
-            v->ptr_val = NULL;
             pscalValueSetHeapPtrBits(v, NULL);
             break;
+        }
 
         case TYPE_STRING:
-        case TYPE_UNICODE_STRING:
-            if (v->s_val) {
+        case TYPE_UNICODE_STRING: {
+            StringObj *s = PSCAL_VALUE_PTR(*v, StringObj);
+            if (s) {
 #ifdef DEBUG
                 fprintf(stderr, "[DEBUG]   Releasing StringObj at %p (buffer '%s') for Value* %p\n",
-                        (void*)v->s_val, v->s_val->buffer ? v->s_val->buffer : "<NULL>", (void*)v);
+                        (void*)s, s->buffer ? s->buffer : "<NULL>", (void*)v);
                 fflush(stderr);
 #endif
-                pscalObjRelease(&v->s_val->header);
-                v->s_val = NULL;
+                pscalObjRelease(&s->header);
                 pscalValueSetHeapPtrBits(v, NULL);
             } else {
 #ifdef DEBUG
@@ -2796,16 +2692,17 @@ void freeValue(Value *v) {
 #endif
             }
             break;
+        }
 
         case TYPE_RECORD: {
+            RecordObj *r = PSCAL_VALUE_PTR(*v, RecordObj);
 #ifdef DEBUG
-            fprintf(stderr, "[DEBUG]   Releasing RecordObj at %p for Value* at %p\n", (void*)v->record_val, (void*)v);
+            fprintf(stderr, "[DEBUG]   Releasing RecordObj at %p for Value* at %p\n", (void*)r, (void*)v);
             fflush(stderr);
 #endif
-            if (v->record_val) {
-                pscalObjRelease(&v->record_val->header);
+            if (r) {
+                pscalObjRelease(&r->header);
             }
-            v->record_val = NULL;
             pscalValueSetHeapPtrBits(v, NULL);
             break;
         }
@@ -2824,75 +2721,82 @@ void freeValue(Value *v) {
              // mutexes guard against is a concern for concurrent readers
              // of a *shared* cell, not for tearing down a value nothing
              // else can see anymore.
+             ArrayObj *a = PSCAL_VALUE_PTR(*v, ArrayObj);
 #ifdef DEBUG
-             fprintf(stderr, "[DEBUG]   Releasing ArrayObj at %p for Value* at %p\n", (void*)v->array_val, (void*)v);
+             fprintf(stderr, "[DEBUG]   Releasing ArrayObj at %p for Value* at %p\n", (void*)a, (void*)v);
              fflush(stderr);
 #endif
-             if (v->array_val) {
-                 pscalObjRelease(&v->array_val->header);
+             if (a) {
+                 pscalObjRelease(&a->header);
              }
-             v->array_val = NULL;
              pscalValueSetHeapPtrBits(v, NULL);
              break;
         }
-        case TYPE_FILE:
+        case TYPE_FILE: {
             // Teardown (including the runtime-owned-stdio-wrapper check)
             // now lives in fileObjDestroy, run by pscalObjRelease only
             // once the last reference lets go -- matches freeValue's
             // treatment of every other boxed type this phase.
-            if (v->f_val) {
-                pscalObjRelease(&v->f_val->header);
+            FileObj *fo = PSCAL_VALUE_PTR(*v, FileObj);
+            if (fo) {
+                pscalObjRelease(&fo->header);
             }
-            v->f_val = NULL;
             pscalValueSetHeapPtrBits(v, NULL);
             break; // Break from the switch statement
-        case TYPE_MEMORYSTREAM:
-              if (v->mstream) {
+        }
+        case TYPE_MEMORYSTREAM: {
+              MStream *ms = PSCAL_VALUE_PTR(*v, MStream);
+              if (ms) {
 #ifdef DEBUG
                   fprintf(stderr, "[DEBUG freeValue] Releasing MStream for Value* %p. MStream* %p (refcount=%u)\n",
-                          (void*)v, (void*)v->mstream, atomic_load(&v->mstream->header.refcount));
+                          (void*)v, (void*)ms, atomic_load(&ms->header.refcount));
                   fflush(stderr);
 #endif
-                  releaseMStream(v->mstream);
-                  v->mstream = NULL;
+                  releaseMStream(ms);
                   pscalValueSetHeapPtrBits(v, NULL);
               }
               break;
-        case TYPE_SET: // VM 2.0 Phase 4c: SetObj carries its own ObjHeader
-            if (v->set_val) {
+        }
+        case TYPE_SET: { // VM 2.0 Phase 4c: SetObj carries its own ObjHeader
+            SetObj *so = PSCAL_VALUE_PTR(*v, SetObj);
+            if (so) {
 #ifdef DEBUG
-                fprintf(stderr, "[DEBUG]   Releasing SetObj at %p for Value* %p\n", (void*)v->set_val, (void*)v);
+                fprintf(stderr, "[DEBUG]   Releasing SetObj at %p for Value* %p\n", (void*)so, (void*)v);
                 fflush(stderr);
 #endif
-                pscalObjRelease(&v->set_val->header);
-                v->set_val = NULL;
+                pscalObjRelease(&so->header);
                 pscalValueSetHeapPtrBits(v, NULL);
             }
             break;
-        case TYPE_INTERFACE:
+        }
+        case TYPE_INTERFACE: {
             // VM 2.0 Phase 4i checkpoint 3a: InterfaceObj is a plain
             // singly-owned allocation (no ObjHeader -- see its comment in
             // core/types.h), so this Value's copy is never shared with
             // another Value's (makeCopyOfValue allocates fresh per copy,
             // only the payload itself is retained/shared) -- always
             // safe to release the payload and free the wrapper directly.
-            if (v->interface) {
-                if (v->interface->payload) {
-                    releaseClosureEnv(v->interface->payload);
+            InterfaceObj *iface = PSCAL_VALUE_PTR(*v, InterfaceObj);
+            if (iface) {
+                if (iface->payload) {
+                    releaseClosureEnv(iface->payload);
                 }
-                free(v->interface);
+                free(iface);
             }
-            v->interface = NULL;
+            pscalValueSetHeapPtrBits(v, NULL);
             break;
-        case TYPE_CLOSURE:
-            if (v->closure) {
-                if (v->closure->env) {
-                    releaseClosureEnv(v->closure->env);
+        }
+        case TYPE_CLOSURE: {
+            ClosureObj *co = PSCAL_VALUE_PTR(*v, ClosureObj);
+            if (co) {
+                if (co->env) {
+                    releaseClosureEnv(co->env);
                 }
-                free(v->closure);
+                free(co);
             }
-            v->closure = NULL;
+            pscalValueSetHeapPtrBits(v, NULL);
             break;
+        }
         // Add other types if they allocate memory pointed to by Value struct members
         default:
 #ifdef DEBUG
@@ -2915,41 +2819,45 @@ void dumpSymbol(Symbol *sym) {
         printf(", Value: ");
         switch (sym->type) {
             case TYPE_INT32:
-                printf("%lld", sym->value->i_val);
+                printf("%lld", VAL_INT(*sym->value));
                 break;
             case TYPE_FLOAT:
-                printf("%f", sym->value->real.f32_val);
+                printf("%f", (double)VAL_REAL32(*sym->value));
                 break;
             case TYPE_DOUBLE:
-                printf("%f", sym->value->real.d_val);
+                printf("%f", VAL_REAL64(*sym->value));
                 break;
             case TYPE_LONG_DOUBLE:
-                printf("%Lf", sym->value->real.r_val);
+                printf("%Lf", VAL_REAL_LD(*sym->value));
                 break;
             case TYPE_STRING:
-            case TYPE_UNICODE_STRING:
-                printf("\"%s\"", (sym->value->s_val && sym->value->s_val->buffer) ? sym->value->s_val->buffer : "(null)");
+            case TYPE_UNICODE_STRING: {
+                StringObj *s = PSCAL_VALUE_PTR(*sym->value, StringObj);
+                printf("\"%s\"", (s && s->buffer) ? s->buffer : "(null)");
                 break;
+            }
             case TYPE_CHAR:
             case TYPE_WIDECHAR:
-                printf("'%c'", sym->value->c_val);
+                printf("'%c'", AS_CHAR(*sym->value));
                 break;
             case TYPE_BOOLEAN:
-                printf("%s", sym->value->i_val ? "true" : "false");
+                printf("%s", VAL_INT(*sym->value) ? "true" : "false");
                 break;
             case TYPE_BYTE:
-                printf("Byte %lld", sym->value->i_val);
+                printf("Byte %lld", VAL_INT(*sym->value));
                 break;
             case TYPE_WORD:
-                printf("Word %u", (unsigned int)sym->value->i_val);
+                printf("Word %u", (unsigned int)VAL_INT(*sym->value));
                 break;
-            case TYPE_ENUM:
+            case TYPE_ENUM: {
+                EnumObj *e = PSCAL_VALUE_PTR(*sym->value, EnumObj);
                 printf("Enumerated Type '%s', Ordinal: %d",
-                       (sym->value->enum_val && sym->value->enum_val->enum_name) ? sym->value->enum_val->enum_name : "?",
-                       sym->value->enum_val ? sym->value->enum_val->ordinal : 0);
+                       (e && e->enum_name) ? e->enum_name : "?",
+                       e ? e->ordinal : 0);
                 break;
+            }
             case TYPE_ARRAY: {
-                ArrayObj *a = sym->value->array_val;
+                ArrayObj *a = PSCAL_VALUE_PTR(*sym->value, ArrayObj);
                 printf("Array[");
                 for (int i = 0; a && i < a->dimensions; i++) {
                     printf("%d..%d", a->lower_bounds[i], a->upper_bounds[i]);
@@ -2962,16 +2870,19 @@ void dumpSymbol(Symbol *sym) {
             }
             case TYPE_RECORD: {
                 printf("Record { ");
-                FieldValue *fv = sym->value->record_val ? sym->value->record_val->fields : NULL;
+                RecordObj *rec = PSCAL_VALUE_PTR(*sym->value, RecordObj);
+                FieldValue *fv = rec ? rec->fields : NULL;
                 while (fv) {
                     const Value *fieldValue = fieldValueStorageConst(fv);
                     printf("%s: %s", fv->name, varTypeToString(fieldValue->type));
                     if (fieldValue->type == TYPE_ENUM) {
+                        EnumObj *fe = PSCAL_VALUE_PTR(*fieldValue, EnumObj);
                         printf(" ('%s', Ordinal: %d)",
-                               (fieldValue->enum_val && fieldValue->enum_val->enum_name) ? fieldValue->enum_val->enum_name : "?",
-                               fieldValue->enum_val ? fieldValue->enum_val->ordinal : 0);
+                               (fe && fe->enum_name) ? fe->enum_name : "?",
+                               fe ? fe->ordinal : 0);
                     } else if (fieldValue->type == TYPE_STRING) {
-                        printf(" (\"%s\")", (fieldValue->s_val && fieldValue->s_val->buffer) ? fieldValue->s_val->buffer : "(null)");
+                        StringObj *fs = PSCAL_VALUE_PTR(*fieldValue, StringObj);
+                        printf(" (\"%s\")", (fs && fs->buffer) ? fs->buffer : "(null)");
                     }
                     fv = fv->next;
                     if (fv) {
@@ -2982,10 +2893,10 @@ void dumpSymbol(Symbol *sym) {
                 break;
             }
             case TYPE_FILE:
-                printf("File (handle: %p)", (void *)sym->value->f_val);
+                printf("File (handle: %p)", (void *)PSCAL_VALUE_PTR(*sym->value, FileObj));
                 break;
             case TYPE_MEMORYSTREAM:
-                printf("MStream (size: %d)", sym->value->mstream->size);
+                printf("MStream (size: %d)", PSCAL_VALUE_PTR(*sym->value, MStream)->size);
                 break;
             case TYPE_NIL:
                  // A TYPE_NIL Value struct represents the absence of a pointer.
@@ -3154,8 +3065,9 @@ static void ensureEnumMemberExported(AST* enum_type_node, AST* value_node, const
 
             if (conflict) {
                 const char* other_enum_name = NULL;
-                if (resolved->value && resolved->value->enum_val && resolved->value->enum_val->enum_name) {
-                    other_enum_name = resolved->value->enum_val->enum_name;
+                EnumObj *resolved_enum = resolved->value ? PSCAL_VALUE_PTR(*resolved->value, EnumObj) : NULL;
+                if (resolved_enum && resolved_enum->enum_name) {
+                    other_enum_name = resolved_enum->enum_name;
                 }
                 fprintf(stderr,
                         "Error: Enum member '%s' from unit '%s' conflicts with existing symbol from %s%s%s.\n",
@@ -3193,16 +3105,17 @@ static void ensureEnumMemberExported(AST* enum_type_node, AST* value_node, const
     sym->is_const = true;
     sym->value->type = TYPE_ENUM;
     pscalEnumEnsureObj(sym->value);
-    sym->value->enum_val->ordinal = value_node->i_val;
-    sym->value->enum_val->enum_type_def = enum_type_node;
+    EnumObj *exported_enum = PSCAL_VALUE_PTR(*sym->value, EnumObj);
+    exported_enum->ordinal = value_node->i_val;
+    exported_enum->enum_type_def = enum_type_node;
 
     const char* enum_name = enum_type_node->token ? enum_type_node->token->value : NULL;
     if (enum_name) {
-        if (sym->value->enum_val->enum_name) {
-            free(sym->value->enum_val->enum_name);
+        if (exported_enum->enum_name) {
+            free(exported_enum->enum_name);
         }
-        sym->value->enum_val->enum_name = strdup(enum_name);
-        if (!sym->value->enum_val->enum_name) {
+        exported_enum->enum_name = strdup(enum_name);
+        if (!exported_enum->enum_name) {
             fprintf(stderr, "Memory allocation failure while duplicating enum name for '%s'.\n", member_name);
             EXIT_FAILURE_HANDLER();
         }
@@ -3547,14 +3460,14 @@ Value makeEnum(const char *enum_name, int ordinal) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_ENUM;
-    v.enum_val = pscalEnumObjCreate();
-    pscalValueSetHeapPtrBits(&v, v.enum_val);
-    v.enum_val->enum_name = enum_name ? strdup(enum_name) : NULL; // Duplicate the name
-     if (enum_name && !v.enum_val->enum_name) { // Check strdup result
+    EnumObj *e = pscalEnumObjCreate();
+    pscalValueSetHeapPtrBits(&v, e);
+    e->enum_name = enum_name ? strdup(enum_name) : NULL; // Duplicate the name
+     if (enum_name && !e->enum_name) { // Check strdup result
          fprintf(stderr, "FATAL: strdup failed for enum_name in makeEnum\n");
          EXIT_FAILURE_HANDLER();
      }
-    v.enum_val->ordinal = ordinal;
+    e->ordinal = ordinal;
     return v;
 }
 
@@ -3629,99 +3542,107 @@ void printValueToStream(Value v, FILE *stream) {
 
     switch (v.type) {
         case TYPE_INT8:
-            fprintf(stream, "%hhd", (int8_t)v.i_val);
+            fprintf(stream, "%hhd", (int8_t)VAL_INT(v));
             break;
         case TYPE_UINT8:
-            fprintf(stream, "%hhu", (uint8_t)v.u_val);
+            fprintf(stream, "%hhu", (uint8_t)VAL_UINT(v));
             break;
         case TYPE_INT16:
-            fprintf(stream, "%hd", (int16_t)v.i_val);
+            fprintf(stream, "%hd", (int16_t)VAL_INT(v));
             break;
         case TYPE_UINT16:
-            fprintf(stream, "%hu", (uint16_t)v.u_val);
+            fprintf(stream, "%hu", (uint16_t)VAL_UINT(v));
             break;
         case TYPE_INT32:
-            fprintf(stream, "%lld", v.i_val);
+            fprintf(stream, "%lld", VAL_INT(v));
             break;
         case TYPE_UINT32:
-            fprintf(stream, "%u", (uint32_t)v.u_val);
+            fprintf(stream, "%u", (uint32_t)VAL_UINT(v));
             break;
         case TYPE_INT64:
-            fprintf(stream, "%lld", v.i_val);
+            fprintf(stream, "%lld", VAL_INT(v));
             break;
         case TYPE_UINT64:
-            fprintf(stream, "%llu", v.u_val);
+            fprintf(stream, "%llu", VAL_UINT(v));
             break;
         case TYPE_FLOAT:
-            fprintf(stream, "%f", v.real.f32_val);
+            fprintf(stream, "%f", (double)VAL_REAL32(v));
             break;
         case TYPE_DOUBLE:
-            fprintf(stream, "%f", v.real.d_val);
+            fprintf(stream, "%f", VAL_REAL64(v));
             break;
         case TYPE_LONG_DOUBLE:
-            fprintf(stream, "%Lf", v.real.r_val);
+            fprintf(stream, "%Lf", VAL_REAL_LD(v));
             break;
         case TYPE_BOOLEAN:
             if (gUppercaseBooleans) {
-                fprintf(stream, "%s", v.i_val ? "TRUE" : "FALSE");
+                fprintf(stream, "%s", VAL_INT(v) ? "TRUE" : "FALSE");
             } else {
-                fprintf(stream, "%s", v.i_val ? "true" : "false");
+                fprintf(stream, "%s", VAL_INT(v) ? "true" : "false");
             }
             break;
         case TYPE_CHAR:
         {
             char utf8[5];
-            size_t len = encodePascalCharUtf8(v.c_val, utf8);
+            size_t len = encodePascalCharUtf8(AS_CHAR(v), utf8);
             fwrite(utf8, 1, len, stream);
             break;
         }
         case TYPE_WIDECHAR:
         {
             char utf8[5];
-            size_t len = encodeUtf8Codepoint((uint32_t)v.c_val, utf8);
+            size_t len = encodeUtf8Codepoint((uint32_t)AS_CHAR(v), utf8);
             fwrite(utf8, 1, len, stream);
             break;
         }
         case TYPE_STRING:
-        case TYPE_UNICODE_STRING:
-            if (v.s_val && v.s_val->buffer) {
-                writePascalText(stream, v.s_val->buffer, strlen(v.s_val->buffer));
+        case TYPE_UNICODE_STRING: {
+            StringObj *s = PSCAL_VALUE_PTR(v, StringObj);
+            if (s && s->buffer) {
+                writePascalText(stream, s->buffer, strlen(s->buffer));
             } else {
                 fprintf(stream, "(null string)");
             }
             break;
+        }
         case TYPE_NIL:
             fprintf(stream, "nil");
             break;
-        case TYPE_POINTER:
-            fprintf(stream, "POINTER(@%p -> ", (void*)(v.ptr_val ? AS_POINTER(v) : NULL));
-            if (v.ptr_val && AS_POINTER(v)) { // If it's not a nil pointer, try to print what it points to
+        case TYPE_POINTER: {
+            PointerObj *po = PSCAL_VALUE_PTR(v, PointerObj);
+            fprintf(stream, "POINTER(@%p -> ", (void*)(po ? AS_POINTER(v) : NULL));
+            if (po && AS_POINTER(v)) { // If it's not a nil pointer, try to print what it points to
                 printValueToStream(*AS_POINTER(v), stream); // Recursive call
             } else {
                 fprintf(stream, "NIL_TARGET");
             }
             fprintf(stream, ")");
             break;
+        }
         case TYPE_INTERFACE: {
+            InterfaceObj *iface = PSCAL_VALUE_PTR(v, InterfaceObj);
             const char* name = "<anonymous interface>";
-            if (v.interface && v.interface->type_def && v.interface->type_def->token && v.interface->type_def->token->value) {
-                name = v.interface->type_def->token->value;
+            if (iface && iface->type_def && iface->type_def->token && iface->type_def->token->value) {
+                name = iface->type_def->token->value;
             }
             fprintf(stream, "INTERFACE(%s)", name);
             break;
         }
-        case TYPE_ARRAY:
+        case TYPE_ARRAY: {
             // VM 2.0 Phase 4e/4f: array metadata now lives in the ArrayObj
-            // wrapper (v.array_val), not directly on v -- see core/types.h.
+            // wrapper, not directly on v -- see core/types.h.
+            ArrayObj *a = PSCAL_VALUE_PTR(v, ArrayObj);
             fprintf(stream, "ARRAY(dims:%d, base_type:%s, elements_at:%p)",
-                    v.array_val ? ARRAY_DIMENSIONS(v) : 0,
-                    varTypeToString(v.array_val ? ARRAY_ELEMENT_TYPE(v) : TYPE_VOID),
-                    (void*)(v.array_val ? AS_ARRAY(v) : NULL));
+                    a ? ARRAY_DIMENSIONS(v) : 0,
+                    varTypeToString(a ? ARRAY_ELEMENT_TYPE(v) : TYPE_VOID),
+                    (void*)(a ? AS_ARRAY(v) : NULL));
             // For a more detailed print, you'd iterate based on dimensions and bounds.
             break;
-        case TYPE_RECORD:
+        }
+        case TYPE_RECORD: {
             fprintf(stream, "RECORD{");
-            FieldValue *field = v.record_val ? v.record_val->fields : NULL;
+            RecordObj *rec = PSCAL_VALUE_PTR(v, RecordObj);
+            FieldValue *field = rec ? rec->fields : NULL;
             bool first_field = true;
             while (field) {
                 if (!first_field) {
@@ -3734,16 +3655,18 @@ void printValueToStream(Value v, FILE *stream) {
             }
             fprintf(stream, "}");
             break;
+        }
         case TYPE_ENUM: {
-            const char *type_name = (v.enum_val && v.enum_val->enum_name) ?
-                v.enum_val->enum_name :
-                ((v.enum_val && v.enum_val->enum_meta) ? v.enum_val->enum_meta->name : NULL);
+            EnumObj *eo = PSCAL_VALUE_PTR(v, EnumObj);
+            const char *type_name = (eo && eo->enum_name) ?
+                eo->enum_name :
+                ((eo && eo->enum_meta) ? eo->enum_meta->name : NULL);
             const char *member_name = NULL;
-            AST *enum_ast = v.enum_val ? v.enum_val->enum_type_def : NULL;
+            AST *enum_ast = eo ? eo->enum_type_def : NULL;
             if (!enum_ast && type_name) {
                 enum_ast = lookupType(type_name);
             }
-            int ordinal = v.enum_val ? v.enum_val->ordinal : 0;
+            int ordinal = eo ? eo->ordinal : 0;
             if (enum_ast && enum_ast->type == AST_ENUM_TYPE &&
                 ordinal >= 0 &&
                 ordinal < enum_ast->child_count) {
@@ -3761,58 +3684,65 @@ void printValueToStream(Value v, FILE *stream) {
             }
             break;
         }
-        case TYPE_SET:
-            if (!v.set_val) {
+        case TYPE_SET: {
+            SetObj *so = PSCAL_VALUE_PTR(v, SetObj);
+            if (!so) {
                 fprintf(stream, "SET(size:0, values:[])");
                 break;
             }
-            fprintf(stream, "SET(size:%d, values:[", v.set_val->set_size);
-            for(int i = 0; i < v.set_val->set_size; ++i) {
-                fprintf(stream, "%lld%s", v.set_val->set_values[i], (i == v.set_val->set_size - 1) ? "" : ", ");
+            fprintf(stream, "SET(size:%d, values:[", so->set_size);
+            for(int i = 0; i < so->set_size; ++i) {
+                fprintf(stream, "%lld%s", so->set_values[i], (i == so->set_size - 1) ? "" : ", ");
             }
             fprintf(stream, "])");
             break;
-        case TYPE_FILE:
-            if (v.f_val && v.f_val->filename) {
-                fprintf(stream, "FILE(%s, handle: %p)", v.f_val->filename, (void*)v.f_val);
+        }
+        case TYPE_FILE: {
+            FileObj *fo = PSCAL_VALUE_PTR(v, FileObj);
+            if (fo && fo->filename) {
+                fprintf(stream, "FILE(%s, handle: %p)", fo->filename, (void*)fo);
             } else {
-                fprintf(stream, "FILE(UNNAMED, handle: %p)", (void*)v.f_val);
+                fprintf(stream, "FILE(UNNAMED, handle: %p)", (void*)fo);
             }
             break;
-        case TYPE_MEMORYSTREAM:
-            if (v.mstream) {
+        }
+        case TYPE_MEMORYSTREAM: {
+            MStream *ms = PSCAL_VALUE_PTR(v, MStream);
+            if (ms) {
                 // Corrected format specifiers for int members of MStream
                 fprintf(stream, "MSTREAM(size:%d, cap:%d, data:%p)",
-                        v.mstream->size,
-                        v.mstream->capacity,
-                        (void*)v.mstream->buffer);
+                        ms->size,
+                        ms->capacity,
+                        (void*)ms->buffer);
             } else {
                 fprintf(stream, "MSTREAM(NULL)");
             }
             break;
+        }
         case TYPE_BYTE:
-            fprintf(stream, "%lld", v.i_val & 0xFF);
+            fprintf(stream, "%lld", VAL_INT(v) & 0xFF);
             break;
         case TYPE_WORD:
-            fprintf(stream, "%lld", v.i_val & 0xFFFF);
+            fprintf(stream, "%lld", VAL_INT(v) & 0xFFFF);
             break;
         case TYPE_CLOSURE: {
-            fprintf(stream, "CLOSURE(entry=%u", v.closure ? v.closure->entry_offset : 0);
-            if (v.closure && v.closure->symbol && v.closure->symbol->name) {
-                fprintf(stream, ", symbol=%s", v.closure->symbol->name);
+            ClosureObj *co = PSCAL_VALUE_PTR(v, ClosureObj);
+            fprintf(stream, "CLOSURE(entry=%u", co ? co->entry_offset : 0);
+            if (co && co->symbol && co->symbol->name) {
+                fprintf(stream, ", symbol=%s", co->symbol->name);
             }
-            if (v.closure && v.closure->env) {
+            if (co && co->env) {
                 fprintf(stream, ", env=%p, slots=%u, ref=%u)",
-                        (void*)v.closure->env,
-                        (unsigned)v.closure->env->slot_count,
-                        atomic_load(&v.closure->env->header.refcount));
+                        (void*)co->env,
+                        (unsigned)co->env->slot_count,
+                        atomic_load(&co->env->header.refcount));
             } else {
                 fprintf(stream, ", env=NULL)");
             }
             break;
         }
         case TYPE_THREAD:
-            fprintf(stream, "%lld", v.i_val);
+            fprintf(stream, "%lld", VAL_INT(v));
             break;
         case TYPE_VOID:
             fprintf(stream, "<VOID_TYPE>");
@@ -3829,75 +3759,77 @@ Value makeCopyOfValue(const Value *src) {
     switch (src->type) {
         case TYPE_STRING:
         case TYPE_UNICODE_STRING: {
-            // `v = *src` above left v.s_val ALIASING src->s_val -- capture
-            // what's needed from src's StringObj before overwriting v.s_val
-            // with a fresh one; never mutate the aliased pointer in place.
-            int src_max_length = src->s_val ? src->s_val->max_length : -1;
-            const char *src_buffer = src->s_val ? src->s_val->buffer : NULL;
-            v.s_val = pscalStringObjCreate(src_max_length, src->type);
-            pscalValueSetHeapPtrBits(&v, v.s_val);
+            // `v = *src` above left v's bits ALIASING src's StringObj --
+            // capture what's needed from src's StringObj before
+            // overwriting with a fresh one; never mutate the aliased
+            // pointer in place.
+            StringObj *src_s = PSCAL_VALUE_PTR(*src, StringObj);
+            int src_max_length = src_s ? src_s->max_length : -1;
+            const char *src_buffer = src_s ? src_s->buffer : NULL;
+            StringObj *s = pscalStringObjCreate(src_max_length, src->type);
+            pscalValueSetHeapPtrBits(&v, s);
             if (src_max_length > 0) {
-                v.s_val->buffer = malloc((size_t)src_max_length + 1);
-                if (!v.s_val->buffer) {
+                s->buffer = malloc((size_t)src_max_length + 1);
+                if (!s->buffer) {
                     fprintf(stderr, "Memory allocation failed in makeCopyOfValue (string)\n");
                     EXIT_FAILURE_HANDLER();
                 }
                 if (src_buffer) {
-                    strncpy(v.s_val->buffer, src_buffer, (size_t)src_max_length);
-                    v.s_val->buffer[src_max_length] = '\0';
+                    strncpy(s->buffer, src_buffer, (size_t)src_max_length);
+                    s->buffer[src_max_length] = '\0';
                 } else {
-                    v.s_val->buffer[0] = '\0';
+                    s->buffer[0] = '\0';
                 }
             } else if (src_buffer) {
                 size_t len = strlen(src_buffer);
-                v.s_val->buffer = malloc(len + 1);
-                if (!v.s_val->buffer) {
+                s->buffer = malloc(len + 1);
+                if (!s->buffer) {
                     fprintf(stderr, "Memory allocation failed in makeCopyOfValue (string)\n");
                     EXIT_FAILURE_HANDLER();
                 }
-                strcpy(v.s_val->buffer, src_buffer);
+                strcpy(s->buffer, src_buffer);
             } else {
-                v.s_val->buffer = NULL;
+                s->buffer = NULL;
             }
             break;
         }
         case TYPE_ENUM: {
-            // `v = *src` above left v.enum_val ALIASING src->enum_val --
+            // `v = *src` above left v's bits ALIASING src->enum_val --
             // capture what's needed from src's EnumObj before overwriting
-            // v.enum_val with a fresh one; never mutate the aliased
-            // pointer in place. enum_meta is copied as-is (a non-owned,
+            // with a fresh one; never mutate the aliased pointer in
+            // place. enum_meta is copied as-is (a non-owned,
             // shared/interned pointer -- see EnumObj's comment).
-            EnumObj *src_enum = src->enum_val;
-            v.enum_val = pscalEnumObjCreate();
-            pscalValueSetHeapPtrBits(&v, v.enum_val);
-            v.enum_val->enum_meta = src_enum ? src_enum->enum_meta : NULL;
-            v.enum_val->ordinal = src_enum ? src_enum->ordinal : 0;
-            v.enum_val->enum_name = (src_enum && src_enum->enum_name) ? strdup(src_enum->enum_name) : NULL;
-            if (src_enum && src_enum->enum_name && !v.enum_val->enum_name) {
+            EnumObj *src_enum = PSCAL_VALUE_PTR(*src, EnumObj);
+            EnumObj *e = pscalEnumObjCreate();
+            pscalValueSetHeapPtrBits(&v, e);
+            e->enum_meta = src_enum ? src_enum->enum_meta : NULL;
+            e->ordinal = src_enum ? src_enum->ordinal : 0;
+            e->enum_name = (src_enum && src_enum->enum_name) ? strdup(src_enum->enum_name) : NULL;
+            if (src_enum && src_enum->enum_name && !e->enum_name) {
                  fprintf(stderr, "Memory allocation failed in makeCopyOfValue (enum name strdup)\n");
                  EXIT_FAILURE_HANDLER();
             }
-            v.enum_val->enum_type_def = src_enum ? src_enum->enum_type_def : NULL;
+            e->enum_type_def = src_enum ? src_enum->enum_type_def : NULL;
             break;
         }
         case TYPE_RECORD: {
-            // `v = *src` above left v.record_val ALIASING src->record_val --
-            // read src's fields before overwriting v.record_val with a
-            // fresh wrapper, never mutate the aliased pointer in place.
-            FieldValue *src_fields = src->record_val ? src->record_val->fields : NULL;
-            v.record_val = pscalRecordObjCreate(copyRecord(src_fields));
-            pscalValueSetHeapPtrBits(&v, v.record_val);
+            // `v = *src` above left v's bits ALIASING src->record_val --
+            // read src's fields before overwriting with a fresh wrapper,
+            // never mutate the aliased pointer in place.
+            RecordObj *src_rec = PSCAL_VALUE_PTR(*src, RecordObj);
+            FieldValue *src_fields = src_rec ? src_rec->fields : NULL;
+            RecordObj *r = pscalRecordObjCreate(copyRecord(src_fields));
+            pscalValueSetHeapPtrBits(&v, r);
             break;
         }
         case TYPE_ARRAY: {
-            // `v = *src` above left v.array_val ALIASING src->array_val.
+            // `v = *src` above left v's bits ALIASING src->array_val.
             // For the dynamic (shared) case that's exactly what we want --
             // just retain it below. For the static (deep-copy) case,
             // overwrite it with a fresh ArrayObj before touching anything,
             // same pattern as TYPE_STRING/TYPE_SET above.
-            ArrayObj *s = src->array_val;
+            ArrayObj *s = PSCAL_VALUE_PTR(*src, ArrayObj);
             if (!s) {
-                v.array_val = NULL;
                 pscalValueSetHeapPtrBits(&v, NULL);
                 break;
             }
@@ -3913,14 +3845,12 @@ Value makeCopyOfValue(const Value *src) {
                 pthread_mutex_lock(&dynamic_array_refcount_mutex);
                 pscalObjRetain(&s->header);
                 pthread_mutex_unlock(&dynamic_array_refcount_mutex);
-                v.array_val = s;
-                pscalValueSetHeapPtrBits(&v, v.array_val);
+                pscalValueSetHeapPtrBits(&v, s);
                 break;
             }
 
             ArrayObj *out = pscalArrayObjCreate();
-            v.array_val = out;
-            pscalValueSetHeapPtrBits(&v, v.array_val);
+            pscalValueSetHeapPtrBits(&v, out);
             out->element_type = s->element_type;
             out->element_type_def = s->element_type_def;
             out->is_packed = s->is_packed;
@@ -3977,62 +3907,63 @@ Value makeCopyOfValue(const Value *src) {
             }
             break;
         }
-        case TYPE_CHAR:
-        case TYPE_WIDECHAR:
-            v.c_val = src->c_val;
-            v.max_length = 1;
-            break;
-        case TYPE_MEMORYSTREAM:
-            v.mstream = NULL;
+        // TYPE_CHAR/TYPE_WIDECHAR: the `v = *src` shallow copy above
+        // already carried `bits` (a self-contained immediate tag, no
+        // heap pointer to alias) over correctly -- nothing left to do.
+        case TYPE_MEMORYSTREAM: {
+            MStream *src_ms = PSCAL_VALUE_PTR(*src, MStream);
             pscalValueSetHeapPtrBits(&v, NULL);
-            if (src->mstream) {
-                v.mstream = malloc(sizeof(MStream));
-                if (!v.mstream) {
+            if (src_ms) {
+                MStream *ms = malloc(sizeof(MStream));
+                if (!ms) {
                     fprintf(stderr, "Memory allocation failed in makeCopyOfValue (mstream)\n");
                     EXIT_FAILURE_HANDLER();
                 }
-                pscalObjHeaderInit(&v.mstream->header, TYPE_MEMORYSTREAM);
-                pscalValueSetHeapPtrBits(&v, v.mstream);
-                v.mstream->buffer = NULL;
-                v.mstream->size = src->mstream->size;
-                v.mstream->capacity = 0;
-                if (src->mstream->buffer && src->mstream->size >= 0) {
-                    size_t copy_size = (size_t)src->mstream->size + 1;
-                    v.mstream->buffer = malloc(copy_size);
-                    if (!v.mstream->buffer) {
-                        free(v.mstream);
+                pscalObjHeaderInit(&ms->header, TYPE_MEMORYSTREAM);
+                pscalValueSetHeapPtrBits(&v, ms);
+                ms->buffer = NULL;
+                ms->size = src_ms->size;
+                ms->capacity = 0;
+                if (src_ms->buffer && src_ms->size >= 0) {
+                    size_t copy_size = (size_t)src_ms->size + 1;
+                    ms->buffer = malloc(copy_size);
+                    if (!ms->buffer) {
+                        free(ms);
                         fprintf(stderr, "Memory allocation failed in makeCopyOfValue (mstream buffer)\n");
                         EXIT_FAILURE_HANDLER();
                     }
-                    memcpy(v.mstream->buffer, src->mstream->buffer, copy_size);
-                    v.mstream->capacity = (int)copy_size;
+                    memcpy(ms->buffer, src_ms->buffer, copy_size);
+                    ms->capacity = (int)copy_size;
                 }
             }
             break;
-        case TYPE_SET:
-            // `v = *src` above left v.set_val ALIASING src->set_val -- must
+        }
+        case TYPE_SET: {
+            // `v = *src` above left v's bits ALIASING src->set_val -- must
             // replace it with a fresh SetObj before touching anything,
             // never mutate the aliased pointer in place (that would
             // corrupt src's own SetObj).
-            v.set_val = pscalSetObjCreate();
-            pscalValueSetHeapPtrBits(&v, v.set_val);
-            if (src->set_val && src->set_val->set_size > 0 && src->set_val->set_values != NULL) {
-                size_t array_size_bytes = sizeof(long long) * (size_t)src->set_val->set_size;
-                v.set_val->set_values = malloc(array_size_bytes);
-                if (!v.set_val->set_values) {
+            SetObj *src_set = PSCAL_VALUE_PTR(*src, SetObj);
+            SetObj *so = pscalSetObjCreate();
+            pscalValueSetHeapPtrBits(&v, so);
+            if (src_set && src_set->set_size > 0 && src_set->set_values != NULL) {
+                size_t array_size_bytes = sizeof(long long) * (size_t)src_set->set_size;
+                so->set_values = malloc(array_size_bytes);
+                if (!so->set_values) {
                     freeValue(&v);
                     fprintf(stderr,
                             "Memory allocation failed in makeCopyOfValue (set)\n");
                     EXIT_FAILURE_HANDLER();
                 }
-                memcpy(v.set_val->set_values, src->set_val->set_values, array_size_bytes);
-                v.set_val->set_size = src->set_val->set_size;
-                v.set_val->capacity = src->set_val->set_size; // exact-fit copy
+                memcpy(so->set_values, src_set->set_values, array_size_bytes);
+                so->set_size = src_set->set_size;
+                so->capacity = src_set->set_size; // exact-fit copy
             }
             break;
+        }
         case TYPE_INTERFACE: {
-            // `v = *src` above left v.interface ALIASING src->interface
-            // (a plain pointer copy). InterfaceObj has no ObjHeader/
+            // `v = *src` above left v's bits ALIASING src->interface (a
+            // plain pointer copy). InterfaceObj has no ObjHeader/
             // refcount of its own (see its comment in core/types.h) --
             // freeValue frees the wrapper directly and unconditionally,
             // so two Values must never share one wrapper instance.
@@ -4040,32 +3971,34 @@ Value makeCopyOfValue(const Value *src) {
             // the payload itself (the actually-shared, actually-
             // refcounted resource) is retained, matching pre-4i
             // behavior exactly.
-            InterfaceObj *src_io = src->interface;
-            v.interface = pscalInterfaceObjCreate();
+            InterfaceObj *src_io = PSCAL_VALUE_PTR(*src, InterfaceObj);
+            InterfaceObj *iface = pscalInterfaceObjCreate();
+            pscalValueSetHeapPtrBits(&v, iface);
             if (src_io) {
-                v.interface->type_def = src_io->type_def;
-                v.interface->payload = src_io->payload;
-                if (v.interface->payload) {
-                    retainClosureEnv(v.interface->payload);
+                iface->type_def = src_io->type_def;
+                iface->payload = src_io->payload;
+                if (iface->payload) {
+                    retainClosureEnv(iface->payload);
                 }
             }
             break;
         }
         case TYPE_CLOSURE: {
-            ClosureObj *src_co = src->closure;
-            v.closure = pscalClosureObjCreate();
+            ClosureObj *src_co = PSCAL_VALUE_PTR(*src, ClosureObj);
+            ClosureObj *co = pscalClosureObjCreate();
+            pscalValueSetHeapPtrBits(&v, co);
             if (src_co) {
-                v.closure->entry_offset = src_co->entry_offset;
-                v.closure->symbol = src_co->symbol;
-                v.closure->env = src_co->env;
-                if (v.closure->env) {
-                    retainClosureEnv(v.closure->env);
+                co->entry_offset = src_co->entry_offset;
+                co->symbol = src_co->symbol;
+                co->env = src_co->env;
+                if (co->env) {
+                    retainClosureEnv(co->env);
                 }
             }
             break;
         }
         case TYPE_POINTER: {
-            // `v = *src` above left v.ptr_val ALIASING src->ptr_val --
+            // `v = *src` above left v's bits ALIASING src->ptr_val --
             // corrected from an earlier draft that kept this a bare,
             // unretained alias (matching TYPE_FILE's pattern). That draft
             // was wrong for pointers specifically: unlike TYPE_FILE
@@ -4084,15 +4017,16 @@ Value makeCopyOfValue(const Value *src) {
             // deep-copies the string itself (it always has), since that
             // flavor owns its target the same way OWNED_POINTER_SENTINEL
             // owns its pointee.
-            void *src_address = (src->ptr_val && AS_POINTER(*src)) ? (void*)AS_POINTER(*src) : NULL;
-            AST *src_base_type_node = src->ptr_val ? src->ptr_val->base_type_node : NULL;
-            v.ptr_val = pscalPointerObjCreate();
-            pscalValueSetHeapPtrBits(&v, v.ptr_val);
+            PointerObj *src_po = PSCAL_VALUE_PTR(*src, PointerObj);
+            void *src_address = (src_po && AS_POINTER(*src)) ? (void*)AS_POINTER(*src) : NULL;
+            AST *src_base_type_node = src_po ? src_po->base_type_node : NULL;
+            PointerObj *po = pscalPointerObjCreate();
+            pscalValueSetHeapPtrBits(&v, po);
             // VM 2.0 Phase 4i: base_type_node now lives inside the fresh
             // PointerObj above, not copied automatically by the earlier
             // `v = *src` shallow struct copy the way the old top-level
             // field was -- must propagate explicitly.
-            v.ptr_val->base_type_node = src_base_type_node;
+            po->base_type_node = src_base_type_node;
             if (src_address && src_base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
                 const char *text = (const char *)src_address;
                 size_t len = strlen(text);
@@ -4102,14 +4036,14 @@ Value makeCopyOfValue(const Value *src) {
                     EXIT_FAILURE_HANDLER();
                 }
                 memcpy(dup, text, len + 1u);
-                v.ptr_val->address = (Value*)dup;
+                po->address = (Value*)dup;
             } else {
-                v.ptr_val->address = (Value*)src_address;
+                po->address = (Value*)src_address;
             }
             break;
         }
         case TYPE_FILE:
-            // `v = *src` above left v.f_val ALIASING src->f_val -- and,
+            // `v = *src` above left v's bits ALIASING src->f_val -- and,
             // deliberately, that alias is NOT retained. This exactly
             // reproduces pre-4g behavior (a bare, untracked raw-FILE*
             // alias) rather than "fixing" it into a refcounted share,
@@ -4123,21 +4057,24 @@ Value makeCopyOfValue(const Value *src) {
             // CALL_BUILTIN's skip guarantees is never matched by a
             // release -- a permanent leak, not a fix.
             break;
-        // VM 2.0 Phase 4i checkpoint 3c: `v = *src` above left
-        // v.int64_box/v.long_double_box ALIASING src's box -- overwrite
-        // with a fresh one, copy-on-construct, matching the
-        // STRING/ENUM/RECORD/SET precedent above. i_val/u_val/real.r_val
-        // already carried over correctly via the shallow copy.
+        // VM 2.0 Phase 4i checkpoint 3c: `v = *src` above left v's bits
+        // ALIASING src's box -- overwrite with a fresh one,
+        // copy-on-construct, matching the STRING/ENUM/RECORD/SET
+        // precedent above.
         case TYPE_INT64:
-        case TYPE_UINT64:
-            v.int64_box = pscalInt64BoxCreate(src->int64_box ? src->int64_box->value : src->i_val);
-            v.int64_box->header.type = src->type;
-            pscalValueSetHeapPtrBits(&v, v.int64_box);
+        case TYPE_UINT64: {
+            Int64Box *src_box = PSCAL_VALUE_PTR(*src, Int64Box);
+            Int64Box *box = pscalInt64BoxCreate(src_box ? src_box->value : VAL_INT(*src));
+            box->header.type = src->type;
+            pscalValueSetHeapPtrBits(&v, box);
             break;
-        case TYPE_LONG_DOUBLE:
-            v.long_double_box = pscalLongDoubleBoxCreate(src->long_double_box ? src->long_double_box->value : src->real.r_val);
-            pscalValueSetHeapPtrBits(&v, v.long_double_box);
+        }
+        case TYPE_LONG_DOUBLE: {
+            LongDoubleBox *src_box = PSCAL_VALUE_PTR(*src, LongDoubleBox);
+            LongDoubleBox *box = pscalLongDoubleBoxCreate(src_box ? src_box->value : VAL_REAL_LD(*src));
+            pscalValueSetHeapPtrBits(&v, box);
             break;
+        }
         default:
             break;
     }
@@ -4152,8 +4089,9 @@ Value copyDynamicArraySnapshotValue(const Value *src) {
 
     pthread_mutex_lock(&dynamic_array_refcount_mutex);
     Value snapshot = *src;
-    if (snapshot.type == TYPE_ARRAY && snapshot.array_val && snapshot.array_val->is_dynamic) {
-        pscalObjRetain(&snapshot.array_val->header);
+    ArrayObj *a = PSCAL_VALUE_PTR(snapshot, ArrayObj);
+    if (snapshot.type == TYPE_ARRAY && a && a->is_dynamic) {
+        pscalObjRetain(&a->header);
     }
     pthread_mutex_unlock(&dynamic_array_refcount_mutex);
     return snapshot;
@@ -4198,13 +4136,12 @@ Value copyDynamicArraySnapshotValue(const Value *src) {
 bool makeDynamicArraySliceValue(const Value *src, int consumed_dims, const int *indices,
                                  Value *out, bool *out_of_bounds) {
     if (out_of_bounds) *out_of_bounds = false;
-    if (!src || !out || !indices || consumed_dims <= 0 || !src->array_val ||
-        consumed_dims >= src->array_val->dimensions ||
-        !src->array_val->lower_bounds || !src->array_val->upper_bounds) {
+    ArrayObj *s = src ? PSCAL_VALUE_PTR(*src, ArrayObj) : NULL;
+    if (!src || !out || !indices || consumed_dims <= 0 || !s ||
+        consumed_dims >= s->dimensions ||
+        !s->lower_bounds || !s->upper_bounds) {
         return false;
     }
-
-    ArrayObj *s = src->array_val;
 
     if (s->element_type == TYPE_ARRAY) {
         if (consumed_dims != 1) {
@@ -4247,11 +4184,10 @@ bool makeDynamicArraySliceValue(const Value *src, int consumed_dims, const int *
     *out = makeNil();
     out->type = TYPE_ARRAY;
     ArrayObj *view = pscalArrayObjCreate();
-    out->array_val = view;
     // The raw `out->type = TYPE_ARRAY;` above (not SET_VALUE_TYPE) left
     // .bits holding makeNil()'s PSCAL_TAG_NIL immediate -- tag the real
     // ArrayObj view we just built instead.
-    pscalValueSetHeapPtrBits(out, out->array_val);
+    pscalValueSetHeapPtrBits(out, view);
     view->is_dynamic = s->is_dynamic;
     view->is_packed = s->is_packed;
     view->dimensions = s->dimensions - consumed_dims;
@@ -4272,11 +4208,11 @@ bool makeDynamicArraySliceValue(const Value *src, int consumed_dims, const int *
 }
 
 int calculateArrayTotalSize(const Value* array_val) {
-    if (!array_val || array_val->type != TYPE_ARRAY || !array_val->array_val ||
-        array_val->array_val->dimensions == 0) {
+    ArrayObj *a = array_val ? PSCAL_VALUE_PTR(*array_val, ArrayObj) : NULL;
+    if (!array_val || array_val->type != TYPE_ARRAY || !a ||
+        a->dimensions == 0) {
         return 0;
     }
-    ArrayObj *a = array_val->array_val;
     if (!a->lower_bounds || !a->upper_bounds) {
         return 0;
     }
@@ -4288,7 +4224,7 @@ int calculateArrayTotalSize(const Value* array_val) {
 }
 
 int computeFlatOffset(Value *array, int *indices) {
-    ArrayObj *a = array->array_val;
+    ArrayObj *a = PSCAL_VALUE_PTR(*array, ArrayObj);
     int offset = 0;
     int multiplier = 1;
 
@@ -4312,11 +4248,12 @@ int computeFlatOffset(Value *array, int *indices) {
 
 // --- Set utility helpers (internal) ---
 static bool setContainsOrdinalUtil(const Value* setVal, long long ordinal) {
-    if (!setVal || setVal->type != TYPE_SET || !setVal->set_val || !setVal->set_val->set_values) {
+    SetObj *so = setVal ? PSCAL_VALUE_PTR(*setVal, SetObj) : NULL;
+    if (!setVal || setVal->type != TYPE_SET || !so || !so->set_values) {
         return false;
     }
-    for (int i = 0; i < setVal->set_val->set_size; i++) {
-        if (setVal->set_val->set_values[i] == ordinal) {
+    for (int i = 0; i < so->set_size; i++) {
+        if (so->set_values[i] == ordinal) {
             return true;
         }
     }
@@ -4324,13 +4261,13 @@ static bool setContainsOrdinalUtil(const Value* setVal, long long ordinal) {
 }
 
 static void addOrdinalToResultSetUtil(Value* resultVal, long long ordinal) {
-    if (!resultVal || resultVal->type != TYPE_SET || !resultVal->set_val) return;
+    SetObj *s = resultVal ? PSCAL_VALUE_PTR(*resultVal, SetObj) : NULL;
+    if (!resultVal || resultVal->type != TYPE_SET || !s) return;
 
     if (setContainsOrdinalUtil(resultVal, ordinal)) {
         return;
     }
 
-    SetObj *s = resultVal->set_val;
     if (s->set_size >= s->capacity) {
         int new_capacity = (s->capacity == 0) ? 8 : s->capacity * 2;
         long long* new_values = realloc(s->set_values, sizeof(long long) * new_capacity);
@@ -4353,26 +4290,28 @@ Value setUnion(Value setA, Value setB) {
         return makeVoid();
     }
 
+    SetObj *a = PSCAL_VALUE_PTR(setA, SetObj);
+    SetObj *b = PSCAL_VALUE_PTR(setB, SetObj);
     Value result = makeValueForType(TYPE_SET, NULL, NULL);
-    int estimated_capacity = (setA.set_val ? setA.set_val->set_size : 0) +
-                              (setB.set_val ? setB.set_val->set_size : 0);
+    SetObj *r = PSCAL_VALUE_PTR(result, SetObj);
+    int estimated_capacity = (a ? a->set_size : 0) + (b ? b->set_size : 0);
     if (estimated_capacity > 0) {
-        result.set_val->set_values = malloc(sizeof(long long) * (size_t)estimated_capacity);
-        if (!result.set_val->set_values) {
+        r->set_values = malloc(sizeof(long long) * (size_t)estimated_capacity);
+        if (!r->set_values) {
             fprintf(stderr, "Malloc failed for set union result\n");
             EXIT_FAILURE_HANDLER();
         }
-        result.set_val->capacity = estimated_capacity;
+        r->capacity = estimated_capacity;
     }
 
-    if (setA.set_val && setA.set_val->set_values) {
-        for (int i = 0; i < setA.set_val->set_size; i++) {
-            addOrdinalToResultSetUtil(&result, setA.set_val->set_values[i]);
+    if (a && a->set_values) {
+        for (int i = 0; i < a->set_size; i++) {
+            addOrdinalToResultSetUtil(&result, a->set_values[i]);
         }
     }
-    if (setB.set_val && setB.set_val->set_values) {
-        for (int i = 0; i < setB.set_val->set_size; i++) {
-            addOrdinalToResultSetUtil(&result, setB.set_val->set_values[i]);
+    if (b && b->set_values) {
+        for (int i = 0; i < b->set_size; i++) {
+            addOrdinalToResultSetUtil(&result, b->set_values[i]);
         }
     }
 
@@ -4384,20 +4323,22 @@ Value setDifference(Value setA, Value setB) {
         return makeVoid();
     }
 
+    SetObj *a = PSCAL_VALUE_PTR(setA, SetObj);
     Value result = makeValueForType(TYPE_SET, NULL, NULL);
-    int estimated_capacity = setA.set_val ? setA.set_val->set_size : 0;
+    SetObj *r = PSCAL_VALUE_PTR(result, SetObj);
+    int estimated_capacity = a ? a->set_size : 0;
     if (estimated_capacity > 0) {
-        result.set_val->set_values = malloc(sizeof(long long) * (size_t)estimated_capacity);
-        if (!result.set_val->set_values) {
+        r->set_values = malloc(sizeof(long long) * (size_t)estimated_capacity);
+        if (!r->set_values) {
             EXIT_FAILURE_HANDLER();
         }
-        result.set_val->capacity = estimated_capacity;
+        r->capacity = estimated_capacity;
     }
 
-    if (setA.set_val && setA.set_val->set_values) {
-        for (int i = 0; i < setA.set_val->set_size; i++) {
-            if (!setContainsOrdinalUtil(&setB, setA.set_val->set_values[i])) {
-                addOrdinalToResultSetUtil(&result, setA.set_val->set_values[i]);
+    if (a && a->set_values) {
+        for (int i = 0; i < a->set_size; i++) {
+            if (!setContainsOrdinalUtil(&setB, a->set_values[i])) {
+                addOrdinalToResultSetUtil(&result, a->set_values[i]);
             }
         }
     }
@@ -4409,22 +4350,25 @@ Value setIntersection(Value setA, Value setB) {
         return makeVoid();
     }
 
+    SetObj *a = PSCAL_VALUE_PTR(setA, SetObj);
+    SetObj *b = PSCAL_VALUE_PTR(setB, SetObj);
     Value result = makeValueForType(TYPE_SET, NULL, NULL);
-    int sizeA = setA.set_val ? setA.set_val->set_size : 0;
-    int sizeB = setB.set_val ? setB.set_val->set_size : 0;
+    SetObj *r = PSCAL_VALUE_PTR(result, SetObj);
+    int sizeA = a ? a->set_size : 0;
+    int sizeB = b ? b->set_size : 0;
     int estimated_capacity = (sizeA < sizeB) ? sizeA : sizeB;
     if (estimated_capacity > 0) {
-        result.set_val->set_values = malloc(sizeof(long long) * (size_t)estimated_capacity);
-        if (!result.set_val->set_values) {
+        r->set_values = malloc(sizeof(long long) * (size_t)estimated_capacity);
+        if (!r->set_values) {
             EXIT_FAILURE_HANDLER();
         }
-        result.set_val->capacity = estimated_capacity;
+        r->capacity = estimated_capacity;
     }
 
-    if (setA.set_val && setA.set_val->set_values) {
-        for (int i = 0; i < setA.set_val->set_size; i++) {
-            if (setContainsOrdinalUtil(&setB, setA.set_val->set_values[i])) {
-                addOrdinalToResultSetUtil(&result, setA.set_val->set_values[i]);
+    if (a && a->set_values) {
+        for (int i = 0; i < a->set_size; i++) {
+            if (setContainsOrdinalUtil(&setB, a->set_values[i])) {
+                addOrdinalToResultSetUtil(&result, a->set_values[i]);
             }
         }
     }

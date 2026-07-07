@@ -1066,24 +1066,25 @@ static bool writeValue(ByteBuf* out, const Value* v) {
         case TYPE_INT8:
         case TYPE_INT16:
         case TYPE_INT64:
-            bufU64LE(out, (uint64_t)v->i_val); break;
+            bufU64LE(out, (uint64_t)VAL_INT(*v)); break;
         case TYPE_UINT8:
         case TYPE_UINT16:
         case TYPE_UINT32:
         case TYPE_UINT64:
-            bufU64LE(out, (uint64_t)v->u_val); break;
+            bufU64LE(out, (uint64_t)VAL_UINT(*v)); break;
         case TYPE_FLOAT:
-            bufF32LE(out, v->real.f32_val); break;
+            bufF32LE(out, VAL_REAL32(*v)); break;
         case TYPE_REAL:
-            bufF64LE(out, v->real.d_val); break;
+            bufF64LE(out, VAL_REAL64(*v)); break;
         case TYPE_LONG_DOUBLE:
-            bufF64LE(out, (double)v->real.r_val); break;
+            bufF64LE(out, (double)VAL_REAL_LD(*v)); break;
         case TYPE_CHAR:
-            bufU32LE(out, (uint32_t)v->c_val); break;
+            bufU32LE(out, (uint32_t)AS_CHAR(*v)); break;
         case TYPE_STRING: {
             /* varint length prefix; NULL vs empty string distinguished by a
              * leading presence byte (varint length alone can't represent -1). */
-            const char *buf = (v->s_val && v->s_val->buffer) ? v->s_val->buffer : NULL;
+            StringObj *str_obj = PSCAL_VALUE_PTR(*v, StringObj);
+            const char *buf = (str_obj && str_obj->buffer) ? str_obj->buffer : NULL;
             uint8_t present = buf ? 1 : 0;
             bufU8(out, present);
             if (present) bufLenPrefixedBytes(out, buf, strlen(buf));
@@ -1092,26 +1093,29 @@ static bool writeValue(ByteBuf* out, const Value* v) {
         case TYPE_NIL:
             break;
         case TYPE_ENUM: {
-            const char *name = v->enum_val ? v->enum_val->enum_name : NULL;
+            EnumObj *enum_obj = PSCAL_VALUE_PTR(*v, EnumObj);
+            const char *name = enum_obj ? enum_obj->enum_name : NULL;
             size_t len = name ? strlen(name) : 0;
             bufLenPrefixedBytes(out, name, len);
-            bufI32LE(out, (int32_t)(v->enum_val ? v->enum_val->ordinal : 0));
+            bufI32LE(out, (int32_t)(enum_obj ? enum_obj->ordinal : 0));
             break;
         }
         case TYPE_SET: {
-            int32_t sz = v->set_val ? v->set_val->set_size : 0;
+            SetObj *set_obj = PSCAL_VALUE_PTR(*v, SetObj);
+            int32_t sz = set_obj ? set_obj->set_size : 0;
             bufI32LE(out, sz);
-            for (int i = 0; i < sz && v->set_val->set_values; i++) {
-                bufU64LE(out, (uint64_t)v->set_val->set_values[i]);
+            for (int i = 0; i < sz && set_obj->set_values; i++) {
+                bufU64LE(out, (uint64_t)set_obj->set_values[i]);
             }
             break;
         }
         case TYPE_ARRAY: {
-            int32_t dims = v->array_val ? ARRAY_DIMENSIONS(*v) : 0;
+            ArrayObj *array_obj = PSCAL_VALUE_PTR(*v, ArrayObj);
+            int32_t dims = array_obj ? ARRAY_DIMENSIONS(*v) : 0;
             bufI32LE(out, dims);
-            bufU32LE(out, (uint32_t)(v->array_val ? ARRAY_ELEMENT_TYPE(*v) : TYPE_VOID));
-            int *lb_arr = v->array_val ? ARRAY_LOWER_BOUNDS(*v) : NULL;
-            int *ub_arr = v->array_val ? ARRAY_UPPER_BOUNDS(*v) : NULL;
+            bufU32LE(out, (uint32_t)(array_obj ? ARRAY_ELEMENT_TYPE(*v) : TYPE_VOID));
+            int *lb_arr = array_obj ? ARRAY_LOWER_BOUNDS(*v) : NULL;
+            int *ub_arr = array_obj ? ARRAY_UPPER_BOUNDS(*v) : NULL;
             for (int i = 0; i < dims; i++) {
                 int32_t lb = lb_arr ? lb_arr[i] : 0;
                 int32_t ub = ub_arr ? ub_arr[i] : -1;
@@ -1499,7 +1503,7 @@ static bool readChunkCoreInline(Cursor* in, BytecodeChunk* chunk, uint32_t versi
 // and fixed as part of 4i's base_type_node relocation audit, which
 // required actually reading this function's body.
 static bool writePointerValue(ByteBuf* out, const Value* v) {
-    if (!v || !v->ptr_val) {
+    if (!v || !PSCAL_VALUE_PTR(*v, PointerObj)) {
         bufU8(out, 0);
         return true;
     }
@@ -1534,7 +1538,6 @@ static bool readPointerValue(Cursor* in, Value* out) {
     uint8_t kind = curU8(in);
     if (in->error) return false;
     if (kind == 0) {
-        out->ptr_val = NULL;
         pscalValueSetHeapPtrBits(out, NULL);
         return true;
     }
@@ -1545,7 +1548,6 @@ static bool readPointerValue(Cursor* in, Value* out) {
         if (in->error || !text) { free(text); return false; }
         AS_POINTER(*out) = (Value*)text;
         PTR_BASE_TYPE_NODE(*out) = SERIALIZED_CHAR_PTR_SENTINEL;
-        out->element_type = TYPE_UNKNOWN;
         return true;
     }
     if (kind == 3) {
@@ -1553,7 +1555,6 @@ static bool readPointerValue(Cursor* in, Value* out) {
         if (in->error) return false;
         AS_POINTER(*out) = (Value*)(uintptr_t)raw_addr;
         PTR_BASE_TYPE_NODE(*out) = OPAQUE_POINTER_SENTINEL;
-        out->element_type = TYPE_UNKNOWN;
         return true;
     }
     if (kind != 1) {
@@ -1607,7 +1608,6 @@ static bool readPointerValue(Cursor* in, Value* out) {
 
     AS_POINTER(*out) = (Value*)compiled;
     PTR_BASE_TYPE_NODE(*out) = SHELL_FUNCTION_PTR_SENTINEL;
-    out->element_type = TYPE_UNKNOWN;
     return true;
 }
 
@@ -1630,23 +1630,34 @@ static void hashValue(uint64_t* hash, const Value* v, ChunkHashContext* ctx) {
         case TYPE_UINT16:
         case TYPE_UINT32:
         case TYPE_INT64:
-        case TYPE_UINT64:
-            fnv1aUpdate(&(*hash), &v->i_val, sizeof(v->i_val));
+        case TYPE_UINT64: {
+            long long i_val = VAL_INT(*v);
+            fnv1aUpdate(&(*hash), &i_val, sizeof(i_val));
             break;
-        case TYPE_FLOAT:
-            fnv1aUpdate(hash, &v->real.f32_val, sizeof(v->real.f32_val));
+        }
+        case TYPE_FLOAT: {
+            float f32_val = VAL_REAL32(*v);
+            fnv1aUpdate(hash, &f32_val, sizeof(f32_val));
             break;
-        case TYPE_REAL:
-            fnv1aUpdate(hash, &v->real.d_val, sizeof(v->real.d_val));
+        }
+        case TYPE_REAL: {
+            double d_val = VAL_REAL64(*v);
+            fnv1aUpdate(hash, &d_val, sizeof(d_val));
             break;
-        case TYPE_LONG_DOUBLE:
-            fnv1aUpdate(hash, &v->real.r_val, sizeof(v->real.r_val));
+        }
+        case TYPE_LONG_DOUBLE: {
+            long double r_val = VAL_REAL_LD(*v);
+            fnv1aUpdate(hash, &r_val, sizeof(r_val));
             break;
-        case TYPE_CHAR:
-            fnv1aUpdate(hash, &v->c_val, sizeof(v->c_val));
+        }
+        case TYPE_CHAR: {
+            int c_val = AS_CHAR(*v);
+            fnv1aUpdate(hash, &c_val, sizeof(c_val));
             break;
+        }
         case TYPE_STRING: {
-            const char *buf = (v->s_val && v->s_val->buffer) ? v->s_val->buffer : NULL;
+            StringObj *str_obj = PSCAL_VALUE_PTR(*v, StringObj);
+            const char *buf = (str_obj && str_obj->buffer) ? str_obj->buffer : NULL;
             int len = buf ? (int)strlen(buf) : -1;
             fnv1aUpdateInt(hash, len);
             if (len > 0) {
@@ -1655,29 +1666,32 @@ static void hashValue(uint64_t* hash, const Value* v, ChunkHashContext* ctx) {
             break;
         }
         case TYPE_ENUM: {
-            const char *name = v->enum_val ? v->enum_val->enum_name : NULL;
+            EnumObj *enum_obj = PSCAL_VALUE_PTR(*v, EnumObj);
+            const char *name = enum_obj ? enum_obj->enum_name : NULL;
             int len = name ? (int)strlen(name) : 0;
             fnv1aUpdateInt(hash, len);
             if (len > 0) {
                 fnv1aUpdate(hash, name, (size_t)len);
             }
-            fnv1aUpdateInt(hash, v->enum_val ? v->enum_val->ordinal : 0);
+            fnv1aUpdateInt(hash, enum_obj ? enum_obj->ordinal : 0);
             break;
         }
         case TYPE_SET: {
-            int sz = v->set_val ? v->set_val->set_size : 0;
+            SetObj *set_obj = PSCAL_VALUE_PTR(*v, SetObj);
+            int sz = set_obj ? set_obj->set_size : 0;
             fnv1aUpdateInt(hash, sz);
-            if (sz > 0 && v->set_val->set_values) {
-                fnv1aUpdate(hash, v->set_val->set_values, sizeof(long long) * (size_t)sz);
+            if (sz > 0 && set_obj->set_values) {
+                fnv1aUpdate(hash, set_obj->set_values, sizeof(long long) * (size_t)sz);
             }
             break;
         }
         case TYPE_ARRAY: {
-            int dims = v->array_val ? ARRAY_DIMENSIONS(*v) : 0;
+            ArrayObj *array_obj = PSCAL_VALUE_PTR(*v, ArrayObj);
+            int dims = array_obj ? ARRAY_DIMENSIONS(*v) : 0;
             fnv1aUpdateInt(hash, dims);
-            fnv1aUpdateInt(hash, v->array_val ? ARRAY_ELEMENT_TYPE(*v) : TYPE_VOID);
-            int *lb_arr = v->array_val ? ARRAY_LOWER_BOUNDS(*v) : NULL;
-            int *ub_arr = v->array_val ? ARRAY_UPPER_BOUNDS(*v) : NULL;
+            fnv1aUpdateInt(hash, array_obj ? ARRAY_ELEMENT_TYPE(*v) : TYPE_VOID);
+            int *lb_arr = array_obj ? ARRAY_LOWER_BOUNDS(*v) : NULL;
+            int *ub_arr = array_obj ? ARRAY_UPPER_BOUNDS(*v) : NULL;
             for (int i = 0; i < dims; ++i) {
                 int lb = lb_arr ? lb_arr[i] : 0;
                 int ub = ub_arr ? ub_arr[i] : -1;
@@ -1701,7 +1715,7 @@ static void hashValue(uint64_t* hash, const Value* v, ChunkHashContext* ctx) {
             // tell them apart.
             if (total > 0 && arrayUsesPackedBytes(v) && AS_ARRAY_RAW(*v)) {
                 fnv1aUpdate(hash, AS_ARRAY_RAW(*v), (size_t)total);
-            } else if (total > 0 && v->array_val && AS_ARRAY(*v)) {
+            } else if (total > 0 && array_obj && AS_ARRAY(*v)) {
                 for (int i = 0; i < total; ++i) {
                     hashValue(hash, &AS_ARRAY(*v)[i], ctx);
                 }
@@ -1712,7 +1726,7 @@ static void hashValue(uint64_t* hash, const Value* v, ChunkHashContext* ctx) {
             // VM 2.0 Phase 4i fix: same v->ptr_val-as-raw-address bug as
             // writePointerValue/readPointerValue above -- see that
             // function's comment.
-            if (!v->ptr_val) {
+            if (!PSCAL_VALUE_PTR(*v, PointerObj)) {
                 fnv1aUpdateUInt64(hash, 0);
                 break;
             }
@@ -1745,16 +1759,18 @@ static void hashValue(uint64_t* hash, const Value* v, ChunkHashContext* ctx) {
         case TYPE_FILE:
         case TYPE_MEMORYSTREAM:
         case TYPE_THREAD:
-            fnv1aUpdateUInt64(hash, (uint64_t)(uintptr_t)v->ptr_val);
+            fnv1aUpdateUInt64(hash, (uint64_t)(uintptr_t)PSCAL_VALUE_PTR(*v, void));
             break;
         case TYPE_NIL:
         case TYPE_VOID:
         case TYPE_UNKNOWN:
         case TYPE_RECORD:
             break;
-        default:
-            fnv1aUpdate(&(*hash), &v->i_val, sizeof(v->i_val));
+        default: {
+            long long i_val = VAL_INT(*v);
+            fnv1aUpdate(&(*hash), &i_val, sizeof(i_val));
             break;
+        }
     }
 }
 
@@ -1778,8 +1794,10 @@ static bool readValue(Cursor* in, Value* out) {
         case TYPE_UINT32:
         case TYPE_UINT64: {
             unsigned long long tmp = curU64LE(in);
+            // SET_INT_VALUE stores the exact 64-bit pattern (Int64Box's
+            // int64_t slot is reinterpreted as unsigned by VAL_UINT), so
+            // no separate raw-field write is needed to preserve range.
             SET_INT_VALUE(out, (long long)tmp);
-            out->u_val = tmp; // preserve the full unsigned range SET_INT_VALUE's (long long) cast can't
             break;
         }
         case TYPE_FLOAT: {
@@ -1794,21 +1812,22 @@ static bool readValue(Cursor* in, Value* out) {
             double tmp = curF64LE(in);
             SET_REAL_VALUE(out, (long double)tmp);
             break; }
-        case TYPE_CHAR:
-            out->c_val = (char)curU32LE(in);
-            SET_INT_VALUE(out, out->c_val);
+        case TYPE_CHAR: {
+            char c_val = (char)curU32LE(in);
+            SET_INT_VALUE(out, c_val);
             break;
+        }
         case TYPE_STRING: {
             uint8_t present = curU8(in);
             if (in->error) return false;
-            out->s_val = pscalStringObjCreate(-1, TYPE_STRING);
-            pscalValueSetHeapPtrBits(out, out->s_val);
+            StringObj *str_obj = pscalStringObjCreate(-1, TYPE_STRING);
+            pscalValueSetHeapPtrBits(out, str_obj);
             if (present) {
                 size_t len = 0;
-                out->s_val->buffer = curLenPrefixedString(in, &len);
-                if (in->error || !out->s_val->buffer) return false;
+                str_obj->buffer = curLenPrefixedString(in, &len);
+                if (in->error || !str_obj->buffer) return false;
             } else {
-                out->s_val->buffer = NULL;
+                str_obj->buffer = NULL;
             }
             break;
         }
@@ -1817,28 +1836,29 @@ static bool readValue(Cursor* in, Value* out) {
             break;
         case TYPE_ENUM: {
             pscalEnumEnsureObj(out);
+            EnumObj *enum_obj = PSCAL_VALUE_PTR(*out, EnumObj);
             size_t len = 0;
-            out->enum_val->enum_name = curLenPrefixedString(in, &len);
+            enum_obj->enum_name = curLenPrefixedString(in, &len);
             if (in->error) return false;
-            if (len == 0) { free(out->enum_val->enum_name); out->enum_val->enum_name = NULL; }
-            out->enum_val->ordinal = curI32LE(in);
+            if (len == 0) { free(enum_obj->enum_name); enum_obj->enum_name = NULL; }
+            enum_obj->ordinal = curI32LE(in);
             if (in->error) return false;
             break;
         }
         case TYPE_SET: {
             int32_t sz = curI32LE(in);
             if (in->error || sz < 0) return false;
-            out->set_val = pscalSetObjCreate();
-            pscalValueSetHeapPtrBits(out, out->set_val);
-            out->set_val->set_size = sz;
+            SetObj *set_obj = pscalSetObjCreate();
+            pscalValueSetHeapPtrBits(out, set_obj);
+            set_obj->set_size = sz;
             if (sz > 0) {
-                out->set_val->set_values = (long long*)malloc(sizeof(long long) * (size_t)sz);
-                if (!out->set_val->set_values) return false;
+                set_obj->set_values = (long long*)malloc(sizeof(long long) * (size_t)sz);
+                if (!set_obj->set_values) return false;
                 for (int i = 0; i < sz; i++) {
-                    out->set_val->set_values[i] = (long long)curU64LE(in);
+                    set_obj->set_values[i] = (long long)curU64LE(in);
                 }
                 if (in->error) return false;
-                out->set_val->capacity = sz;
+                set_obj->capacity = sz;
             }
             break;
         }
@@ -1846,7 +1866,7 @@ static bool readValue(Cursor* in, Value* out) {
             int32_t dims = curI32LE(in);
             if (in->error || dims < 0) return false;
             pscalArrayEnsureObj(out);
-            ArrayObj *a = out->array_val;
+            ArrayObj *a = PSCAL_VALUE_PTR(*out, ArrayObj);
             a->dimensions = dims;
             a->element_type = (VarType)curU32LE(in);
             if (in->error) return false;

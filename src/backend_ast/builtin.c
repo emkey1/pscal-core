@@ -2525,7 +2525,7 @@ Value vmBuiltinSqr(VM* vm, int arg_count, Value* args) {
     Value arg = args[0];
     if (IS_INTLIKE(arg)) {
         long long v = AS_INTEGER(arg);
-        return makeInt(v * v);
+        return pscalIntResultLike1(arg, v * v);
     } else if (isRealType(VALUE_TYPE(arg))) {
         long double v = AS_REAL(arg);
         return makeReal(v * v);
@@ -2554,7 +2554,7 @@ Value vmBuiltinSucc(VM* vm, int arg_count, Value* args) {
     }
     Value arg = args[0];
     if (IS_INTLIKE(arg)) {
-        return makeInt(AS_INTEGER(arg) + 1);
+        return pscalIntResultLike1(arg, AS_INTEGER(arg) + 1);
     }
     switch(VALUE_TYPE(arg)) {
         case TYPE_CHAR:
@@ -3362,7 +3362,7 @@ static bool resizeDynamicArrayValue(VM* vm,
                                     Value* array_value,
                                     int dimension_count,
                                     const long long* lengths) {
-    if (!array_value || VALUE_TYPE(*array_value) != TYPE_ARRAY || !array_value->array_val) {
+    if (!array_value || VALUE_TYPE(*array_value) != TYPE_ARRAY || !PSCAL_VALUE_PTR(*array_value, ArrayObj)) {
         runtimeError(vm, "SetLength target is not an array.");
         return false;
     }
@@ -3431,7 +3431,7 @@ static bool resizeDynamicArrayValue(VM* vm,
         new_total = 0;
     }
 
-    ArrayObj* old = array_value->array_val;
+    ArrayObj* old = PSCAL_VALUE_PTR(*array_value, ArrayObj);
     size_t old_total = 0;
     int* old_lower_bounds = old->lower_bounds;
     int* old_upper_bounds = old->upper_bounds;
@@ -3591,8 +3591,7 @@ static bool resizeDynamicArrayValue(VM* vm,
     }
 
     pscalObjRelease(&old->header);
-    array_value->array_val = new_obj;
-    pscalValueSetHeapPtrBits(array_value, array_value->array_val);
+    pscalValueSetHeapPtrBits(array_value, new_obj);
 
     return true;
 
@@ -6565,7 +6564,7 @@ Value vmBuiltinPower(VM* vm, int arg_count, Value* args) {
                     overflow |= __builtin_mul_overflow(b, b, &b);
             }
             if (!overflow) {
-                return makeInt(result);
+                return pscalIntResultLike2(args[0], args[1], result);
             }
             // fall through to real computation on overflow
         }
@@ -6610,7 +6609,7 @@ Value vmBuiltinMax(VM* vm, int arg_count, Value* args) {
     if (aInt && bInt) {
         long long a = AS_INTEGER(args[0]);
         long long b = AS_INTEGER(args[1]);
-        return makeInt((a > b) ? a : b);
+        return pscalIntResultLike2(args[0], args[1], (a > b) ? a : b);
     } else {
         double a = aInt ? (double)AS_INTEGER(args[0]) : AS_REAL(args[0]);
         double b = bInt ? (double)AS_INTEGER(args[1]) : AS_REAL(args[1]);
@@ -6627,7 +6626,7 @@ Value vmBuiltinMin(VM* vm, int arg_count, Value* args) {
     if (aInt && bInt) {
         long long a = AS_INTEGER(args[0]);
         long long b = AS_INTEGER(args[1]);
-        return makeInt((a < b) ? a : b);
+        return pscalIntResultLike2(args[0], args[1], (a < b) ? a : b);
     } else {
         double a = aInt ? (double)AS_INTEGER(args[0]) : AS_REAL(args[0]);
         double b = bInt ? (double)AS_INTEGER(args[1]) : AS_REAL(args[1]);
@@ -6641,9 +6640,12 @@ Value vmBuiltinClamp(VM* vm, int arg_count, Value* args) {
         long long x = AS_INTEGER(args[0]);
         long long lo = AS_INTEGER(args[1]);
         long long hi = AS_INTEGER(args[2]);
-        if (x < lo) return makeInt(lo);
-        if (x > hi) return makeInt(hi);
-        return makeInt(x);
+        bool anyUInt64 = VALUE_TYPE(args[0]) == TYPE_UINT64 || VALUE_TYPE(args[1]) == TYPE_UINT64 || VALUE_TYPE(args[2]) == TYPE_UINT64;
+        bool anyInt64 = VALUE_TYPE(args[0]) == TYPE_INT64 || VALUE_TYPE(args[1]) == TYPE_INT64 || VALUE_TYPE(args[2]) == TYPE_INT64;
+        long long result = (x < lo) ? lo : (x > hi) ? hi : x;
+        if (anyUInt64) return makeUInt64((unsigned long long)result);
+        if (anyInt64) return makeInt64(result);
+        return makeInt(result);
     }
     double x = IS_INTLIKE(args[0]) ? (double)AS_INTEGER(args[0]) : AS_REAL(args[0]);
     double lo = IS_INTLIKE(args[1]) ? (double)AS_INTEGER(args[1]) : AS_REAL(args[1]);
@@ -6655,20 +6657,20 @@ Value vmBuiltinClamp(VM* vm, int arg_count, Value* args) {
 
 Value vmBuiltinFloor(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1) { runtimeError(vm, "floor expects 1 argument."); return makeInt(0); }
-    double x = IS_INTLIKE(args[0]) ? (double)AS_INTEGER(args[0]) : (double)AS_REAL(args[0]);
-    return makeInt((long long)floor(x));
+    if (IS_INTLIKE(args[0])) return pscalIntResultLike1(args[0], AS_INTEGER(args[0]));
+    return makeInt((long long)floor((double)AS_REAL(args[0])));
 }
 
 Value vmBuiltinCeil(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1) { runtimeError(vm, "ceil expects 1 argument."); return makeInt(0); }
-    double x = IS_INTLIKE(args[0]) ? (double)AS_INTEGER(args[0]) : (double)AS_REAL(args[0]);
-    return makeInt((long long)ceil(x));
+    if (IS_INTLIKE(args[0])) return pscalIntResultLike1(args[0], AS_INTEGER(args[0]));
+    return makeInt((long long)ceil((double)AS_REAL(args[0])));
 }
 
 Value vmBuiltinTrunc(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1) { runtimeError(vm, "trunc expects 1 argument."); return makeInt(0); }
     Value arg = args[0];
-    if (IS_INTLIKE(arg)) return makeInt(AS_INTEGER(arg));
+    if (IS_INTLIKE(arg)) return pscalIntResultLike1(arg, AS_INTEGER(arg));
     if (isRealType(VALUE_TYPE(arg))) return makeInt((long long)AS_REAL(arg));
     runtimeError(vm, "trunc expects a numeric argument.");
     return makeInt(0);
@@ -6680,15 +6682,17 @@ static inline bool isOrdinalDelta(const Value* v) {
 
 static inline long long coerceDeltaToI64(const Value* v) {
     switch (VALUE_TYPE(*v)) {
-        case TYPE_INTEGER:
-        case TYPE_WORD:
-        case TYPE_BYTE:
-        case TYPE_BOOLEAN:
-            return VAL_INT(*v);
         case TYPE_CHAR:
             return AS_CHAR(*v);
         default:
-            return 0;
+            /* isOrdinalDelta() (the caller's gate) already restricts this
+             * to intlike types or TYPE_CHAR -- AS_INTEGER's generic
+             * dispatch covers every intlike width (INT8/16/32/64,
+             * UINT8/16/32/64, WORD, BYTE, BOOLEAN), unlike the old
+             * hand-picked switch here, which silently returned 0 (a
+             * no-op delta) for any width it didn't explicitly list, e.g.
+             * TYPE_INT16 ("SmallInt"). */
+            return isIntlikeType(VALUE_TYPE(*v)) ? AS_INTEGER(*v) : 0;
     }
 }
 
@@ -6706,7 +6710,7 @@ Value vmBuiltinOrd(VM* vm, int arg_count, Value* args) {
     }
     if (VALUE_TYPE(arg) == TYPE_BOOLEAN) return makeInt(VAL_INT(arg));
     if (VALUE_TYPE(arg) == TYPE_ENUM) return makeInt(AS_ENUM(arg).ordinal);
-    if (IS_INTLIKE(arg)) return makeInt(AS_INTEGER(arg));
+    if (IS_INTLIKE(arg)) return pscalIntResultLike1(arg, AS_INTEGER(arg));
     runtimeError(vm, "ord expects an ordinal type argument.");
     return makeInt(0);
 }
@@ -7176,7 +7180,7 @@ Value vmBuiltinNew(VM* vm, int arg_count, Value* args) {
     // above is a no-op here), .bits is now wrongly out of sync with the
     // wrapper that's actually there. Re-tag unconditionally; safe whether
     // ensure just allocated fresh or found one already present.
-    pscalValueSetHeapPtrBits(pointerVarValuePtr, pointerVarValuePtr->ptr_val);
+    pscalValueSetHeapPtrBits(pointerVarValuePtr, PSCAL_VALUE_PTR(*pointerVarValuePtr, PointerObj));
     AS_POINTER(*pointerVarValuePtr) = allocated_memory;
 
     // Safety: if base type metadata is unknown, treat as integer for subsequent dereferences
@@ -8121,7 +8125,7 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
     if (!io_error && ferror(input_stream)) io_error = 1;
     else if (io_error != 1) io_error = 0;
 
-    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); args[0].f_val = NULL; }
+    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); pscalValueSetHeapPtrBits(&args[0], NULL); }
 
     if (input_stream == stdin) {
         vmEnableRawMode();
@@ -8177,7 +8181,7 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
                     vm ? (int)vm->suspend_unwind_requested : -1);
         }
         // ***NEW***: prevent VM cleanup from closing the stream we used
-        if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); args[0].f_val = NULL; }  // ***NEW***
+        if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); pscalValueSetHeapPtrBits(&args[0], NULL); }  // ***NEW***
         if (input_stream == stdin) vmEnableRawMode();
         vmCommitLastIoError(io_error);
         return makeVoid();
@@ -8282,15 +8286,18 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
                     io_error = 1;
                     break;
                 }
-                if (isPascalStringType(VALUE_TYPE(*dst)) && AS_STRING(*dst)) {
-                    free(AS_STRING(*dst));
+                StringObj* dst_str_obj = PSCAL_VALUE_PTR(*dst, StringObj);
+                VarType dst_str_retype = (VALUE_TYPE(*dst) == TYPE_UNICODE_STRING) ? TYPE_UNICODE_STRING : TYPE_STRING;
+                if (isPascalStringType(VALUE_TYPE(*dst)) && dst_str_obj && dst_str_obj->buffer) {
+                    free(dst_str_obj->buffer);
                 }
-                SET_VALUE_TYPE(dst, (VALUE_TYPE(*dst) == TYPE_UNICODE_STRING) ? TYPE_UNICODE_STRING : TYPE_STRING);
+                SET_VALUE_TYPE(dst, dst_str_retype);
                 // dst reached this switch case via VALUE_TYPE(*dst), so it
                 // was already a real string wrapper before the retype above
                 // reset .bits to a nil-pointer placeholder -- re-tag with
-                // the wrapper that's still there (never reallocated here).
-                pscalValueSetHeapPtrBits(dst, dst->s_val);
+                // the wrapper that's still there (never reallocated here,
+                // captured in dst_str_obj before the retype wiped .bits).
+                pscalValueSetHeapPtrBits(dst, dst_str_obj);
                 AS_STRING(*dst) = tmp;
                 i = arg_count; // consume the line; ignore trailing params
                 break;
@@ -8308,7 +8315,7 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
     else if (io_error != 1) io_error = 0;
 
     // ***NEW***: neuter FILE-by-value arg so VM cleanup won’t fclose()
-    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); args[0].f_val = NULL; }  // ***NEW***
+    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); pscalValueSetHeapPtrBits(&args[0], NULL); }  // ***NEW***
 
     if (input_stream == stdin) {
         vmEnableRawMode();
@@ -8530,7 +8537,7 @@ Value vmBuiltinWrite(VM* vm, int arg_count, Value* args) {
     if (output_stream != stdout) {
         fflush(output_stream);
     }
-    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[1], TYPE_NIL); args[1].f_val = NULL; }
+    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[1], TYPE_NIL); pscalValueSetHeapPtrBits(&args[1], NULL); }
 
     return makeVoid();
 }
@@ -8596,11 +8603,11 @@ Value vmBuiltinGetenvint(VM* vm, int arg_count, Value* args) {
     const char* name = AS_STRING(args[0]);
     long long defVal = AS_INTEGER(args[1]);
     const char* val = getenv(name);
-    if (!val || *val == '\0') return makeInt(defVal);
+    if (!val || *val == '\0') return pscalIntResultLike1(args[1], defVal);
     char* endptr;
     long long parsed = strtoll(val, &endptr, 10);
-    if (endptr == val || *endptr != '\0') return makeInt(defVal);
-    return makeInt(parsed);
+    if (endptr == val || *endptr != '\0') return pscalIntResultLike1(args[1], defVal);
+    return pscalIntResultLike1(args[1], parsed);
 }
 
 // Parse string to numeric value similar to Turbo Pascal's Val procedure
@@ -9088,7 +9095,9 @@ Value vmBuiltinMstreamfree(VM* vm, int arg_count, Value* args) {
 
     if (ms) { // Only free if MStream struct itself exists
         releaseMStream(ms);
-        AS_MSTREAM(*ms_value_ptr) = NULL; // Crucial: Set the MStream pointer in the variable's Value struct to NULL
+        // VM 2.0 Phase 4i checkpoint 3d: mstream IS bits now -- this call
+        // both clears the pointer and updates the tag, replacing the old
+        // "AS_MSTREAM(*ms_value_ptr) = NULL;" raw union write.
         pscalValueSetHeapPtrBits(ms_value_ptr, NULL);
     }
     // If ms was NULL, it's a no-op, which is fine.
@@ -9369,7 +9378,7 @@ Value vmBuiltinSizeof(VM* vm, int arg_count, Value* args) {
 
 Value vmBuiltinAbs(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1) { runtimeError(vm, "abs expects 1 argument."); return makeInt(0); }
-    if (IS_INTLIKE(args[0])) return makeInt(llabs(AS_INTEGER(args[0])));
+    if (IS_INTLIKE(args[0])) return pscalIntResultLike1(args[0], llabs(AS_INTEGER(args[0])));
     if (isRealType(VALUE_TYPE(args[0]))) return makeReal(fabsl(AS_REAL(args[0])));
     runtimeError(vm, "abs expects a numeric argument.");
     return makeInt(0);
@@ -9378,7 +9387,7 @@ Value vmBuiltinAbs(VM* vm, int arg_count, Value* args) {
 Value vmBuiltinRound(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1) { runtimeError(vm, "Round expects 1 argument."); return makeInt(0); }
     if (isRealType(VALUE_TYPE(args[0]))) return makeInt((long long)llround(AS_REAL(args[0])));
-    if (IS_INTLIKE(args[0])) return makeInt(AS_INTEGER(args[0]));
+    if (IS_INTLIKE(args[0])) return pscalIntResultLike1(args[0], AS_INTEGER(args[0]));
     runtimeError(vm, "Round expects a numeric argument.");
     return makeInt(0);
 }

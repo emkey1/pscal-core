@@ -51,9 +51,11 @@
 // non-NULL first (see pscalStringEnsureObj) since dereferencing a NULL
 // StringObj* to assign its buffer crashes exactly like any other NULL
 // deref would.
-#define AS_STRING(value)  (PSCAL_VALUE_FIELD(value, s_val)->buffer)
+#define AS_STRING(value)  (PSCAL_VALUE_PTR(value, StringObj)->buffer)
 #define IS_CHAR(value)    (isPascalCharType(VALUE_TYPE(value)))
-#define AS_CHAR(value)    PSCAL_VALUE_FIELD(value, c_val)
+// VM 2.0 Phase 4i checkpoint 3d: c_val is gone; VAL_INT's TYPE_CHAR/
+// TYPE_WIDECHAR cases already decode the exact codepoint from `bits`.
+#define AS_CHAR(value)    ((int)VAL_INT(value))
 
 static inline bool isPascalStringType(VarType t) {
     return t == TYPE_STRING || t == TYPE_UNICODE_STRING;
@@ -147,24 +149,26 @@ static inline bool tryValueToOrdinal(const Value* v, long long* out) {
         case TYPE_UINT8:
         case TYPE_WORD:
         case TYPE_BYTE:
-            *out = (long long)v->u_val;
+            *out = (long long)VAL_UINT(*v);
             return true;
         case TYPE_INT64:
         case TYPE_INT32:
         case TYPE_INT16:
         case TYPE_INT8:
         case TYPE_BOOLEAN:
-            *out = v->i_val;
+            *out = VAL_INT(*v);
             return true;
         case TYPE_CHAR:
-            *out = (unsigned char)v->c_val;
+            *out = (unsigned char)AS_CHAR(*v);
             return true;
         case TYPE_WIDECHAR:
-            *out = v->c_val;
+            *out = AS_CHAR(*v);
             return true;
-        case TYPE_ENUM:
-            *out = v->enum_val ? v->enum_val->ordinal : 0;
+        case TYPE_ENUM: {
+            EnumObj *e = PSCAL_VALUE_PTR(*v, EnumObj);
+            *out = e ? e->ordinal : 0;
             return true;
+        }
         default:
             return false;
     }
@@ -195,30 +199,26 @@ static inline long long asI64(Value v) {
         case TYPE_UINT8:
         case TYPE_WORD:
         case TYPE_BYTE:
-            return (long long)v.u_val;
+            return (long long)VAL_UINT(v);
         default:
-            return v.i_val;
+            return VAL_INT(v);
     }
 }
 static inline long double asLd(Value v) {
     switch (v.type) {
         case TYPE_FLOAT:
-            /*
-             * Floats are stored with multiple precision representations in
-             * the Value union (long double, double and float).  Using the
-             * raw 32-bit float for numeric comparisons causes literals such
-             * as `3.14` assigned to a float and later compared to a `3.14`
-             * constant to fail equality checks due to rounding differences.
-             * Return the highest precision representation so that float
-             * values participate in comparisons using their original
-             * long‑double precision, matching existing regression
-             * expectations.
-             */
-            return v.real.r_val;
         case TYPE_DOUBLE:
-            return v.real.d_val;
         case TYPE_LONG_DOUBLE:
-            return v.real.r_val;
+            /*
+             * VM 2.0 Phase 4i checkpoint 3d: VAL_REAL_LD already decodes
+             * each of these three at its own natural precision (float's
+             * bit pattern widened, double's bit pattern widened, or the
+             * LongDoubleBox's own long double value) -- no separate
+             * "widen the float specially" step needed anymore, since
+             * there's only one stored representation per Value now, not
+             * three kept in sync simultaneously.
+             */
+            return VAL_REAL_LD(v);
         default:
             return (long double)asI64(v);
     }
@@ -335,6 +335,23 @@ Value makeUInt16(uint16_t val);
 Value makeUInt32(uint32_t val);
 Value makeInt64(long long val);
 Value makeUInt64(unsigned long long val);
+
+// Generic integer opcodes/constant-folding compute a `long long` result and
+// need a Value as wide as their widest operand -- makeInt() alone always
+// tags TYPE_INT32, whose tagged immediate is a real 32-bit budget (VM 2.0
+// Phase 4i checkpoint 3d made this authoritative), so blindly using it
+// would silently truncate int64/uint64 arithmetic.
+static inline Value pscalIntResultLike1(Value a, long long result) {
+    if (VALUE_TYPE(a) == TYPE_UINT64) return makeUInt64((unsigned long long)result);
+    if (VALUE_TYPE(a) == TYPE_INT64) return makeInt64(result);
+    return makeInt(result);
+}
+static inline Value pscalIntResultLike2(Value a, Value b, long long result) {
+    if (VALUE_TYPE(a) == TYPE_UINT64 || VALUE_TYPE(b) == TYPE_UINT64) return makeUInt64((unsigned long long)result);
+    if (VALUE_TYPE(a) == TYPE_INT64 || VALUE_TYPE(b) == TYPE_INT64) return makeInt64(result);
+    return makeInt(result);
+}
+
 Value makeByte(unsigned char val);
 Value makeWord(unsigned int val);
 Value makeNil(void);
