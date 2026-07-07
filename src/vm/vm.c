@@ -3315,6 +3315,14 @@ static void assignRealToIntChecked(VM* vm, Value* dest, long double real_val) {
             }
             VAL_UINT(*dest) = tmp;
             VAL_INT(*dest) = (tmp <= (unsigned long long)LLONG_MAX) ? (long long)tmp : LLONG_MAX;
+            // VM 2.0 Phase 4i checkpoint 3c: this branch predates
+            // SET_INT_VALUE and writes VAL_UINT/VAL_INT directly (VAL_INT
+            // deliberately clamps rather than bit-reinterpreting, unlike
+            // every other case here -- not something to fold into a plain
+            // SET_INT_VALUE call). Update the bits/box mirror explicitly
+            // instead, bit-reinterpreting `tmp` the same way VAL_UINT just
+            // did, so pscalValueBitsConsistent's u_val comparison holds.
+            pscalValueSetIntBits(dest, (long long)tmp);
             break;
         }
         case TYPE_INT64: {
@@ -3691,16 +3699,26 @@ static Value copyValueForStack(const Value* src) {
         case TYPE_INT16:
         case TYPE_UINT16:
         case TYPE_UINT32:
-        case TYPE_INT64:
-        case TYPE_UINT64:
         case TYPE_FLOAT:
-        case TYPE_LONG_DOUBLE:
         case TYPE_NIL:
         {
             Value copy = *src;
             pthread_mutex_unlock(&value_cell_mutex);
             return copy;
         }
+        // VM 2.0 Phase 4i checkpoint 3c: TYPE_INT64/TYPE_UINT64/
+        // TYPE_LONG_DOUBLE used to belong in the bare-bitwise-copy group
+        // above (fully inline data, no heap ownership) -- WRONG now that
+        // each owns an Int64Box/LongDoubleBox: a bitwise `Value copy =
+        // *src;` aliases the SAME box as `*src` with no retain, and both
+        // eventually being freed independently double-frees it. Exactly
+        // the TYPE_CLOSURE bug shape from checkpoint 3a (see that case's
+        // comment below) -- confirmed by an actual heap-use-after-free
+        // under ASan (`outer=1,inner=2,outer_after=1` scope-shadowing
+        // test: printf's stack-pushed copy of a local int64 variable
+        // destroyed the variable's own live box). Falls through to
+        // makeCopyOfValue's TYPE_INT64/UINT64/LONG_DOUBLE case, which
+        // already allocates a fresh box per copy.
         default:
             break;
     }

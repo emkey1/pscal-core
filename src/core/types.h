@@ -383,6 +383,19 @@ typedef struct ValueStruct {
         PointerObj *ptr_val; // VM 2.0 Phase 4g: was a plain struct ValueStruct*
         ClosureObj *closure; // VM 2.0 Phase 4i: was an embedded struct, now a heap pointer
         InterfaceObj *interface; // VM 2.0 Phase 4i: was an embedded struct, now a heap pointer
+        // VM 2.0 Phase 4i checkpoint 3c: i_val/u_val/real.r_val (above)
+        // remain the PRIMARY storage for TYPE_INT64/TYPE_UINT64/
+        // TYPE_LONG_DOUBLE during this checkpoint -- these two boxes exist
+        // solely to give `bits` something real to tag, exactly like
+        // checkpoint 2 added `bits` as a MIRROR for inline scalars rather
+        // than replacing i_val/real outright. The box becomes the sole
+        // source of truth only at the checkpoint 3d flag day, when
+        // i_val/u_val/real are deleted. int64_box serves both TYPE_INT64
+        // and TYPE_UINT64 (bit-identical, see Int64Box's own comment in
+        // core/obj_header.h); header.type on the box always matches
+        // dest->type at the moment it was (re)allocated.
+        Int64Box *int64_box;
+        LongDoubleBox *long_double_box;
     };
     uint8_t *array_raw;
     bool array_is_packed;
@@ -450,7 +463,31 @@ static inline void pscalValueSetIntBits(Value *dest, long long val) {
         case TYPE_INT32:    dest->bits = pscalTagInt32((int32_t)val); break;
         case TYPE_UINT32:   dest->bits = pscalTagUInt32((uint32_t)val); break;
         case TYPE_THREAD:   dest->bits = pscalTagInt32((int32_t)val); break;
-        default: break; // TYPE_INT64/TYPE_UINT64: deferred to checkpoint 3
+        // VM 2.0 Phase 4i checkpoint 3c: release-then-allocate, not
+        // allocate-only. `dest->type` is ALREADY TYPE_INT64/TYPE_UINT64 by
+        // the time this runs (every caller sets `.type` first, per this
+        // function's own precondition) -- which means any existing
+        // `int64_box` here is guaranteed to be a real, matching box from
+        // an earlier call, never a stale union member from a DIFFERENT
+        // type (that would require retyping via SET_VALUE_TYPE, which
+        // never touches this box -- callers are responsible for freeing
+        // old heap-owned content before retyping, same contract every
+        // other boxed type already has). This makes copy-on-construct
+        // safe for the in-place-mutation call sites checkpoint 3c's audit
+        // found (Inc/Dec, INC_LOCAL/DEC_LOCAL, SET_LOCAL/SET_UPVALUE/
+        // SET_INDIRECT's same-type assignment path) with zero call-site
+        // changes -- exactly the same "extend the shared macro, not every
+        // caller" lesson checkpoint 2 established.
+        case TYPE_INT64:
+        case TYPE_UINT64:
+            if (dest->int64_box) {
+                pscalObjRelease(&dest->int64_box->header);
+            }
+            dest->int64_box = pscalInt64BoxCreate(val);
+            dest->int64_box->header.type = dest->type;
+            dest->bits = pscalTagPointer(dest->int64_box);
+            break;
+        default: break;
     }
 }
 
@@ -458,7 +495,16 @@ static inline void pscalValueSetRealBits(Value *dest, long double val) {
     switch (dest->type) {
         case TYPE_FLOAT:  dest->bits = pscalTagFloat((float)val); break;
         case TYPE_DOUBLE: dest->bits = pscalBoxDouble((double)val); break;
-        default: break; // TYPE_LONG_DOUBLE: deferred to checkpoint 3 (needs LongDoubleBox)
+        // VM 2.0 Phase 4i checkpoint 3c: same release-then-allocate
+        // reasoning as TYPE_INT64/TYPE_UINT64 above.
+        case TYPE_LONG_DOUBLE:
+            if (dest->long_double_box) {
+                pscalObjRelease(&dest->long_double_box->header);
+            }
+            dest->long_double_box = pscalLongDoubleBoxCreate(val);
+            dest->bits = pscalTagPointer(dest->long_double_box);
+            break;
+        default: break;
     }
 }
 
@@ -532,8 +578,22 @@ static inline void pscalValueResetBitsForType(Value *dest, VarType t) {
         case TYPE_POINTER:
         case TYPE_SET:
         case TYPE_MEMORYSTREAM:
+        // VM 2.0 Phase 4i checkpoint 3c: same nil-pointer-placeholder
+        // treatment as the heap-pointer types above -- a retype to one of
+        // these three does NOT itself allocate a box (matching every
+        // other boxed type's contract: the caller is responsible for
+        // releasing old heap-owned content before retyping away, and the
+        // box gets allocated by pscalValueSetIntBits/RealBits once the
+        // numeric value is actually set). Deliberately does NOT touch
+        // int64_box/long_double_box here -- leaving that decision to the
+        // dedicated setters keeps this function a pure "what should bits
+        // look like" query, with zero risk of double-freeing a box a
+        // caller already released.
+        case TYPE_INT64:
+        case TYPE_UINT64:
+        case TYPE_LONG_DOUBLE:
             dest->bits = pscalTagPointer(NULL); break;
-        default:            dest->bits = 0; break; // deferred: INT64/UINT64/LONG_DOUBLE (checkpoint 3c)
+        default:            dest->bits = 0; break;
     }
 }
 

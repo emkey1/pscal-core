@@ -2667,8 +2667,23 @@ bool pscalValueBitsConsistent(const Value *v) {
         case TYPE_MEMORYSTREAM:
             if (!pscalWordIsNanBoxTag(v->bits) || !pscalTaggedWordIsPointer(v->bits)) return false;
             return pscalUntagPointer(v->bits) == (const void *)v->mstream;
+        // VM 2.0 Phase 4i checkpoint 3c: int64_box/long_double_box mirror
+        // i_val/u_val/real.r_val (still the primary storage this
+        // checkpoint) -- verify both the tag decodes to the live box AND
+        // the box's own value still matches the legacy field.
+        case TYPE_INT64:
+        case TYPE_UINT64:
+            if (!pscalWordIsNanBoxTag(v->bits) || !pscalTaggedWordIsPointer(v->bits)) return false;
+            if (pscalUntagPointer(v->bits) != (const void *)v->int64_box) return false;
+            return v->int64_box && (uint64_t)v->int64_box->value == v->u_val;
+        case TYPE_LONG_DOUBLE:
+            if (!pscalWordIsNanBoxTag(v->bits) || !pscalTaggedWordIsPointer(v->bits)) return false;
+            if (pscalUntagPointer(v->bits) != (const void *)v->long_double_box) return false;
+            if (!v->long_double_box) return false;
+            if (isnan((double)v->real.r_val)) return isnan((double)v->long_double_box->value);
+            return v->long_double_box->value == v->real.r_val;
         default:
-            return true; // deferred: TYPE_CLOSURE/TYPE_INTERFACE, INT64/UINT64/LONG_DOUBLE
+            return true; // deferred: TYPE_CLOSURE/TYPE_INTERFACE
     }
 }
 
@@ -2706,6 +2721,25 @@ void freeValue(Value *v) {
  //           fprintf(stderr, "[DEBUG]   No heap data to free for type %s directly within Value struct.\n", varTypeToString(v->type));
   //          fflush(stderr);
 //#endif
+            break;
+        // VM 2.0 Phase 4i checkpoint 3c: int64_box/long_double_box are the
+        // only heap data these three types own; i_val/u_val/real.r_val
+        // stay valid (they're not heap pointers) but are otherwise inert
+        // once freeValue tears the Value down.
+        case TYPE_INT64:
+        case TYPE_UINT64:
+            if (v->int64_box) {
+                pscalObjRelease(&v->int64_box->header);
+            }
+            v->int64_box = NULL;
+            v->bits = pscalTagPointer(NULL);
+            break;
+        case TYPE_LONG_DOUBLE:
+            if (v->long_double_box) {
+                pscalObjRelease(&v->long_double_box->header);
+            }
+            v->long_double_box = NULL;
+            v->bits = pscalTagPointer(NULL);
             break;
         case TYPE_ENUM:
             if (v->enum_val) {
@@ -4088,6 +4122,21 @@ Value makeCopyOfValue(const Value *src) {
             // would add one reference per stack-argument push that
             // CALL_BUILTIN's skip guarantees is never matched by a
             // release -- a permanent leak, not a fix.
+            break;
+        // VM 2.0 Phase 4i checkpoint 3c: `v = *src` above left
+        // v.int64_box/v.long_double_box ALIASING src's box -- overwrite
+        // with a fresh one, copy-on-construct, matching the
+        // STRING/ENUM/RECORD/SET precedent above. i_val/u_val/real.r_val
+        // already carried over correctly via the shallow copy.
+        case TYPE_INT64:
+        case TYPE_UINT64:
+            v.int64_box = pscalInt64BoxCreate(src->int64_box ? src->int64_box->value : src->i_val);
+            v.int64_box->header.type = src->type;
+            pscalValueSetHeapPtrBits(&v, v.int64_box);
+            break;
+        case TYPE_LONG_DOUBLE:
+            v.long_double_box = pscalLongDoubleBoxCreate(src->long_double_box ? src->long_double_box->value : src->real.r_val);
+            pscalValueSetHeapPtrBits(&v, v.long_double_box);
             break;
         default:
             break;

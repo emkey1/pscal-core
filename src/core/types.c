@@ -11,6 +11,24 @@ void setTypeValue(Value *val, VarType type) {
                 varTypeToString(val->type), varTypeToString(type));
     }
 #endif
+    // VM 2.0 Phase 4i checkpoint 3c: unlike SET_VALUE_TYPE (used at fresh-
+    // construction sites, or sites already audited to freeValue first),
+    // setTypeValue's own callers (vm.c's real/int parameter-coercion
+    // sites) retype an ALREADY-LIVE Value across the real/int family
+    // boundary with no freeValue call in between. Release an old
+    // Int64Box/LongDoubleBox here before it becomes unreachable, or every
+    // such coercion leaks one box.
+    if (val->type == TYPE_INT64 || val->type == TYPE_UINT64) {
+        if (val->int64_box) {
+            pscalObjRelease(&val->int64_box->header);
+            val->int64_box = NULL;
+        }
+    } else if (val->type == TYPE_LONG_DOUBLE) {
+        if (val->long_double_box) {
+            pscalObjRelease(&val->long_double_box->header);
+            val->long_double_box = NULL;
+        }
+    }
     val->type = type;
 }
 
