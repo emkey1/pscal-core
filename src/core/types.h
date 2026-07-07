@@ -302,6 +302,28 @@ typedef struct PointerObj {
     ObjHeader header; // header.type is always TYPE_POINTER
     struct ValueStruct *address;
     struct AST *base_type_node; // AST typedef not yet visible this early in the file
+    // VM 2.0 follow-up to dynamic_array_fresh_publish_race (pscal-core
+    // f65432e): GET_ELEMENT_ADDRESS/GET_ELEMENT_ADDRESS_CONST hand out a
+    // raw `address` pointing directly INTO a live dynamic ArrayObj's own
+    // `elements`/`raw` buffer (needed for SET_INDIRECT, VAR-parameter
+    // aliasing, and Inc/Dec-style read-modify-write -- unlike
+    // LOAD_ELEMENT_VALUE, this opcode cannot get away with returning a
+    // detached copy). A concurrent SetLength() on the same array can free
+    // that buffer once this pointer has already been handed out, unless
+    // something keeps the owning ArrayObj alive for exactly as long as
+    // this PointerObj is. Non-NULL here means this PointerObj holds
+    // exactly one retained reference (dynamic_array_refcount_mutex-
+    // protected, ObjHeader-refcounted, same convention as ArrayObj's own
+    // `view_of`) on the ArrayObj that `address` points into; freeValue's
+    // TYPE_POINTER case releases it, and makeCopyOfValue's TYPE_POINTER
+    // case re-retains it for the copy (copy-on-construct, matching every
+    // other PointerObj field). Deliberately independent of
+    // `base_type_node`'s existing sentinel scheme (OWNED_POINTER_SENTINEL
+    // et al): unlike those flavors, this pointer's target is not itself a
+    // freestanding owned allocation, and base_type_node still needs to
+    // carry the real element type AST for chained indexing/field access,
+    // so this can't reuse that field the way the sentinels do.
+    struct ArrayObj *retained_array;
 } PointerObj;
 
 // VM 2.0 Phase 4i checkpoint 3a (Docs/pscal_vm2_plan.md sec 5.10.3/

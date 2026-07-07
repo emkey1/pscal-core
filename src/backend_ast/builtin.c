@@ -3362,7 +3362,7 @@ static bool resizeDynamicArrayValue(VM* vm,
                                     Value* array_value,
                                     int dimension_count,
                                     const long long* lengths) {
-    if (!array_value || VALUE_TYPE(*array_value) != TYPE_ARRAY || !PSCAL_VALUE_PTR(*array_value, ArrayObj)) {
+    if (!array_value || VALUE_TYPE(*array_value) != TYPE_ARRAY) {
         runtimeError(vm, "SetLength target is not an array.");
         return false;
     }
@@ -3371,17 +3371,57 @@ static bool resizeDynamicArrayValue(VM* vm,
         return false;
     }
 
-    if (ARRAY_DIMENSIONS(*array_value) > 0 && ARRAY_DIMENSIONS(*array_value) != dimension_count) {
-        runtimeError(vm, "SetLength dimension count (%d) does not match existing array (%d).",
-                     dimension_count,
-                     ARRAY_DIMENSIONS(*array_value));
+    // VM 2.0 follow-up to dynamic_array_fresh_publish_race (pscal-core
+    // f65432e): f65432e serialized this function's own release-old/
+    // publish-new step (further down) against a concurrent READER's
+    // copyDynamicArraySnapshotValue(), but left this function's own
+    // initial read of *array_value's current ArrayObj -- used throughout
+    // the rest of this function to read the array's existing
+    // element_type/bounds/data for the resize -- unprotected against a
+    // SECOND thread concurrently calling SetLength on the SAME array. If
+    // that other thread's own publish step (the locked release+install
+    // further down) runs while this thread is still reading `old`'s
+    // fields, `old` can be freed out from under this thread: a genuine
+    // use-after-free under concurrent-writer stress, not just the
+    // reader/writer case f65432e covered.
+    //
+    // Retaining `old` here (matching copyDynamicArraySnapshotValue's own
+    // retain-under-lock convention) gives this thread its OWN
+    // independent reference, so `old` stays alive for the rest of this
+    // function regardless of what a concurrent SetLength does to the
+    // live cell. This retain is deliberately separate from -- and
+    // released separately from -- the cell's own reference: the publish
+    // step below no longer assumes the cell still holds `old` (another
+    // thread may already have replaced it there), it re-reads the
+    // cell's CURRENT content under lock and releases THAT, and only
+    // then does this function release its own defensive retain of
+    // `old`. Not a whole-function lock: the dimension_count > 1
+    // recursive call further down only ever touches its own freshly
+    // allocated, not-yet-published elements, never this outer
+    // array_value cell, and by the time that recursion happens this
+    // retain's own lock has long since been released -- so it cannot
+    // deadlock against this (pthread_mutex_lock here is not reentrant).
+    pthread_mutex_lock(&dynamic_array_refcount_mutex);
+    ArrayObj* old = PSCAL_VALUE_PTR(*array_value, ArrayObj);
+    if (old) pscalObjRetain(&old->header);
+    pthread_mutex_unlock(&dynamic_array_refcount_mutex);
+    if (!old) {
+        runtimeError(vm, "SetLength target is not an array.");
         return false;
     }
 
-    VarType element_type = ARRAY_ELEMENT_TYPE(*array_value);
-    AST* element_type_def = ARRAY_ELEMENT_TYPE_DEF(*array_value);
+    if (old->dimensions > 0 && old->dimensions != dimension_count) {
+        runtimeError(vm, "SetLength dimension count (%d) does not match existing array (%d).",
+                     dimension_count,
+                     old->dimensions);
+        pscalObjRelease(&old->header);
+        return false;
+    }
+
+    VarType element_type = old->element_type;
+    AST* element_type_def = old->element_type_def;
     bool use_packed = isPackedByteElementType(element_type);
-    bool is_dynamic = ARRAY_IS_DYNAMIC(*array_value);
+    bool is_dynamic = old->is_dynamic;
 
     int* new_lower = (int*)malloc(sizeof(int) * dimension_count);
     int* new_upper = (int*)malloc(sizeof(int) * dimension_count);
@@ -3389,6 +3429,7 @@ static bool resizeDynamicArrayValue(VM* vm,
         if (new_lower) free(new_lower);
         if (new_upper) free(new_upper);
         runtimeError(vm, "SetLength: memory allocation failed for array bounds.");
+        pscalObjRelease(&old->header);
         return false;
     }
 
@@ -3400,6 +3441,7 @@ static bool resizeDynamicArrayValue(VM* vm,
             runtimeError(vm, "SetLength: array length must be non-negative.");
             free(new_lower);
             free(new_upper);
+            pscalObjRelease(&old->header);
             return false;
         }
         if (len == 0) {
@@ -3411,6 +3453,7 @@ static bool resizeDynamicArrayValue(VM* vm,
                 runtimeError(vm, "SetLength: array length exceeds supported range.");
                 free(new_lower);
                 free(new_upper);
+                pscalObjRelease(&old->header);
                 return false;
             }
             new_lower[i] = 0;
@@ -3420,6 +3463,7 @@ static bool resizeDynamicArrayValue(VM* vm,
                     runtimeError(vm, "SetLength: requested array size is too large.");
                     free(new_lower);
                     free(new_upper);
+                    pscalObjRelease(&old->header);
                     return false;
                 }
                 new_total *= (size_t)len;
@@ -3431,7 +3475,6 @@ static bool resizeDynamicArrayValue(VM* vm,
         new_total = 0;
     }
 
-    ArrayObj* old = PSCAL_VALUE_PTR(*array_value, ArrayObj);
     size_t old_total = 0;
     int* old_lower_bounds = old->lower_bounds;
     int* old_upper_bounds = old->upper_bounds;
@@ -3602,12 +3645,26 @@ static bool resizeDynamicArrayValue(VM* vm,
     // released here, or dereference it just after release frees its
     // storage -- both confirmed as real heap-corruption crashes under
     // concurrent SetLength()/read stress.
+    //
+    // f65432e follow-up (two-writer case): re-read the cell's CURRENT
+    // ArrayObj here rather than assuming it is still `old` -- a second
+    // thread racing this same SetLength() may already have published its
+    // own new_obj into this cell before this thread got here. Releasing
+    // whatever is actually installed right now (not necessarily `old`)
+    // is what keeps the cell's own reference-count bookkeeping balanced
+    // regardless of which thread's resize reaches this step first; this
+    // function's own defensive retain of `old` (top of function) is then
+    // released separately below, independent of that outcome.
     pthread_mutex_lock(&value_cell_mutex);
     pthread_mutex_lock(&dynamic_array_refcount_mutex);
-    pscalObjRelease(&old->header);
+    ArrayObj* current = PSCAL_VALUE_PTR(*array_value, ArrayObj);
+    if (current) {
+        pscalObjRelease(&current->header);
+    }
     pscalValueSetHeapPtrBits(array_value, new_obj);
     pthread_mutex_unlock(&dynamic_array_refcount_mutex);
     pthread_mutex_unlock(&value_cell_mutex);
+    pscalObjRelease(&old->header);
 
     return true;
 
@@ -3632,6 +3689,7 @@ setlength_cleanup_failure:
     }
     free(new_lower);
     free(new_upper);
+    pscalObjRelease(&old->header);
     return false;
 }
 
@@ -3706,18 +3764,49 @@ Value vmBuiltinSetlength(VM* vm, int arg_count, Value* args) {
         return makeVoid();
     }
 
-    if ((ARRAY_ELEMENT_TYPE(*target) == TYPE_UNKNOWN || ARRAY_ELEMENT_TYPE(*target) == TYPE_VOID ||
-         ARRAY_ELEMENT_TYPE_DEF(*target) == NULL) &&
-        PTR_BASE_TYPE_NODE(args[0]) != NULL) {
+    // VM 2.0 follow-up to dynamic_array_fresh_publish_race (pscal-core
+    // f65432e / this fix): this back-fill (for a target whose element type
+    // wasn't yet known, e.g. from an inferred/generic declaration) reads
+    // *target's ArrayObj fields and, if still unset, mutates them in place
+    // -- unprotected, both the read and the later mutate race a SECOND
+    // thread's concurrent SetLength() on the SAME array publishing (and
+    // freeing the old) ArrayObj via resizeDynamicArrayValue below, exactly
+    // like that function's own now-fixed initial read did (confirmed via
+    // Tests/vm_thread_stress/setlength_concurrent_writers_race.pas hitting
+    // a use-after-free HERE, not in resizeDynamicArrayValue, under ASan).
+    // Each of the two dereferences below re-fetches *target's CURRENT
+    // ArrayObj fresh under dynamic_array_refcount_mutex rather than
+    // trusting a pointer captured before or across makeValueForType()'s
+    // (lock-free) work, so neither can observe a torn read or a freed
+    // ArrayObj; value_cell_mutex is not needed here since this block only
+    // ever mutates fields of whatever ArrayObj *target currently points
+    // to, never swaps *target's own pointer bits the way
+    // replaceValueCell/resizeDynamicArrayValue's publish step does.
+    bool needs_type_backfill;
+    {
+        pthread_mutex_lock(&dynamic_array_refcount_mutex);
+        ArrayObj *target_array = PSCAL_VALUE_PTR(*target, ArrayObj);
+        needs_type_backfill = target_array &&
+            (target_array->element_type == TYPE_UNKNOWN || target_array->element_type == TYPE_VOID ||
+             target_array->element_type_def == NULL) &&
+            PTR_BASE_TYPE_NODE(args[0]) != NULL;
+        pthread_mutex_unlock(&dynamic_array_refcount_mutex);
+    }
+    if (needs_type_backfill) {
         Value typed_template = makeValueForType(TYPE_ARRAY, PTR_BASE_TYPE_NODE(args[0]), NULL);
         if (VALUE_TYPE(typed_template) == TYPE_ARRAY) {
-            if (ARRAY_ELEMENT_TYPE(*target) == TYPE_UNKNOWN || ARRAY_ELEMENT_TYPE(*target) == TYPE_VOID) {
-                ARRAY_ELEMENT_TYPE(*target) = ARRAY_ELEMENT_TYPE(typed_template);
+            pthread_mutex_lock(&dynamic_array_refcount_mutex);
+            ArrayObj *target_array = PSCAL_VALUE_PTR(*target, ArrayObj);
+            if (target_array) {
+                if (target_array->element_type == TYPE_UNKNOWN || target_array->element_type == TYPE_VOID) {
+                    target_array->element_type = ARRAY_ELEMENT_TYPE(typed_template);
+                }
+                if (target_array->element_type_def == NULL) {
+                    target_array->element_type_def = ARRAY_ELEMENT_TYPE_DEF(typed_template);
+                }
+                target_array->is_packed = ARRAY_IS_PACKED(typed_template);
             }
-            if (ARRAY_ELEMENT_TYPE_DEF(*target) == NULL) {
-                ARRAY_ELEMENT_TYPE_DEF(*target) = ARRAY_ELEMENT_TYPE_DEF(typed_template);
-            }
-            ARRAY_IS_PACKED(*target) = ARRAY_IS_PACKED(typed_template);
+            pthread_mutex_unlock(&dynamic_array_refcount_mutex);
         }
         freeValue(&typed_template);
     }

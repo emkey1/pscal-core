@@ -2366,6 +2366,18 @@ Value makePointer(void* address, AST* base_type_node) {
     return v;
 }
 
+Value makeRetainedArrayElementPointer(void* address, AST* base_type_node, ArrayObj* owner) {
+    Value v;
+    memset(&v, 0, sizeof(Value));
+    v.type = TYPE_POINTER;
+    PointerObj *po = pscalPointerObjCreate();
+    pscalValueSetHeapPtrBits(&v, po);
+    po->address = (Value*)address;
+    po->base_type_node = base_type_node;
+    po->retained_array = owner;
+    return v;
+}
+
 // VM 2.0 Phase 4b (Docs/pscal_vm2_plan.md §5.10.4/§5.10.3): ClosureEnvPayload
 // already carried its own ad hoc refcount; this routes it through the
 // generic ObjHeader mechanism instead. One destructor, registered under
@@ -2667,6 +2679,17 @@ void freeValue(Value *v) {
                     free(owned);
                 } else if (AS_POINTER(*v) && po->base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
                     free((char*)AS_POINTER(*v));
+                }
+                // VM 2.0 follow-up to dynamic_array_fresh_publish_race
+                // (pscal-core f65432e): see PointerObj.retained_array's
+                // comment (core/types.h) -- releases the reference this
+                // pointer was keeping the target array's owning ArrayObj
+                // alive with, independent of the sentinel handling above.
+                if (po->retained_array) {
+                    pthread_mutex_lock(&dynamic_array_refcount_mutex);
+                    pscalObjRelease(&po->retained_array->header);
+                    pthread_mutex_unlock(&dynamic_array_refcount_mutex);
+                    po->retained_array = NULL;
                 }
                 pscalObjRelease(&po->header);
             }
@@ -4020,6 +4043,7 @@ Value makeCopyOfValue(const Value *src) {
             PointerObj *src_po = PSCAL_VALUE_PTR(*src, PointerObj);
             void *src_address = (src_po && AS_POINTER(*src)) ? (void*)AS_POINTER(*src) : NULL;
             AST *src_base_type_node = src_po ? src_po->base_type_node : NULL;
+            ArrayObj *src_retained_array = src_po ? src_po->retained_array : NULL;
             PointerObj *po = pscalPointerObjCreate();
             pscalValueSetHeapPtrBits(&v, po);
             // VM 2.0 Phase 4i: base_type_node now lives inside the fresh
@@ -4039,6 +4063,19 @@ Value makeCopyOfValue(const Value *src) {
                 po->address = (Value*)dup;
             } else {
                 po->address = (Value*)src_address;
+            }
+            // VM 2.0 follow-up to dynamic_array_fresh_publish_race
+            // (pscal-core f65432e): a retained-array-owning pointer
+            // (core/types.h's PointerObj.retained_array) must keep the
+            // copy-on-construct invariant every other PointerObj field
+            // already has -- re-retain for the fresh copy rather than
+            // sharing src_po's single reference, so each independent
+            // PointerObj holds its own.
+            if (src_retained_array) {
+                pthread_mutex_lock(&dynamic_array_refcount_mutex);
+                pscalObjRetain(&src_retained_array->header);
+                pthread_mutex_unlock(&dynamic_array_refcount_mutex);
+                po->retained_array = src_retained_array;
             }
             break;
         }

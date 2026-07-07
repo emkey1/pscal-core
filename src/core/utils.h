@@ -376,6 +376,17 @@ void pscalValueSwap(Value *a, Value *b);
 // Value constructor for creating a Value representing a general pointer.
 // Used by the 'new' builtin.
 Value makePointer(void* address, AST* base_type_node); // <<< ADD THIS PROTOTYPE >>>
+// Like makePointer(), but for an address that points directly INTO a live
+// dynamic array's own storage (a GET_ELEMENT_ADDRESS/GET_ELEMENT_ADDRESS_CONST
+// result) rather than a freestanding allocation. `owner`'s ObjHeader
+// reference is TRANSFERRED into the resulting PointerObj (caller must
+// already hold a retained reference to hand off, e.g. from
+// copyDynamicArraySnapshotValue() -- this function does not retain it
+// itself); freeValue() releases it (dynamic_array_refcount_mutex-protected)
+// when the pointer Value is torn down, keeping `owner` alive for exactly as
+// long as this pointer is, even across a concurrent SetLength() on the same
+// array. See PointerObj.retained_array's comment (core/types.h).
+Value makeRetainedArrayElementPointer(void* address, AST* base_type_node, struct ArrayObj* owner);
 Value makeString(const char *val);
 Value makeStringLen(const char *val, size_t len);
 Value makeChar(int c);

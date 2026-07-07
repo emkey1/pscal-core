@@ -939,8 +939,23 @@ static bool pushFieldValueByName(VM* vm, Value* base_val_ptr, const char* field_
     FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
     if (current) {
         Value* fieldStorage = fieldValueStorage(current);
-        if (fieldStorage && VALUE_TYPE(*fieldStorage) == TYPE_ARRAY && ARRAY_IS_DYNAMIC(*fieldStorage)) {
-            push(vm, copyDynamicArraySnapshotValue(fieldStorage));
+        // VM 2.0 follow-up to dynamic_array_fresh_publish_race (pscal-core
+        // f65432e): checking ARRAY_IS_DYNAMIC(*fieldStorage) here first,
+        // before any lock, would itself race a concurrent SetLength publish
+        // on this same field -- same "peek before lock" shape as
+        // LOAD_ELEMENT_VALUE had before f65432e, just for a record field
+        // instead of a plain global. copyDynamicArraySnapshotValue() takes
+        // the whole-struct copy, the is_dynamic check, and the conditional
+        // retain all under one critical section, so call it unconditionally
+        // first and only branch on dynamic-vs-static from the now-safe
+        // local copy.
+        if (fieldStorage && VALUE_TYPE(*fieldStorage) == TYPE_ARRAY) {
+            Value snapshot = copyDynamicArraySnapshotValue(fieldStorage);
+            if (ARRAY_IS_DYNAMIC(snapshot)) {
+                push(vm, snapshot);
+            } else {
+                push(vm, copyValueForStack(fieldStorage));
+            }
         } else {
             push(vm, copyValueForStack(fieldStorage));
         }
@@ -7887,14 +7902,39 @@ comparison_error_label:
                 }
 
                 Value* array_val_ptr = NULL;
+                Value shared_snapshot = makeNil();
                 Value temp_wrapper;
                 vmInitArrayIndexWrapper(&temp_wrapper);
                 bool using_wrapper = false;
+                bool using_snapshot = false;
 
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* candidate = (Value*)AS_POINTER(operand);
                     if (candidate && VALUE_TYPE(*candidate) == TYPE_ARRAY) {
-                        array_val_ptr = candidate;
+                        // VM 2.0 follow-up to dynamic_array_fresh_publish_race
+                        // (pscal-core f65432e): `candidate` here can alias a
+                        // shared global's live Value cell. This opcode always
+                        // hands out an address that MAY be used to mutate the
+                        // array in place or alias it as a VAR parameter, so
+                        // (unlike LOAD_ELEMENT_VALUE's read-only snapshot,
+                        // which is freed before that opcode returns) the
+                        // retained reference this snapshot takes on a
+                        // dynamic array must OUTLIVE this opcode -- it gets
+                        // transferred into the returned pointer's
+                        // PointerObj.retained_array below (core/types.h)
+                        // instead of being freed here. Checking
+                        // ARRAY_IS_DYNAMIC(*candidate) before any lock would
+                        // itself race a concurrent SetLength publish the
+                        // same way LOAD_ELEMENT_VALUE's did, so call
+                        // copyDynamicArraySnapshotValue() unconditionally
+                        // first and branch on the result.
+                        shared_snapshot = copyDynamicArraySnapshotValue(candidate);
+                        if (ARRAY_IS_DYNAMIC(shared_snapshot)) {
+                            array_val_ptr = &shared_snapshot;
+                            using_snapshot = true;
+                        } else {
+                            array_val_ptr = candidate;
+                        }
                     } else if (PTR_BASE_TYPE_NODE(operand) && PTR_BASE_TYPE_NODE(operand)->type == AST_ARRAY_TYPE) {
                         AST* arrayType = PTR_BASE_TYPE_NODE(operand);
                         int dims = arrayType->child_count;
@@ -7996,6 +8036,9 @@ comparison_error_label:
                         if (using_wrapper) {
                             vmFreeArrayIndexWrapper(&temp_wrapper);
                         }
+                        if (using_snapshot) {
+                            freeValue(&shared_snapshot);
+                        }
                         return INTERPRET_RUNTIME_ERROR;
                     }
                     push(vm, makePointer(slice, OWNED_POINTER_SENTINEL));
@@ -8004,6 +8047,13 @@ comparison_error_label:
                     }
                     if (using_wrapper) {
                         vmFreeArrayIndexWrapper(&temp_wrapper);
+                    }
+                    // makeDynamicArraySliceValue() above already took its
+                    // own retained reference (view_of) on the underlying
+                    // array -- this snapshot's own retain is no longer
+                    // needed once the slice exists independently.
+                    if (using_snapshot) {
+                        freeValue(&shared_snapshot);
                     }
                     break;
                 }
@@ -8017,6 +8067,9 @@ comparison_error_label:
                     freeValue(&operand);
                     if (using_wrapper) {
                         vmFreeArrayIndexWrapper(&temp_wrapper);
+                    }
+                    if (using_snapshot) {
+                        freeValue(&shared_snapshot);
                     }
                     return INTERPRET_RUNTIME_ERROR;
                 }
@@ -8047,11 +8100,36 @@ comparison_error_label:
                         if (using_wrapper) {
                             vmFreeArrayIndexWrapper(&temp_wrapper);
                         }
+                        if (using_snapshot) {
+                            freeValue(&shared_snapshot);
+                        }
                         return INTERPRET_RUNTIME_ERROR;
                     }
-                    push(vm, makePointer(&AS_ARRAY_RAW(*array_val_ptr)[offset], BYTE_ARRAY_PTR_SENTINEL));
+                    // VM 2.0 follow-up to dynamic_array_fresh_publish_race
+                    // (pscal-core f65432e): when using_snapshot, this
+                    // address points into shared_snapshot's own retained
+                    // ArrayObj -- hand that retained reference off to the
+                    // returned pointer (PointerObj.retained_array,
+                    // core/types.h) instead of freeing shared_snapshot
+                    // below, so the buffer stays alive for exactly as long
+                    // as the pointer does, even across a concurrent
+                    // SetLength() on the live global this snapshot was
+                    // taken from.
+                    if (using_snapshot) {
+                        push(vm, makeRetainedArrayElementPointer(&AS_ARRAY_RAW(*array_val_ptr)[offset],
+                                                                  BYTE_ARRAY_PTR_SENTINEL,
+                                                                  PSCAL_VALUE_PTR(shared_snapshot, ArrayObj)));
+                    } else {
+                        push(vm, makePointer(&AS_ARRAY_RAW(*array_val_ptr)[offset], BYTE_ARRAY_PTR_SENTINEL));
+                    }
                 } else {
-                    push(vm, makePointer(&AS_ARRAY(*array_val_ptr)[offset], element_base_type));
+                    if (using_snapshot) {
+                        push(vm, makeRetainedArrayElementPointer(&AS_ARRAY(*array_val_ptr)[offset],
+                                                                  element_base_type,
+                                                                  PSCAL_VALUE_PTR(shared_snapshot, ArrayObj)));
+                    } else {
+                        push(vm, makePointer(&AS_ARRAY(*array_val_ptr)[offset], element_base_type));
+                    }
                 }
 
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
@@ -8060,6 +8138,8 @@ comparison_error_label:
                 if (using_wrapper) {
                     vmFreeArrayIndexWrapper(&temp_wrapper);
                 }
+                // shared_snapshot's retain was transferred into the pointer
+                // above (using_snapshot case) -- do not also free it here.
 
                 break;
             }
@@ -8093,14 +8173,25 @@ comparison_error_label:
                 }
 
                 Value* array_val_ptr = NULL;
+                Value shared_snapshot = makeNil();
                 Value temp_wrapper;
                 vmInitArrayIndexWrapper(&temp_wrapper);
                 bool using_wrapper = false;
+                bool using_snapshot = false;
 
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* candidate = (Value*)AS_POINTER(operand);
                     if (candidate && VALUE_TYPE(*candidate) == TYPE_ARRAY) {
-                        array_val_ptr = candidate;
+                        // VM 2.0 follow-up to dynamic_array_fresh_publish_race
+                        // (pscal-core f65432e): see the matching comment in
+                        // GET_ELEMENT_ADDRESS -- same hazard, same fix.
+                        shared_snapshot = copyDynamicArraySnapshotValue(candidate);
+                        if (ARRAY_IS_DYNAMIC(shared_snapshot)) {
+                            array_val_ptr = &shared_snapshot;
+                            using_snapshot = true;
+                        } else {
+                            array_val_ptr = candidate;
+                        }
                     } else if (PTR_BASE_TYPE_NODE(operand) && PTR_BASE_TYPE_NODE(operand)->type == AST_ARRAY_TYPE) {
                         AST* arrayType = PTR_BASE_TYPE_NODE(operand);
                         int dims = arrayType->child_count;
@@ -8174,6 +8265,9 @@ comparison_error_label:
                     if (using_wrapper) {
                         vmFreeArrayIndexWrapper(&temp_wrapper);
                     }
+                    if (using_snapshot) {
+                        freeValue(&shared_snapshot);
+                    }
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
@@ -8203,11 +8297,26 @@ comparison_error_label:
                         if (using_wrapper) {
                             vmFreeArrayIndexWrapper(&temp_wrapper);
                         }
+                        if (using_snapshot) {
+                            freeValue(&shared_snapshot);
+                        }
                         return INTERPRET_RUNTIME_ERROR;
                     }
-                    push(vm, makePointer(&AS_ARRAY_RAW(*array_val_ptr)[flat_offset], BYTE_ARRAY_PTR_SENTINEL));
+                    if (using_snapshot) {
+                        push(vm, makeRetainedArrayElementPointer(&AS_ARRAY_RAW(*array_val_ptr)[flat_offset],
+                                                                  BYTE_ARRAY_PTR_SENTINEL,
+                                                                  PSCAL_VALUE_PTR(shared_snapshot, ArrayObj)));
+                    } else {
+                        push(vm, makePointer(&AS_ARRAY_RAW(*array_val_ptr)[flat_offset], BYTE_ARRAY_PTR_SENTINEL));
+                    }
                 } else {
-                    push(vm, makePointer(&AS_ARRAY(*array_val_ptr)[flat_offset], element_base_type));
+                    if (using_snapshot) {
+                        push(vm, makeRetainedArrayElementPointer(&AS_ARRAY(*array_val_ptr)[flat_offset],
+                                                                  element_base_type,
+                                                                  PSCAL_VALUE_PTR(shared_snapshot, ArrayObj)));
+                    } else {
+                        push(vm, makePointer(&AS_ARRAY(*array_val_ptr)[flat_offset], element_base_type));
+                    }
                 }
 
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
@@ -8216,6 +8325,8 @@ comparison_error_label:
                 if (using_wrapper) {
                     vmFreeArrayIndexWrapper(&temp_wrapper);
                 }
+                // shared_snapshot's retain was transferred into the pointer
+                // above (using_snapshot case) -- do not also free it here.
 
                 break;
             }
