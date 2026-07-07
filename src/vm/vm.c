@@ -8291,8 +8291,20 @@ comparison_error_label:
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* candidate = (Value*)AS_POINTER(operand);
                     if (candidate && VALUE_TYPE(*candidate) == TYPE_ARRAY) {
-                        if (ARRAY_IS_DYNAMIC(*candidate)) {
-                            shared_snapshot = copyDynamicArraySnapshotValue(candidate);
+                        // Checking ARRAY_IS_DYNAMIC(*candidate) here first,
+                        // before any lock, would itself race a concurrent
+                        // SetLength publish (dynamic_array_fresh_publish_race
+                        // follow-up, pscal-core builtin.c's
+                        // resizeDynamicArrayValue) -- it dereferences
+                        // candidate's live bits pointer the same way the
+                        // element read below does. copyDynamicArraySnapshotValue()
+                        // takes the whole-struct copy, the is_dynamic check,
+                        // and the conditional retain all under one critical
+                        // section, so call it unconditionally and only
+                        // branch on dynamic-vs-static from the now-safe
+                        // local copy.
+                        shared_snapshot = copyDynamicArraySnapshotValue(candidate);
+                        if (ARRAY_IS_DYNAMIC(shared_snapshot)) {
                             array_val_ptr = &shared_snapshot;
                             using_snapshot = true;
                         } else {
@@ -8479,8 +8491,20 @@ comparison_error_label:
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* candidate = (Value*)AS_POINTER(operand);
                     if (candidate && VALUE_TYPE(*candidate) == TYPE_ARRAY) {
-                        if (ARRAY_IS_DYNAMIC(*candidate)) {
-                            shared_snapshot = copyDynamicArraySnapshotValue(candidate);
+                        // Checking ARRAY_IS_DYNAMIC(*candidate) here first,
+                        // before any lock, would itself race a concurrent
+                        // SetLength publish (dynamic_array_fresh_publish_race
+                        // follow-up, pscal-core builtin.c's
+                        // resizeDynamicArrayValue) -- it dereferences
+                        // candidate's live bits pointer the same way the
+                        // element read below does. copyDynamicArraySnapshotValue()
+                        // takes the whole-struct copy, the is_dynamic check,
+                        // and the conditional retain all under one critical
+                        // section, so call it unconditionally and only
+                        // branch on dynamic-vs-static from the now-safe
+                        // local copy.
+                        shared_snapshot = copyDynamicArraySnapshotValue(candidate);
+                        if (ARRAY_IS_DYNAMIC(shared_snapshot)) {
                             array_val_ptr = &shared_snapshot;
                             using_snapshot = true;
                         } else {

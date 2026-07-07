@@ -3590,8 +3590,24 @@ static bool resizeDynamicArrayValue(VM* vm,
         }
     }
 
+    // VM 2.0 follow-up to dynamic_array_fresh_publish_race (pscal-core
+    // dbac64a): that fix serializes replaceValueCell()'s whole-value
+    // reassignment against copyDynamicArraySnapshotValue()'s retain-under-
+    // lock read, but SetLength's in-place resize publishes a fresh ArrayObj
+    // through this exact same array_value cell via a completely different,
+    // previously-unlocked path. Without the same two mutexes (same order:
+    // value_cell_mutex, then dynamic_array_refcount_mutex, per
+    // core/utils.h's dynamic_array_refcount_mutex comment), a concurrent
+    // reader's snapshot/bounds read can retain `old` right as it's being
+    // released here, or dereference it just after release frees its
+    // storage -- both confirmed as real heap-corruption crashes under
+    // concurrent SetLength()/read stress.
+    pthread_mutex_lock(&value_cell_mutex);
+    pthread_mutex_lock(&dynamic_array_refcount_mutex);
     pscalObjRelease(&old->header);
     pscalValueSetHeapPtrBits(array_value, new_obj);
+    pthread_mutex_unlock(&dynamic_array_refcount_mutex);
+    pthread_mutex_unlock(&value_cell_mutex);
 
     return true;
 
@@ -6944,13 +6960,31 @@ static ArrayBoundsResult resolveFirstDimBounds(Value* arg) {
         if (VALUE_TYPE(*current) == TYPE_ARRAY) {
             int lower = 0;
             int upper = -1;
-            if (ARRAY_DIMENSIONS(*current) > 0 && ARRAY_LOWER_BOUNDS(*current) && ARRAY_UPPER_BOUNDS(*current)) {
-                lower = ARRAY_LOWER_BOUNDS(*current)[0];
-                upper = ARRAY_UPPER_BOUNDS(*current)[0];
+            // `current` here can be a direct alias into a shared global's
+            // live Value cell (e.g. Length(sharedDyn) resolving through a
+            // GET_GSLOT_ADDRESS-passed pointer), not a private copy. For a
+            // dynamic array, resizeDynamicArrayValue's SetLength publish
+            // step frees the old ArrayObj (including its lower_bounds/
+            // upper_bounds arrays) under dynamic_array_refcount_mutex.
+            // Peeking at ARRAY_IS_DYNAMIC(*current) here first (before any
+            // lock) would itself race the publish step -- it dereferences
+            // *current's live bits pointer same as the bounds read below.
+            // copyDynamicArraySnapshotValue() takes the whole-struct copy,
+            // the is_dynamic check, and the retain all under one critical
+            // section (matching this exact race's existing fix in
+            // vm.c's LOAD_ELEMENT_VALUE), so call it unconditionally and
+            // only decide dynamic-vs-static from the now-safe local copy.
+            Value snapshot = copyDynamicArraySnapshotValue(current);
+            bool dynamic_array = ARRAY_IS_DYNAMIC(snapshot);
+            Value* bounds_src = dynamic_array ? &snapshot : current;
+            if (ARRAY_DIMENSIONS(*bounds_src) > 0 && ARRAY_LOWER_BOUNDS(*bounds_src) && ARRAY_UPPER_BOUNDS(*bounds_src)) {
+                lower = ARRAY_LOWER_BOUNDS(*bounds_src)[0];
+                upper = ARRAY_UPPER_BOUNDS(*bounds_src)[0];
             } else {
-                lower = ARRAY_LOWER_BOUND(*current);
-                upper = ARRAY_UPPER_BOUND(*current);
+                lower = ARRAY_LOWER_BOUND(*bounds_src);
+                upper = ARRAY_UPPER_BOUND(*bounds_src);
             }
+            if (dynamic_array) freeValue(&snapshot);
             result.hasBounds = true;
             result.lower = lower;
             result.upper = upper;
