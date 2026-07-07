@@ -291,6 +291,15 @@ void pscalFileEnsureObj(Value *v);
 PointerObj *pscalPointerObjCreate(void);
 void pscalPointerEnsureObj(Value *v);
 
+// VM 2.0 Phase 4i checkpoint 3a. Returns a fresh, refcount=1 ClosureObj/
+// InterfaceObj with every field zeroed/NULL; callers set fields
+// afterward, same pattern as pscalArrayObjCreate. Copies retain the
+// SAME wrapper (see ClosureObj's comment in core/types.h for why this
+// is the file-like sharing precedent, not the pointer-like
+// copy-on-construct one).
+ClosureObj *pscalClosureObjCreate(void);
+InterfaceObj *pscalInterfaceObjCreate(void);
+
 MStream *createMStream(void);
 void retainMStream(MStream* ms);
 void releaseMStream(MStream* ms);

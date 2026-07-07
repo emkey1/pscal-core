@@ -304,6 +304,63 @@ typedef struct PointerObj {
     struct AST *base_type_node; // AST typedef not yet visible this early in the file
 } PointerObj;
 
+// VM 2.0 Phase 4i checkpoint 3a (Docs/pscal_vm2_plan.md sec 5.10.3/
+// 5.10.4): TYPE_CLOSURE/TYPE_INTERFACE were never actually boxed into a
+// single heap pointer in 4b -- that sub-phase ported the *payload*
+// (ClosureEnvPayload, `env`/`payload` below) onto ObjHeader, but the
+// Value-level union members stayed inline multi-field anonymous structs
+// (`entry_offset`+`symbol`+`env`, `type_def`+`payload`). That was fine
+// for every prior sub-phase (physical layout was never the concern
+// until now), but it means these two types don't fit in a single
+// tagged-word `bits` pointer as they stand -- boxing them properly is a
+// checkpoint 3 prerequisite, not optional. Field names/order match the
+// old inline structs exactly, so every existing `AS_CLOSURE(v).field`/
+// `AS_INTERFACE(v).field` call site keeps compiling unchanged once
+// AS_CLOSURE/AS_INTERFACE dereference a pointer instead of returning the
+// struct by value (same coexistence trick as AS_ENUM/AS_SET).
+//
+// **Deliberately NOT ObjHeader-based, unlike every other boxed type in
+// this file -- a real conflict found only by trying it.** `ObjHeader`'s
+// generic retain/release dispatch keys SOLELY on `VarType`, one
+// destructor slot per type. But `ClosureEnvPayload` (the `env`/`payload`
+// field below) ALREADY claims both `TYPE_CLOSURE` and `TYPE_INTERFACE`
+// as ITS OWN `header.type` (see `createClosureEnv`'s `owner_type`
+// parameter and `registerClosureEnvDestructor` in core/utils.c, both
+// from 4b) -- the payload uses these two tags to distinguish which kind
+// of construct owns it, not to mean "this object IS a Value-level
+// TYPE_CLOSURE/TYPE_INTERFACE wrapper". A `ClosureObj`/`InterfaceObj`
+// with its own embedded `ObjHeader` tagged the same way collides on that
+// single destructor slot -- confirmed by `pscalObjRegisterDestructor`
+// aborting ("already has a destructor registered") the first time a
+// real closure was created and boxed under this scheme.
+//
+// The fix: these two wrappers don't need refcounting of their own at
+// all. The only actually-shared, actually-refcounted resource is
+// `env`/`payload` itself (already ObjHeader-based, already retained/
+// released via `retainClosureEnv`/`releaseClosureEnv`); `entry_offset`/
+// `symbol`/`type_def` are plain copyable data with no ownership
+// semantics. So each wrapper is a plain, singly-owned heap allocation
+// (no `pscalObjRegisterDestructor`, no `pscalObjRetain`) --
+// `makeCopyOfValue` allocates a FRESH wrapper per copy and copies
+// `entry_offset`/`symbol`/`type_def` by value, retaining the SAME
+// `env`/`payload` (copy-on-construct for the wrapper, share-by-retain
+// for the payload it points at) -- observably identical to sharing the
+// wrapper itself would have been, since `env`/`payload` identity (not
+// wrapper identity) is what every comparison/dispatch site actually
+// checks (confirmed: vm.c's closure-equality check compares
+// `entry_offset`/`symbol`/`env` field values, never wrapper pointers).
+// `freeValue` releases `env`/`payload` then frees the wrapper directly.
+typedef struct ClosureObj {
+    uint32_t entry_offset;
+    struct Symbol_s *symbol;
+    ClosureEnvPayload *env;
+} ClosureObj;
+
+typedef struct InterfaceObj {
+    struct AST *type_def; // AST typedef not yet visible this early in the file
+    ClosureEnvPayload *payload;
+} InterfaceObj;
+
 // Forward declaration of AST
 typedef struct AST AST;
 
@@ -324,15 +381,8 @@ typedef struct ValueStruct {
         MStream *mstream;
         EnumObj *enum_val; // VM 2.0 Phase 4g: was an embedded struct, now a heap pointer
         PointerObj *ptr_val; // VM 2.0 Phase 4g: was a plain struct ValueStruct*
-        struct {
-            uint32_t entry_offset;
-            struct Symbol_s *symbol;
-            ClosureEnvPayload *env;
-        } closure;
-        struct {
-            struct AST *type_def;
-            ClosureEnvPayload *payload;
-        } interface;
+        ClosureObj *closure; // VM 2.0 Phase 4i: was an embedded struct, now a heap pointer
+        InterfaceObj *interface; // VM 2.0 Phase 4i: was an embedded struct, now a heap pointer
     };
     uint8_t *array_raw;
     bool array_is_packed;
@@ -544,8 +594,8 @@ static inline void pscalValueResetBitsForType(Value *dest, VarType t) {
 // call sites keep working with `.` unchanged (EnumObj's field names match
 // the old embedded struct's on purpose, same trick as AS_SET/SetObj).
 #define AS_ENUM(v)       (*PSCAL_VALUE_FIELD(v, enum_val))
-#define AS_CLOSURE(v)    PSCAL_VALUE_FIELD(v, closure)
-#define AS_INTERFACE(v)  PSCAL_VALUE_FIELD(v, interface)
+#define AS_CLOSURE(v)    (*PSCAL_VALUE_FIELD(v, closure))
+#define AS_INTERFACE(v)  (*PSCAL_VALUE_FIELD(v, interface))
 // VM 2.0 Phase 4c: set_val is now a SetObj* (was an embedded struct); AS_SET
 // dereferences it so existing `AS_SET(v).set_size`/`.set_values` call sites
 // keep working with `.` unchanged (SetObj's field names match the old

@@ -968,6 +968,30 @@ void pscalPointerEnsureObj(Value *v) {
     v->ptr_val = pscalPointerObjCreate();
 }
 
+// VM 2.0 Phase 4i checkpoint 3a: NOT ObjHeader-based -- see ClosureObj's
+// comment in core/types.h for why (TYPE_CLOSURE/TYPE_INTERFACE are
+// already claimed as ClosureEnvPayload's own header.type tag). Plain
+// singly-owned allocations instead: freeValue calls
+// releaseClosureEnv/free directly rather than going through
+// pscalObjRelease's generic dispatch.
+ClosureObj *pscalClosureObjCreate(void) {
+    ClosureObj *co = calloc(1, sizeof(ClosureObj));
+    if (!co) {
+        fprintf(stderr, "FATAL: Memory allocation failed in pscalClosureObjCreate\n");
+        EXIT_FAILURE_HANDLER();
+    }
+    return co;
+}
+
+InterfaceObj *pscalInterfaceObjCreate(void) {
+    InterfaceObj *io = calloc(1, sizeof(InterfaceObj));
+    if (!io) {
+        fprintf(stderr, "FATAL: Memory allocation failed in pscalInterfaceObjCreate\n");
+        EXIT_FAILURE_HANDLER();
+    }
+    return io;
+}
+
 static bool ensureFieldSlotCapacity(FieldValue*** slotOwners, int* capacity, int requiredSlots) {
     if (!slotOwners || !capacity || requiredSlots <= *capacity) {
         return true;
@@ -2278,8 +2302,9 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
             SET_INT_VALUE(&v, -1);
             break;
         case TYPE_INTERFACE:
-            v.interface.type_def = actual_type_def ? actual_type_def : type_def_param;
-            v.interface.payload = NULL;
+            v.interface = pscalInterfaceObjCreate();
+            v.interface->type_def = actual_type_def ? actual_type_def : type_def_param;
+            v.interface->payload = NULL;
             break;
         case TYPE_NIL:
             return makeNil();
@@ -2391,9 +2416,10 @@ Value makeClosure(uint32_t entry_offset, struct Symbol_s* symbol, ClosureEnvPayl
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_CLOSURE;
-    v.closure.entry_offset = entry_offset;
-    v.closure.symbol = symbol;
-    v.closure.env = env;
+    v.closure = pscalClosureObjCreate();
+    v.closure->entry_offset = entry_offset;
+    v.closure->symbol = symbol;
+    v.closure->env = env;
     if (env) {
         retainClosureEnv(env);
     }
@@ -2404,8 +2430,9 @@ Value makeInterface(AST* interfaceType, ClosureEnvPayload* payload) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_INTERFACE;
-    v.interface.type_def = interfaceType;
-    v.interface.payload = payload;
+    v.interface = pscalInterfaceObjCreate();
+    v.interface->type_def = interfaceType;
+    v.interface->payload = payload;
     if (payload) {
         retainClosureEnv(payload);
     }
@@ -2745,19 +2772,28 @@ void freeValue(Value *v) {
             }
             break;
         case TYPE_INTERFACE:
-            if (v->interface.payload) {
-                releaseClosureEnv(v->interface.payload);
-                v->interface.payload = NULL;
+            // VM 2.0 Phase 4i checkpoint 3a: InterfaceObj is a plain
+            // singly-owned allocation (no ObjHeader -- see its comment in
+            // core/types.h), so this Value's copy is never shared with
+            // another Value's (makeCopyOfValue allocates fresh per copy,
+            // only the payload itself is retained/shared) -- always
+            // safe to release the payload and free the wrapper directly.
+            if (v->interface) {
+                if (v->interface->payload) {
+                    releaseClosureEnv(v->interface->payload);
+                }
+                free(v->interface);
             }
-            v->interface.type_def = NULL;
+            v->interface = NULL;
             break;
         case TYPE_CLOSURE:
-            if (v->closure.env) {
-                releaseClosureEnv(v->closure.env);
-                v->closure.env = NULL;
+            if (v->closure) {
+                if (v->closure->env) {
+                    releaseClosureEnv(v->closure->env);
+                }
+                free(v->closure);
             }
-            v->closure.symbol = NULL;
-            v->closure.entry_offset = 0;
+            v->closure = NULL;
             break;
         // Add other types if they allocate memory pointed to by Value struct members
         default:
@@ -3569,8 +3605,8 @@ void printValueToStream(Value v, FILE *stream) {
             break;
         case TYPE_INTERFACE: {
             const char* name = "<anonymous interface>";
-            if (v.interface.type_def && v.interface.type_def->token && v.interface.type_def->token->value) {
-                name = v.interface.type_def->token->value;
+            if (v.interface && v.interface->type_def && v.interface->type_def->token && v.interface->type_def->token->value) {
+                name = v.interface->type_def->token->value;
             }
             fprintf(stream, "INTERFACE(%s)", name);
             break;
@@ -3662,15 +3698,15 @@ void printValueToStream(Value v, FILE *stream) {
             fprintf(stream, "%lld", v.i_val & 0xFFFF);
             break;
         case TYPE_CLOSURE: {
-            fprintf(stream, "CLOSURE(entry=%u", v.closure.entry_offset);
-            if (v.closure.symbol && v.closure.symbol->name) {
-                fprintf(stream, ", symbol=%s", v.closure.symbol->name);
+            fprintf(stream, "CLOSURE(entry=%u", v.closure ? v.closure->entry_offset : 0);
+            if (v.closure && v.closure->symbol && v.closure->symbol->name) {
+                fprintf(stream, ", symbol=%s", v.closure->symbol->name);
             }
-            if (v.closure.env) {
+            if (v.closure && v.closure->env) {
                 fprintf(stream, ", env=%p, slots=%u, ref=%u)",
-                        (void*)v.closure.env,
-                        (unsigned)v.closure.env->slot_count,
-                        atomic_load(&v.closure.env->header.refcount));
+                        (void*)v.closure->env,
+                        (unsigned)v.closure->env->slot_count,
+                        atomic_load(&v.closure->env->header.refcount));
             } else {
                 fprintf(stream, ", env=NULL)");
             }
@@ -3886,16 +3922,40 @@ Value makeCopyOfValue(const Value *src) {
                 v.set_val->capacity = src->set_val->set_size; // exact-fit copy
             }
             break;
-        case TYPE_INTERFACE:
-            if (v.interface.payload) {
-                retainClosureEnv(v.interface.payload);
+        case TYPE_INTERFACE: {
+            // `v = *src` above left v.interface ALIASING src->interface
+            // (a plain pointer copy). InterfaceObj has no ObjHeader/
+            // refcount of its own (see its comment in core/types.h) --
+            // freeValue frees the wrapper directly and unconditionally,
+            // so two Values must never share one wrapper instance.
+            // Allocate a FRESH wrapper and copy the plain fields over;
+            // the payload itself (the actually-shared, actually-
+            // refcounted resource) is retained, matching pre-4i
+            // behavior exactly.
+            InterfaceObj *src_io = src->interface;
+            v.interface = pscalInterfaceObjCreate();
+            if (src_io) {
+                v.interface->type_def = src_io->type_def;
+                v.interface->payload = src_io->payload;
+                if (v.interface->payload) {
+                    retainClosureEnv(v.interface->payload);
+                }
             }
             break;
-        case TYPE_CLOSURE:
-            if (v.closure.env) {
-                retainClosureEnv(v.closure.env);
+        }
+        case TYPE_CLOSURE: {
+            ClosureObj *src_co = src->closure;
+            v.closure = pscalClosureObjCreate();
+            if (src_co) {
+                v.closure->entry_offset = src_co->entry_offset;
+                v.closure->symbol = src_co->symbol;
+                v.closure->env = src_co->env;
+                if (v.closure->env) {
+                    retainClosureEnv(v.closure->env);
+                }
             }
             break;
+        }
         case TYPE_POINTER: {
             // `v = *src` above left v.ptr_val ALIASING src->ptr_val --
             // corrected from an earlier draft that kept this a bare,

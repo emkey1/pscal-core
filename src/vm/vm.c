@@ -3713,14 +3713,18 @@ static Value copyValueForStack(const Value* src) {
         return alias;
     }
 
-    if (VALUE_TYPE(*src) == TYPE_CLOSURE) {
-        Value alias = *src;
-        if (AS_CLOSURE(alias).env) {
-            retainClosureEnv(AS_CLOSURE(alias).env);
-        }
-        pthread_mutex_unlock(&value_cell_mutex);
-        return alias;
-    }
+    // VM 2.0 Phase 4i checkpoint 3a: TYPE_CLOSURE used to have its own
+    // fast-path here identical in shape to TYPE_MEMORYSTREAM's above
+    // (`Value alias = *src;` then retain the shared resource) -- correct
+    // when `.closure` was inline data (env was the only owned resource),
+    // WRONG now that ClosureObj is itself a plain, singly-owned heap
+    // allocation with no refcount of its own: `alias.closure` ended up
+    // aliasing the SAME ClosureObj* as `*src`, and both eventually being
+    // freed independently double-freed it (confirmed by a real crash --
+    // a closure captured, stored, and invoked twice). makeCopyOfValue's
+    // TYPE_CLOSURE case (below, via the generic fallthrough) already
+    // does this correctly: allocates a fresh wrapper, copies the plain
+    // fields, and retains only the actually-shared `env`.
 
     Value copy = makeCopyOfValue(src);
     pthread_mutex_unlock(&value_cell_mutex);
