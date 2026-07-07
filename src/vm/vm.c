@@ -82,7 +82,10 @@ static char* vmStringifyValueForConcat(const Value* value) {
 #define VM_PROC_REGISTRY_CAPACITY 1024
 
 static pthread_mutex_t gVmProcRegistryLock = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t value_cell_mutex = PTHREAD_MUTEX_INITIALIZER;
+// Not static: VM 2.0 Phase 4j's valueEnsureUnique() (core/utils.c) shares
+// this same mutex -- see the extern declaration and comment in
+// core/utils.h.
+pthread_mutex_t value_cell_mutex = PTHREAD_MUTEX_INITIALIZER;
 static VM* gVmProcRegistry[VM_PROC_REGISTRY_CAPACITY];
 static size_t gVmProcRegistryCount = 0;
 
@@ -3730,6 +3733,63 @@ static Value copyValueForStack(const Value* src) {
         return alias;
     }
 
+    // VM 2.0 Phase 4j (Stage B): STRING/SET/RECORD/ENUM/ARRAY used to fall
+    // through to makeCopyOfValue's deep clone unconditionally (a fresh
+    // wrapper + a fresh copy of its contents on EVERY read of a variable
+    // holding one of these -- correct value semantics, but far more
+    // allocation than necessary for the common case of "read it, maybe
+    // pass it somewhere, never mutate it"). Now a cheap alias + retain,
+    // matching TYPE_MEMORYSTREAM's shape above; any actual in-place
+    // mutation (GET_ELEMENT_ADDRESS/GET_FIELD_ADDRESS* and the
+    // string-char-address opcodes -- the only places that take an address
+    // into one of these payloads, since reads use LOAD_ELEMENT_VALUE/
+    // LOAD_FIELD_VALUE* and never touch a raw address at all) calls
+    // valueEnsureUnique() first to clone-on-write if the object turns out
+    // to still be shared at that point. TYPE_ARRAY needs no is_dynamic
+    // branch here -- retain-sharing on COPY is correct and desired for
+    // both static and dynamic arrays; the static-vs-dynamic distinction
+    // only matters at valueEnsureUnique()'s WRITE-time choke point.
+    switch (VALUE_TYPE(*src)) {
+        case TYPE_STRING:
+        case TYPE_UNICODE_STRING: {
+            Value alias = *src;
+            StringObj *s = PSCAL_VALUE_PTR(alias, StringObj);
+            if (s) pscalObjRetain(&s->header);
+            pthread_mutex_unlock(&value_cell_mutex);
+            return alias;
+        }
+        case TYPE_SET: {
+            Value alias = *src;
+            SetObj *s = PSCAL_VALUE_PTR(alias, SetObj);
+            if (s) pscalObjRetain(&s->header);
+            pthread_mutex_unlock(&value_cell_mutex);
+            return alias;
+        }
+        case TYPE_RECORD: {
+            Value alias = *src;
+            RecordObj *r = PSCAL_VALUE_PTR(alias, RecordObj);
+            if (r) pscalObjRetain(&r->header);
+            pthread_mutex_unlock(&value_cell_mutex);
+            return alias;
+        }
+        case TYPE_ENUM: {
+            Value alias = *src;
+            EnumObj *e = PSCAL_VALUE_PTR(alias, EnumObj);
+            if (e) pscalObjRetain(&e->header);
+            pthread_mutex_unlock(&value_cell_mutex);
+            return alias;
+        }
+        case TYPE_ARRAY: {
+            Value alias = *src;
+            ArrayObj *a = PSCAL_VALUE_PTR(alias, ArrayObj);
+            if (a) pscalObjRetain(&a->header);
+            pthread_mutex_unlock(&value_cell_mutex);
+            return alias;
+        }
+        default:
+            break;
+    }
+
     // VM 2.0 Phase 4i checkpoint 3a: TYPE_CLOSURE used to have its own
     // fast-path here identical in shape to TYPE_MEMORYSTREAM's above
     // (`Value alias = *src;` then retain the shared resource) -- correct
@@ -6405,8 +6465,21 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
                     } \
                     size_t total_len = len_a + len_b; \
                     char* temp_concat_buffer = NULL; \
-                    if (final_a == &a_val_popped && VALUE_TYPE(a_val_popped) == TYPE_STRING && AS_STRING(a_val_popped)) { \
-                        temp_concat_buffer = (char*)realloc(AS_STRING(a_val_popped), total_len + 1); \
+                    StringObj *a_concat_obj = (final_a == &a_val_popped && VALUE_TYPE(a_val_popped) == TYPE_STRING) \
+                        ? PSCAL_VALUE_PTR(a_val_popped, StringObj) : NULL; \
+                    /* VM 2.0 Phase 4j (Stage B): this realloc-in-place fast \
+                     * path mutates a_val_popped's buffer directly -- only \
+                     * safe when nothing else shares this StringObj (e.g. a \
+                     * retain-shared string constant/variable copyValueForStack \
+                     * now hands out): reallocating/nulling a shared buffer \
+                     * here corrupted every other alias, including the \
+                     * bytecode constant pool's own permanent copy of a \
+                     * string literal used in more than one concatenation. \
+                     * Falls through to the always-safe fresh-malloc path \
+                     * whenever the object is still shared. */ \
+                    if (a_concat_obj && a_concat_obj->buffer && \
+                        atomic_load_explicit(&a_concat_obj->header.refcount, memory_order_acquire) == 1) { \
+                        temp_concat_buffer = (char*)realloc(a_concat_obj->buffer, total_len + 1); \
                         if (!temp_concat_buffer) { \
                             free(coerced_b); \
                             runtimeError(vm, "Runtime Error: Realloc failed for string concatenation buffer."); \
@@ -6415,7 +6488,7 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
                         } \
                         memcpy(temp_concat_buffer + len_a, s_b, len_b); \
                         temp_concat_buffer[total_len] = '\0'; \
-                        AS_STRING(a_val_popped) = NULL; \
+                        a_concat_obj->buffer = NULL; \
                     } else { \
                         temp_concat_buffer = (char*)malloc(total_len + 1); \
                         if (!temp_concat_buffer) { \
@@ -6821,6 +6894,10 @@ dispatch_switch:
                 if (!vmResolveStringIndex(vm, pscal_index, len, &char_offset, false, NULL)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+
+                // VM 2.0 Phase 4j (Stage B): see the matching comment in
+                // GET_ELEMENT_ADDRESS.
+                valueEnsureUnique(string_val);
 
                 Value popped_string_ptr = pop(vm);
                 freeValue(&popped_string_ptr);
@@ -7582,6 +7659,13 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
+                // VM 2.0 Phase 4j (Stage B): this address is about to be
+                // handed out for a potential in-place mutation (SET_INDIRECT,
+                // further field/element chaining, or VAR-param aliasing) --
+                // clone the RecordObj here if it's still shared, before
+                // resolving the field's storage address.
+                valueEnsureUnique(record_struct_ptr);
+
                 const char* field_name = AS_STRING(vm->chunk->constants[field_name_idx]);
                 FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
                 if (current) {
@@ -7611,6 +7695,13 @@ comparison_error_label:
                     runtimeError(vm, "VM Error: Internal - expected to resolve to a record for field access.");
                     return INTERPRET_RUNTIME_ERROR;
                 }
+
+                // VM 2.0 Phase 4j (Stage B): this address is about to be
+                // handed out for a potential in-place mutation (SET_INDIRECT,
+                // further field/element chaining, or VAR-param aliasing) --
+                // clone the RecordObj here if it's still shared, before
+                // resolving the field's storage address.
+                valueEnsureUnique(record_struct_ptr);
 
                 const char* field_name = AS_STRING(vm->chunk->constants[field_name_idx]);
                 FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
@@ -7642,6 +7733,13 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
+                // VM 2.0 Phase 4j (Stage B): this address is about to be
+                // handed out for a potential in-place mutation (SET_INDIRECT,
+                // further field/element chaining, or VAR-param aliasing) --
+                // clone the RecordObj here if it's still shared, before
+                // resolving the field's storage address.
+                valueEnsureUnique(record_struct_ptr);
+
                 const char* field_name = AS_STRING(vm->chunk->constants[field_name_idx]);
                 FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
                 if (current) {
@@ -7669,6 +7767,13 @@ comparison_error_label:
                     runtimeError(vm, "VM Error: Internal - expected to resolve to a record for field access.");
                     return INTERPRET_RUNTIME_ERROR;
                 }
+
+                // VM 2.0 Phase 4j (Stage B): this address is about to be
+                // handed out for a potential in-place mutation (SET_INDIRECT,
+                // further field/element chaining, or VAR-param aliasing) --
+                // clone the RecordObj here if it's still shared, before
+                // resolving the field's storage address.
+                valueEnsureUnique(record_struct_ptr);
 
                 const char* field_name = AS_STRING(vm->chunk->constants[field_name_idx]);
                 FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
@@ -7731,6 +7836,16 @@ comparison_error_label:
                         }
                         long long pscal_index = VAL_INT(index_val);
                         freeValue(&index_val);
+
+                        // VM 2.0 Phase 4j (Stage B): this address is about to
+                        // be handed out for a potential in-place mutation
+                        // (SET_INDIRECT, or aliased into a VAR parameter) --
+                        // clone the StringObj here if it's still shared,
+                        // BEFORE computing an address into it, so a write
+                        // through this pointer can never leak into another
+                        // Value that shares the same buffer via 4j's cheap
+                        // copyValueForStack retain-share.
+                        valueEnsureUnique(base_val);
 
                         size_t len = AS_STRING(*base_val) ? strlen(AS_STRING(*base_val)) : 0;
                         size_t char_offset = 0;
@@ -7844,6 +7959,17 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
+                // VM 2.0 Phase 4j (Stage B): this opcode always returns an
+                // address that MAY be used to mutate the array in place
+                // (SET_INDIRECT, VAR-param aliasing, or Inc/Dec-style
+                // read-modify-write) -- clone here if still shared, before
+                // computing any offset into it. A no-op when array_val_ptr
+                // is the temp_wrapper/operand-literal case (always
+                // freshly-built, refcount 1) or already uniquely owned;
+                // dynamic arrays are permanently exempt (valueEnsureUnique
+                // itself branches on ArrayObj.is_dynamic).
+                valueEnsureUnique(array_val_ptr);
+
                 // See the matching comment in LOAD_ELEMENT_VALUE: a dynamic
                 // array's true dimensionality can exceed dimension_count
                 // here (e.g. `g[i][j]` against a value from
@@ -7956,6 +8082,10 @@ comparison_error_label:
                             return INTERPRET_RUNTIME_ERROR;
                         }
 
+                        // VM 2.0 Phase 4j (Stage B): see the matching comment
+                        // in GET_ELEMENT_ADDRESS.
+                        valueEnsureUnique(base_val);
+
                         push(vm, makePointer(&AS_STRING(*base_val)[flat_offset], STRING_CHAR_PTR_SENTINEL));
                         freeValue(&operand);
                         break;
@@ -8030,6 +8160,10 @@ comparison_error_label:
                     freeValue(&operand);
                     return INTERPRET_RUNTIME_ERROR;
                 }
+
+                // VM 2.0 Phase 4j (Stage B): see the matching comment in
+                // GET_ELEMENT_ADDRESS.
+                valueEnsureUnique(array_val_ptr);
 
                 int total_size = calculateArrayTotalSize(array_val_ptr);
                 if (flat_offset >= (uint32_t)total_size) {

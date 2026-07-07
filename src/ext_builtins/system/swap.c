@@ -21,9 +21,7 @@ static Value vmBuiltinSwap(struct VM_s* vm, int arg_count, Value* args) {
                      varTypeToString(VALUE_TYPE(*varA)), varTypeToString(VALUE_TYPE(*varB)));
         return makeVoid();
     }
-    Value temp = *varA;
-    *varA = *varB;
-    *varB = temp;
+    pscalValueSwap(varA, varB);
     return makeVoid();
 }
 

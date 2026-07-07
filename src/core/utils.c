@@ -4082,6 +4082,91 @@ Value makeCopyOfValue(const Value *src) {
     return v;
 }
 
+// VM 2.0 Phase 4j (Stage B): the CoW choke point. `hdr` doubles as both the
+// "is this a CoW-eligible boxed type" dispatch and the uniqueness check --
+// every one of these structs embeds `ObjHeader header` as its first member
+// (verified: StringObj/SetObj/RecordObj/EnumObj/ArrayObj), so `&x->header`
+// is always a valid ObjHeader*.
+void valueEnsureUnique(Value *target) {
+    if (!target) return;
+
+    // Serializes against vm.c's copyValueForStack() (the cheap retain-share
+    // copy this function's clone-on-write exists to protect against) and
+    // against a second concurrent valueEnsureUnique() call racing to clone
+    // the SAME shared object -- without this, two threads can each
+    // independently decide "still shared, clone it", then stomp on each
+    // other's install/release (confirmed as a real heap-corruption crash
+    // under a multithreaded stress test before this lock was added).
+    pthread_mutex_lock(&value_cell_mutex);
+
+    ObjHeader *hdr = NULL;
+    switch (target->type) {
+        case TYPE_STRING:
+        case TYPE_UNICODE_STRING: {
+            StringObj *s = PSCAL_VALUE_PTR(*target, StringObj);
+            if (s) hdr = &s->header;
+            break;
+        }
+        case TYPE_SET: {
+            SetObj *s = PSCAL_VALUE_PTR(*target, SetObj);
+            if (s) hdr = &s->header;
+            break;
+        }
+        case TYPE_RECORD: {
+            RecordObj *r = PSCAL_VALUE_PTR(*target, RecordObj);
+            if (r) hdr = &r->header;
+            break;
+        }
+        case TYPE_ENUM: {
+            EnumObj *e = PSCAL_VALUE_PTR(*target, EnumObj);
+            if (e) hdr = &e->header;
+            break;
+        }
+        case TYPE_ARRAY: {
+            // Permanent exemption: dynamic arrays are reference types by
+            // design (Engine^.Matrix := BuildGrid(...) observed from a
+            // second alias is SUPPOSED to see the mutation -- real
+            // Free/Delphi dynamic-array semantics, already implemented via
+            // copyDynamicArraySnapshotValue's retain-only sharing above).
+            // CoW-cloning a dynamic array on write would silently turn
+            // that into value semantics -- a regression, not a fix.
+            ArrayObj *a = PSCAL_VALUE_PTR(*target, ArrayObj);
+            if (a && !a->is_dynamic) hdr = &a->header;
+            break;
+        }
+        // Permanent exemption: TYPE_FILE's OS handle is identity-bearing
+        // state (Phase 6's assign/reset/rewrite/close-by-address finding);
+        // cloning it would silently open a second, independent handle
+        // where the program expects one shared, mutating-in-place
+        // resource. TYPE_POINTER's boxed cell uses copy-on-construct, a
+        // distinct concern from this write-time uniqueness guard (see
+        // Docs/pscal_vm2_plan.md sec 5.10.5 point 3). Every other type
+        // reaching here (scalars, TYPE_FILE, TYPE_POINTER,
+        // TYPE_CLOSURE/INTERFACE/MEMORYSTREAM which are reference types by
+        // design, TYPE_INT64/UINT64/LONG_DOUBLE whose "mutation" is always
+        // release-then-allocate-fresh and therefore already CoW-safe) is
+        // not CoW-eligible and needs no action.
+        default:
+            hdr = NULL;
+            break;
+    }
+
+    if (hdr && atomic_load_explicit(&hdr->refcount, memory_order_acquire) > 1) {
+        Value fresh = makeCopyOfValue(target);
+        freeValue(target);
+        *target = fresh;
+    }
+
+    pthread_mutex_unlock(&value_cell_mutex);
+}
+
+void pscalValueSwap(Value *a, Value *b) {
+    if (!a || !b || a == b) return;
+    Value temp = *a;
+    *a = *b;
+    *b = temp;
+}
+
 Value copyDynamicArraySnapshotValue(const Value *src) {
     if (!src) {
         return makeNil();

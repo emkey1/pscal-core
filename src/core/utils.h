@@ -355,6 +355,24 @@ static inline Value pscalIntResultLike2(Value a, Value b, long long result) {
 Value makeByte(unsigned char val);
 Value makeWord(unsigned int val);
 Value makeNil(void);
+// VM 2.0 Phase 4j (Stage B): call before taking any address INTO a
+// CoW-eligible boxed Value's payload that could be used to mutate it in
+// place -- GET_ELEMENT_ADDRESS/GET_ELEMENT_ADDRESS_CONST,
+// GET_FIELD_ADDRESS/16/_KEEP/16, and the string-char-address sites.
+// Read-only value loads (LOAD_ELEMENT_VALUE, LOAD_FIELD_VALUE*) never take
+// such an address to begin with, so they never need to call this.
+// If `target`'s underlying object is shared (ObjHeader.refcount > 1),
+// clones it via makeCopyOfValue so the caller-about-to-mutate has a
+// private copy; a no-op otherwise (unique already, or not a CoW-eligible
+// type). TYPE_ARRAY with is_dynamic==true and TYPE_FILE are permanent
+// exemptions -- see Docs/pscal_vm2_plan.md sec 5.10.5.
+void valueEnsureUnique(Value *target);
+// Exchanges the contents of two Value cells (the `Swap` builtin). A raw
+// three-way struct swap conserves whatever references each cell already
+// held (no clone, no retain/release needed either side), so this is just a
+// named home for the pattern rather than a leftover raw Value copy outside
+// the representation layer.
+void pscalValueSwap(Value *a, Value *b);
 // Value constructor for creating a Value representing a general pointer.
 // Used by the 'new' builtin.
 Value makePointer(void* address, AST* base_type_node); // <<< ADD THIS PROTOTYPE >>>
@@ -451,6 +469,15 @@ bool makeDynamicArraySliceValue(const Value *src, int consumed_dims, const int *
  * whole-struct snapshot copy can interleave with a writer's whole-struct
  * publish and observe a torn header. See utils.c for the definition. */
 extern pthread_mutex_t dynamic_array_refcount_mutex;
+/* Shared with vm.c's copyValueForStack()/replaceValueCell(): VM 2.0 Phase
+ * 4j's valueEnsureUnique() (utils.c) must serialize its check-then-clone
+ * sequence on this same mutex, or two threads racing a write-time clone
+ * (or a clone racing a cheap retain-share copy) against the SAME shared
+ * object can each decide independently to clone, then stomp on each
+ * other's install/release -- confirmed as a real heap-corruption crash
+ * under a multithreaded stress test (two threads concurrently cloning the
+ * same shared TYPE_RECORD). See vm.c for the definition. */
+extern pthread_mutex_t value_cell_mutex;
 
 // Set operations
 Value setUnion(Value setA, Value setB);
