@@ -470,6 +470,23 @@ static inline void pscalValueSetCharBits(Value *dest, int val) {
     }
 }
 
+// VM 2.0 Phase 4i checkpoint 3b: mirrors any of the 8 heap-pointer union
+// members (s_val/array_val/record_val/f_val/enum_val/ptr_val/set_val/
+// mstream) into `bits`, via the generic pointer-tag scheme from
+// core/obj_header.h. Unlike the scalar setters above, there is no
+// per-type encoding to dispatch on -- every heap pointer is boxed
+// identically (pscalTagPointer), and the decode-side consistency check
+// (pscalValueBitsConsistent) re-derives which union member to compare
+// against from dest->type, matching the scalar precedent. `ptr` may be
+// NULL (a not-yet-constructed or just-released wrapper, or a detached
+// alias) -- pscalTagPointer(NULL) round-trips cleanly. Callers pass the
+// exact pointer just stored in the union member, not the Value's type --
+// this function trusts its caller the same way pscalValueSetIntBits
+// trusts dest->type to already be correct.
+static inline void pscalValueSetHeapPtrBits(Value *dest, const void *ptr) {
+    dest->bits = pscalTagPointer(ptr);
+}
+
 // Resets `bits` to a zero-valued placeholder matching `t` -- called
 // whenever a Value's type changes, so `bits` never silently carries a
 // stale kind tag left over from whatever type the Value used to be
@@ -495,7 +512,28 @@ static inline void pscalValueResetBitsForType(Value *dest, VarType t) {
         case TYPE_FLOAT:    dest->bits = pscalTagFloat(0.0f); break;
         case TYPE_DOUBLE:   dest->bits = pscalBoxDouble(0.0); break;
         case TYPE_THREAD:   dest->bits = pscalTagInt32(0); break;
-        default:            dest->bits = 0; break; // deferred types (checkpoint 3)
+        // VM 2.0 Phase 4i checkpoint 3b: heap-pointer types get a real
+        // nil-pointer placeholder (not bare 0) the moment a Value is
+        // retyped to one of these, matching the scalar precedent of
+        // never leaving a stale kind tag around -- and closing off the
+        // same "makeX()-then-retype" hazard checkpoint 2 found for
+        // TYPE_THREAD: any retype to a heap type now round-trips through
+        // pscalValueBitsConsistent even before the real wrapper exists,
+        // instead of leaving bits=0 (which pscalTaggedWordKind would
+        // misread as an inline PSCAL_TAG_VOID-shaped immediate, not a
+        // pointer, once checkpoint 3b's consistency check below stops
+        // treating these types as vacuously true).
+        case TYPE_STRING:
+        case TYPE_UNICODE_STRING:
+        case TYPE_ARRAY:
+        case TYPE_RECORD:
+        case TYPE_FILE:
+        case TYPE_ENUM:
+        case TYPE_POINTER:
+        case TYPE_SET:
+        case TYPE_MEMORYSTREAM:
+            dest->bits = pscalTagPointer(NULL); break;
+        default:            dest->bits = 0; break; // deferred: INT64/UINT64/LONG_DOUBLE (checkpoint 3c)
     }
 }
 

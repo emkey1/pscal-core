@@ -1535,6 +1535,7 @@ static bool readPointerValue(Cursor* in, Value* out) {
     if (in->error) return false;
     if (kind == 0) {
         out->ptr_val = NULL;
+        pscalValueSetHeapPtrBits(out, NULL);
         return true;
     }
     pscalPointerEnsureObj(out);
@@ -1801,6 +1802,7 @@ static bool readValue(Cursor* in, Value* out) {
             uint8_t present = curU8(in);
             if (in->error) return false;
             out->s_val = pscalStringObjCreate(-1, TYPE_STRING);
+            pscalValueSetHeapPtrBits(out, out->s_val);
             if (present) {
                 size_t len = 0;
                 out->s_val->buffer = curLenPrefixedString(in, &len);
@@ -1827,6 +1829,7 @@ static bool readValue(Cursor* in, Value* out) {
             int32_t sz = curI32LE(in);
             if (in->error || sz < 0) return false;
             out->set_val = pscalSetObjCreate();
+            pscalValueSetHeapPtrBits(out, out->set_val);
             out->set_val->set_size = sz;
             if (sz > 0) {
                 out->set_val->set_values = (long long*)malloc(sizeof(long long) * (size_t)sz);

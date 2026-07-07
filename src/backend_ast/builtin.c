@@ -3592,6 +3592,7 @@ static bool resizeDynamicArrayValue(VM* vm,
 
     pscalObjRelease(&old->header);
     array_value->array_val = new_obj;
+    pscalValueSetHeapPtrBits(array_value, array_value->array_val);
 
     return true;
 
@@ -7168,6 +7169,14 @@ Value vmBuiltinNew(VM* vm, int arg_count, Value* args) {
     // Update the pointer variable that was passed by reference
     SET_VALUE_TYPE(pointerVarValuePtr, TYPE_POINTER);
     pscalPointerEnsureObj(pointerVarValuePtr);
+    // SET_VALUE_TYPE just reset .bits to a nil-pointer placeholder (VM 2.0
+    // Phase 4i checkpoint 3b) -- but if this pointer variable already held
+    // a real PointerObj (the common case: Pascal pointer vars start out
+    // nil-but-wrappered via makeValueForType, so pscalPointerEnsureObj
+    // above is a no-op here), .bits is now wrongly out of sync with the
+    // wrapper that's actually there. Re-tag unconditionally; safe whether
+    // ensure just allocated fresh or found one already present.
+    pscalValueSetHeapPtrBits(pointerVarValuePtr, pointerVarValuePtr->ptr_val);
     AS_POINTER(*pointerVarValuePtr) = allocated_memory;
 
     // Safety: if base type metadata is unknown, treat as integer for subsequent dereferences
@@ -8277,6 +8286,11 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
                     free(AS_STRING(*dst));
                 }
                 SET_VALUE_TYPE(dst, (VALUE_TYPE(*dst) == TYPE_UNICODE_STRING) ? TYPE_UNICODE_STRING : TYPE_STRING);
+                // dst reached this switch case via VALUE_TYPE(*dst), so it
+                // was already a real string wrapper before the retype above
+                // reset .bits to a nil-pointer placeholder -- re-tag with
+                // the wrapper that's still there (never reallocated here).
+                pscalValueSetHeapPtrBits(dst, dst->s_val);
                 AS_STRING(*dst) = tmp;
                 i = arg_count; // consume the line; ignore trailing params
                 break;
@@ -9075,6 +9089,7 @@ Value vmBuiltinMstreamfree(VM* vm, int arg_count, Value* args) {
     if (ms) { // Only free if MStream struct itself exists
         releaseMStream(ms);
         AS_MSTREAM(*ms_value_ptr) = NULL; // Crucial: Set the MStream pointer in the variable's Value struct to NULL
+        pscalValueSetHeapPtrBits(ms_value_ptr, NULL);
     }
     // If ms was NULL, it's a no-op, which is fine.
 

@@ -1270,6 +1270,10 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
                 }
             }
             SET_VALUE_TYPE(sym->value, sym->type);
+            // Re-tag after the retype above stomped .bits back to a
+            // nil-pointer placeholder -- sym->value->s_val is the same
+            // wrapper the mutations above wrote into, never reallocated.
+            pscalValueSetHeapPtrBits(sym->value, sym->value->s_val);
             break;
         }
 
@@ -1299,6 +1303,7 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
                 // through AS_FILE/FILE_FILENAME, which would mutate f1's
                 // real, still-live FileObj in place.
                 val.f_val = NULL;
+                pscalValueSetHeapPtrBits(&val, NULL);
             }
             break;
 

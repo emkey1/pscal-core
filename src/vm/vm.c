@@ -1165,6 +1165,7 @@ static void vmFreeArrayIndexWrapper(Value* temp_wrapper) {
     free(temp_wrapper->array_val->upper_bounds);
     free(temp_wrapper->array_val);
     temp_wrapper->array_val = NULL;
+    pscalValueSetHeapPtrBits(temp_wrapper, NULL);
 }
 
 static bool adjustLocalByDelta(VM* vm, Value* slot, long long delta, const char* opcode_name) {
@@ -6413,6 +6414,10 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
                     } \
                     result_val = makeOwnedString(temp_concat_buffer, total_len); \
                     SET_VALUE_TYPE(&result_val, result_type); \
+                    /* Re-tag after the retype above stomped .bits back to a \
+                     * nil-pointer placeholder -- result_val.s_val is the \
+                     * real StringObj makeOwnedString already allocated. */ \
+                    pscalValueSetHeapPtrBits(&result_val, result_val.s_val); \
                     free(coerced_b); \
                     freeValue(&a_val_popped); freeValue(&b_val_popped); \
                     op_is_handled = true; \
@@ -6462,6 +6467,10 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
                     temp_concat_buffer[total_len] = '\0'; \
                     result_val = makeOwnedString(temp_concat_buffer, total_len); \
                     SET_VALUE_TYPE(&result_val, result_type); \
+                    /* Re-tag after the retype above stomped .bits back to a \
+                     * nil-pointer placeholder -- result_val.s_val is the \
+                     * real StringObj makeOwnedString already allocated. */ \
+                    pscalValueSetHeapPtrBits(&result_val, result_val.s_val); \
                     free(coerced_a); \
                     freeValue(&a_val_popped); freeValue(&b_val_popped); \
                     op_is_handled = true; \
@@ -7753,6 +7762,14 @@ comparison_error_label:
                         AST* arrayType = PTR_BASE_TYPE_NODE(operand);
                         int dims = arrayType->child_count;
                         SET_VALUE_TYPE(&temp_wrapper, TYPE_ARRAY);
+                        // SET_VALUE_TYPE just reset .bits to a nil-pointer
+                        // placeholder (VM 2.0 Phase 4i checkpoint 3b), but
+                        // temp_wrapper.array_val is already a real ArrayObj*
+                        // from vmInitArrayIndexWrapper's pscalArrayEnsureObj
+                        // call above -- re-tag with the wrapper that's
+                        // actually there, same "re-tag after retype" fix
+                        // checkpoint 2 needed for TYPE_THREAD.
+                        pscalValueSetHeapPtrBits(&temp_wrapper, temp_wrapper.array_val);
                         ARRAY_DIMENSIONS(temp_wrapper) = dims;
                         ARRAY_ELEMENT_TYPE(temp_wrapper) = vmResolveArrayElementType(arrayType);
                         ARRAY_IS_PACKED(temp_wrapper) = isPackedByteElementType(ARRAY_ELEMENT_TYPE(temp_wrapper));
@@ -7932,6 +7949,14 @@ comparison_error_label:
                         AST* arrayType = PTR_BASE_TYPE_NODE(operand);
                         int dims = arrayType->child_count;
                         SET_VALUE_TYPE(&temp_wrapper, TYPE_ARRAY);
+                        // SET_VALUE_TYPE just reset .bits to a nil-pointer
+                        // placeholder (VM 2.0 Phase 4i checkpoint 3b), but
+                        // temp_wrapper.array_val is already a real ArrayObj*
+                        // from vmInitArrayIndexWrapper's pscalArrayEnsureObj
+                        // call above -- re-tag with the wrapper that's
+                        // actually there, same "re-tag after retype" fix
+                        // checkpoint 2 needed for TYPE_THREAD.
+                        pscalValueSetHeapPtrBits(&temp_wrapper, temp_wrapper.array_val);
                         ARRAY_DIMENSIONS(temp_wrapper) = dims;
                         ARRAY_ELEMENT_TYPE(temp_wrapper) = vmResolveArrayElementType(arrayType);
                         ARRAY_IS_PACKED(temp_wrapper) = isPackedByteElementType(ARRAY_ELEMENT_TYPE(temp_wrapper));
@@ -8113,6 +8138,14 @@ comparison_error_label:
                         AST* arrayType = PTR_BASE_TYPE_NODE(operand);
                         int dims = arrayType->child_count;
                         SET_VALUE_TYPE(&temp_wrapper, TYPE_ARRAY);
+                        // SET_VALUE_TYPE just reset .bits to a nil-pointer
+                        // placeholder (VM 2.0 Phase 4i checkpoint 3b), but
+                        // temp_wrapper.array_val is already a real ArrayObj*
+                        // from vmInitArrayIndexWrapper's pscalArrayEnsureObj
+                        // call above -- re-tag with the wrapper that's
+                        // actually there, same "re-tag after retype" fix
+                        // checkpoint 2 needed for TYPE_THREAD.
+                        pscalValueSetHeapPtrBits(&temp_wrapper, temp_wrapper.array_val);
                         ARRAY_DIMENSIONS(temp_wrapper) = dims;
                         ARRAY_ELEMENT_TYPE(temp_wrapper) = vmResolveArrayElementType(arrayType);
                         ARRAY_IS_PACKED(temp_wrapper) = isPackedByteElementType(ARRAY_ELEMENT_TYPE(temp_wrapper));
@@ -8289,6 +8322,14 @@ comparison_error_label:
                         AST* arrayType = PTR_BASE_TYPE_NODE(operand);
                         int dims = arrayType->child_count;
                         SET_VALUE_TYPE(&temp_wrapper, TYPE_ARRAY);
+                        // SET_VALUE_TYPE just reset .bits to a nil-pointer
+                        // placeholder (VM 2.0 Phase 4i checkpoint 3b), but
+                        // temp_wrapper.array_val is already a real ArrayObj*
+                        // from vmInitArrayIndexWrapper's pscalArrayEnsureObj
+                        // call above -- re-tag with the wrapper that's
+                        // actually there, same "re-tag after retype" fix
+                        // checkpoint 2 needed for TYPE_THREAD.
+                        pscalValueSetHeapPtrBits(&temp_wrapper, temp_wrapper.array_val);
                         ARRAY_DIMENSIONS(temp_wrapper) = dims;
                         ARRAY_ELEMENT_TYPE(temp_wrapper) = vmResolveArrayElementType(arrayType);
                         ARRAY_IS_PACKED(temp_wrapper) = isPackedByteElementType(ARRAY_ELEMENT_TYPE(temp_wrapper));
@@ -8546,6 +8587,12 @@ comparison_error_label:
                                 AS_STRING(*target_lvalue_ptr)[encoded_len] = '\0';
                             }
                             SET_VALUE_TYPE(target_lvalue_ptr, destType);
+                            // SET_VALUE_TYPE just reset .bits to a nil-pointer
+                            // placeholder (VM 2.0 Phase 4i checkpoint 3b) --
+                            // re-tag with the StringObj actually stored above,
+                            // same "re-tag after retype" fix checkpoint 2
+                            // needed for TYPE_THREAD.
+                            pscalValueSetHeapPtrBits(target_lvalue_ptr, target_lvalue_ptr->s_val);
                             STRING_MAX_LENGTH(*target_lvalue_ptr) = -1;
                         } else if (isPascalStringType(VALUE_TYPE(value_to_set)) && AS_STRING(value_to_set)) {
                             VarType destType = VALUE_TYPE(*target_lvalue_ptr);
@@ -8558,7 +8605,12 @@ comparison_error_label:
                              * pscalStringEnsureObj here at all. */
                             target_lvalue_ptr->s_val = value_to_set.s_val;
                             value_to_set.s_val = NULL; /* Prevent double-free */
+                            pscalValueSetHeapPtrBits(&value_to_set, NULL);
                             SET_VALUE_TYPE(target_lvalue_ptr, destType);
+                            // Re-tag after the retype above stomped .bits back
+                            // to a nil-pointer placeholder -- see the sibling
+                            // comment a few lines up.
+                            pscalValueSetHeapPtrBits(target_lvalue_ptr, target_lvalue_ptr->s_val);
                             STRING_MAX_LENGTH(*target_lvalue_ptr) = -1;
                         } else {
                             runtimeError(vm, "Type mismatch: Cannot assign this type to a dynamic string.");
@@ -8672,6 +8724,11 @@ comparison_error_label:
                             Value replacement = value_to_set;
                             replaceValueCell(target_lvalue_ptr, replacement, preserved_base);
                             AS_MSTREAM(value_to_set) = NULL;
+                            // Detached the alias above without updating .bits
+                            // (VM 2.0 Phase 4i checkpoint 3b) -- value_to_set
+                            // is freeValue'd a few lines down and would
+                            // otherwise abort on a stale non-NULL pointer tag.
+                            pscalValueSetHeapPtrBits(&value_to_set, NULL);
                         } else {
                             Value replacement = makeCopyOfValue(&value_to_set);
                             replaceValueCell(target_lvalue_ptr, replacement, preserved_base);
@@ -9097,6 +9154,10 @@ comparison_error_label:
                         return INTERPRET_RUNTIME_ERROR;
                     }
                     SET_VALUE_TYPE(target_slot, destType);
+                    // Re-tag after the retype above stomped .bits back to a
+                    // nil-pointer placeholder -- target_slot->s_val is the
+                    // real StringObj pscalStringEnsureObj already allocated.
+                    pscalValueSetHeapPtrBits(target_slot, target_slot->s_val);
                     STRING_MAX_LENGTH(*target_slot) = -1;
                 } else if (VALUE_TYPE(*target_slot) == TYPE_STRING && STRING_MAX_LENGTH(*target_slot) > 0) {
                     // Special case: Assignment to a fixed-length string.
