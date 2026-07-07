@@ -97,6 +97,60 @@ void pscalObjRelease(ObjHeader *header) {
     g_obj_destructors[type](header);
 }
 
+// Both destructors are trivial -- neither struct owns anything beyond
+// its own memory (no nested pointers, no sentinel-dependent freeing
+// decision the way PointerObj's does). Registered lazily on first
+// pscalXBoxCreate call via an atomic claim-once guard, mirroring the
+// canary's own idiom above rather than pthread_once, since this file has
+// no other pthread dependency to justify pulling in pthread.h for.
+static void int64BoxDestroy(ObjHeader *header) {
+    free((Int64Box *)header);
+}
+
+static void longDoubleBoxDestroy(ObjHeader *header) {
+    free((LongDoubleBox *)header);
+}
+
+static atomic_bool g_int64_box_destructors_registered = false;
+
+static void ensureInt64BoxDestructorsRegistered(void) {
+    if (atomic_exchange_explicit(&g_int64_box_destructors_registered, true, memory_order_acq_rel)) {
+        return; // already claimed by this thread or another
+    }
+    // Both VarTypes are registered together -- Int64Box serves both, and
+    // a caller only decides which one after pscalInt64BoxCreate returns.
+    pscalObjRegisterDestructor(TYPE_INT64, int64BoxDestroy);
+    pscalObjRegisterDestructor(TYPE_UINT64, int64BoxDestroy);
+}
+
+Int64Box *pscalInt64BoxCreate(int64_t value) {
+    ensureInt64BoxDestructorsRegistered();
+    Int64Box *box = malloc(sizeof(Int64Box));
+    if (!box) {
+        fprintf(stderr, "PSCAL VM 2.0: pscalInt64BoxCreate: allocation failed.\n");
+        abort();
+    }
+    pscalObjHeaderInit(&box->header, TYPE_INT64);
+    box->value = value;
+    return box;
+}
+
+static atomic_bool g_long_double_box_destructor_registered = false;
+
+LongDoubleBox *pscalLongDoubleBoxCreate(long double value) {
+    if (!atomic_exchange_explicit(&g_long_double_box_destructor_registered, true, memory_order_acq_rel)) {
+        pscalObjRegisterDestructor(TYPE_LONG_DOUBLE, longDoubleBoxDestroy);
+    }
+    LongDoubleBox *box = malloc(sizeof(LongDoubleBox));
+    if (!box) {
+        fprintf(stderr, "PSCAL VM 2.0: pscalLongDoubleBoxCreate: allocation failed.\n");
+        abort();
+    }
+    pscalObjHeaderInit(&box->header, TYPE_LONG_DOUBLE);
+    box->value = value;
+    return box;
+}
+
 void pscalObjRunPointerWidthCanary(void) {
     // atomic_exchange claims the right to run the check; any thread that
     // loses the race returns immediately rather than re-running it. This
