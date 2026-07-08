@@ -11,6 +11,7 @@
 
 #include "core/types.h" // For Value struct, as constants will be Values
 #include "symbol/symbol.h" // For HashTable definition
+#include <stdatomic.h>
 
 // VM 2.0 Phase 1e legacy width: GET_GLOBAL_CACHED/SET_GLOBAL_CACHED/
 // GET_GLOBAL16_CACHED/SET_GLOBAL16_CACHED (opcodes.def 0x28-0x2B) reserved
@@ -124,7 +125,14 @@ typedef struct {
     int constants_capacity; // Allocated capacity for 'constants'
     Value* constants;   // Array of constants (Value structs: numbers, strings)
     int* builtin_lowercase_indices; // Maps string constant indices to their lowercase copies (-1 if not a builtin)
-    int* builtin_resolved_ids; // Maps string constant indices to resolved builtin ids (-2 unknown, -1 unresolved)
+    // Maps string constant indices to resolved builtin ids (-2 unknown, -1
+    // unresolved). Populated lazily at runtime by interpretBytecode()'s
+    // CALL_BUILTIN handler, which can run concurrently on this shared chunk
+    // from multiple TaskSpawn'd worker VMs -- _Atomic so that unlocked
+    // fast-path reads and the compute-and-populate write are race-free
+    // under ThreadSanitizer (the writes are idempotent, so no mutex is
+    // needed, just atomicity).
+    _Atomic int* builtin_resolved_ids;
 
     int cache_count;    // Number of GET/SET_GLOBAL[16] cache sites the compiler emitted (compile-time constant);
                         // always 0 for chunks compiled post-Phase-2b (no opcode carries a 'c' operand anymore)

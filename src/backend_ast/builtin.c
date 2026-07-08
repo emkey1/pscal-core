@@ -4205,7 +4205,14 @@ typedef struct {
 #define VM_COLOR_STACK_MAX 16
 static _Thread_local VmColorState vm_color_stack[VM_COLOR_STACK_MAX];
 static _Thread_local int vm_color_stack_depth = 0;
-static volatile sig_atomic_t g_vm_sigint_seen = 0;
+// _Atomic (not plain volatile sig_atomic_t): set from vmSignalHandler
+// (actual SIGINT handler context, so only lock-free atomic ops are safe
+// here) but also read/cleared from ordinary multi-threaded code
+// (pscalRuntimeConsumeSigint(), called concurrently by TaskSpawn'd worker
+// VMs) -- volatile alone only guarantees signal-safety within one thread,
+// not cross-thread visibility/ordering. atomic_int is still async-signal-
+// safe for a lock-free type (C11 7.17.4) while fixing the cross-thread race.
+static atomic_int g_vm_sigint_seen = 0;
 static int g_vm_sigint_pipe[2] = {-1, -1};
 static pthread_once_t g_vm_sigint_pipe_once = PTHREAD_ONCE_INIT;
 static atomic_bool g_vm_interrupt_broadcast = false;
@@ -4505,7 +4512,7 @@ static void vmAtExitCleanup(void) {
 // Signal handler to ensure terminal state is restored on interrupts.
 static void vmSignalHandler(int signum) {
     if (signum == SIGINT) {
-        g_vm_sigint_seen = 1;
+        atomic_store(&g_vm_sigint_seen, 1);
         if (g_vm_sigint_pipe[1] >= 0) {
             char c = 'i';
             (void)write(g_vm_sigint_pipe[1], &c, 1);
@@ -4657,7 +4664,7 @@ void pscalRuntimeRequestSigint(void) {
     }
 #endif
     vmEnsureSigintPipe();
-    g_vm_sigint_seen = 1;
+    atomic_store(&g_vm_sigint_seen, 1);
     atomic_store(&g_vm_interrupt_broadcast, true);
     if (g_vm_sigint_pipe[1] >= 0) {
         char c = 'i';
@@ -4739,7 +4746,7 @@ int pscalRuntimeCurrentForegroundPgid(void) {
 }
 
 bool pscalRuntimeSigintPending(void) {
-    if (g_vm_sigint_seen != 0) {
+    if (atomic_load(&g_vm_sigint_seen) != 0) {
         return true;
     }
     if (atomic_load(&g_vm_interrupt_broadcast)) {
@@ -4762,8 +4769,7 @@ void pscalRuntimeClearInterruptFlag(void) {
 
 bool pscalRuntimeConsumeSigint(void) {
     vmEnsureSigintPipe();
-    bool seen = g_vm_sigint_seen != 0;
-    g_vm_sigint_seen = 0;
+    bool seen = atomic_exchange(&g_vm_sigint_seen, 0) != 0;
     int fd = g_vm_sigint_pipe[0];
     if (fd >= 0) {
         int flags = fcntl(fd, F_GETFL, 0);

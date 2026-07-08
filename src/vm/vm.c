@@ -6836,12 +6836,17 @@ typedef enum {
 } VmBuiltinTypeCacheState;
 
 static pthread_mutex_t gVmBuiltinMetadataCacheMutex = PTHREAD_MUTEX_INITIALIZER;
-static uint8_t gVmBuiltinNeedsLockCache[UINT16_MAX + 1];
-static uint8_t gVmBuiltinTypeCache[UINT16_MAX + 1];
+// _Atomic: read unlocked on the fast path (below) from any TaskSpawn'd
+// worker VM sharing this process's builtin metadata; gVmBuiltinMetadataCacheMutex
+// still serializes the compute-and-populate slow path (harmless if raced --
+// every writer computes the same value for a given builtin_id -- but the
+// mutex avoids redundant concurrent recomputation on a cache miss).
+static _Atomic uint8_t gVmBuiltinNeedsLockCache[UINT16_MAX + 1];
+static _Atomic uint8_t gVmBuiltinTypeCache[UINT16_MAX + 1];
 
 static bool vmBuiltinNeedsGlobalLockCached(int builtin_id, const char* fallback_name) {
     if (builtin_id >= 0 && builtin_id <= UINT16_MAX) {
-        uint8_t cached = gVmBuiltinNeedsLockCache[builtin_id];
+        uint8_t cached = atomic_load(&gVmBuiltinNeedsLockCache[builtin_id]);
         if (cached == VM_BUILTIN_CACHE_TRUE) {
             return true;
         }
@@ -6856,8 +6861,8 @@ static bool vmBuiltinNeedsGlobalLockCached(int builtin_id, const char* fallback_
         bool needs_lock = builtinUsesGlobalStructures(name);
 
         pthread_mutex_lock(&gVmBuiltinMetadataCacheMutex);
-        if (gVmBuiltinNeedsLockCache[builtin_id] == VM_BUILTIN_CACHE_UNKNOWN) {
-            gVmBuiltinNeedsLockCache[builtin_id] = needs_lock ? VM_BUILTIN_CACHE_TRUE : VM_BUILTIN_CACHE_FALSE;
+        if (atomic_load(&gVmBuiltinNeedsLockCache[builtin_id]) == VM_BUILTIN_CACHE_UNKNOWN) {
+            atomic_store(&gVmBuiltinNeedsLockCache[builtin_id], needs_lock ? VM_BUILTIN_CACHE_TRUE : VM_BUILTIN_CACHE_FALSE);
         }
         pthread_mutex_unlock(&gVmBuiltinMetadataCacheMutex);
         return needs_lock;
@@ -6868,7 +6873,7 @@ static bool vmBuiltinNeedsGlobalLockCached(int builtin_id, const char* fallback_
 
 static BuiltinRoutineType vmBuiltinTypeCached(int builtin_id, const char* fallback_name) {
     if (builtin_id >= 0 && builtin_id <= UINT16_MAX) {
-        uint8_t cached = gVmBuiltinTypeCache[builtin_id];
+        uint8_t cached = atomic_load(&gVmBuiltinTypeCache[builtin_id]);
         switch (cached) {
             case VM_BUILTIN_TYPE_CACHE_NONE:
                 return BUILTIN_TYPE_NONE;
@@ -6893,8 +6898,8 @@ static BuiltinRoutineType vmBuiltinTypeCached(int builtin_id, const char* fallba
         }
 
         pthread_mutex_lock(&gVmBuiltinMetadataCacheMutex);
-        if (gVmBuiltinTypeCache[builtin_id] == VM_BUILTIN_TYPE_CACHE_UNKNOWN) {
-            gVmBuiltinTypeCache[builtin_id] = encoded;
+        if (atomic_load(&gVmBuiltinTypeCache[builtin_id]) == VM_BUILTIN_TYPE_CACHE_UNKNOWN) {
+            atomic_store(&gVmBuiltinTypeCache[builtin_id], encoded);
         }
         pthread_mutex_unlock(&gVmBuiltinMetadataCacheMutex);
         return builtin_type;
@@ -10965,7 +10970,7 @@ comparison_error_label:
 
                 if (vm->chunk && vm->chunk->builtin_resolved_ids &&
                     name_const_idx < vm->chunk->constants_count) {
-                    mapped_builtin_id = vm->chunk->builtin_resolved_ids[name_const_idx];
+                    mapped_builtin_id = atomic_load(&vm->chunk->builtin_resolved_ids[name_const_idx]);
                     if (mapped_builtin_id >= 0) {
                         handler = getVmBuiltinHandlerById(mapped_builtin_id);
                         canonical_name = getVmBuiltinNameById(mapped_builtin_id);
@@ -10986,7 +10991,7 @@ comparison_error_label:
                         } else {
                             mapped_builtin_id = -1;
                         }
-                        vm->chunk->builtin_resolved_ids[name_const_idx] = mapped_builtin_id;
+                        atomic_store(&vm->chunk->builtin_resolved_ids[name_const_idx], mapped_builtin_id);
                     }
                 } else {
                     VmBuiltinMapping mapping;

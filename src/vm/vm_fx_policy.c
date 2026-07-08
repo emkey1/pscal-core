@@ -3,6 +3,7 @@
 #include "core/utils.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,7 +13,13 @@ static const char kFxJournalMagic[4] = {'P', 'S', 'F', 'X'};
 #define FX_JOURNAL_VERSION 1
 
 static EffectMask g_fx_cli_denied_mask = FX_PURE;
-static bool g_fx_env_checked = false;
+// pthread_once (not a lazily-checked plain bool): PSCAL_VM_DENY is read
+// concurrently by every TaskSpawn'd worker VM's first builtin call via
+// pscalFxPolicyActive()/vmApplyFxPolicy(), so the "checked once, then
+// cached" init needs real synchronization -- pthread_once guarantees the
+// init function runs exactly once and that every caller (including ones
+// that arrive after it already ran) observes its writes.
+static pthread_once_t g_fx_env_once = PTHREAD_ONCE_INIT;
 static EffectMask g_fx_env_denied_mask = FX_PURE;
 
 static FILE *g_fx_record_file = NULL;
@@ -56,19 +63,20 @@ bool pscalFxPolicyActive(void) {
     return pscalFxEffectiveDeniedMask() != FX_PURE || g_fx_record_file != NULL || g_fx_replay_file != NULL;
 }
 
-EffectMask pscalFxEffectiveDeniedMask(void) {
-    if (!g_fx_env_checked) {
-        g_fx_env_checked = true;
-        const char *env = getenv("PSCAL_VM_DENY");
-        if (env && *env) {
-            EffectMask parsed = FX_PURE;
-            if (pscalFxParseDenyList(env, &parsed)) {
-                g_fx_env_denied_mask = parsed;
-            } else {
-                fprintf(stderr, "Warning: ignoring unrecognized PSCAL_VM_DENY value '%s'.\n", env);
-            }
+static void pscalFxInitEnvDeniedMaskOnce(void) {
+    const char *env = getenv("PSCAL_VM_DENY");
+    if (env && *env) {
+        EffectMask parsed = FX_PURE;
+        if (pscalFxParseDenyList(env, &parsed)) {
+            g_fx_env_denied_mask = parsed;
+        } else {
+            fprintf(stderr, "Warning: ignoring unrecognized PSCAL_VM_DENY value '%s'.\n", env);
         }
     }
+}
+
+EffectMask pscalFxEffectiveDeniedMask(void) {
+    pthread_once(&g_fx_env_once, pscalFxInitEnvDeniedMaskOnce);
     return g_fx_cli_denied_mask | g_fx_env_denied_mask;
 }
 

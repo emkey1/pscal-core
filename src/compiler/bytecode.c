@@ -266,9 +266,9 @@ int addConstantToChunk(BytecodeChunk* chunk, const Value* value) {
         chunk->builtin_lowercase_indices = (int*)reallocate(chunk->builtin_lowercase_indices,
                                                            sizeof(int) * oldCapacity,
                                                            sizeof(int) * chunk->constants_capacity);
-        chunk->builtin_resolved_ids = (int*)reallocate(chunk->builtin_resolved_ids,
-                                                       sizeof(int) * oldCapacity,
-                                                       sizeof(int) * chunk->constants_capacity);
+        chunk->builtin_resolved_ids = (_Atomic int*)reallocate(chunk->builtin_resolved_ids,
+                                                       sizeof(*chunk->builtin_resolved_ids) * oldCapacity,
+                                                       sizeof(*chunk->builtin_resolved_ids) * chunk->constants_capacity);
         for (int i = oldCapacity; i < chunk->constants_capacity; ++i) {
             chunk->builtin_lowercase_indices[i] = -1;
             chunk->builtin_resolved_ids[i] = -2;
@@ -282,9 +282,9 @@ int addConstantToChunk(BytecodeChunk* chunk, const Value* value) {
         }
     }
     if (!chunk->builtin_resolved_ids && chunk->constants_capacity > 0) {
-        chunk->builtin_resolved_ids = (int*)reallocate(NULL,
+        chunk->builtin_resolved_ids = (_Atomic int*)reallocate(NULL,
                                                        0,
-                                                       sizeof(int) * chunk->constants_capacity);
+                                                       sizeof(*chunk->builtin_resolved_ids) * chunk->constants_capacity);
         for (int i = 0; i < chunk->constants_capacity; ++i) {
             chunk->builtin_resolved_ids[i] = -2;
         }
