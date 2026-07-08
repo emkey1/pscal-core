@@ -575,7 +575,7 @@ static bool appendAetherMetaObject(JsonText *json,
   if (!jsonTextAppend(json, ",\"category\":")) return false;
   if (!jsonTextAppendEscaped(json, meta->category)) return false;
   if (!jsonTextAppend(json, ",\"effectful\":")) return false;
-  if (!jsonTextAppend(json, pscalBuiltinNameIsEffectful(meta->aether_name) ? "true" : "false")) return false;
+  if (!jsonTextAppend(json, pscalBuiltinNameEffectMaskLive(meta->aether_name) != FX_PURE ? "true" : "false")) return false;
   if (!jsonTextAppend(json, ",\"return_type\":")) return false;
   if (!jsonTextAppendEscaped(json, meta->return_type)) return false;
   if (detailed) {
@@ -614,7 +614,7 @@ static bool appendVmBuiltinObject(JsonText *json,
   if (!jsonTextAppend(json, ",\"category\":")) return false;
   if (!jsonTextAppendEscaped(json, category)) return false;
   if (!jsonTextAppend(json, ",\"effectful\":")) return false;
-  if (!jsonTextAppend(json, pscalBuiltinNameIsEffectful(name) ? "true" : "false")) return false;
+  if (!jsonTextAppend(json, pscalBuiltinNameEffectMaskLive(name) != FX_PURE ? "true" : "false")) return false;
   if (group && strcasecmp(group, kDefaultGroupName) != 0) {
     if (!jsonTextAppend(json, ",\"group\":")) return false;
     if (!jsonTextAppendEscaped(json, group)) return false;

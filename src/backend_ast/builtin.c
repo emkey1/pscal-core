@@ -2312,6 +2312,14 @@ bool pscalBuiltinNameIsEffectful(const char *name) {
     return pscalBuiltinNameEffectMask(name) != FX_PURE;
 }
 
+EffectMask pscalBuiltinNameEffectMaskLive(const char *name) {
+    int id = getVmBuiltinID(name);
+    if (id >= 0) {
+        return getVmBuiltinEffectMaskById(id);
+    }
+    return pscalBuiltinNameEffectMask(name);
+}
+
 EffectMask getVmBuiltinEffectMaskById(int id) {
     if (id < 0) return FX_PURE;
     pthread_once(&builtin_registry_once, initBuiltinRegistryMutex);

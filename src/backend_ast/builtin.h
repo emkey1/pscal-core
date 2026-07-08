@@ -61,6 +61,25 @@ bool pscalBuiltinNameIsEffectful(const char *name);
 EffectMask getVmBuiltinEffectMaskById(int id);
 EffectMask pscalBuiltinNameEffectMask(const char *name);
 
+/* VM 2.0 Phase 7 follow-up: pscalBuiltinNameEffectMask()/
+ * pscalBuiltinNameIsEffectful() above only classify the static ~130-name
+ * table they carry -- blind to any builtin an ext_builtins category (or,
+ * since Phase 7, a dlopen plugin) registers at runtime with its own
+ * explicit effect mask via registerVmBuiltin(). A name-based compile-time
+ * checker (Aether's FX-001 gate, the builtin-introspection JSON) that only
+ * consults the static table would silently treat a plugin-provided
+ * effectful builtin as pure. This is the comprehensive answer: resolves
+ * `name` to its registry id (covering core dispatch-table AND
+ * extra_vm_builtins/plugin ids alike) and returns getVmBuiltinEffectMaskById()
+ * for it, falling back to the static classification only for a name that
+ * isn't registered at all (called before registerAllBuiltins() has run, or
+ * a genuine typo). Callers needing this should use it in place of
+ * pscalBuiltinNameEffectMask()/pscalBuiltinNameIsEffectful(); those two stay
+ * as the static-only primitive getVmBuiltinEffectMaskById() itself uses to
+ * seed the core dispatch table's mask cache -- calling this function from
+ * there would recurse. */
+EffectMask pscalBuiltinNameEffectMaskLive(const char *name);
+
 /* Optional hook for externally linked built-ins.  The weak
  * definition in builtin.c does nothing unless overridden. */
 void registerExtendedBuiltins(void);
