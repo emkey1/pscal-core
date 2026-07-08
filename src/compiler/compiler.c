@@ -9821,6 +9821,27 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                         ((strcasecmp(calleeName, "blockread") == 0 || strcasecmp(calleeName, "blockwrite") == 0) && (param_index == 0 || param_index == 1 || param_index == 3)) ||
                         (strcasecmp(calleeName, "readln") == 0 && (param_index > 0 || (param_index == 0 && arg_node->var_type != TYPE_FILE))) ||
                         ((strcasecmp(calleeName, "val") == 0 || strcasecmp(calleeName, "valreal") == 0) && param_index >= 1) ||
+                        // VM 2.0 Phase 5b checkpoint 5b-i (Docs/pscal_vm2_plan.md
+                        // Sec 6.2): ChannelTryReceive(channel, var status, var
+                        // outValue) needs two genuine var out-parameters -- unlike
+                        // HttpTryAwait's "out: mstream" (works only because MStream
+                        // is itself a heap handle mutated in place), a channel's
+                        // payload can be ANY Value type, and a record-return was
+                        // tried first and found not to work: Pascal's compiler
+                        // requires a compile-time-known record shape for `.field`
+                        // access, which a generic builtin's dynamically-shaped
+                        // return can't provide (confirmed empirically). A THIRD
+                        // attempt tried a single `var outValue` with the status as
+                        // this call's ordinary return value, but this whole
+                        // is_var_param table only applies when the call is
+                        // compiled as a bare statement (its return value
+                        // discarded) -- exactly Val's/Str's own calling shape,
+                        // confirmed by testing -- not when used inside an
+                        // assignment/expression, so the status had to become a
+                        // second var-param too, matching Val's own
+                        // (input, var-out1, var-out2) shape exactly, called as
+                        // ChannelTryReceive(channel, status, outValue);
+                        ((strcasecmp(calleeName, "channeltryreceive") == 0) && param_index >= 1) ||
                         (strcasecmp(calleeName, "getmousestate") == 0) ||
                         (strcasecmp(calleeName, "getscreensize") == 0 && param_index <= 1) ||
                         (strcasecmp(calleeName, "gettextsize") == 0 && param_index > 0) ||

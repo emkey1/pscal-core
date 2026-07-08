@@ -402,6 +402,10 @@ Value makeMStream(MStream *ms);
 struct VM_s;
 TaskObj *createTaskObj(int threadId, struct VM_s *owner);
 Value makeTask(int threadId, struct VM_s *owner);
+// VM 2.0 Phase 5b checkpoint 5b-i: capacity is fixed at creation, never
+// resized -- see ChannelObj's comment in core/types.h.
+ChannelObj *createChannelObj(size_t capacity);
+Value makeChannel(size_t capacity);
 Value makeVoid(void);
 Value makeValueForType(VarType type, AST *type_def, Symbol* context_symbol);
 // owner_type must be TYPE_CLOSURE or TYPE_INTERFACE -- both share this

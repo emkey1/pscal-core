@@ -169,6 +169,15 @@ Value vmBuiltinTaskAwait(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinTaskDone(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinTaskCancel(struct VM_s* vm, int arg_count, Value* args);
 
+/* VM 2.0 Phase 5b checkpoint 5b-i (Docs/pscal_vm2_plan.md Sec 6.2): TYPE_CHANNEL builtins */
+Value vmBuiltinChannelCreate(struct VM_s* vm, int arg_count, Value* args);
+Value vmBuiltinChannelSend(struct VM_s* vm, int arg_count, Value* args);
+Value vmBuiltinChannelReceive(struct VM_s* vm, int arg_count, Value* args);
+Value vmBuiltinChannelTrySend(struct VM_s* vm, int arg_count, Value* args);
+Value vmBuiltinChannelTryReceive(struct VM_s* vm, int arg_count, Value* args);
+Value vmBuiltinChannelClose(struct VM_s* vm, int arg_count, Value* args);
+Value vmBuiltinChannelIsClosed(struct VM_s* vm, int arg_count, Value* args);
+
 /* Shell builtins */
 Value vmBuiltinShellExec(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinShellPipeline(struct VM_s* vm, int arg_count, Value* args);

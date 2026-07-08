@@ -3217,6 +3217,185 @@ static bool joinThreadInternal(VM* vm, int id) {
     return true;
 }
 
+// VM 2.0 Phase 5b checkpoint 5b-i (Docs/pscal_vm2_plan.md Sec 6.2): Channel
+// blocking Send/Receive follow the identical wait-loop shape
+// vmThreadTakeResult/joinThreadInternal above already established --
+// pthread_cond_timedwait on a 100ms deadline, rechecking cancellation and
+// the general interrupt-request hook on every wake rather than a single
+// unbounded wait. Two differences from those functions' cancellation
+// check: (1) there is no single "the thread this operation is about" to
+// call vmThreadCancel on the way those functions' vmConsumeInterruptRequest
+// callers do -- a channel op blocks the CALLING thread itself, not some
+// other thread's job, so on interrupt this just unblocks and returns
+// rather than canceling anything; (2) it additionally polls the calling
+// thread's OWN Thread.cancelRequested (via vm->owningThread, NULL when
+// running on the main/root VM) so a task blocked on
+// ChannelSend/ChannelReceive actually wakes when TaskCancel'd -- the same
+// poll-don't-callback pattern 5a-iii's HTTP async cancellation uses (see
+// httpJobCancelRequested's comment in builtin_network_api.c for why a
+// callback-based hook was tried and reverted there).
+static bool vmChannelOperationInterrupted(VM* vm) {
+    if (!vm) {
+        return false;
+    }
+    if (vm->owningThread && atomic_load(&vm->owningThread->cancelRequested)) {
+        return true;
+    }
+    return vmConsumeInterruptRequest(vm);
+}
+
+VmChannelStatus vmChannelSend(VM* vm, ChannelObj* ch, Value value) {
+    if (!ch) {
+        freeValue(&value);
+        return VM_CHANNEL_CLOSED;
+    }
+    pthread_mutex_lock(&ch->lock);
+    while (ch->count >= ch->capacity && !ch->closed) {
+        if (vmChannelOperationInterrupted(vm)) {
+            pthread_mutex_unlock(&ch->lock);
+            freeValue(&value);
+            return VM_CHANNEL_INTERRUPTED;
+        }
+        struct timespec deadline;
+        vmComputeDeadline(&deadline, 100);
+        int wait_status = pthread_cond_timedwait(&ch->notFull, &ch->lock, &deadline);
+        if (wait_status == ETIMEDOUT || wait_status == EINTR) {
+            continue;
+        }
+        if (wait_status != 0) {
+            pthread_mutex_unlock(&ch->lock);
+            freeValue(&value);
+            return VM_CHANNEL_INTERRUPTED;
+        }
+    }
+    if (ch->closed) {
+        pthread_mutex_unlock(&ch->lock);
+        freeValue(&value);
+        return VM_CHANNEL_CLOSED;
+    }
+    size_t tail = (ch->head + ch->count) % ch->capacity;
+    ch->buf[tail] = value; // ownership transferred into the ring buffer
+    ch->count++;
+    pthread_cond_signal(&ch->notEmpty); // one item added -- wake at most one receiver, not all
+    pthread_mutex_unlock(&ch->lock);
+    return VM_CHANNEL_OK;
+}
+
+VmChannelStatus vmChannelReceive(VM* vm, ChannelObj* ch, Value* outValue) {
+    if (!ch) {
+        if (outValue) *outValue = makeNil();
+        return VM_CHANNEL_CLOSED;
+    }
+    pthread_mutex_lock(&ch->lock);
+    while (ch->count == 0 && !ch->closed) {
+        if (vmChannelOperationInterrupted(vm)) {
+            pthread_mutex_unlock(&ch->lock);
+            if (outValue) *outValue = makeNil();
+            return VM_CHANNEL_INTERRUPTED;
+        }
+        struct timespec deadline;
+        vmComputeDeadline(&deadline, 100);
+        int wait_status = pthread_cond_timedwait(&ch->notEmpty, &ch->lock, &deadline);
+        if (wait_status == ETIMEDOUT || wait_status == EINTR) {
+            continue;
+        }
+        if (wait_status != 0) {
+            pthread_mutex_unlock(&ch->lock);
+            if (outValue) *outValue = makeNil();
+            return VM_CHANNEL_INTERRUPTED;
+        }
+    }
+    if (ch->count == 0) {
+        // Closed and drained -- not an error, see VmChannelStatus's comment.
+        pthread_mutex_unlock(&ch->lock);
+        if (outValue) *outValue = makeNil();
+        return VM_CHANNEL_CLOSED;
+    }
+    Value v = ch->buf[ch->head];
+    ch->buf[ch->head] = makeNil(); // vacated slot cleared, no dangling ownership
+    ch->head = (ch->head + 1) % ch->capacity;
+    ch->count--;
+    pthread_cond_signal(&ch->notFull); // one slot freed -- wake at most one sender, not all
+    pthread_mutex_unlock(&ch->lock);
+    if (outValue) {
+        *outValue = v; // ownership transferred out to the caller
+    } else {
+        freeValue(&v);
+    }
+    return VM_CHANNEL_OK;
+}
+
+VmChannelStatus vmChannelTrySend(ChannelObj* ch, Value value) {
+    if (!ch) {
+        freeValue(&value);
+        return VM_CHANNEL_CLOSED;
+    }
+    pthread_mutex_lock(&ch->lock);
+    if (ch->closed) {
+        pthread_mutex_unlock(&ch->lock);
+        freeValue(&value);
+        return VM_CHANNEL_CLOSED;
+    }
+    if (ch->count >= ch->capacity) {
+        pthread_mutex_unlock(&ch->lock);
+        freeValue(&value);
+        return VM_CHANNEL_WOULD_BLOCK;
+    }
+    size_t tail = (ch->head + ch->count) % ch->capacity;
+    ch->buf[tail] = value;
+    ch->count++;
+    pthread_cond_signal(&ch->notEmpty);
+    pthread_mutex_unlock(&ch->lock);
+    return VM_CHANNEL_OK;
+}
+
+VmChannelStatus vmChannelTryReceive(ChannelObj* ch, Value* outValue) {
+    if (!ch) {
+        if (outValue) *outValue = makeNil();
+        return VM_CHANNEL_CLOSED;
+    }
+    pthread_mutex_lock(&ch->lock);
+    if (ch->count == 0) {
+        VmChannelStatus status = ch->closed ? VM_CHANNEL_CLOSED : VM_CHANNEL_WOULD_BLOCK;
+        pthread_mutex_unlock(&ch->lock);
+        if (outValue) *outValue = makeNil();
+        return status;
+    }
+    Value v = ch->buf[ch->head];
+    ch->buf[ch->head] = makeNil();
+    ch->head = (ch->head + 1) % ch->capacity;
+    ch->count--;
+    pthread_cond_signal(&ch->notFull);
+    pthread_mutex_unlock(&ch->lock);
+    if (outValue) {
+        *outValue = v;
+    } else {
+        freeValue(&v);
+    }
+    return VM_CHANNEL_OK;
+}
+
+void vmChannelClose(ChannelObj* ch) {
+    if (!ch) {
+        return;
+    }
+    pthread_mutex_lock(&ch->lock);
+    ch->closed = true; // monotonic -- never reset to false
+    pthread_cond_broadcast(&ch->notEmpty); // wake EVERY blocked receiver, not just one
+    pthread_cond_broadcast(&ch->notFull);  // wake EVERY blocked sender, not just one
+    pthread_mutex_unlock(&ch->lock);
+}
+
+bool vmChannelIsClosed(ChannelObj* ch) {
+    if (!ch) {
+        return true; // a nil/never-created channel is inert, same as a closed one
+    }
+    pthread_mutex_lock(&ch->lock);
+    bool closed = ch->closed;
+    pthread_mutex_unlock(&ch->lock);
+    return closed;
+}
+
 static void joinThread(VM* vm, int id) {
     if (!vm) {
         return;
@@ -6310,6 +6489,7 @@ static bool vmSizeForVarType(VarType type, long long* out_bytes) {
         case TYPE_CLOSURE:
         case TYPE_THREAD:
         case TYPE_TASK:
+        case TYPE_CHANNEL:
             *out_bytes = (long long)sizeof(void*);
             return true;
         case TYPE_ENUM:

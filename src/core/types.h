@@ -9,6 +9,9 @@
 #include <math.h>
 #include <time.h>
 #include <stdint.h>
+#include <pthread.h> // ChannelObj (VM 2.0 Phase 5b checkpoint 5b-i) embeds a
+                     // pthread_mutex_t/pthread_cond_t pair directly, same as
+                     // vm.h's Mutex struct does for the mutex builtins.
 #include "list.h"
 #include <stdbool.h>
 #include "common/frontend_symbol_aliases.h"
@@ -88,6 +91,41 @@ typedef struct TaskObj {
     int threadId;      // slot index in owner->threads[]
     struct VM_s *owner; // VM instance whose threads[] this slot belongs to
 } TaskObj;
+
+// VM 2.0 Phase 5b checkpoint 5b-i (Docs/pscal_vm2_plan.md Sec 6.2): a
+// bounded MPMC ring buffer of Values, ObjHeader-refcounted like TaskObj --
+// and, like TaskObj, retain-and-share on every Value copy rather than
+// copy-on-construct: a channel has no meaningful value semantics either,
+// its whole identity is the shared buffer, so every copy must refer to the
+// SAME underlying ChannelObj (the same reasoning as TaskObj's comment
+// above, not repeated in full here). Unlike TaskObj, a channel is NOT tied
+// to any particular VM's threads[] slot -- it's meant to be created once
+// and shared across however many tasks/threads hold a reference, so there
+// is deliberately no `owner`/`VM*` field and no VM-level registry (the
+// mmap-reservation growable-array machinery threads[]/mutexes[] use exists
+// specifically because THOSE arrays hold long-lived pointers taken while a
+// lock is held across a blocking wait -- a plain heap-allocated ChannelObj
+// has no equivalent "array of slots referenced by index" problem to solve).
+// `lock` guards every field below it; `notEmpty` is signaled by a
+// successful Send (or broadcast by Close), `notFull` by a successful
+// Receive (or broadcast by Close). `buf` is a ring buffer of exactly
+// `capacity` Values (capacity is fixed at ChannelCreate time, never
+// resized); `head` is the index of the oldest buffered Value, `count` how
+// many slots are currently occupied. `closed` is monotonic -- once true,
+// never reset to false.
+typedef struct ChannelObj {
+    ObjHeader header;        // header.type is always TYPE_CHANNEL
+    pthread_mutex_t lock;
+    pthread_cond_t notEmpty; // signaled/broadcast when count goes 0 -> >0, or on close
+    pthread_cond_t notFull;  // signaled/broadcast when count goes capacity -> <capacity, or on close
+    struct ValueStruct *buf; // ring buffer of exactly `capacity` Values (forward-referenced via the
+                              // struct tag -- the Value typedef itself isn't visible yet this early
+                              // in the file, same as FieldValue.storage below does)
+    size_t capacity;
+    size_t count;
+    size_t head;
+    bool closed;
+} ChannelObj;
 
 // VM 2.0 Phase 4c (Docs/pscal_vm2_plan.md §5.10.4/§5.10.3): field names
 // (set_size, set_values) intentionally match the pre-4c embedded
@@ -830,6 +868,9 @@ static inline long double pscalValueDecodeRealLD(Value v) {
 // pointer-not-lvalue shape as AS_MSTREAM (a Task's fields are set once at
 // construction via makeTask(), never reassigned in place afterward).
 #define AS_TASK(v)       PSCAL_VALUE_PTR(v, TaskObj)
+// VM 2.0 Phase 5b checkpoint 5b-i: returns the ChannelObj* directly, same
+// pointer-not-lvalue shape as AS_TASK/AS_MSTREAM.
+#define AS_CHANNEL(v)    PSCAL_VALUE_PTR(v, ChannelObj)
 // VM 2.0 Phase 4g: ptr_val is now a PointerObj* (was a plain struct
 // ValueStruct*); AS_POINTER dereferences it so existing `AS_POINTER(v)`
 // reads/writes (an address) keep working unchanged, given the wrapper

@@ -50,7 +50,18 @@ typedef enum {
     // post-PSB3 (Sec 2) and .bc files carry no compatibility promise
     // (recompile is the story), so there is no correctness reason to
     // renumber, only a cosmetic one.
-    TYPE_TASK
+    TYPE_TASK,
+    // VM 2.0 Phase 5b (Docs/pscal_vm2_plan.md Sec 6.2, checkpoint 5b-i):
+    // ObjHeader-boxed bounded MPMC queue of Values (ChannelObj, core/
+    // types.h). Appended after TYPE_TASK for the identical append-only
+    // reason above -- MUST stay the last member until the next VarType is
+    // added, or core/obj_header.c's PSCAL_OBJ_DESTRUCTOR_TABLE_SIZE (sized
+    // off "the enum's last member") needs updating too. TYPE_TASK's own
+    // addition is exactly the bug this note exists to prevent: the table
+    // was sized off the previous last member and aborted registering
+    // TYPE_TASK's destructor as "out of range" until an actual TaskSpawn
+    // smoke test caught it.
+    TYPE_CHANNEL
 } VarType;
 
 /*

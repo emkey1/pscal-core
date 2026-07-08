@@ -7,18 +7,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-// VarType is a small, dense enum (core/var_type.h) with TYPE_TASK as its
-// last member (VM 2.0 Phase 5a checkpoint 5a-i appended it after
-// TYPE_UNICODE_STRING, the previous last member), so a flat array indexed
-// by the enum value is simpler and faster than a hash table and keeps
-// registration allocation-free. Sized off the enum's own last value (not a
-// hardcoded number) -- update this macro's referenced type, not just its
-// value, whenever a future VarType is appended (TYPE_TASK's own addition
-// is exactly the bug this comment now warns about: the table was sized off
-// TYPE_UNICODE_STRING, one short of TYPE_TASK's actual value, which made
+// VarType is a small, dense enum (core/var_type.h) with TYPE_CHANNEL as its
+// last member (VM 2.0 Phase 5b checkpoint 5b-i appended it after TYPE_TASK,
+// the previous last member), so a flat array indexed by the enum value is
+// simpler and faster than a hash table and keeps registration
+// allocation-free. Sized off the enum's own last value (not a hardcoded
+// number) -- update this macro's referenced type, not just its value,
+// whenever a future VarType is appended (TYPE_TASK's own addition was
+// exactly this bug: the table was sized off TYPE_UNICODE_STRING, one short
+// of TYPE_TASK's actual value, which made
 // pscalObjRegisterDestructor(TYPE_TASK, ...) abort as "out of range" until
-// this was caught by an actual TaskSpawn smoke test).
-#define PSCAL_OBJ_DESTRUCTOR_TABLE_SIZE ((size_t)TYPE_TASK + 1)
+// caught by an actual TaskSpawn smoke test -- re-verify with an actual
+// ChannelCreate smoke test after this change too, not just visual
+// inspection).
+#define PSCAL_OBJ_DESTRUCTOR_TABLE_SIZE ((size_t)TYPE_CHANNEL + 1)
 
 static PscalObjDestroyFn g_obj_destructors[PSCAL_OBJ_DESTRUCTOR_TABLE_SIZE];
 static bool g_obj_destructor_registered[PSCAL_OBJ_DESTRUCTOR_TABLE_SIZE];

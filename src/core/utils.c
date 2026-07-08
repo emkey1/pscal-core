@@ -436,6 +436,7 @@ const char *varTypeToString(VarType type) {
         case TYPE_NIL:          return "NIL";
         case TYPE_THREAD:       return "THREAD";
         case TYPE_TASK:         return "TASK";
+        case TYPE_CHANNEL:      return "CHANNEL";
         default:                return "UNKNOWN_VAR_TYPE";
     }
 }
@@ -726,6 +727,70 @@ Value makeTask(int threadId, struct VM_s *owner) {
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_TASK;
     pscalValueSetHeapPtrBits(&v, createTaskObj(threadId, owner));
+    return v;
+}
+
+// VM 2.0 Phase 5b checkpoint 5b-i (Docs/pscal_vm2_plan.md Sec 6.2):
+// ChannelObj owns its ring buffer and every currently-buffered Value --
+// unlike TaskObj (which owns nothing beyond itself), a channel that still
+// has count>0 buffered items when its last reference drops must free each
+// of them, or they leak silently (there is no other path back to them --
+// nothing else holds a reference into the ring buffer once it's gone).
+static void channelObjDestroy(ObjHeader *header) {
+    ChannelObj *ch = (ChannelObj *)header;
+    for (size_t i = 0; i < ch->count; i++) {
+        size_t idx = (ch->head + i) % ch->capacity;
+        freeValue(&ch->buf[idx]);
+    }
+    free(ch->buf);
+    pthread_mutex_destroy(&ch->lock);
+    pthread_cond_destroy(&ch->notEmpty);
+    pthread_cond_destroy(&ch->notFull);
+    free(ch);
+}
+
+static pthread_once_t g_channel_destructor_once = PTHREAD_ONCE_INIT;
+static void registerChannelObjDestructor(void) {
+    pscalObjRegisterDestructor(TYPE_CHANNEL, channelObjDestroy);
+}
+
+// Precondition: capacity >= 1, enforced by the ChannelCreate builtin (the
+// actual system boundary where user input needs validating) -- this
+// internal constructor trusts its caller rather than re-validating, per
+// this codebase's usual boundary-only-validation convention. A capacity-0
+// ring buffer would be a guaranteed modulo-by-zero/deadlock hazard, not
+// something to silently clamp away from a lower layer.
+ChannelObj *createChannelObj(size_t capacity) {
+    pthread_once(&g_channel_destructor_once, registerChannelObjDestructor);
+    ChannelObj *ch = malloc(sizeof(ChannelObj));
+    if (!ch) {
+        fprintf(stderr, "Memory allocation error in createChannelObj\n");
+        EXIT_FAILURE_HANDLER();
+    }
+    pscalObjHeaderInit(&ch->header, TYPE_CHANNEL);
+    pthread_mutex_init(&ch->lock, NULL);
+    pthread_cond_init(&ch->notEmpty, NULL);
+    pthread_cond_init(&ch->notFull, NULL);
+    ch->buf = malloc(sizeof(Value) * capacity);
+    if (!ch->buf) {
+        fprintf(stderr, "Memory allocation error in createChannelObj\n");
+        EXIT_FAILURE_HANDLER();
+    }
+    for (size_t i = 0; i < capacity; i++) {
+        ch->buf[i] = makeNil();
+    }
+    ch->capacity = capacity;
+    ch->count = 0;
+    ch->head = 0;
+    ch->closed = false;
+    return ch;
+}
+
+Value makeChannel(size_t capacity) {
+    Value v;
+    memset(&v, 0, sizeof(Value));
+    v.type = TYPE_CHANNEL;
+    pscalValueSetHeapPtrBits(&v, createChannelObj(capacity));
     return v;
 }
 
@@ -1305,6 +1370,7 @@ VarType lookupBuiltinPascalTypeName(const char *name) {
         strcasecmp(name, "textfile") == 0) return TYPE_FILE;
     if (strcasecmp(name, "thread") == 0) return TYPE_THREAD;
     if (strcasecmp(name, "task") == 0) return TYPE_TASK;
+    if (strcasecmp(name, "channel") == 0) return TYPE_CHANNEL;
     if (strcasecmp(name, "mstream") == 0) return TYPE_MEMORYSTREAM;
 
     return TYPE_VOID;
@@ -2370,6 +2436,13 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
             // a NULL PSCAL_VALUE_PTR as the empty/unset case).
             pscalValueSetHeapPtrBits(&v, NULL);
             break;
+        case TYPE_CHANNEL:
+            // Same "nil until assigned" convention as TYPE_TASK just above
+            // -- a channel-declared variable has no live channel until
+            // ChannelCreate is called (freeValue/AS_CHANNEL already treat a
+            // NULL PSCAL_VALUE_PTR as the empty/unset case, mirrored below).
+            pscalValueSetHeapPtrBits(&v, NULL);
+            break;
         case TYPE_INTERFACE: {
             InterfaceObj *iface = pscalInterfaceObjCreate();
             pscalValueSetHeapPtrBits(&v, iface);
@@ -2876,6 +2949,14 @@ void freeValue(Value *v) {
             }
             break;
         }
+        case TYPE_CHANNEL: {
+            ChannelObj *ch = PSCAL_VALUE_PTR(*v, ChannelObj);
+            if (ch) {
+                pscalObjRelease(&ch->header);
+                pscalValueSetHeapPtrBits(v, NULL);
+            }
+            break;
+        }
         // Add other types if they allocate memory pointed to by Value struct members
         default:
 #ifdef DEBUG
@@ -2980,6 +3061,12 @@ void dumpSymbol(Symbol *sym) {
             case TYPE_TASK:
                 printf("Task (threadId: %d)", PSCAL_VALUE_PTR(*sym->value, TaskObj)->threadId);
                 break;
+            case TYPE_CHANNEL: {
+                ChannelObj *ch = PSCAL_VALUE_PTR(*sym->value, ChannelObj);
+                printf("Channel (capacity: %zu, count: %zu, closed: %s)",
+                       ch->capacity, ch->count, ch->closed ? "true" : "false");
+                break;
+            }
             case TYPE_NIL:
                  // A TYPE_NIL Value struct represents the absence of a pointer.
                  // It does not own any heap data itself (the ptr_val field is NULL).
@@ -3831,6 +3918,16 @@ void printValueToStream(Value v, FILE *stream) {
             fprintf(stream, "TASK(threadId=%d)", t ? t->threadId : -1);
             break;
         }
+        case TYPE_CHANNEL: {
+            ChannelObj *ch = PSCAL_VALUE_PTR(v, ChannelObj);
+            if (ch) {
+                fprintf(stream, "CHANNEL(capacity=%zu, count=%zu, closed=%s)",
+                        ch->capacity, ch->count, ch->closed ? "true" : "false");
+            } else {
+                fprintf(stream, "CHANNEL(nil)");
+            }
+            break;
+        }
         case TYPE_VOID:
             fprintf(stream, "<VOID_TYPE>");
             break;
@@ -4094,6 +4191,19 @@ Value makeCopyOfValue(const Value *src) {
             if (t) {
                 pscalObjRetain(&t->header);
                 pscalValueSetHeapPtrBits(&v, t);
+            }
+            break;
+        }
+        case TYPE_CHANNEL: {
+            // Same reasoning as TYPE_TASK just above: a channel's whole
+            // identity is the shared buffer, so every copy must retain-and-
+            // share the SAME ChannelObj (see its comment in core/types.h),
+            // not allocate a fresh wrapper.
+            ChannelObj *ch = PSCAL_VALUE_PTR(*src, ChannelObj);
+            pscalValueSetHeapPtrBits(&v, NULL);
+            if (ch) {
+                pscalObjRetain(&ch->header);
+                pscalValueSetHeapPtrBits(&v, ch);
             }
             break;
         }

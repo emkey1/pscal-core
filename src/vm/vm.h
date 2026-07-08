@@ -435,6 +435,30 @@ int vmTaskCreateNative(VM* vm, VMThreadCallback work_fn, void* user_data, VMThre
 // means "unknown," matching HTTP's pre-existing dl_total contract.
 void vmTaskReportProgress(VM* threadVm, long long now, long long total);
 bool vmTaskGetProgress(VM* owner, int threadId, long long* outNow, long long* outTotal);
+
+// VM 2.0 Phase 5b checkpoint 5b-i (Docs/pscal_vm2_plan.md Sec 6.2): Channel
+// blocking/non-blocking Send/Receive, plus Close/IsClosed. Unlike the Task
+// API above, these take a plain ChannelObj* (no VM-level registry, no
+// owner/threadId addressing -- see ChannelObj's comment in core/types.h)
+// alongside the CALLING VM (needed only so the blocking variants can poll
+// cancellation/interrupt state while waiting -- see vmChannelSend/Receive's
+// own comments in vm.c for exactly what they poll and why).
+typedef enum {
+    VM_CHANNEL_OK = 0,          // operation completed: value sent, or *outValue holds a received value
+    VM_CHANNEL_CLOSED = 1,      // Send: channel is closed (caller should raise a runtime error);
+                                 // Receive: channel is closed AND drained (not an error -- *outValue is nil)
+    VM_CHANNEL_WOULD_BLOCK = 2, // TrySend/TryReceive only: buffer full/empty right now, channel still open
+    VM_CHANNEL_INTERRUPTED = 3  // Send/Receive only: canceled (Thread.cancelRequested) or interrupted
+                                 // (vmConsumeInterruptRequest) while blocked -- not an error, same soft-
+                                 // outcome tolerance as TaskCancel racing TaskAwait already has
+} VmChannelStatus;
+
+VmChannelStatus vmChannelSend(VM* vm, ChannelObj* ch, Value value);
+VmChannelStatus vmChannelReceive(VM* vm, ChannelObj* ch, Value* outValue);
+VmChannelStatus vmChannelTrySend(ChannelObj* ch, Value value);
+VmChannelStatus vmChannelTryReceive(ChannelObj* ch, Value* outValue);
+void vmChannelClose(ChannelObj* ch);
+bool vmChannelIsClosed(ChannelObj* ch);
 int vmSpawnBuiltinThread(VM* vm, int builtinId, const char* builtinName, int argCount,
                          const Value* args, bool submitOnly, const char* threadName);
 void vmThreadStoreResult(VM* vm, const Value* result, bool success);

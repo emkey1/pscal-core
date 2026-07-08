@@ -1022,6 +1022,7 @@ static bool builtinSizeForVarType(VarType type, long long *out_bytes) {
         case TYPE_CLOSURE:
         case TYPE_THREAD:
         case TYPE_TASK:
+        case TYPE_CHANNEL:
             *out_bytes = (long long)sizeof(void*);
             return true;
         case TYPE_ENUM:
@@ -1970,6 +1971,15 @@ static VmBuiltinMapping vmBuiltinDispatchTable[] = {
     {"taskawait", vmBuiltinTaskAwait},
     {"taskdone", vmBuiltinTaskDone},
     {"taskcancel", vmBuiltinTaskCancel},
+    /* VM 2.0 Phase 5b checkpoint 5b-i (Docs/pscal_vm2_plan.md Sec 6.2):
+     * appended here per this table's own append-only convention above. */
+    {"channelcreate", vmBuiltinChannelCreate},
+    {"channelsend", vmBuiltinChannelSend},
+    {"channelreceive", vmBuiltinChannelReceive},
+    {"channeltrysend", vmBuiltinChannelTrySend},
+    {"channeltryreceive", vmBuiltinChannelTryReceive},
+    {"channelclose", vmBuiltinChannelClose},
+    {"channelisclosed", vmBuiltinChannelIsClosed},
 };
 
 static const size_t num_vm_builtins = sizeof(vmBuiltinDispatchTable) / sizeof(vmBuiltinDispatchTable[0]);
@@ -10626,6 +10636,194 @@ Value vmBuiltinTaskCancel(VM* vm, int arg_count, Value* args) {
     return makeBoolean(vmThreadCancel(t->owner, t->threadId));
 }
 
+// VM 2.0 Phase 5b checkpoint 5b-i (Docs/pscal_vm2_plan.md Sec 6.2):
+// TYPE_CHANNEL builtins. Unlike TaskObj, a ChannelObj carries no owning VM
+// -- see its comment in core/types.h -- so these builtins pass `vm` (the
+// CALLING VM) straight through to vmChannelSend/Receive only so their
+// blocking wait loops can poll cancellation/interrupt state, not to
+// address the channel itself.
+Value vmBuiltinChannelCreate(VM* vm, int arg_count, Value* args) {
+    if (!vm) {
+        return makeNil();
+    }
+    if (arg_count != 1 || !isIntlikeType(VALUE_TYPE(args[0]))) {
+        runtimeError(vm, "ChannelCreate expects a single integer capacity argument.");
+        return makeNil();
+    }
+    long long capacity = asI64(args[0]);
+    if (capacity < 1) {
+        runtimeError(vm, "ChannelCreate requires capacity >= 1.");
+        return makeNil();
+    }
+    return makeChannel((size_t)capacity);
+}
+
+// Blocking; a true procedure (no meaningful return value on success).
+// Raises a runtime error on a closed channel -- matching Go's "send on
+// closed channel panics" convention, not a silently-tolerated no-op, since
+// sending after close is a programming error, not a normal runtime state a
+// caller polls for. A canceled/interrupted wait is NOT an error (same
+// soft-outcome tolerance TaskCancel racing TaskAwait already has, see
+// vmBuiltinTaskAwait's comment above): the value is simply not sent and
+// the caller gets no result.
+Value vmBuiltinChannelSend(VM* vm, int arg_count, Value* args) {
+    if (!vm) {
+        return makeVoid();
+    }
+    if (arg_count != 2 || VALUE_TYPE(args[0]) != TYPE_CHANNEL) {
+        runtimeError(vm, "ChannelSend expects (channel, value).");
+        return makeVoid();
+    }
+    ChannelObj* ch = AS_CHANNEL(args[0]);
+    if (!ch) {
+        runtimeError(vm, "ChannelSend received an invalid channel.");
+        return makeVoid();
+    }
+    VmChannelStatus status = vmChannelSend(vm, ch, makeCopyOfValue(&args[1]));
+    if (status == VM_CHANNEL_CLOSED) {
+        runtimeError(vm, "ChannelSend: channel is closed.");
+    }
+    return makeVoid();
+}
+
+// Blocking; returns the received value, or nil if the channel is closed
+// and drained, or the wait was canceled/interrupted -- same nil-overload
+// tolerance TaskAwait already accepts for its own degenerate cases.
+// Callers who need to disambiguate a legitimately-sent nil from "nothing
+// more will ever arrive" can follow up with ChannelIsClosed (race-free:
+// closed is monotonic, so a true result there stays true), or use
+// ChannelTryReceive's fully-disambiguated record return instead.
+Value vmBuiltinChannelReceive(VM* vm, int arg_count, Value* args) {
+    if (!vm) {
+        return makeNil();
+    }
+    if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_CHANNEL) {
+        runtimeError(vm, "ChannelReceive expects a single channel argument.");
+        return makeNil();
+    }
+    ChannelObj* ch = AS_CHANNEL(args[0]);
+    if (!ch) {
+        runtimeError(vm, "ChannelReceive received an invalid channel.");
+        return makeNil();
+    }
+    Value result = makeNil();
+    vmChannelReceive(vm, ch, &result);
+    return result;
+}
+
+// Non-blocking. Returns 1 if sent, 0 if the buffer is currently full
+// (channel still open -- try again later). Raises the same runtime error
+// as ChannelSend on a closed channel, for the same reason.
+Value vmBuiltinChannelTrySend(VM* vm, int arg_count, Value* args) {
+    if (!vm) {
+        return makeInt(0);
+    }
+    if (arg_count != 2 || VALUE_TYPE(args[0]) != TYPE_CHANNEL) {
+        runtimeError(vm, "ChannelTrySend expects (channel, value).");
+        return makeInt(0);
+    }
+    ChannelObj* ch = AS_CHANNEL(args[0]);
+    if (!ch) {
+        runtimeError(vm, "ChannelTrySend received an invalid channel.");
+        return makeInt(0);
+    }
+    VmChannelStatus status = vmChannelTrySend(ch, makeCopyOfValue(&args[1]));
+    if (status == VM_CHANNEL_CLOSED) {
+        runtimeError(vm, "ChannelTrySend: channel is closed.");
+        return makeInt(0);
+    }
+    return makeInt(status == VM_CHANNEL_OK ? 1 : 0);
+}
+
+// Non-blocking procedure: ChannelTryReceive(channel, var status, var
+// outValue). Writes an integer status into `status` (1 = got a value, now
+// in `outValue`; 0 = buffer momentarily empty, channel still open, try
+// again later; -1 = closed and drained, nothing more will ever arrive) and
+// the received value (nil if none) into `outValue` -- both genuine `var`
+// output parameters, since a channel's payload can be ANY Value type
+// (unlike HttpTryAwait's `out: mstream`, which works only because MStream
+// is itself a heap handle mutated in place). Two earlier designs were
+// tried and abandoned: a {ok, closed, value} record return doesn't work
+// because Pascal's compiler requires a compile-time-known record shape for
+// `.field` access, which a generic builtin's dynamically-shaped return
+// can't provide; and a single `var outValue` with status as this call's
+// ordinary return value doesn't work either, because the var-param
+// compilation table below only applies when the call is compiled as a
+// bare statement (return value discarded) -- exactly Val's/Str's own
+// calling shape -- not inside an assignment/expression (confirmed by
+// testing both, not assumed). Reusing Val's exact (input, var-out1,
+// var-out2) shape, called as a bare statement
+// (`ChannelTryReceive(ch, status, outValue);`), is what actually works;
+// see compiler.c's per-builtin-name param-index table's
+// "channeltryreceive" entry, which compiles both var arguments to
+// TYPE_POINTER (the address of the caller's variable) instead of a
+// by-value copy.
+Value vmBuiltinChannelTryReceive(VM* vm, int arg_count, Value* args) {
+    if (!vm) {
+        return makeVoid();
+    }
+    if (arg_count != 3 || VALUE_TYPE(args[0]) != TYPE_CHANNEL ||
+        VALUE_TYPE(args[1]) != TYPE_POINTER || VALUE_TYPE(args[2]) != TYPE_POINTER) {
+        runtimeError(vm, "ChannelTryReceive expects (channel, var status, var outValue).");
+        return makeVoid();
+    }
+    ChannelObj* ch = AS_CHANNEL(args[0]);
+    if (!ch) {
+        runtimeError(vm, "ChannelTryReceive received an invalid channel.");
+        return makeVoid();
+    }
+    Value* outStatus = (Value*)AS_POINTER(args[1]);
+    Value* outValue = (Value*)AS_POINTER(args[2]);
+    Value received = makeNil();
+    VmChannelStatus status = vmChannelTryReceive(ch, &received);
+    int statusCode = (status == VM_CHANNEL_OK) ? 1 : (status == VM_CHANNEL_CLOSED ? -1 : 0);
+    if (outStatus) {
+        freeValue(outStatus);
+        *outStatus = makeInt(statusCode);
+    }
+    if (outValue) {
+        freeValue(outValue); // release whatever the caller's variable held before this call
+        *outValue = received;
+    } else {
+        freeValue(&received);
+    }
+    return makeVoid();
+}
+
+// A true procedure. Idempotent: closing an already-closed channel is a
+// harmless no-op, not an error -- deliberately NOT Go's "close of closed
+// channel panics" convention, to avoid a whole new error case in this
+// first checkpoint (vmChannelClose already sets `closed` unconditionally
+// and re-broadcasts, which is safe either way).
+Value vmBuiltinChannelClose(VM* vm, int arg_count, Value* args) {
+    if (!vm) {
+        return makeVoid();
+    }
+    if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_CHANNEL) {
+        runtimeError(vm, "ChannelClose expects a single channel argument.");
+        return makeVoid();
+    }
+    ChannelObj* ch = AS_CHANNEL(args[0]);
+    if (!ch) {
+        runtimeError(vm, "ChannelClose received an invalid channel.");
+        return makeVoid();
+    }
+    vmChannelClose(ch);
+    return makeVoid();
+}
+
+Value vmBuiltinChannelIsClosed(VM* vm, int arg_count, Value* args) {
+    if (!vm) {
+        return makeBoolean(true);
+    }
+    if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_CHANNEL) {
+        runtimeError(vm, "ChannelIsClosed expects a single channel argument.");
+        return makeBoolean(true);
+    }
+    ChannelObj* ch = AS_CHANNEL(args[0]);
+    return makeBoolean(vmChannelIsClosed(ch));
+}
+
 Value vmBuiltinThreadStats(VM* vm, int arg_count, Value* args) {
     (void)args;
     if (!vm) {
@@ -11300,6 +11498,14 @@ static void populateBuiltinRegistry(void) {
     registerBuiltinFunctionUnlocked("TaskAwait", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("TaskDone", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("TaskCancel", AST_FUNCTION_DECL, NULL);
+    // VM 2.0 Phase 5b checkpoint 5b-i (Docs/pscal_vm2_plan.md Sec 6.2)
+    registerBuiltinFunctionUnlocked("ChannelCreate", AST_FUNCTION_DECL, NULL);
+    registerBuiltinFunctionUnlocked("ChannelSend", AST_PROCEDURE_DECL, NULL);
+    registerBuiltinFunctionUnlocked("ChannelReceive", AST_FUNCTION_DECL, NULL);
+    registerBuiltinFunctionUnlocked("ChannelTrySend", AST_FUNCTION_DECL, NULL);
+    registerBuiltinFunctionUnlocked("ChannelTryReceive", AST_PROCEDURE_DECL, NULL);
+    registerBuiltinFunctionUnlocked("ChannelClose", AST_PROCEDURE_DECL, NULL);
+    registerBuiltinFunctionUnlocked("ChannelIsClosed", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("BlockRead", AST_PROCEDURE_DECL, NULL);
     registerBuiltinFunctionUnlocked("BlockWrite", AST_PROCEDURE_DECL, NULL);
     registerBuiltinFunctionUnlocked("FileSize", AST_FUNCTION_DECL, NULL);
