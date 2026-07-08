@@ -92,12 +92,14 @@ set(PSCAL_CORE_SOURCES
     ${SRC}/core/diagmap.c
     ${SRC}/vm/vm.c
     ${SRC}/vm/vm_fx_policy.c
+    ${SRC}/backend_ast/pscal_ext_api.c
     ${CMAKE_CURRENT_SOURCE_DIR}/lib/noise/noise.c
     ${SRC}/runtime/terrain/terrain_generator.c ${SRC}/runtime/shaders/shader_common.c
     ${SRC}/runtime/shaders/terrain/terrain_shader.c ${SRC}/runtime/shaders/sky/sky_dome.c
     ${SRC}/runtime/shaders/sky/cloud_layer.c
     ${CMAKE_CURRENT_SOURCE_DIR}/third-party/nextvi/vi.c
     ${SRC}/ext_builtins/register.c ${SRC}/ext_builtins/registry.c
+    ${SRC}/ext_builtins/plugin_loader.c
     ${SRC}/ext_builtins/query_builtin.c ${SRC}/ext_builtins/dump.c
     ${SRC}/ext_builtins/math/chudnovsky.c ${SRC}/ext_builtins/math/factorial.c
     ${SRC}/ext_builtins/math/fibonacci.c ${SRC}/ext_builtins/math/mandelbrot.c

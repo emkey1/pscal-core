@@ -481,10 +481,19 @@ typedef struct RealValue { float f32_val; double d_val; long double r_val; } Rea
 // bytes (4-byte VarType + 4 bytes padding + 8-byte bits) -- an 11x
 // reduction from 176, achieving Phase 4's actual goal (a small,
 // cheap-to-copy Value) without literal single-word purity.
+// VM 2.0 Phase 7 (Docs/pscal_vm2_plan.md §7.1): backend_ast/pscal_ext_api.h
+// (the plugin ABI header) defines a byte-identical mirror of this struct
+// under the same guard, so a translation unit that includes both this file
+// and pscal_ext_api.h (true only for the sqlite-as-plugin proof, which sits
+// on both sides of the ABI boundary) sees exactly one definition regardless
+// of include order, instead of a redefinition error.
+#ifndef PSCAL_VALUE_TYPE_DEFINED
+#define PSCAL_VALUE_TYPE_DEFINED
 typedef struct ValueStruct {
     VarType type;
     uint64_t bits;
 } Value;
+#endif
 
 // VM 2.0 Phase 4i checkpoint 2: dispatches on `dest->type` (already set by
 // every call site below -- every scalar constructor sets `.type` before

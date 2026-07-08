@@ -6,6 +6,7 @@
 #include "symbol/symbol.h"
 #include "backend_ast/builtin.h"
 #include "vm/vm_fx_policy.h"
+#include "ext_builtins/plugin_loader.h"
 #include "common/frontend_kind.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -57,9 +58,11 @@ int pscalvm_main(int argc, char* argv[]) {
     }
 
     int argi = 1;
-    while (argi < argc && pscalFxIsCliFlag(argv[argi])) {
-        const char *fx_value = (argi + 1 < argc) ? argv[argi + 1] : NULL;
-        if (!pscalFxHandleCliFlag(argv[argi], fx_value)) {
+    while (argi < argc && (pscalFxIsCliFlag(argv[argi]) || pscalExtIsCliFlag(argv[argi]))) {
+        const char *value = (argi + 1 < argc) ? argv[argi + 1] : NULL;
+        bool ok = pscalFxIsCliFlag(argv[argi]) ? pscalFxHandleCliFlag(argv[argi], value)
+                                                : pscalExtHandleCliFlag(argv[argi], value);
+        if (!ok) {
             PSCALVM_RETURN(vmExitWithCleanup(EXIT_FAILURE));
         }
         argi += 2;

@@ -1,4 +1,5 @@
 #include "backend_ast/builtin.h"
+#include "ext_builtins/plugin_loader.h"
 #include <pthread.h>
 
 void registerMathBuiltins(void);
@@ -54,6 +55,12 @@ static void registerExtendedBuiltinsOnce(void) {
 #if defined(PSCAL_TARGET_IOS)
   registerShellFrontendBuiltins();
 #endif
+  // VM 2.0 Phase 7 (Docs/pscal_vm2_plan.md §7.1): dlopen'd plugins register
+  // in the same exactly-once phase as the static in-tree categories above,
+  // after initSymbolSystem() has already run (registerExtendedBuiltins() is
+  // called from deep inside registerBuiltinFunction()'s own setup, never
+  // before). No-op if no --ext flag / PSCAL_EXT_DIR was set.
+  pscalExtLoadRegisteredPlugins();
 }
 
 void registerExtendedBuiltins(void) {
