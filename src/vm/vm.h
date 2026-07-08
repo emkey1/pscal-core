@@ -230,6 +230,30 @@ typedef struct {
                                      // shutdown-only case it was first assumed to be.
                                      // Joins active/paused/cancelRequested/killRequested
                                      // as an atomic flag.
+    atomic_bool needsJoin;           // True from a successful pthread_create until
+                                     // whichever teardown path (freeVM/
+                                     // vmResetExecutionState) actually calls
+                                     // pthread_join on this slot's handle. Deliberately
+                                     // NOT touched by the worker's own natural-exit path
+                                     // (threadStart clears inPool/active as its very last
+                                     // steps before returning) -- gating the join decision
+                                     // on inPool/active instead of a dedicated flag is a
+                                     // real, TSan-reproducible race: freeVM sets the
+                                     // *global* shuttingDownWorkers/jobQueue-shutdown
+                                     // flags and broadcasts before it ever loops over
+                                     // per-thread slots, so an idle worker blocked in
+                                     // vmThreadJobQueuePop can wake, notice shutdown, and
+                                     // fully exit (clearing inPool) before freeVM's loop
+                                     // reaches that slot's index -- freeVM then reads
+                                     // inPool/active as already false and skips
+                                     // pthread_join entirely, leaking the already-finished
+                                     // OS thread (confirmed via ThreadSanitizer "thread
+                                     // leak" reports on Tests/vm_thread_stress/*.pas).
+                                     // pthread_join on an already-finished-but-not-yet-
+                                     // joined thread is always valid regardless of timing,
+                                     // so gating on "was a pthread ever created here and
+                                     // not yet reaped" instead of "is it still running
+                                     // right now" closes the race.
     bool idle;                      // True when waiting for a job
     bool shouldExit;                // Signals worker loop shutdown
     bool ownsVm;                    // Tracks whether vm pointer should be destroyed

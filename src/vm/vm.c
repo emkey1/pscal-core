@@ -1969,6 +1969,7 @@ static void vmThreadInitSlot(Thread* thread) {
     thread->vm = NULL;
     thread->ownsVm = false;
     atomic_store(&thread->inPool, false);
+    atomic_store(&thread->needsJoin, false);
     thread->idle = false;
     thread->shouldExit = false;
     thread->awaitingReuse = false;
@@ -2612,16 +2613,53 @@ static int createThreadJob(VM* vm,
         return -1;
     }
 
+    // Prefer an already-idle pooled worker over spawning a brand-new OS
+    // thread: a worker that finished a job loops back to the top of
+    // threadStart and parks in vmThreadJobQueuePop (announcing itself via
+    // availableWorkers++, still inPool==true -- see threadStart's job==NULL
+    // branch) rather than clearing inPool, since inPool marks "this slot is
+    // a live pooled worker", not "this worker is currently busy". The
+    // free-slot scan below only ever finds inPool==false on a slot whose
+    // worker has fully exited (kill/shutdown), which natural job completion
+    // never triggers -- so without this check every spawn here would burn a
+    // fresh pthread even in a sequential spawn/wait/consume/repeat loop that
+    // only ever needs one worker at a time (confirmed via
+    // thread_worker_reuse.exsh: 18 sequential cycles produced 18 unique
+    // thread IDs). When an idle worker exists, fall through to the
+    // job-queue push below instead -- that path already reads
+    // job->assignedThread/assignedThreadId back out once the idle worker's
+    // threadStart loop pops the job and calls vmThreadJobSignalAssignment,
+    // and is exercised (pool-at-ceiling case) and TSan-clean already.
+    //
     // VM 2.0 Phase 5a checkpoint 5a-ii: reuse a free slot within the
     // currently committed range first (identical scan to pre-5a-ii); only
     // grow (vmGrowThreadStorage) when every committed slot is occupied but
     // the ceiling still allows more -- keeps the common case (a hole
     // exists) exactly as cheap as before, growth only on genuine pressure.
     size_t threadsCeiling = pscalVmThreadsCeiling();
-    if ((size_t)vm->workerCount < threadsCeiling - 1) {
+    if (vm->availableWorkers == 0 && (size_t)vm->workerCount < threadsCeiling - 1) {
         for (size_t i = 1; i < vm->threadsCommittedCount; ++i) {
             Thread* candidate = &vm->threads[i];
             if (!atomic_load(&candidate->inPool)) {
+                // This slot's previous occupant (if any) has already run to
+                // completion -- inPool only goes false as the very last step
+                // before threadStart returns (see needsJoin's vm.h comment)
+                // -- but nothing has reaped its OS thread yet if it exited
+                // on its own (e.g. an explicit per-task cancel/kill) rather
+                // than through a full VM teardown. Reap it here, before
+                // pthread_create below overwrites candidate->handle with a
+                // new thread's id: otherwise the old, already-finished
+                // pthread's handle is lost forever (nobody left holding it
+                // to join), a genuine, confirmed leak distinct from the
+                // needsJoin/shutdown-race one (reproduced via
+                // Tests/vm_thread_stress/http_async_task_stress.pas and
+                // task_cancel_race.pas, which explicitly cancel mid-flight
+                // tasks and churn this exact slot-reuse path). This join
+                // returns immediately since the thread has already exited.
+                if (atomic_load(&candidate->needsJoin)) {
+                    pthread_join(candidate->handle, NULL);
+                    atomic_store(&candidate->needsJoin, false);
+                }
                 assignedThread = candidate;
                 assignedId = (int)i;
                 spawnNewWorker = true;
@@ -2705,6 +2743,12 @@ static int createThreadJob(VM* vm,
             vmThreadJobDestroy(job);
             return -1;
         }
+
+        // pthread_create succeeded: this slot now owns a live, joinable OS
+        // thread that only ever gets reaped by a teardown path's
+        // pthread_join call (see needsJoin's declaration comment in vm.h) --
+        // set this before any other thread can observe the handle as valid.
+        atomic_store(&assignedThread->needsJoin, true);
 
         vmThreadJobSignalAssignment(job, assignedThread, assignedId);
         // We already have assignedThread/assignedId locally (we created this
@@ -5844,9 +5888,15 @@ void vmResetExecutionState(VM* vm) {
             atomic_store(&thread->killRequested, true);
             vmThreadWakeStateWaiters(thread);
         }
-        if (atomic_load(&thread->active)) {
+        // Gate on needsJoin, not inPool/active: the global shutdown flags
+        // just set above already let any idle worker wake and fully exit
+        // (clearing inPool/active) before this loop reaches its slot, so
+        // reading those here would race and skip the join, leaking the
+        // already-finished OS thread (see needsJoin's vm.h comment).
+        if (atomic_load(&thread->needsJoin)) {
             pthread_join(thread->handle, NULL);
             atomic_store(&thread->active, false);
+            atomic_store(&thread->needsJoin, false);
         }
         if (thread->ownsVm && thread->vm) {
             freeVM(thread->vm);
@@ -6029,14 +6079,19 @@ void freeVM(VM* vm) {
     }
     for (size_t i = 1; i < vm->threadsCommittedCount; i++) {
         Thread* thread = &vm->threads[i];
-        bool shouldJoin = atomic_load(&thread->inPool) || atomic_load(&thread->active);
         if (atomic_load(&thread->inPool)) {
             atomic_store(&thread->killRequested, true);
             vmThreadWakeStateWaiters(thread);
         }
-        if (shouldJoin) {
+        // Gate on needsJoin, not inPool/active: the global shutdown flags
+        // just set above already let any idle worker wake and fully exit
+        // (clearing inPool/active) before this loop reaches its slot, so
+        // reading those here would race and skip the join, leaking the
+        // already-finished OS thread (see needsJoin's vm.h comment).
+        if (atomic_load(&thread->needsJoin)) {
             pthread_join(thread->handle, NULL);
             atomic_store(&thread->active, false);
+            atomic_store(&thread->needsJoin, false);
         }
         if (thread->ownsVm && thread->vm) {
             freeVM(thread->vm);
