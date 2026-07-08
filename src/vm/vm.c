@@ -8213,6 +8213,29 @@ dispatch_switch:
                     }
                     comparison_succeeded = true;
                 }
+                // Any other concrete value compared against NIL: builtins
+                // like ChannelReceive/TaskAwait return TYPE_NIL to signal a
+                // degenerate/closed/canceled result even when the receiving
+                // variable is declared as an ordinary type (e.g. `integer`),
+                // and callers are documented to check that result against
+                // nil (see vmBuiltinChannelReceive's comment) -- so a
+                // concrete non-nil value of ANY type must compare as simply
+                // "not nil", not as a type error. Only '=' and '<>' make
+                // sense here; ordering against nil is still rejected. (Both
+                // sides NIL is already handled above, so reaching here with
+                // either side NIL means the other side is some standalone
+                // type -- ordinal, real, etc. -- not already covered by the
+                // string/char/memorystream/interface/closure/pointer blocks.)
+                else if (VALUE_TYPE(a_val) == TYPE_NIL || VALUE_TYPE(b_val) == TYPE_NIL) {
+                    if (instruction_val == EQUAL) {
+                        result_val = makeBoolean(false);
+                    } else if (instruction_val == NOT_EQUAL) {
+                        result_val = makeBoolean(true);
+                    } else {
+                        goto comparison_error_label;
+                    }
+                    comparison_succeeded = true;
+                }
 
 comparison_error_label:
                 if (comparison_succeeded) {
