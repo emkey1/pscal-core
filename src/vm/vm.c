@@ -1996,6 +1996,197 @@ static void vmThreadDestroySlot(Thread* thread) {
     }
 }
 
+// VM 2.0 Phase 5a checkpoint 5a-ii (Docs/pscal_vm2_plan.md Sec 6.1):
+// threads[]/mutexes[] growable storage, mmap-reservation + mprotect-extend
+// -- the operand stack's technique (vmAllocStackStorage above), not
+// frames[]'s realloc technique. Confirmed necessary, not assumed: a
+// dedicated audit found lockMutex/unlockMutex hold a raw Mutex* across a
+// released mutexRegistryLock into a potentially unbounded
+// pthread_mutex_lock/unlock call, joinThreadInternal/vmThreadTakeResult
+// hold a raw Thread* across a resultCond wait loop the same way, and
+// VM_s.owningThread (vmThreadPrepareWorkerVm) plus threadStart's own
+// persistent `Thread*` parameter both outlive any single call scope for a
+// pooled worker's entire lifetime -- realloc relocating the array under
+// any of these would dangle a live pointer.
+
+size_t pscalVmThreadsCeiling(void) {
+    static size_t cached = 0;
+    if (cached == 0) {
+        size_t v = (size_t)VM_MAX_THREADS;
+        const char* env = getenv("PSCAL_VM_MAX_THREADS");
+        if (env && *env) {
+            char* end = NULL;
+            unsigned long long parsed = strtoull(env, &end, 10);
+            if (end && *end == '\0' && parsed > 0) v = (size_t)parsed;
+        }
+        cached = v;
+    }
+    return cached;
+}
+
+size_t pscalVmMutexesCeiling(void) {
+    static size_t cached = 0;
+    if (cached == 0) {
+        size_t v = (size_t)VM_MAX_MUTEXES;
+        const char* env = getenv("PSCAL_VM_MAX_MUTEXES");
+        if (env && *env) {
+            char* end = NULL;
+            unsigned long long parsed = strtoull(env, &end, 10);
+            if (end && *end == '\0' && parsed > 0) v = (size_t)parsed;
+        }
+        cached = v;
+    }
+    return cached;
+}
+
+// Reserves the full ceiling up front (PROT_NONE) and commits+vmThreadInitSlot
+// (real pthread_mutex_init/pthread_cond_init calls, not just zero-fill) the
+// initial VM_THREADS_INITIAL_COUNT slots -- matching this codebase's exact
+// pre-5a-ii behavior for a VM that never needs to grow. Returns false on
+// mmap/mprotect failure (fatal in initVM(), same contract as
+// vmAllocStackStorage).
+static bool vmAllocThreadStorage(VM* vm) {
+    size_t ceiling = pscalVmThreadsCeiling();
+    size_t initial = VM_THREADS_INITIAL_COUNT;
+    if (initial > ceiling) initial = ceiling;
+
+    size_t reserve_bytes = vmPageRoundUp(ceiling * sizeof(Thread));
+    void* mapped = mmap(NULL, reserve_bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapped == MAP_FAILED) {
+        return false;
+    }
+
+    size_t commit_bytes = vmPageRoundUp(initial * sizeof(Thread));
+    if (commit_bytes > reserve_bytes) commit_bytes = reserve_bytes;
+    if (commit_bytes > 0 && mprotect(mapped, commit_bytes, PROT_READ | PROT_WRITE) != 0) {
+        munmap(mapped, reserve_bytes);
+        return false;
+    }
+
+    vm->threads = (Thread*)mapped;
+    vm->threadsMappedBytes = reserve_bytes;
+    vm->threadsReservedCount = reserve_bytes / sizeof(Thread);
+    vm->threadsCommittedCount = commit_bytes / sizeof(Thread);
+    for (size_t i = 0; i < vm->threadsCommittedCount; i++) {
+        vmThreadInitSlot(&vm->threads[i]);
+    }
+    return true;
+}
+
+static void vmFreeThreadStorage(VM* vm) {
+    if (vm->threads) {
+        for (size_t i = 0; i < vm->threadsCommittedCount; i++) {
+            vmThreadDestroySlot(&vm->threads[i]);
+        }
+        munmap(vm->threads, vm->threadsMappedBytes);
+    }
+    vm->threads = NULL;
+    vm->threadsMappedBytes = 0;
+    vm->threadsReservedCount = 0;
+    vm->threadsCommittedCount = 0;
+}
+
+// Extends the committed prefix (mprotect only, base never moves) so at
+// least `neededCount` slots are usable, then vmThreadInitSlot's the newly
+// committed range (real pthread objects, not just zero-fill -- committed-
+// but-never-yet-`vmThreadInitSlot`'d memory would have `syncInitialized==
+// false` from the zero page, which every caller already treats as "not
+// constructed yet," but createThreadJob's slot-scan and the growth path
+// below both expect every committed slot to already be construction-ready
+// the moment it becomes visible, matching how the ORIGINAL VM_THREADS_
+// INITIAL_COUNT slots are already all vmThreadInitSlot'd up front).
+// Caller must hold threadRegistryLock (matches vm->workerCount/
+// vm->threadCount's own locking discipline in createThreadJob). Returns
+// false only when neededCount exceeds the hard ceiling or mprotect fails.
+static bool vmGrowThreadStorage(VM* vm, size_t neededCount) {
+    if (neededCount <= vm->threadsCommittedCount) return true;
+    if (neededCount > vm->threadsReservedCount) return false;
+
+    size_t newCommitted = vm->threadsCommittedCount * 2;
+    if (newCommitted < neededCount) newCommitted = neededCount;
+    if (newCommitted > vm->threadsReservedCount) newCommitted = vm->threadsReservedCount;
+
+    size_t oldCommitBytes = vmPageRoundUp(vm->threadsCommittedCount * sizeof(Thread));
+    size_t newCommitBytes = vmPageRoundUp(newCommitted * sizeof(Thread));
+    if (newCommitBytes > oldCommitBytes) {
+        if (mprotect((char*)vm->threads + oldCommitBytes, newCommitBytes - oldCommitBytes,
+                     PROT_READ | PROT_WRITE) != 0) {
+            return false;
+        }
+    }
+    size_t oldCommittedCount = vm->threadsCommittedCount;
+    vm->threadsCommittedCount = newCommitted;
+    for (size_t i = oldCommittedCount; i < newCommitted; i++) {
+        vmThreadInitSlot(&vm->threads[i]);
+    }
+    return true;
+}
+
+// Mutex slots need no per-slot construction on commit (unlike threads):
+// createMutex() itself calls pthread_mutex_init lazily, only for a slot it
+// is about to hand out, and the zero-filled `active` flag on every other
+// committed-but-unused slot already means "not a real mutex" -- matching
+// this codebase's exact pre-5a-ii behavior (initVM only ever set
+// `active = false` for the original VM_MUTEXES_INITIAL_COUNT slots, never
+// pthread_mutex_init'd them eagerly).
+static bool vmAllocMutexStorage(VM* vm) {
+    size_t ceiling = pscalVmMutexesCeiling();
+    size_t initial = VM_MUTEXES_INITIAL_COUNT;
+    if (initial > ceiling) initial = ceiling;
+
+    size_t reserve_bytes = vmPageRoundUp(ceiling * sizeof(Mutex));
+    void* mapped = mmap(NULL, reserve_bytes, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (mapped == MAP_FAILED) {
+        return false;
+    }
+
+    size_t commit_bytes = vmPageRoundUp(initial * sizeof(Mutex));
+    if (commit_bytes > reserve_bytes) commit_bytes = reserve_bytes;
+    if (commit_bytes > 0 && mprotect(mapped, commit_bytes, PROT_READ | PROT_WRITE) != 0) {
+        munmap(mapped, reserve_bytes);
+        return false;
+    }
+
+    vm->mutexes = (Mutex*)mapped;
+    vm->mutexesMappedBytes = reserve_bytes;
+    vm->mutexesReservedCount = reserve_bytes / sizeof(Mutex);
+    vm->mutexesCommittedCount = commit_bytes / sizeof(Mutex);
+    return true;
+}
+
+static void vmFreeMutexStorage(VM* vm) {
+    if (vm->mutexes) {
+        munmap(vm->mutexes, vm->mutexesMappedBytes);
+    }
+    vm->mutexes = NULL;
+    vm->mutexesMappedBytes = 0;
+    vm->mutexesReservedCount = 0;
+    vm->mutexesCommittedCount = 0;
+}
+
+// Caller must hold mutexRegistryLock. Newly committed slots are already
+// correctly zero-filled (active=false) by mprotect'ing fresh anonymous
+// pages -- no per-slot init loop needed, unlike threads above.
+static bool vmGrowMutexStorage(VM* vm, size_t neededCount) {
+    if (neededCount <= vm->mutexesCommittedCount) return true;
+    if (neededCount > vm->mutexesReservedCount) return false;
+
+    size_t newCommitted = vm->mutexesCommittedCount * 2;
+    if (newCommitted < neededCount) newCommitted = neededCount;
+    if (newCommitted > vm->mutexesReservedCount) newCommitted = vm->mutexesReservedCount;
+
+    size_t oldCommitBytes = vmPageRoundUp(vm->mutexesCommittedCount * sizeof(Mutex));
+    size_t newCommitBytes = vmPageRoundUp(newCommitted * sizeof(Mutex));
+    if (newCommitBytes > oldCommitBytes) {
+        if (mprotect((char*)vm->mutexes + oldCommitBytes, newCommitBytes - oldCommitBytes,
+                     PROT_READ | PROT_WRITE) != 0) {
+            return false;
+        }
+    }
+    vm->mutexesCommittedCount = newCommitted;
+    return true;
+}
+
 static void* threadStart(void* arg) {
     ThreadStartArgs* args = (ThreadStartArgs*)arg;
     if (!args) {
@@ -2415,14 +2606,28 @@ static int createThreadJob(VM* vm,
         return -1;
     }
 
-    if (vm->workerCount < VM_MAX_WORKERS) {
-        for (int i = 1; i < VM_MAX_THREADS; ++i) {
+    // VM 2.0 Phase 5a checkpoint 5a-ii: reuse a free slot within the
+    // currently committed range first (identical scan to pre-5a-ii); only
+    // grow (vmGrowThreadStorage) when every committed slot is occupied but
+    // the ceiling still allows more -- keeps the common case (a hole
+    // exists) exactly as cheap as before, growth only on genuine pressure.
+    size_t threadsCeiling = pscalVmThreadsCeiling();
+    if ((size_t)vm->workerCount < threadsCeiling - 1) {
+        for (size_t i = 1; i < vm->threadsCommittedCount; ++i) {
             Thread* candidate = &vm->threads[i];
             if (!atomic_load(&candidate->inPool)) {
                 assignedThread = candidate;
-                assignedId = i;
+                assignedId = (int)i;
                 spawnNewWorker = true;
                 break;
+            }
+        }
+        if (!spawnNewWorker && vm->threadsCommittedCount < threadsCeiling) {
+            size_t newSlotIndex = vm->threadsCommittedCount;
+            if (vmGrowThreadStorage(vm, newSlotIndex + 1)) {
+                assignedThread = &vm->threads[newSlotIndex];
+                assignedId = (int)newSlotIndex;
+                spawnNewWorker = true;
             }
         }
     }
@@ -2560,7 +2765,7 @@ static int createThread(VM* vm, uint32_t entry) {
 // phase started. Does not consume or block -- a later TaskAwait/TaskDone
 // on the same task still sees a consistent state.
 bool vmTaskIsDone(VM* vm, int threadId) {
-    if (!vm || threadId <= 0 || threadId >= VM_MAX_THREADS) {
+    if (!vm || threadId <= 0 || (size_t)threadId >= vm->threadsCommittedCount) {
         return false;
     }
     Thread* thread = &vm->threads[threadId];
@@ -2724,7 +2929,7 @@ static bool vmHandleGlobalInterrupt(VM* vm) {
             pthread_cond_broadcast(&root->jobQueue->cond);
             pthread_mutex_unlock(&root->jobQueue->mutex);
         }
-        for (int i = 1; i < VM_MAX_THREADS; ++i) {
+        for (size_t i = 1; i < root->threadsCommittedCount; ++i) {
             Thread* thread = &root->threads[i];
             if (!atomic_load(&thread->inPool)) {
                 continue;
@@ -2787,7 +2992,7 @@ bool vmThreadTakeResult(VM* vm, int threadId, Value* outResult, bool takeValue, 
     if (!vm) {
         return false;
     }
-    if (threadId <= 0 || threadId >= VM_MAX_THREADS) {
+    if (threadId <= 0 || (size_t)threadId >= vm->threadsCommittedCount) {
         return false;
     }
     Thread* thread = &vm->threads[threadId];
@@ -2873,7 +3078,7 @@ static bool joinThreadInternal(VM* vm, int id) {
     if (!vm) {
         return false;
     }
-    if (id <= 0 || id >= VM_MAX_THREADS) {
+    if (id <= 0 || (size_t)id >= vm->threadsCommittedCount) {
         return false;
     }
 
@@ -2918,7 +3123,7 @@ bool vmJoinThreadById(VM* vm, int id) {
     joinThread(vm, id);
 
     /* Ensure any pending status/result is consumed so the worker can be reused. */
-    if (vm && id > 0 && id < VM_MAX_THREADS) {
+    if (vm && id > 0 && (size_t)id < vm->threadsCommittedCount) {
         vmThreadTakeResult(vm, id, NULL, false, NULL, true);
         Thread *thread = &vm->threads[id];
         if (thread && atomic_load(&thread->inPool) && thread->syncInitialized) {
@@ -2946,7 +3151,7 @@ bool vmJoinThreadById(VM* vm, int id) {
 }
 
 bool vmThreadAssignName(VM* vm, int threadId, const char* name) {
-    if (!vm || threadId <= 0 || threadId >= VM_MAX_THREADS) {
+    if (!vm || threadId <= 0 || (size_t)threadId >= vm->threadsCommittedCount) {
         return false;
     }
     pthread_mutex_lock(&vm->threadRegistryLock);
@@ -2964,20 +3169,20 @@ int vmThreadFindIdByName(VM* vm, const char* name) {
     if (!vm || !name) {
         return -1;
     }
-    for (int i = 1; i < VM_MAX_THREADS; ++i) {
+    for (size_t i = 1; i < vm->threadsCommittedCount; ++i) {
         Thread* thread = &vm->threads[i];
         if (!atomic_load(&thread->inPool)) {
             continue;
         }
         if (strncmp(thread->name, name, THREAD_NAME_MAX) == 0) {
-            return i;
+            return (int)i;
         }
     }
     return -1;
 }
 
 bool vmThreadPause(VM* vm, int threadId) {
-    if (!vm || threadId <= 0 || threadId >= VM_MAX_THREADS) {
+    if (!vm || threadId <= 0 || (size_t)threadId >= vm->threadsCommittedCount) {
         return false;
     }
     Thread* thread = &vm->threads[threadId];
@@ -2990,7 +3195,7 @@ bool vmThreadPause(VM* vm, int threadId) {
 }
 
 bool vmThreadResume(VM* vm, int threadId) {
-    if (!vm || threadId <= 0 || threadId >= VM_MAX_THREADS) {
+    if (!vm || threadId <= 0 || (size_t)threadId >= vm->threadsCommittedCount) {
         return false;
     }
     Thread* thread = &vm->threads[threadId];
@@ -3003,7 +3208,7 @@ bool vmThreadResume(VM* vm, int threadId) {
 }
 
 bool vmThreadCancel(VM* vm, int threadId) {
-    if (!vm || threadId <= 0 || threadId >= VM_MAX_THREADS) {
+    if (!vm || threadId <= 0 || (size_t)threadId >= vm->threadsCommittedCount) {
         return false;
     }
     Thread* thread = &vm->threads[threadId];
@@ -3021,7 +3226,7 @@ bool vmThreadCancel(VM* vm, int threadId) {
 }
 
 bool vmThreadKill(VM* vm, int threadId) {
-    if (!vm || threadId <= 0 || threadId >= VM_MAX_THREADS) {
+    if (!vm || threadId <= 0 || (size_t)threadId >= vm->threadsCommittedCount) {
         return false;
     }
     Thread* thread = &vm->threads[threadId];
@@ -3043,7 +3248,7 @@ size_t vmSnapshotWorkerUsage(VM* vm, ThreadMetrics* outMetrics, size_t capacity)
         return 0;
     }
     size_t count = 0;
-    for (int i = 1; i < VM_MAX_THREADS && count < capacity; ++i) {
+    for (size_t i = 1; i < vm->threadsCommittedCount && count < capacity; ++i) {
         Thread* thread = &vm->threads[i];
         if (!atomic_load(&thread->inPool)) {
             continue;
@@ -3106,16 +3311,16 @@ size_t vmSnapshotProcWorkers(uintptr_t vm_address,
 
     VM* root = vm->threadOwner ? vm->threadOwner : vm;
     size_t count = 0;
-    for (int i = 1; i < VM_MAX_THREADS && count < capacity; ++i) {
+    for (size_t i = 1; i < root->threadsCommittedCount && count < capacity; ++i) {
         Thread* thread = &root->threads[i];
-        bool include = thread->inPool || atomic_load(&thread->active) || thread->vm != NULL;
+        bool include = atomic_load(&thread->inPool) || atomic_load(&thread->active) || thread->vm != NULL;
         if (!include) {
             continue;
         }
 
         VMProcWorkerSnapshot snapshot;
         memset(&snapshot, 0, sizeof(snapshot));
-        snapshot.slot_id = i;
+        snapshot.slot_id = (int)i;
         snapshot.vm_address = (uintptr_t)thread->vm;
 
         bool locked = (pthread_mutex_trylock(&thread->stateMutex) == 0);
@@ -3145,7 +3350,7 @@ size_t vmSnapshotProcWorkers(uintptr_t vm_address,
             strncpy(snapshot.name, thread->name, sizeof(snapshot.name) - 1);
             snapshot.name[sizeof(snapshot.name) - 1] = '\0';
         } else {
-            snprintf(snapshot.name, sizeof(snapshot.name), "worker-%d", i);
+            snprintf(snapshot.name, sizeof(snapshot.name), "worker-%d", (int)i);
         }
         if (locked) {
             pthread_mutex_unlock(&thread->stateMutex);
@@ -3170,9 +3375,15 @@ static int createMutex(VM* vm, bool recursive) {
             break;
         }
     }
-    // If none found, append a new mutex if capacity allows.
+    // If none found, append a new mutex if capacity allows (VM 2.0 Phase 5a
+    // checkpoint 5a-ii: grow the committed range on demand, up to the
+    // ceiling, mirroring createThreadJob's slot-scan-then-grow shape).
     if (id == -1) {
-        if (owner->mutexCount >= VM_MAX_MUTEXES) {
+        if ((size_t)owner->mutexCount >= pscalVmMutexesCeiling()) {
+            pthread_mutex_unlock(&owner->mutexRegistryLock);
+            return -1;
+        }
+        if (!vmGrowMutexStorage(owner, (size_t)owner->mutexCount + 1)) {
             pthread_mutex_unlock(&owner->mutexRegistryLock);
             return -1;
         }
@@ -5554,7 +5765,7 @@ void vmResetExecutionState(VM* vm) {
         pthread_cond_broadcast(&vm->jobQueue->cond);
         pthread_mutex_unlock(&vm->jobQueue->mutex);
     }
-    for (int i = 1; i < VM_MAX_THREADS; ++i) {
+    for (size_t i = 1; i < vm->threadsCommittedCount; ++i) {
         Thread* thread = &vm->threads[i];
         if (atomic_load(&thread->inPool)) {
             atomic_store(&thread->killRequested, true);
@@ -5649,9 +5860,14 @@ void initVM(VM* vm) { // As in all.txt, with frameCount
 
     vm->threadCount = 1; // main thread occupies index 0
     vm->threadOwner = vm;
-    memset(vm->threads, 0, sizeof(vm->threads));
-    for (int i = 0; i < VM_MAX_THREADS; i++) {
-        vmThreadInitSlot(&vm->threads[i]);
+    vm->threads = NULL;
+    vm->threadsMappedBytes = 0;
+    vm->threadsReservedCount = 0;
+    vm->threadsCommittedCount = 0;
+    if (!vmAllocThreadStorage(vm)) {
+        fprintf(stderr, "Fatal VM Error: Could not reserve the thread pool "
+                         "(%zu slots).\n", pscalVmThreadsCeiling());
+        EXIT_FAILURE_HANDLER();
     }
     vm->threads[0].vm = vm;
     pthread_mutex_init(&vm->threadRegistryLock, NULL);
@@ -5663,8 +5879,14 @@ void initVM(VM* vm) { // As in all.txt, with frameCount
     vm->mutexCount = 0;
     pthread_mutex_init(&vm->mutexRegistryLock, NULL);
     vm->mutexOwner = vm;
-    for (int i = 0; i < VM_MAX_MUTEXES; i++) {
-        vm->mutexes[i].active = false;
+    vm->mutexes = NULL;
+    vm->mutexesMappedBytes = 0;
+    vm->mutexesReservedCount = 0;
+    vm->mutexesCommittedCount = 0;
+    if (!vmAllocMutexStorage(vm)) {
+        fprintf(stderr, "Fatal VM Error: Could not reserve the mutex pool "
+                         "(%zu slots).\n", pscalVmMutexesCeiling());
+        EXIT_FAILURE_HANDLER();
     }
 
     vm->owningThread = NULL;
@@ -5732,9 +5954,9 @@ void freeVM(VM* vm) {
         pthread_cond_broadcast(&vm->jobQueue->cond);
         pthread_mutex_unlock(&vm->jobQueue->mutex);
     }
-    for (int i = 1; i < VM_MAX_THREADS; i++) {
+    for (size_t i = 1; i < vm->threadsCommittedCount; i++) {
         Thread* thread = &vm->threads[i];
-        bool shouldJoin = thread->inPool || atomic_load(&thread->active);
+        bool shouldJoin = atomic_load(&thread->inPool) || atomic_load(&thread->active);
         if (atomic_load(&thread->inPool)) {
             atomic_store(&thread->killRequested, true);
             vmThreadWakeStateWaiters(thread);
@@ -5767,9 +5989,9 @@ void freeVM(VM* vm) {
             }
         }
     }
-    for (int i = 0; i < VM_MAX_THREADS; i++) {
-        vmThreadDestroySlot(&vm->threads[i]);
-    }
+    // vmFreeThreadStorage below already vmThreadDestroySlot's every
+    // committed slot before unmapping -- no separate loop needed here
+    // (VM 2.0 Phase 5a checkpoint 5a-ii).
     pthread_mutex_destroy(&vm->mutexRegistryLock);
     vmCleanupGlobalCachesIfIdle();
     // No explicit freeing of vm->host_functions array itself as it's part of
@@ -5786,6 +6008,10 @@ void freeVM(VM* vm) {
         vm->frames = NULL;
     }
     vm->frameCapacity = 0;
+    // VM 2.0 Phase 5a checkpoint 5a-ii: threads[]/mutexes[] are now mmap
+    // reservations too, same lifecycle as the stack above.
+    vmFreeThreadStorage(vm);
+    vmFreeMutexStorage(vm);
 }
 
 // Unwind the current call frame. If there are no more frames, the VM should halt.

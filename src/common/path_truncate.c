@@ -2145,11 +2145,24 @@ static void pathTruncateWriteProcVm(const char *procdir) {
             continue;
         }
 
-        VMProcWorkerSnapshot workers[VM_MAX_THREADS];
+        // VM 2.0 Phase 5a checkpoint 5a-ii: VM_MAX_THREADS is now a growable
+        // ceiling (default 4096, env-overridable), not a small fixed count
+        // -- a `VMProcWorkerSnapshot workers[VM_MAX_THREADS]` stack array
+        // would risk a stack overflow. This debug dump is inherently
+        // best-effort (a representative snapshot, not an exhaustive one),
+        // so it uses its own fixed, generous cap instead of coupling to the
+        // VM's actual (possibly much larger) thread ceiling.
+        enum { kWorkerSnapshotCap = 1024 };
+        VMProcWorkerSnapshot *workers = (VMProcWorkerSnapshot *)malloc(
+            sizeof(VMProcWorkerSnapshot) * kWorkerSnapshotCap);
+        if (!workers) {
+            fclose(workers_file);
+            continue;
+        }
         size_t worker_count = pathTruncateSnapshotProcVmWorkers(
             snapshot->vm_address,
             workers,
-            sizeof(workers) / sizeof(workers[0]));
+            kWorkerSnapshotCap);
         fprintf(workers_file,
                 "slot vm_addr in_pool active idle paused cancel kill owns_vm pool_worker "
                 "awaiting_reuse ready_for_reuse status_ready result_ready generation "
@@ -2185,6 +2198,7 @@ static void pathTruncateWriteProcVm(const char *procdir) {
                     rss_end,
                     worker->name[0] ? worker->name : "-");
         }
+        free(workers);
         fclose(workers_file);
     }
 }

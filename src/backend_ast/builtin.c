@@ -9603,7 +9603,12 @@ static bool parseThreadIdValue(const Value* value, int* outId) {
     }
     if (VALUE_TYPE(*value) == TYPE_THREAD || IS_INTLIKE(*value)) {
         long long raw = asI64(*value);
-        if (raw <= 0 || raw >= VM_MAX_THREADS) {
+        // No VM in scope here to check a real committed count against --
+        // this is just a coarse plausibility filter (reject negative/absurd
+        // values); every actual array-indexing use site downstream checks
+        // against that specific VM's threadsCommittedCount for real memory
+        // safety (VM 2.0 Phase 5a checkpoint 5a-ii).
+        if (raw <= 0 || (size_t)raw >= pscalVmThreadsCeiling()) {
             return false;
         }
         *outId = (int)raw;
@@ -10226,7 +10231,7 @@ Value vmBuiltinThreadGetResult(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "ThreadGetResult argument must be a valid thread id.");
         return makeNil();
     }
-    if (thread_id >= VM_MAX_THREADS) {
+    if ((size_t)thread_id >= pscalVmThreadsCeiling()) {
         runtimeError(vm, "ThreadGetResult received thread id %d out of range.", thread_id);
         return makeNil();
     }
@@ -10245,7 +10250,7 @@ Value vmBuiltinThreadGetResult(VM* vm, int arg_count, Value* args) {
     }
 
     Thread* slot = NULL;
-    if (thread_vm && thread_id > 0 && thread_id < VM_MAX_THREADS) {
+    if (thread_vm && thread_id > 0 && (size_t)thread_id < thread_vm->threadsCommittedCount) {
         slot = &thread_vm->threads[thread_id];
         if (atomic_load(&slot->active) && !slot->awaitingReuse) {
             runtimeError(vm, "Thread %d is still running; join it before retrieving the result.", thread_id);
@@ -10261,7 +10266,7 @@ Value vmBuiltinThreadGetResult(VM* vm, int arg_count, Value* args) {
 
     if (thread_vm && thread_vm != vm) {
         Thread* fallback_slot = NULL;
-        if (thread_id > 0 && thread_id < VM_MAX_THREADS) {
+        if (thread_id > 0 && (size_t)thread_id < vm->threadsCommittedCount) {
             fallback_slot = &vm->threads[thread_id];
             if (atomic_load(&fallback_slot->active) && !fallback_slot->awaitingReuse) {
                 runtimeError(vm,
@@ -10298,7 +10303,7 @@ Value vmBuiltinThreadGetStatus(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "ThreadGetStatus argument must be a valid thread id.");
         return makeBoolean(false);
     }
-    if (thread_id >= VM_MAX_THREADS) {
+    if ((size_t)thread_id >= pscalVmThreadsCeiling()) {
         runtimeError(vm, "ThreadGetStatus received thread id %d out of range.", thread_id);
         return makeBoolean(false);
     }
@@ -10317,7 +10322,7 @@ Value vmBuiltinThreadGetStatus(VM* vm, int arg_count, Value* args) {
     }
 
     Thread* slot = NULL;
-    if (thread_vm && thread_id > 0 && thread_id < VM_MAX_THREADS) {
+    if (thread_vm && thread_id > 0 && (size_t)thread_id < thread_vm->threadsCommittedCount) {
         slot = &thread_vm->threads[thread_id];
         if (atomic_load(&slot->active) && !slot->awaitingReuse) {
             runtimeError(vm, "Thread %d is still running; join it before querying status.", thread_id);
@@ -10353,7 +10358,7 @@ Value vmBuiltinThreadGetStatus(VM* vm, int arg_count, Value* args) {
 
     if (thread_vm && thread_vm != vm) {
         Thread* fallback_slot = NULL;
-        if (thread_id > 0 && thread_id < VM_MAX_THREADS) {
+        if (thread_id > 0 && (size_t)thread_id < vm->threadsCommittedCount) {
             fallback_slot = &vm->threads[thread_id];
             if (atomic_load(&fallback_slot->active) && !fallback_slot->awaitingReuse) {
                 runtimeError(vm, "Thread %d is still running; join it before querying status.", thread_id);
@@ -10451,7 +10456,7 @@ Value vmBuiltinThreadLookup(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "ThreadLookup requires a thread name (string) or id (integer).");
         return makeInt(-1);
     }
-    if (thread_id <= 0 || thread_id >= VM_MAX_THREADS) {
+    if (thread_id <= 0 || (size_t)thread_id >= pscalVmThreadsCeiling()) {
         return makeInt(-1);
     }
     Value result = makeInt(thread_id);
@@ -10634,7 +10639,7 @@ Value vmBuiltinThreadStats(VM* vm, int arg_count, Value* args) {
     VM* thread_vm = vm->threadOwner ? vm->threadOwner : vm;
     pthread_mutex_lock(&thread_vm->threadRegistryLock);
     int active_count = 0;
-    for (int i = 1; i < VM_MAX_THREADS; ++i) {
+    for (size_t i = 1; i < thread_vm->threadsCommittedCount; ++i) {
         Thread *thread = &thread_vm->threads[i];
         const char *name = thread->name;
         bool include = thread->poolWorker || (name && *name && strstr(name, "pool") != NULL);
@@ -10651,14 +10656,14 @@ Value vmBuiltinThreadStats(VM* vm, int arg_count, Value* args) {
     int upper_bounds[1] = {active_count - 1};
     Value result = makeArrayND(1, lower_bounds, upper_bounds, TYPE_RECORD, NULL);
     int index = 0;
-    for (int i = 1; i < VM_MAX_THREADS && index < active_count; ++i) {
+    for (size_t i = 1; i < thread_vm->threadsCommittedCount && index < active_count; ++i) {
         Thread* thread = &thread_vm->threads[i];
         const char *name = thread->name;
         bool include = thread->poolWorker || (name && *name && strstr(name, "pool") != NULL);
         if (!atomic_load(&thread->inPool) || thread->readyForReuse || !include) {
             continue;
         }
-        Value entry = makeThreadStateRecord(i, thread);
+        Value entry = makeThreadStateRecord((int)i, thread);
         freeValue(&AS_ARRAY(result)[index]);
         AS_ARRAY(result)[index] = entry;
         index++;
@@ -10683,7 +10688,7 @@ Value vmBuiltinThreadStatsJson(VM* vm, int arg_count, Value* args) {
     JsonBuffer buffer = {0, 0, 0};
     bool ok = jsonBufferAppendFormat(&buffer, "[");
     int emitted = 0;
-    for (int i = 1; i < VM_MAX_THREADS && ok; ++i) {
+    for (size_t i = 1; i < thread_vm->threadsCommittedCount && ok; ++i) {
         Thread *thread = &thread_vm->threads[i];
         const char *thread_name = thread->name;
         bool include = thread->poolWorker || (thread_name && *thread_name && strstr(thread_name, "pool") != NULL);
@@ -10707,7 +10712,7 @@ Value vmBuiltinThreadStatsJson(VM* vm, int arg_count, Value* args) {
             reported_idle = true;
             status_flag = false;
         }
-        ok = jsonBufferAppendFormat(&buffer, "{\"id\": %d, \"name\": ", i);
+        ok = jsonBufferAppendFormat(&buffer, "{\"id\": %d, \"name\": ", (int)i);
         if (ok) {
             ok = jsonAppendEscapedString(&buffer, name);
         }

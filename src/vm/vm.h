@@ -34,20 +34,37 @@
 
 #define VM_CALL_STACK_MAX 131072            // default ceiling: max active call frames
 #define VM_CALL_FRAME_INITIAL_CAPACITY 256  // initial frames[] capacity
-#define VM_MAX_THREADS 16
-#define VM_MAX_MUTEXES 64
 
-// Effective ceilings (VM_STACK_MAX / VM_CALL_STACK_MAX unless overridden by
-// PSCAL_VM_MAX_STACK_VALUES / PSCAL_VM_MAX_CALL_FRAMES); read once per process.
+// VM 2.0 Phase 5a checkpoint 5a-ii (Docs/pscal_vm2_plan.md Sec 6.1):
+// VM_MAX_THREADS / VM_MAX_MUTEXES are *default ceilings* now, matching
+// VM_STACK_MAX/VM_CALL_STACK_MAX's convention above -- threads[]/mutexes[]
+// each start committed at the INITIAL count (matching this codebase's exact
+// pre-5a-ii behavior, 16/64) and grow toward these ceilings on demand, via
+// mmap-reservation + mprotect-extend (the operand stack's technique, NOT
+// frames[]'s realloc technique -- confirmed necessary, not assumed: several
+// call sites here (lockMutex, joinThreadInternal, vmThreadTakeResult) take a
+// raw Thread*/Mutex* pointer, release the owning registry lock, and then
+// BLOCK on it for an arbitrary duration (pthread_mutex_lock/
+// pthread_cond_timedwait) -- a realloc that relocated the array mid-wait
+// would leave that pointer dangling). Override at runtime via
+// PSCAL_VM_MAX_THREADS / PSCAL_VM_MAX_MUTEXES (read once via
+// pscalVmThreadsCeiling() / pscalVmMutexesCeiling(), below).
+#define VM_MAX_THREADS 4096            // default ceiling: max concurrent thread-pool slots
+#define VM_THREADS_INITIAL_COUNT 16    // initial committed thread-pool slots
+#define VM_MAX_MUTEXES 65536           // default ceiling: max concurrent mutex slots
+#define VM_MUTEXES_INITIAL_COUNT 64    // initial committed mutex slots
+
+// Effective ceilings (VM_STACK_MAX / VM_CALL_STACK_MAX / VM_MAX_THREADS /
+// VM_MAX_MUTEXES unless overridden by PSCAL_VM_MAX_STACK_VALUES /
+// PSCAL_VM_MAX_CALL_FRAMES / PSCAL_VM_MAX_THREADS / PSCAL_VM_MAX_MUTEXES);
+// read once per process.
 size_t pscalVmStackCeilingValues(void);
 size_t pscalVmCallFrameCeiling(void);
+size_t pscalVmThreadsCeiling(void);
+size_t pscalVmMutexesCeiling(void);
 
 #ifndef THREAD_NAME_MAX
 #define THREAD_NAME_MAX 64
-#endif
-
-#ifndef VM_MAX_WORKERS
-#define VM_MAX_WORKERS (VM_MAX_THREADS - 1)
 #endif
 
 // Flags for the VM write/writeln builtin.
@@ -286,8 +303,16 @@ typedef struct VM_s {
     const char* current_builtin_name; // Tracks the name of the builtin currently executing (for diagnostics)
     Value threadMyself;       // Per-VM receiver context for Pascal record methods
 
-    // Threading support
-    Thread threads[VM_MAX_THREADS];
+    // Threading support (VM 2.0 Phase 5a checkpoint 5a-ii: mmap-reserved,
+    // growable storage -- see vmAllocThreadStorage's comment. `threads` is
+    // fixed for the life of the VM once allocated, exactly like `stack`
+    // above: VM_s.owningThread and threadStart's own persistent `Thread*`
+    // (TSan/audit-confirmed long-lived pointers, Docs/pscal_vm2_plan.md
+    // Sec 6.1) depend on this.
+    Thread* threads;
+    size_t threadsReservedCount;
+    size_t threadsCommittedCount;
+    size_t threadsMappedBytes;
     int threadCount;
     struct VM_s* threadOwner;
 
@@ -297,8 +322,14 @@ typedef struct VM_s {
     int availableWorkers;               // Number of idle workers in pool
     atomic_bool shuttingDownWorkers;    // Signals pool shutdown
 
-    // Mutex support
-    Mutex mutexes[VM_MAX_MUTEXES];
+    // Mutex support (VM 2.0 Phase 5a checkpoint 5a-ii: mmap-reserved,
+    // growable storage, same rationale as `threads` above -- lockMutex/
+    // unlockMutex hold a raw Mutex* across a potentially long blocking
+    // pthread_mutex_lock/unlock call, after releasing mutexRegistryLock).
+    Mutex* mutexes;
+    size_t mutexesReservedCount;
+    size_t mutexesCommittedCount;
+    size_t mutexesMappedBytes;
     int mutexCount;
     pthread_mutex_t mutexRegistryLock; // Protects mutex registry updates
     struct VM_s* mutexOwner; // VM that owns the mutex registry
