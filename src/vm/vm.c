@@ -2463,7 +2463,25 @@ static void* threadStart(void* arg) {
                             pscalValueSetHeapPtrBits(workerVm->stackTop, NULL);
                             vmThreadStoreResultDirect(thread, &taskResult, true);
                             freeValue(&taskResult);
+                        } else if (jobResult != INTERPRET_OK) {
+                            // The job aborted (runtimeError already printed its
+                            // diagnostic and set workerVm->abort_requested) --
+                            // report failure explicitly, mirroring
+                            // THREAD_JOB_BUILTIN's `success = !workerVm->
+                            // abort_requested` above. Without this, falling
+                            // through left statusReady unset here, so the
+                            // generic post-switch fallback below stored
+                            // success=true (it only checks the pre-run
+                            // canceled/killed flags, not whether the job
+                            // itself crashed) -- silently turning a crashed
+                            // task into what looked like a normal nil-
+                            // returning success to TaskAwait.
+                            vmThreadStoreResultDirect(thread, NULL, false);
                         }
+                        // else: jobResult == INTERPRET_OK but nothing to pop
+                        // (void procedure, or a function whose result was
+                        // already consumed) -- fall through to the generic
+                        // success=true store below, unchanged.
                     }
                 } else {
                     vmThreadStoreResultDirect(thread, NULL, false);

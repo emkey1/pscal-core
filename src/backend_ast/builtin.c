@@ -10579,9 +10579,22 @@ Value vmBuiltinTaskAwait(VM* vm, int arg_count, Value* args) {
     bool status = false;
     Value result = makeNil();
     if (vmThreadTakeResult(owner, id, &result, true, &status, true)) {
+        if (!status) {
+            // statusFlag is false for every "didn't succeed" outcome --
+            // canceled, killed, or (since the ordinal-vs-nil comparison fix)
+            // a genuine runtime-error abort inside the task. The abort
+            // itself already printed its own diagnostic from the worker
+            // thread at the moment it happened; this just makes sure the
+            // awaiting caller ALSO gets a signal instead of a plain nil
+            // indistinguishable from a legitimately-nil-returning task.
+            runtimeWarning(vm, "Task %d did not complete successfully (canceled, killed, or aborted -- see any earlier error above).", id);
+        }
         return result;
     }
     if (owner != vm && vmThreadTakeResult(vm, id, &result, true, &status, true)) {
+        if (!status) {
+            runtimeWarning(vm, "Task %d did not complete successfully (canceled, killed, or aborted -- see any earlier error above).", id);
+        }
         return result;
     }
 
