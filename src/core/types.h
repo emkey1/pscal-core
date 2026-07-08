@@ -61,6 +61,34 @@ typedef struct MStream {
     int capacity;
 } MStream;
 
+// VM 2.0 Phase 5a checkpoint 5a-i (Docs/pscal_vm2_plan.md Sec 6.1): a real,
+// ObjHeader-refcounted wrapper around a slot in `owner`'s existing
+// `threads[VM_MAX_THREADS]` pool -- unlike ClosureObj/InterfaceObj (plain,
+// singly-owned, copy-on-construct: those types have genuine Pascal-level
+// value semantics), a task has no meaningful value semantics at all -- it
+// is a handle to a singular, unrepeatable in-flight computation, so every
+// Value copy of a task must refer to the SAME underlying pool slot
+// (retain-and-share, matching TYPE_FILE's identity contract, but with real
+// refcounting rather than TYPE_FILE's deliberately-untracked-alias
+// exemption -- Task values flow through ordinary CALL_BUILTIN argument/
+// return paths, not VAR-parameter-only, so an untracked alias would leak or
+// double-release). `owner` is always resolved to whichever VM was actually
+// executing TaskSpawn (the same VM createThreadJob indexes `threads[]` on
+// today -- NOT necessarily the process-root VM: a worker's own per-thread
+// VM has its own independent pool, exactly like a nested THREAD_CREATE
+// call would), so TaskAwait/TaskDone/TaskCancel are unambiguous about which
+// pool a threadId belongs to -- no guessing needed, unlike the historical
+// bare-int-handle callers that fall back between vm->threadOwner and vm
+// itself. Dropping a Task without ever awaiting/canceling it leaks its
+// pool slot exactly as an un-joined THREAD_CREATE handle does today (see
+// checkpoint 5a-i's writeup in the plan) -- pre-existing thread-pool
+// behavior, not a new regression.
+typedef struct TaskObj {
+    ObjHeader header; // header.type is always TYPE_TASK
+    int threadId;      // slot index in owner->threads[]
+    struct VM_s *owner; // VM instance whose threads[] this slot belongs to
+} TaskObj;
+
 // VM 2.0 Phase 4c (Docs/pscal_vm2_plan.md §5.10.4/§5.10.3): field names
 // (set_size, set_values) intentionally match the pre-4c embedded
 // `Value.set_val` struct's field names, so `AS_SET(v).set_size`/
@@ -590,6 +618,9 @@ static inline void pscalValueResetBitsForType(Value *dest, VarType t) {
         // treatment as every other boxed type.
         case TYPE_CLOSURE:
         case TYPE_INTERFACE:
+        // VM 2.0 Phase 5a checkpoint 5a-i: TYPE_TASK joins the heap-pointer
+        // group above -- same nil-pointer-placeholder treatment.
+        case TYPE_TASK:
             dest->bits = pscalTagPointer(NULL); break;
         default:            dest->bits = 0; break;
     }
@@ -795,6 +826,10 @@ static inline long double pscalValueDecodeRealLD(Value v) {
 // were rewritten to call `pscalValueSetHeapPtrBits(&v, X)` directly,
 // which is the actual mechanism that changes `bits` anyway.
 #define AS_MSTREAM(v)    PSCAL_VALUE_PTR(v, MStream)
+// VM 2.0 Phase 5a checkpoint 5a-i: returns the TaskObj* directly, same
+// pointer-not-lvalue shape as AS_MSTREAM (a Task's fields are set once at
+// construction via makeTask(), never reassigned in place afterward).
+#define AS_TASK(v)       PSCAL_VALUE_PTR(v, TaskObj)
 // VM 2.0 Phase 4g: ptr_val is now a PointerObj* (was a plain struct
 // ValueStruct*); AS_POINTER dereferences it so existing `AS_POINTER(v)`
 // reads/writes (an address) keep working unchanged, given the wrapper

@@ -41,7 +41,16 @@ typedef enum {
     TYPE_NIL,
     TYPE_THREAD,
     TYPE_WIDECHAR,
-    TYPE_UNICODE_STRING
+    TYPE_UNICODE_STRING,
+    // VM 2.0 Phase 5a (Docs/pscal_vm2_plan.md Sec 6.1, checkpoint 5a-i):
+    // ObjHeader-boxed handle to a spawned unit of work (TaskObj, core/
+    // types.h), formalizing today's opaque TYPE_THREAD int handle as a
+    // first-class refcounted value. Appended at the end, not grouped near
+    // TYPE_THREAD/TYPE_CLOSURE -- opcode/VarType numbering is append-only
+    // post-PSB3 (Sec 2) and .bc files carry no compatibility promise
+    // (recompile is the story), so there is no correctness reason to
+    // renumber, only a cosmetic one.
+    TYPE_TASK
 } VarType;
 
 /*

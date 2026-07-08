@@ -435,6 +435,7 @@ const char *varTypeToString(VarType type) {
         case TYPE_LONG_DOUBLE:  return "LONG_DOUBLE";
         case TYPE_NIL:          return "NIL";
         case TYPE_THREAD:       return "THREAD";
+        case TYPE_TASK:         return "TASK";
         default:                return "UNKNOWN_VAR_TYPE";
     }
 }
@@ -688,6 +689,44 @@ void retainMStream(MStream* ms) {
 void releaseMStream(MStream* ms) {
     if (!ms) return;
     pscalObjRelease(&ms->header);
+}
+
+// VM 2.0 Phase 5a checkpoint 5a-i (Docs/pscal_vm2_plan.md Sec 6.1): TaskObj
+// owns nothing heap-allocated beyond itself -- the pool slot it names
+// (owner->threads[threadId]) is owned by the VM, not by the task handle
+// (see TaskObj's comment in core/types.h for why dropping an unawaited
+// task intentionally leaks the slot rather than force-joining/canceling
+// from a destructor, which could block or race from an arbitrary call
+// site).
+static void taskObjDestroy(ObjHeader *header) {
+    TaskObj *t = (TaskObj *)header;
+    free(t);
+}
+
+static pthread_once_t g_task_destructor_once = PTHREAD_ONCE_INIT;
+static void registerTaskObjDestructor(void) {
+    pscalObjRegisterDestructor(TYPE_TASK, taskObjDestroy);
+}
+
+TaskObj *createTaskObj(int threadId, struct VM_s *owner) {
+    pthread_once(&g_task_destructor_once, registerTaskObjDestructor);
+    TaskObj *t = malloc(sizeof(TaskObj));
+    if (!t) {
+        fprintf(stderr, "Memory allocation error in createTaskObj\n");
+        EXIT_FAILURE_HANDLER();
+    }
+    pscalObjHeaderInit(&t->header, TYPE_TASK);
+    t->threadId = threadId;
+    t->owner = owner;
+    return t;
+}
+
+Value makeTask(int threadId, struct VM_s *owner) {
+    Value v;
+    memset(&v, 0, sizeof(Value));
+    v.type = TYPE_TASK;
+    pscalValueSetHeapPtrBits(&v, createTaskObj(threadId, owner));
+    return v;
 }
 
 // VM 2.0 Phase 4c (Docs/pscal_vm2_plan.md §5.10.4/§5.10.3): SetObj replaces
@@ -2820,6 +2859,14 @@ void freeValue(Value *v) {
             pscalValueSetHeapPtrBits(v, NULL);
             break;
         }
+        case TYPE_TASK: {
+            TaskObj *t = PSCAL_VALUE_PTR(*v, TaskObj);
+            if (t) {
+                pscalObjRelease(&t->header);
+                pscalValueSetHeapPtrBits(v, NULL);
+            }
+            break;
+        }
         // Add other types if they allocate memory pointed to by Value struct members
         default:
 #ifdef DEBUG
@@ -2920,6 +2967,9 @@ void dumpSymbol(Symbol *sym) {
                 break;
             case TYPE_MEMORYSTREAM:
                 printf("MStream (size: %d)", PSCAL_VALUE_PTR(*sym->value, MStream)->size);
+                break;
+            case TYPE_TASK:
+                printf("Task (threadId: %d)", PSCAL_VALUE_PTR(*sym->value, TaskObj)->threadId);
                 break;
             case TYPE_NIL:
                  // A TYPE_NIL Value struct represents the absence of a pointer.
@@ -3767,6 +3817,11 @@ void printValueToStream(Value v, FILE *stream) {
         case TYPE_THREAD:
             fprintf(stream, "%lld", VAL_INT(v));
             break;
+        case TYPE_TASK: {
+            TaskObj *t = PSCAL_VALUE_PTR(v, TaskObj);
+            fprintf(stream, "TASK(threadId=%d)", t ? t->threadId : -1);
+            break;
+        }
         case TYPE_VOID:
             fprintf(stream, "<VOID_TYPE>");
             break;
@@ -4017,6 +4072,19 @@ Value makeCopyOfValue(const Value *src) {
                 if (co->env) {
                     retainClosureEnv(co->env);
                 }
+            }
+            break;
+        }
+        case TYPE_TASK: {
+            // Unlike TYPE_CLOSURE above, a Task has no per-copy fields worth
+            // duplicating -- its whole identity IS the pool slot it names,
+            // so every copy must retain-and-share the SAME TaskObj (see its
+            // comment in core/types.h), not allocate a fresh wrapper.
+            TaskObj *t = PSCAL_VALUE_PTR(*src, TaskObj);
+            pscalValueSetHeapPtrBits(&v, NULL);
+            if (t) {
+                pscalObjRetain(&t->header);
+                pscalValueSetHeapPtrBits(&v, t);
             }
             break;
         }

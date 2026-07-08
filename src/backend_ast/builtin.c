@@ -1021,6 +1021,7 @@ static bool builtinSizeForVarType(VarType type, long long *out_bytes) {
         case TYPE_INTERFACE:
         case TYPE_CLOSURE:
         case TYPE_THREAD:
+        case TYPE_TASK:
             *out_bytes = (long long)sizeof(void*);
             return true;
         case TYPE_ENUM:
@@ -1963,6 +1964,12 @@ static VmBuiltinMapping vmBuiltinDispatchTable[] = {
     /* pow was briefly inserted next to power (mid-table), which shifted every
      * id after it and broke bytecode compatibility; appended here instead. */
     {"pow", vmBuiltinPower},   /* C-style alias of power(base, exp) */
+    /* VM 2.0 Phase 5a checkpoint 5a-i (Docs/pscal_vm2_plan.md Sec 6.1):
+     * appended here per this table's own append-only convention above. */
+    {"taskspawn", vmBuiltinTaskSpawn},
+    {"taskawait", vmBuiltinTaskAwait},
+    {"taskdone", vmBuiltinTaskDone},
+    {"taskcancel", vmBuiltinTaskCancel},
 };
 
 static const size_t num_vm_builtins = sizeof(vmBuiltinDispatchTable) / sizeof(vmBuiltinDispatchTable[0]);
@@ -2146,6 +2153,8 @@ static const struct { size_t id; const char *name; } kBuiltinIdSentinels[] = {
     {182, "fprintf"},
     {276, "odd"},
     {277, "pow"},
+    {278, "taskspawn"},
+    {281, "taskcancel"},
 };
 
 static void verifyBuiltinIdSentinels(void) {
@@ -2229,6 +2238,11 @@ static const EffectClassification kEffectClassifiedNames[] = {
     {"thread_get_result", FX_PROC}, {"thread_get_status", FX_PROC},
     {"thread_lookup", FX_PROC}, {"thread_stats", FX_PROC},
     {"threadspawnbuiltin", FX_PROC}, {"waitforthread", FX_PROC},
+    /* VM 2.0 Phase 5a checkpoint 5a-i: the new TYPE_TASK builtins -- distinct
+     * from the task_* Aether-alias names above, which are Aether's existing
+     * frontend sugar over ThreadSpawnBuiltin/ThreadPoolSubmit, not this. */
+    {"taskspawn", FX_PROC}, {"taskawait", FX_PROC}, {"taskdone", FX_PROC},
+    {"taskcancel", FX_PROC},
     /* filesystem + file-handle I/O */
     {"fileexists", FX_IO}, {"getcurrentdir", FX_IO}, {"mkdir", FX_IO},
     {"rmdir", FX_IO}, {"rename", FX_IO}, {"erase", FX_IO}, {"findfirst", FX_IO},
@@ -9761,7 +9775,7 @@ static Value makeThreadStateRecord(int threadId, const Thread* thread) {
     }
 
     bool active = thread && atomic_load(&thread->active);
-    const bool in_pool = thread && thread->inPool;
+    const bool in_pool = thread && atomic_load(&thread->inPool);
     bool reported_idle = thread &&
         (thread->idle ||
          thread->readyForReuse ||
@@ -10482,6 +10496,131 @@ Value vmBuiltinThreadCancel(VM* vm, int arg_count, Value* args) {
     return threadControlOperation(vm, arg_count, args, "ThreadCancel", vmThreadCancel);
 }
 
+// VM 2.0 Phase 5a checkpoint 5a-i (Docs/pscal_vm2_plan.md Sec 6.1): TYPE_TASK
+// builtins. Unlike the historical thread-id builtins above, a TaskObj
+// carries its owning VM explicitly (captured at TaskSpawn time as whichever
+// VM was actually executing it -- a worker's own per-thread VM has its own
+// independent pool, exactly like a nested THREAD_CREATE call would), so
+// there is no vm->threadOwner-vs-vm fallback guesswork needed here.
+//
+// Known limitation, not fixed in this checkpoint: a Task whose pool slot
+// has already been fully consumed (TaskAwait'd) and reused for an unrelated
+// later TaskSpawn will, like a stale raw thread-id today, silently observe
+// the NEW job's state rather than erroring -- Thread.poolGeneration exists
+// and could detect this, but doing so correctly needs its own locking
+// audit (poolGeneration is currently written under threadRegistryLock but
+// only ever read unlocked, diagnostic-only); left for a dedicated follow-up
+// rather than expanding this checkpoint's scope. Not a regression --
+// today's raw int-handle world has the identical ambiguity.
+Value vmBuiltinTaskSpawn(VM* vm, int arg_count, Value* args) {
+    if (!vm) {
+        return makeNil();
+    }
+    if (arg_count < 1) {
+        runtimeError(vm, "TaskSpawn requires at least one argument (a procedure or closure).");
+        return makeNil();
+    }
+    int id = vmHostCreateTaskEntry(vm, args[0], arg_count - 1, args + 1);
+    if (id < 0) {
+        return makeNil();
+    }
+    return makeTask(id, vm);
+}
+
+Value vmBuiltinTaskAwait(VM* vm, int arg_count, Value* args) {
+    if (!vm) {
+        return makeNil();
+    }
+    if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_TASK) {
+        runtimeError(vm, "TaskAwait expects a single task argument.");
+        return makeNil();
+    }
+    TaskObj* t = AS_TASK(args[0]);
+    if (!t || !t->owner) {
+        runtimeError(vm, "TaskAwait received an invalid task.");
+        return makeNil();
+    }
+    VM* owner = t->owner;
+    int id = t->threadId;
+
+    // vmThreadTakeResult(..., takeValue=true, takeStatus=true) alone is the
+    // complete "await" operation: its own wait loop already blocks (on
+    // resultCond) until the job's statusReady fires, then extracts the
+    // value/status and -- because both takeValue and takeStatus are true --
+    // triggers the release-worker-to-pool gate itself. Do NOT call
+    // vmJoinThreadById first: that performs its OWN separate consume-and-
+    // release cycle (with a NULL result) and marks the slot readyForReuse
+    // before this call ever runs, so by the time this call's wait loop
+    // checks `!thread->active && !thread->awaitingReuse` the answer can
+    // already be "nothing to wait for" -- confirmed by an actual "Task N
+    // has no stored result" failure on a plain void-procedure task during
+    // this checkpoint's own smoke test.
+    bool status = false;
+    Value result = makeNil();
+    if (vmThreadTakeResult(owner, id, &result, true, &status, true)) {
+        return result;
+    }
+    if (owner != vm && vmThreadTakeResult(vm, id, &result, true, &status, true)) {
+        return result;
+    }
+
+    if ((vm->abort_requested || vm->exit_requested) ||
+        (owner->abort_requested || owner->exit_requested)) {
+        return makeNil();
+    }
+    // A non-fatal warning, not runtimeError: reachable via a legitimate
+    // race (TaskCancel racing the worker thread's own startup, before
+    // Thread.active is even set) that this checkpoint chose not to paper
+    // over with extra synchronization -- see vmBuiltinTaskCancel's comment.
+    // Aborting the whole program for "the task never got a chance to store
+    // anything" would be too harsh for an outcome a caller can reasonably
+    // hit just by canceling promptly after spawn.
+    runtimeWarning(vm, "Task %d has no stored result (already consumed, or canceled before it started).", id);
+    return makeNil();
+}
+
+Value vmBuiltinTaskDone(VM* vm, int arg_count, Value* args) {
+    if (!vm) {
+        return makeBoolean(false);
+    }
+    if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_TASK) {
+        runtimeError(vm, "TaskDone expects a single task argument.");
+        return makeBoolean(false);
+    }
+    TaskObj* t = AS_TASK(args[0]);
+    if (!t || !t->owner) {
+        runtimeError(vm, "TaskDone received an invalid task.");
+        return makeBoolean(false);
+    }
+    return makeBoolean(vmTaskIsDone(t->owner, t->threadId));
+}
+
+// Cooperative, like vmThreadCancel itself: sets an atomic flag the worker's
+// interpreter loop and job-pickup path check at safe points, not preemptive.
+// Calling this immediately after TaskSpawn (before the worker thread has
+// even reached its job-pickup code and set Thread.active) is a real,
+// reachable race, not a hypothetical -- confirmed by this checkpoint's own
+// stress fixtures -- and its outcome is simply "the job never really
+// started," surfaced as TaskAwait returning nil with a warning rather than
+// a stored result (see vmBuiltinTaskAwait's comment). This is considered
+// correct, not a bug to fix: matches vmThreadCancel's existing contract for
+// plain THREAD_CREATE handles today.
+Value vmBuiltinTaskCancel(VM* vm, int arg_count, Value* args) {
+    if (!vm) {
+        return makeBoolean(false);
+    }
+    if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_TASK) {
+        runtimeError(vm, "TaskCancel expects a single task argument.");
+        return makeBoolean(false);
+    }
+    TaskObj* t = AS_TASK(args[0]);
+    if (!t || !t->owner) {
+        runtimeError(vm, "TaskCancel received an invalid task.");
+        return makeBoolean(false);
+    }
+    return makeBoolean(vmThreadCancel(t->owner, t->threadId));
+}
+
 Value vmBuiltinThreadStats(VM* vm, int arg_count, Value* args) {
     (void)args;
     if (!vm) {
@@ -10499,7 +10638,7 @@ Value vmBuiltinThreadStats(VM* vm, int arg_count, Value* args) {
         Thread *thread = &thread_vm->threads[i];
         const char *name = thread->name;
         bool include = thread->poolWorker || (name && *name && strstr(name, "pool") != NULL);
-        if (thread->inPool && include && !thread->readyForReuse) {
+        if (atomic_load(&thread->inPool) && include && !thread->readyForReuse) {
             active_count++;
         }
     }
@@ -10516,7 +10655,7 @@ Value vmBuiltinThreadStats(VM* vm, int arg_count, Value* args) {
         Thread* thread = &thread_vm->threads[i];
         const char *name = thread->name;
         bool include = thread->poolWorker || (name && *name && strstr(name, "pool") != NULL);
-        if (!thread->inPool || thread->readyForReuse || !include) {
+        if (!atomic_load(&thread->inPool) || thread->readyForReuse || !include) {
             continue;
         }
         Value entry = makeThreadStateRecord(i, thread);
@@ -10548,7 +10687,7 @@ Value vmBuiltinThreadStatsJson(VM* vm, int arg_count, Value* args) {
         Thread *thread = &thread_vm->threads[i];
         const char *thread_name = thread->name;
         bool include = thread->poolWorker || (thread_name && *thread_name && strstr(thread_name, "pool") != NULL);
-        if (!thread->inPool || thread->readyForReuse || !include) {
+        if (!atomic_load(&thread->inPool) || thread->readyForReuse || !include) {
             continue;
         }
         if (emitted > 0) {
@@ -11151,6 +11290,11 @@ static void populateBuiltinRegistry(void) {
     registerBuiltinFunctionUnlocked("ThreadCancel", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("ThreadStats", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("ThreadStatsJson", AST_FUNCTION_DECL, NULL);
+    // VM 2.0 Phase 5a checkpoint 5a-i (Docs/pscal_vm2_plan.md Sec 6.1)
+    registerBuiltinFunctionUnlocked("TaskSpawn", AST_FUNCTION_DECL, NULL);
+    registerBuiltinFunctionUnlocked("TaskAwait", AST_FUNCTION_DECL, NULL);
+    registerBuiltinFunctionUnlocked("TaskDone", AST_FUNCTION_DECL, NULL);
+    registerBuiltinFunctionUnlocked("TaskCancel", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("BlockRead", AST_PROCEDURE_DECL, NULL);
     registerBuiltinFunctionUnlocked("BlockWrite", AST_PROCEDURE_DECL, NULL);
     registerBuiltinFunctionUnlocked("FileSize", AST_FUNCTION_DECL, NULL);

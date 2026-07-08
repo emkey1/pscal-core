@@ -397,6 +397,11 @@ Value makeBoolean(int b);
 Value makeFile(FILE *f);
 Value makeRecord(FieldValue *rec);
 Value makeMStream(MStream *ms);
+// VM 2.0 Phase 5a checkpoint 5a-i: `owner` is the VM whose threads[] pool
+// slot `threadId` names -- see TaskObj's comment in core/types.h.
+struct VM_s;
+TaskObj *createTaskObj(int threadId, struct VM_s *owner);
+Value makeTask(int threadId, struct VM_s *owner);
 Value makeVoid(void);
 Value makeValueForType(VarType type, AST *type_def, Symbol* context_symbol);
 // owner_type must be TYPE_CLOSURE or TYPE_INTERFACE -- both share this

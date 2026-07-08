@@ -1962,7 +1962,7 @@ static void vmThreadInitSlot(Thread* thread) {
     atomic_store(&thread->active, false);
     thread->vm = NULL;
     thread->ownsVm = false;
-    thread->inPool = false;
+    atomic_store(&thread->inPool, false);
     thread->idle = false;
     thread->shouldExit = false;
     thread->awaitingReuse = false;
@@ -2236,8 +2236,36 @@ static void* threadStart(void* arg) {
                         workerVm->frameCount--;
                         vmThreadStoreResultDirect(thread, NULL, false);
                     } else {
-                        interpretBytecode(workerVm, workerVm->chunk, workerVm->vmGlobalSymbols,
+                        InterpretResult jobResult = interpretBytecode(workerVm, workerVm->chunk, workerVm->vmGlobalSymbols,
                                           workerVm->vmConstGlobalSymbols, workerVm->procedureTable, job->entry);
+                        // VM 2.0 Phase 5a checkpoint 5a-i (Docs/pscal_vm2_plan.md
+                        // Sec 6.1): THREAD_JOB_BYTECODE previously never stored a
+                        // result at all -- THREAD_JOIN's own doc comment already
+                        // says it "consumes and discards" the result, which was
+                        // literally true because nothing upstream of it ever
+                        // captured one. TaskAwait needs an actual value for
+                        // function tasks, so capture it here: returnFromCall's
+                        // halt path (frameCount reaching 0) leaves a function's
+                        // result pushed on workerVm's own stack, exactly mirroring
+                        // what a synchronous CALL's caller would otherwise pop --
+                        // this manually-installed top-level frame has no such
+                        // caller, so the value just sits there until taken. Only
+                        // pop it for an actual function (has_result, same
+                        // condition returnFromCall itself uses); a bare procedure
+                        // has nothing on the stack to pop.
+                        bool has_result = proc_symbol && proc_symbol->type != TYPE_VOID;
+                        if (jobResult == INTERPRET_OK && has_result &&
+                            workerVm->stackTop > workerVm->stack) {
+                            // pop() is defined later in this file (static,
+                            // no forward declaration) -- inlined here rather
+                            // than reordering; matches pop()'s own body.
+                            workerVm->stackTop--;
+                            Value taskResult = *workerVm->stackTop;
+                            SET_VALUE_TYPE(workerVm->stackTop, TYPE_VOID);
+                            pscalValueSetHeapPtrBits(workerVm->stackTop, NULL);
+                            vmThreadStoreResultDirect(thread, &taskResult, true);
+                            freeValue(&taskResult);
+                        }
                     }
                 } else {
                     vmThreadStoreResultDirect(thread, NULL, false);
@@ -2248,7 +2276,23 @@ static void* threadStart(void* arg) {
                 break;
         }
 
-        if (!thread->statusReady) {
+        // VM 2.0 Phase 5a checkpoint 5a-i: this read of statusReady was
+        // already unlocked before this checkpoint (TSan just never had a
+        // reason to catch it -- nothing awaited a THREAD_JOB_BYTECODE job's
+        // result fast enough to overlap it until TaskAwait's own stress
+        // fixtures did). Only T37 (this worker) ever WRITES statusReady at
+        // this point in its lifecycle, so the decision below is always
+        // internally consistent from T37's own perspective regardless of
+        // locking -- but an awaiter thread can concurrently read the same
+        // field under resultMutex (vmThreadTakeResult), and an unsynchronized
+        // access racing a locked one is still undefined behavior. Read
+        // under the same lock so there's no race, even though the
+        // lock-then-unlock-then-maybe-store below is not a single atomic
+        // step -- that's fine, since only this thread writes here.
+        pthread_mutex_lock(&thread->resultMutex);
+        bool alreadyStored = thread->statusReady;
+        pthread_mutex_unlock(&thread->resultMutex);
+        if (!alreadyStored) {
             vmThreadStoreResultDirect(thread, NULL, !(canceled || killed));
         }
 
@@ -2317,8 +2361,19 @@ static void* threadStart(void* arg) {
     pthread_mutex_lock(&thread->stateMutex);
     vmThreadResetResult(thread);
     pthread_mutex_unlock(&thread->stateMutex);
-    thread->inPool = false;
+    // VM 2.0 Phase 5a checkpoint 5a-i: currentJob=NULL MUST happen before
+    // inPool's seq_cst store flips to false, not after -- a spawner
+    // reusing this slot only synchronizes on inPool (createThreadJob's
+    // slot-scan reads it, also seq_cst), so inPool going false is the
+    // "safe to reuse" publish signal every other plain field write here
+    // must precede in program order for the spawner to be guaranteed to
+    // see it (the standard atomic-flag-as-publish-gate idiom -- getting
+    // the order backwards, as an earlier draft of this function did, is
+    // a real, TSan-confirmed, reachable race: createThreadJob vm.c:2430
+    // could write currentJob=job for the new job concurrently with this
+    // thread still writing currentJob=NULL for the one it just finished).
     thread->currentJob = NULL;
+    atomic_store(&thread->inPool, false);
 
     return NULL;
 }
@@ -2363,7 +2418,7 @@ static int createThreadJob(VM* vm,
     if (vm->workerCount < VM_MAX_WORKERS) {
         for (int i = 1; i < VM_MAX_THREADS; ++i) {
             Thread* candidate = &vm->threads[i];
-            if (!candidate->inPool) {
+            if (!atomic_load(&candidate->inPool)) {
                 assignedThread = candidate;
                 assignedId = i;
                 spawnNewWorker = true;
@@ -2374,7 +2429,7 @@ static int createThreadJob(VM* vm,
 
     if (spawnNewWorker && assignedThread) {
         int originalGeneration = assignedThread->poolGeneration;
-        assignedThread->inPool = true;
+        atomic_store(&assignedThread->inPool, true);
         atomic_store(&assignedThread->active, true);
         assignedThread->idle = false;
         assignedThread->poolGeneration++;
@@ -2393,7 +2448,7 @@ static int createThreadJob(VM* vm,
         if (!args) {
             pthread_mutex_lock(&vm->threadRegistryLock);
             vm->workerCount--;
-            assignedThread->inPool = false;
+            atomic_store(&assignedThread->inPool, false);
             assignedThread->poolGeneration = originalGeneration;
             atomic_store(&assignedThread->active, false);
             assignedThread->idle = false;
@@ -2421,7 +2476,7 @@ static int createThreadJob(VM* vm,
             free(args);
             pthread_mutex_lock(&vm->threadRegistryLock);
             vm->workerCount--;
-            assignedThread->inPool = false;
+            atomic_store(&assignedThread->inPool, false);
             assignedThread->poolGeneration = originalGeneration;
             atomic_store(&assignedThread->active, false);
             assignedThread->idle = false;
@@ -2494,6 +2549,28 @@ static int createThreadWithArgs(VM* vm,
 // Backward-compatible helper: no argument provided, pass NIL
 static int createThread(VM* vm, uint32_t entry) {
     return createThreadWithArgs(vm, entry, NULL, NULL, 0, NULL);
+}
+
+// VM 2.0 Phase 5a checkpoint 5a-i: non-blocking "has this task's job
+// completed" poll for TaskDone -- reads Thread.statusReady under
+// resultMutex (the lock joinThreadInternal/vmThreadTakeResult already treat
+// as authoritative for this field, see vmThreadResetResult's comment) so
+// builtin.c never has to reach into Thread's fields directly, which would
+// reintroduce the exact cross-mutex race class fixed just before this
+// phase started. Does not consume or block -- a later TaskAwait/TaskDone
+// on the same task still sees a consistent state.
+bool vmTaskIsDone(VM* vm, int threadId) {
+    if (!vm || threadId <= 0 || threadId >= VM_MAX_THREADS) {
+        return false;
+    }
+    Thread* thread = &vm->threads[threadId];
+    if (!atomic_load(&thread->inPool) || !thread->syncInitialized) {
+        return false;
+    }
+    pthread_mutex_lock(&thread->resultMutex);
+    bool done = thread->statusReady;
+    pthread_mutex_unlock(&thread->resultMutex);
+    return done;
 }
 
 int vmSpawnCallbackThread(VM* vm, VMThreadCallback callback, void* user_data, VMThreadCleanup cleanup) {
@@ -2649,7 +2726,7 @@ static bool vmHandleGlobalInterrupt(VM* vm) {
         }
         for (int i = 1; i < VM_MAX_THREADS; ++i) {
             Thread* thread = &root->threads[i];
-            if (!thread->inPool) {
+            if (!atomic_load(&thread->inPool)) {
                 continue;
             }
             atomic_store(&thread->cancelRequested, true);
@@ -2801,7 +2878,7 @@ static bool joinThreadInternal(VM* vm, int id) {
     }
 
     Thread* thread = &vm->threads[id];
-    if (!thread->inPool) {
+    if (!atomic_load(&thread->inPool)) {
         return false;
     }
     pthread_mutex_lock(&thread->resultMutex);
@@ -2844,7 +2921,7 @@ bool vmJoinThreadById(VM* vm, int id) {
     if (vm && id > 0 && id < VM_MAX_THREADS) {
         vmThreadTakeResult(vm, id, NULL, false, NULL, true);
         Thread *thread = &vm->threads[id];
-        if (thread && thread->inPool && thread->syncInitialized) {
+        if (thread && atomic_load(&thread->inPool) && thread->syncInitialized) {
             bool mark_ready = false;
             pthread_mutex_lock(&thread->resultMutex);
             if (!thread->statusReady) {
@@ -2874,7 +2951,7 @@ bool vmThreadAssignName(VM* vm, int threadId, const char* name) {
     }
     pthread_mutex_lock(&vm->threadRegistryLock);
     Thread* thread = &vm->threads[threadId];
-    if (!thread->inPool) {
+    if (!atomic_load(&thread->inPool)) {
         pthread_mutex_unlock(&vm->threadRegistryLock);
         return false;
     }
@@ -2889,7 +2966,7 @@ int vmThreadFindIdByName(VM* vm, const char* name) {
     }
     for (int i = 1; i < VM_MAX_THREADS; ++i) {
         Thread* thread = &vm->threads[i];
-        if (!thread->inPool) {
+        if (!atomic_load(&thread->inPool)) {
             continue;
         }
         if (strncmp(thread->name, name, THREAD_NAME_MAX) == 0) {
@@ -2904,7 +2981,7 @@ bool vmThreadPause(VM* vm, int threadId) {
         return false;
     }
     Thread* thread = &vm->threads[threadId];
-    if (!thread->inPool) {
+    if (!atomic_load(&thread->inPool)) {
         return false;
     }
     atomic_store(&thread->paused, true);
@@ -2917,7 +2994,7 @@ bool vmThreadResume(VM* vm, int threadId) {
         return false;
     }
     Thread* thread = &vm->threads[threadId];
-    if (!thread->inPool) {
+    if (!atomic_load(&thread->inPool)) {
         return false;
     }
     atomic_store(&thread->paused, false);
@@ -2930,7 +3007,7 @@ bool vmThreadCancel(VM* vm, int threadId) {
         return false;
     }
     Thread* thread = &vm->threads[threadId];
-    if (!thread->inPool) {
+    if (!atomic_load(&thread->inPool)) {
         return false;
     }
     atomic_store(&thread->cancelRequested, true);
@@ -2948,7 +3025,7 @@ bool vmThreadKill(VM* vm, int threadId) {
         return false;
     }
     Thread* thread = &vm->threads[threadId];
-    if (!thread->inPool) {
+    if (!atomic_load(&thread->inPool)) {
         return false;
     }
     atomic_store(&thread->killRequested, true);
@@ -2968,7 +3045,7 @@ size_t vmSnapshotWorkerUsage(VM* vm, ThreadMetrics* outMetrics, size_t capacity)
     size_t count = 0;
     for (int i = 1; i < VM_MAX_THREADS && count < capacity; ++i) {
         Thread* thread = &vm->threads[i];
-        if (!thread->inPool) {
+        if (!atomic_load(&thread->inPool)) {
             continue;
         }
         if (pthread_mutex_trylock(&thread->stateMutex) != 0) {
@@ -3042,7 +3119,7 @@ size_t vmSnapshotProcWorkers(uintptr_t vm_address,
         snapshot.vm_address = (uintptr_t)thread->vm;
 
         bool locked = (pthread_mutex_trylock(&thread->stateMutex) == 0);
-        snapshot.in_pool = thread->inPool;
+        snapshot.in_pool = atomic_load(&thread->inPool);
         snapshot.active = atomic_load(&thread->active);
         snapshot.idle = thread->idle;
         snapshot.owns_vm = thread->ownsVm;
@@ -3767,6 +3844,21 @@ static Value copyValueForStack(const Value* src) {
         return alias;
     }
 
+    // VM 2.0 Phase 5a checkpoint 5a-i: same shape as TYPE_MEMORYSTREAM above
+    // -- a Task's identity IS the shared pool slot, so DUP/CONSTANT/push's
+    // fast path always retains-and-shares, never clones (there is no
+    // valueEnsureUnique()/clone-on-write path for TYPE_TASK at all, unlike
+    // STRING/SET/RECORD/ENUM/ARRAY below -- a task has no in-place-mutable
+    // contents to protect).
+    if (VALUE_TYPE(*src) == TYPE_TASK) {
+        Value alias = *src;
+        if (AS_TASK(alias)) {
+            pscalObjRetain(&AS_TASK(alias)->header);
+        }
+        pthread_mutex_unlock(&value_cell_mutex);
+        return alias;
+    }
+
     // VM 2.0 Phase 4j (Stage B): STRING/SET/RECORD/ENUM/ARRAY used to fall
     // through to makeCopyOfValue's deep clone unconditionally (a fresh
     // wrapper + a fresh copy of its contents on EVERY read of a variable
@@ -4147,6 +4239,68 @@ static Value vmHostCreateThreadAddr(VM* vm) {
         }
         return makeInt(id < 0 ? -1 : id);
     }
+}
+
+// VM 2.0 Phase 5a checkpoint 5a-i (Docs/pscal_vm2_plan.md Sec 6.1):
+// TaskSpawn's entry-resolution logic -- the exact same closure/procedure-
+// name/raw-offset dispatch vmHostCreateThreadAddr above uses, over
+// createThreadWithArgs (the SAME createThreadJob/ThreadJobQueue path, not a
+// second pool). Unlike vmHostCreateThreadAddr (a CALL_HOST target that pops
+// a variable number of stack args into a fixed [8] local array), this takes
+// `fnVal` and an already-materialized `argv` array directly, matching a
+// VmBuiltinFn's calling convention -- no 8-arg cap, since that cap was an
+// artifact of the stack-popping shape, not of createThreadWithArgs itself.
+// Does not free/consume fnVal or argv -- the caller (a builtin) owns that
+// via its normal argument-cleanup path. Returns the new thread id, or -1
+// with runtimeError already raised.
+int vmHostCreateTaskEntry(VM* vm, Value fnVal, int argc, const Value* argv) {
+    if (!vm) {
+        return -1;
+    }
+    uint32_t entry = 0;
+    bool validEntry = false;
+    ClosureEnvPayload* closureEnv = NULL;
+    Symbol* closureSymbol = NULL;
+    if (VALUE_TYPE(fnVal) == TYPE_CLOSURE) {
+        entry = (uint32_t)AS_CLOSURE(fnVal).entry_offset;
+        closureEnv = AS_CLOSURE(fnVal).env;
+        closureSymbol = AS_CLOSURE(fnVal).symbol;
+        if (closureEnv) {
+            retainClosureEnv(closureEnv);
+        }
+        validEntry = true;
+    } else if (isPascalStringType(VALUE_TYPE(fnVal)) && AS_STRING(fnVal)) {
+        char lookup_name[MAX_SYMBOL_LENGTH + 1];
+        strncpy(lookup_name, AS_STRING(fnVal), MAX_SYMBOL_LENGTH);
+        lookup_name[MAX_SYMBOL_LENGTH] = '\0';
+        toLowerString(lookup_name);
+        Symbol* proc_symbol = findProcedureByName(vm->procedureTable, lookup_name, vm);
+        if (proc_symbol && proc_symbol->is_defined && proc_symbol->bytecode_address >= 0) {
+            entry = (uint32_t)proc_symbol->bytecode_address;
+            closureSymbol = proc_symbol;
+            validEntry = true;
+        }
+    } else if (IS_INTLIKE(fnVal)) {
+        entry = (uint32_t)AS_INTEGER(fnVal);
+        validEntry = true;
+    }
+
+    if (!validEntry) {
+        if (closureEnv) {
+            releaseClosureEnv(closureEnv);
+        }
+        runtimeError(vm, "TaskSpawn requires a procedure pointer or closure.");
+        return -1;
+    }
+
+    int id = createThreadWithArgs(vm, entry, closureEnv, closureSymbol, argc, argv);
+    if (closureEnv) {
+        releaseClosureEnv(closureEnv);
+    }
+    if (id < 0 && !vm->abort_requested) {
+        runtimeError(vm, "Task limit exceeded.");
+    }
+    return id;
 }
 
 static Value vmHostCreateClosure(VM* vm) {
@@ -5402,7 +5556,7 @@ void vmResetExecutionState(VM* vm) {
     }
     for (int i = 1; i < VM_MAX_THREADS; ++i) {
         Thread* thread = &vm->threads[i];
-        if (thread->inPool) {
+        if (atomic_load(&thread->inPool)) {
             atomic_store(&thread->killRequested, true);
             vmThreadWakeStateWaiters(thread);
         }
@@ -5581,7 +5735,7 @@ void freeVM(VM* vm) {
     for (int i = 1; i < VM_MAX_THREADS; i++) {
         Thread* thread = &vm->threads[i];
         bool shouldJoin = thread->inPool || atomic_load(&thread->active);
-        if (thread->inPool) {
+        if (atomic_load(&thread->inPool)) {
             atomic_store(&thread->killRequested, true);
             vmThreadWakeStateWaiters(thread);
         }
@@ -5595,7 +5749,7 @@ void freeVM(VM* vm) {
             thread->vm = NULL;
             thread->ownsVm = false;
         }
-        thread->inPool = false;
+        atomic_store(&thread->inPool, false);
     }
     if (vm->jobQueue) {
         vmThreadJobQueueDestroy(vm->jobQueue);
@@ -5801,6 +5955,7 @@ static bool vmSizeForVarType(VarType type, long long* out_bytes) {
         case TYPE_INTERFACE:
         case TYPE_CLOSURE:
         case TYPE_THREAD:
+        case TYPE_TASK:
             *out_bytes = (long long)sizeof(void*);
             return true;
         case TYPE_ENUM:

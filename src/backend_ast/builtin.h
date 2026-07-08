@@ -163,6 +163,12 @@ Value vmBuiltinThreadCancel(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinThreadStats(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinThreadStatsJson(struct VM_s* vm, int arg_count, Value* args);
 
+/* VM 2.0 Phase 5a checkpoint 5a-i (Docs/pscal_vm2_plan.md Sec 6.1): TYPE_TASK builtins */
+Value vmBuiltinTaskSpawn(struct VM_s* vm, int arg_count, Value* args);
+Value vmBuiltinTaskAwait(struct VM_s* vm, int arg_count, Value* args);
+Value vmBuiltinTaskDone(struct VM_s* vm, int arg_count, Value* args);
+Value vmBuiltinTaskCancel(struct VM_s* vm, int arg_count, Value* args);
+
 /* Shell builtins */
 Value vmBuiltinShellExec(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinShellPipeline(struct VM_s* vm, int arg_count, Value* args);

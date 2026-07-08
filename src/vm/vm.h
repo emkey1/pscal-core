@@ -204,7 +204,15 @@ typedef struct {
     atomic_bool killRequested;      // Hard termination requested
 
     // Pool ownership bookkeeping
-    bool inPool;                    // True when thread participates in worker pool
+    atomic_bool inPool;              // True when thread participates in worker pool --
+                                     // TSan-confirmed reachable race (VM 2.0 Phase 5a
+                                     // checkpoint 5a-i): createThreadJob's slot-scan
+                                     // reads this unlocked while a worker retiring due
+                                     // to job-queue idle timeout writes it unlocked, in
+                                     // ordinary (non-shutdown) operation -- not the
+                                     // shutdown-only case it was first assumed to be.
+                                     // Joins active/paused/cancelRequested/killRequested
+                                     // as an atomic flag.
     bool idle;                      // True when waiting for a job
     bool shouldExit;                // Signals worker loop shutdown
     bool ownsVm;                    // Tracks whether vm pointer should be destroyed
@@ -319,6 +327,12 @@ void vmResetExecutionState(VM* vm); // Reset stack/frames so a VM can be reused
 InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globals, HashTable* const_globals, HashTable* procedures, uint32_t entry);
 void vmNullifyAliases(VM* vm, uintptr_t disposedAddrValue);
 int vmSpawnCallbackThread(VM* vm, VMThreadCallback callback, void* user_data, VMThreadCleanup cleanup);
+// VM 2.0 Phase 5a checkpoint 5a-i (Docs/pscal_vm2_plan.md Sec 6.1): task
+// primitives backing TaskSpawn/TaskDone (builtin.c). TaskAwait/TaskCancel
+// reuse the existing vmJoinThreadById/vmThreadTakeResult/vmThreadCancel
+// above directly -- no new entry point needed for those.
+int vmHostCreateTaskEntry(VM* vm, Value fnVal, int argc, const Value* argv);
+bool vmTaskIsDone(VM* vm, int threadId);
 int vmSpawnBuiltinThread(VM* vm, int builtinId, const char* builtinName, int argCount,
                          const Value* args, bool submitOnly, const char* threadName);
 void vmThreadStoreResult(VM* vm, const Value* result, bool success);
