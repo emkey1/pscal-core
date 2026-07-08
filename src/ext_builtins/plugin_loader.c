@@ -5,6 +5,7 @@
 #include "ext_builtins/plugin_loader.h"
 
 #include "backend_ast/pscal_ext_api.h"
+#include "vm/vm_fx_policy.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -76,24 +77,35 @@ bool pscalExtHandleCliFlag(const char *flag, const char *value) {
     return true;
 }
 
-#if defined(PSCAL_TARGET_IOS)
+#if defined(PSCAL_TARGET_IOS) || defined(PSCAL_EXT_PLUGINS_DISABLED)
 
-// iOS: no dlopen culture, statically linked only (Docs/pscal_vm2_plan.md §9
-// risk register). --ext/PSCAL_EXT_DIR are recognized (so a shared script
-// invoking pscalvm/pascal/etc. with --ext doesn't get "unknown option" on
-// iOS) but produce a clean, immediate, unambiguous rejection rather than a
-// silently-compiled-but-nonfunctional dlopen path.
+// Two independent reasons land here: iOS has no dlopen culture and is
+// statically linked only (Docs/pscal_vm2_plan.md §9 risk register), or the
+// build was explicitly configured with -DPSCAL_ENABLE_EXT_PLUGINS=OFF (a
+// deployment-level hard gate -- unlike --deny ext below, no runtime flag
+// can re-enable a capability that was never compiled in). Either way,
+// --ext/PSCAL_EXT_DIR are still recognized (so a shared script invoking
+// pscalvm/pascal/etc. doesn't get "unknown option") but produce a clean,
+// immediate, unambiguous rejection rather than a silently-compiled-but-
+// nonfunctional dlopen path.
 void pscalExtLoadRegisteredPlugins(void) {
     if (g_ext_plugin_count == 0 && !getenv("PSCAL_EXT_DIR")) {
         return;
     }
+#if defined(PSCAL_TARGET_IOS)
     fprintf(stderr,
             "Error: dlopen plugin loading (--ext/PSCAL_EXT_DIR) is not supported on this "
             "platform (iOS is static-registration-only). Remove --ext / unset PSCAL_EXT_DIR.\n");
+#else
+    fprintf(stderr,
+            "Error: dlopen plugin loading (--ext/PSCAL_EXT_DIR) was disabled at build time "
+            "(PSCAL_ENABLE_EXT_PLUGINS=OFF). Remove --ext / unset PSCAL_EXT_DIR, or rebuild with "
+            "plugin support enabled.\n");
+#endif
     exit(EXIT_FAILURE);
 }
 
-#else /* !PSCAL_TARGET_IOS: real dlopen-backed loading */
+#else /* real dlopen-backed loading: neither iOS nor build-disabled */
 
 #include <dirent.h>
 #include <dlfcn.h>
@@ -322,6 +334,22 @@ static bool pscalExtLoadOnePlugin(const char *path) {
 }
 
 void pscalExtLoadRegisteredPlugins(void) {
+    // Runtime gate (VM 2.0 Phase 7 follow-up): --deny ext / PSCAL_VM_DENY=ext
+    // (or the "all" shorthand) makes plugin loading a denied capability the
+    // same way --deny net/proc already govern individual builtin calls --
+    // checked here, once, before any dlopen is attempted, rather than at
+    // --ext's own CLI-parse time, since --deny may appear later in argv
+    // than --ext and pscalFxEffectiveDeniedMask() only reflects accumulated
+    // state once all CLI parsing (by both flags, in either order) is done.
+    // Checked before pscalExtScanConfiguredDirectory() so a denied
+    // PSCAL_EXT_DIR fails without even reading the directory.
+    bool ext_requested = g_ext_plugin_count > 0 || getenv("PSCAL_EXT_DIR") != NULL;
+    if (ext_requested && (pscalFxEffectiveDeniedMask() & FX_EXT)) {
+        fprintf(stderr,
+                "Error: dlopen plugin loading (--ext/PSCAL_EXT_DIR) denied by --deny/PSCAL_VM_DENY "
+                "policy (ext). Remove --deny ext (or 'all'), or remove --ext / unset PSCAL_EXT_DIR.\n");
+        exit(EXIT_FAILURE);
+    }
     pscalExtScanConfiguredDirectory();
     if (g_ext_plugin_count == 0) {
         return;
@@ -333,4 +361,4 @@ void pscalExtLoadRegisteredPlugins(void) {
     }
 }
 
-#endif /* PSCAL_TARGET_IOS */
+#endif /* PSCAL_TARGET_IOS || PSCAL_EXT_PLUGINS_DISABLED */

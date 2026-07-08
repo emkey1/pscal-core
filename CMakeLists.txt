@@ -45,6 +45,22 @@ if(PSCAL_VM_CODE_PROTECT)
     message(STATUS "pscal-core: VM CODE-section mprotect ENABLED")
 endif()
 
+# VM 2.0 Phase 7 (plan Docs/pscal_vm2_plan.md §7.1): dlopen-based plugin
+# loading (--ext/PSCAL_EXT_DIR). Deployment-level hard gate, independent of
+# the runtime --deny ext / PSCAL_VM_DENY=ext sandbox control -- turning
+# this OFF means the real dlopen path is compiled out of the binary
+# entirely (ext_builtins/plugin_loader.c falls back to the same clean
+# rejection iOS already gets), so no runtime flag or env var can re-enable
+# native plugin loading in a build that doesn't have it. Default ON;
+# desktop/server builds that never want this capability available at all
+# (e.g. an agent-facing deployment where only a compile-time guarantee is
+# trustworthy) should configure with -DPSCAL_ENABLE_EXT_PLUGINS=OFF.
+option(PSCAL_ENABLE_EXT_PLUGINS "Enable dlopen-based plugin loading (--ext/PSCAL_EXT_DIR)" ON)
+if(NOT PSCAL_ENABLE_EXT_PLUGINS)
+    add_compile_definitions(PSCAL_EXT_PLUGINS_DISABLED)
+    message(STATUS "pscal-core: dlopen plugin loading DISABLED at build time")
+endif()
+
 set(SRC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 find_package(Threads REQUIRED)

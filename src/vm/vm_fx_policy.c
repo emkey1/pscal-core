@@ -47,6 +47,7 @@ bool pscalFxParseDenyList(const char *csv, EffectMask *out_mask) {
             else if (strcasecmp(tok, "proc") == 0) *out_mask |= FX_PROC;
             else if (strcasecmp(tok, "clock") == 0) *out_mask |= FX_CLOCK;
             else if (strcasecmp(tok, "random") == 0) *out_mask |= FX_RANDOM;
+            else if (strcasecmp(tok, "ext") == 0) *out_mask |= FX_EXT;
             else if (strcasecmp(tok, "all") == 0) *out_mask |= FX_ALL_KNOWN;
             else return false;
         }
@@ -461,7 +462,7 @@ bool pscalFxHandleCliFlag(const char *flag, const char *value) {
     if (strcmp(flag, "--deny") == 0) {
         EffectMask mask = FX_PURE;
         if (!pscalFxParseDenyList(value, &mask)) {
-            fprintf(stderr, "Error: --deny: unrecognized token in '%s' (expected io,net,proc,clock,random,all).\n", value);
+            fprintf(stderr, "Error: --deny: unrecognized token in '%s' (expected io,net,proc,clock,random,ext,all).\n", value);
             return false;
         }
         pscalFxSetDeniedMask(mask);
