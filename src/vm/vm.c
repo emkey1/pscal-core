@@ -1943,6 +1943,12 @@ static void vmThreadResetResult(Thread* thread) {
     thread->startedAt = (struct timespec){0, 0};
     thread->finishedAt = (struct timespec){0, 0};
     vmThreadMetricsReset(&thread->metrics);
+    // VM 2.0 Phase 5a checkpoint 5a-iii: clear native-task progress counters
+    // on slot reuse so a later, unrelated job (bytecode or a different
+    // native task) reusing this slot never inherits stale progress from
+    // whatever ran here before.
+    atomic_store(&thread->nativeProgressNow, 0);
+    atomic_store(&thread->nativeProgressTotal, 0);
 }
 
 static void vmThreadInitSlot(Thread* thread) {
@@ -2788,6 +2794,61 @@ int vmSpawnCallbackThread(VM* vm, VMThreadCallback callback, void* user_data, VM
     return createThreadJob(vm, THREAD_JOB_CALLBACK, vm->chunk, 0, NULL, NULL, 0, NULL, callback, cleanup, user_data, NULL, -1, NULL, false, NULL);
 }
 
+// VM 2.0 Phase 5a checkpoint 5a-iii (Docs/pscal_vm2_plan.md Sec 6.1): see
+// the vm.h declaration for the full rationale. Unlike vmSpawnCallbackThread,
+// guarantees cleanup runs exactly once regardless of why spawning failed
+// (not just the narrow !vm||!callback case) -- createThreadJob's own
+// internal failure paths (pool exhausted, mmap-growth failed, pthread_create
+// failed) call vmThreadJobDestroy, which frees the job's own bookkeeping but
+// deliberately never touches job->user_data/cleanup (a job can be destroyed
+// before a worker ever picks it up, so "call cleanup" and "destroy the job
+// struct" are different concerns) -- so this wrapper closes that gap for
+// callers who want a simple, uniform contract.
+int vmTaskCreateNative(VM* vm, VMThreadCallback work_fn, void* user_data, VMThreadCleanup cleanup) {
+    int id = vmSpawnCallbackThread(vm, work_fn, user_data, cleanup);
+    if (id < 0) {
+        // vmSpawnCallbackThread already ran cleanup for the !vm||!callback
+        // case; for every other failure inside createThreadJob it did not,
+        // so this call is a no-op there and the only real invocation here
+        // for those cases. Callers must not double-free user_data
+        // themselves after calling this function.
+        if (vm && work_fn && cleanup && user_data) {
+            cleanup(user_data);
+        }
+        return -1;
+    }
+    // Progress counters only -- no cancel hook to set here, see the vm.h
+    // declaration's comment for why (nativeCancelFn was removed after a
+    // confirmed race against this exact slot's first-job-pickup
+    // vmThreadResetResult call on the worker's own thread).
+    VM* owner = vm->threadOwner ? vm->threadOwner : vm;
+    Thread* thread = &owner->threads[id];
+    atomic_store(&thread->nativeProgressNow, 0);
+    atomic_store(&thread->nativeProgressTotal, 0);
+    return id;
+}
+
+void vmTaskReportProgress(VM* threadVm, long long now, long long total) {
+    if (!threadVm || !threadVm->owningThread) {
+        return;
+    }
+    atomic_store(&threadVm->owningThread->nativeProgressNow, now);
+    atomic_store(&threadVm->owningThread->nativeProgressTotal, total);
+}
+
+bool vmTaskGetProgress(VM* owner, int threadId, long long* outNow, long long* outTotal) {
+    if (!owner || threadId <= 0 || (size_t)threadId >= owner->threadsCommittedCount) {
+        return false;
+    }
+    Thread* thread = &owner->threads[threadId];
+    if (!atomic_load(&thread->inPool)) {
+        return false;
+    }
+    if (outNow) *outNow = atomic_load(&thread->nativeProgressNow);
+    if (outTotal) *outTotal = atomic_load(&thread->nativeProgressTotal);
+    return true;
+}
+
 int vmSpawnBuiltinThread(VM* vm, int builtinId, const char* builtinName, int argCount,
                          const Value* args, bool submitOnly, const char* threadName) {
     if (!vm || builtinId < 0) {
@@ -3216,6 +3277,18 @@ bool vmThreadCancel(VM* vm, int threadId) {
         return false;
     }
     atomic_store(&thread->cancelRequested, true);
+    // VM 2.0 Phase 5a checkpoint 5a-iii: native (non-bytecode) work has no
+    // interpreter safe points to cooperatively observe cancelRequested at,
+    // unlike bytecode where the interpreter loop already polls it. There is
+    // deliberately no separate native-cancel-hook mechanism here: an earlier
+    // draft added a per-slot Thread.nativeCancelFn invoked from this
+    // function, but that write raced against this exact worker's own
+    // threadStart job-pickup code resetting the slot on its first loop
+    // iteration (confirmed via a failing cancel-demo run, not just
+    // theorized). Native work_fn implementations must instead poll
+    // Thread.cancelRequested directly at their own natural safe points
+    // (e.g. HTTP async's curl progress callback does) -- that needs no new
+    // plumbing since every native work_fn already has its own Thread*.
     vmThreadWakeStateWaiters(thread);
     pthread_mutex_lock(&thread->stateMutex);
     thread->readyForReuse = true;

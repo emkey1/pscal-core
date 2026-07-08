@@ -248,6 +248,28 @@ typedef struct {
     pthread_mutex_t stateMutex;    // Protects paused/cancel flags and state transitions
     pthread_cond_t stateCond;      // Signals state changes (pause/resume/kill)
     bool stateSyncInitialized;     // True once state mutex/cond initialised
+
+    // VM 2.0 Phase 5a checkpoint 5a-iii (Docs/pscal_vm2_plan.md Sec 6.1):
+    // native-task progress counters, generic enough for any future
+    // vmTaskCreateNative caller (HTTP async today; SQLite busy queries, DNS
+    // lookups later), not HTTP-specific. Cancellation deliberately has NO
+    // separate native-task hook here: an earlier draft added `nativeCancelFn`
+    // (a per-slot function pointer set by vmTaskCreateNative right after
+    // spawning, for vmThreadCancel to invoke), but that write raced against
+    // this exact worker's OWN threadStart job-pickup code calling
+    // vmThreadResetResult on its first loop iteration -- confirmed by an
+    // actual failing cancel-demo run, not assumed -- since both can run
+    // concurrently on different threads with no ordering between them.
+    // Native work has no interpreter safe points to cooperatively check
+    // cancelRequested at (unlike bytecode, which the interpreter loop
+    // already polls), but it CAN poll cancelRequested directly itself, at
+    // its own natural safe points (e.g. HTTP async's curl progress
+    // callback does) -- which needs no new plumbing at all, just a plain
+    // atomic_load of the flag every native work_fn already has access to
+    // via its own Thread*.
+    atomic_llong nativeProgressNow;   // vmTaskReportProgress / vmTaskGetProgress
+    atomic_llong nativeProgressTotal; // (0 total means "unknown", matching
+                                       // HTTP's existing dl_total convention)
 } Thread;
 
 typedef void (*VMThreadCallback)(struct VM_s* threadVm, void* user_data);
@@ -364,6 +386,31 @@ int vmSpawnCallbackThread(VM* vm, VMThreadCallback callback, void* user_data, VM
 // above directly -- no new entry point needed for those.
 int vmHostCreateTaskEntry(VM* vm, Value fnVal, int argc, const Value* argv);
 bool vmTaskIsDone(VM* vm, int threadId);
+// VM 2.0 Phase 5a checkpoint 5a-iii: the "any future builtin needing
+// awaitable async work" entry point the plan calls for (HTTP async is the
+// first caller, retiring its own bespoke 32-slot pool; SQLite busy queries
+// or DNS lookups are natural future callers). A thin wrapper over
+// vmSpawnCallbackThread (same underlying growable pool, same job-queue
+// machinery). The interpreter's own cooperative-cancel safe points don't
+// exist inside native C code, so work_fn is responsible for polling
+// Thread.cancelRequested itself (via threadVm->owningThread) at its own
+// natural safe points (e.g. a curl progress callback) -- deliberately NOT
+// a separate cancel_fn hook set post-spawn: an earlier draft tried that and
+// found it races against this exact worker's own first-job-pickup
+// vmThreadResetResult call on a different thread (confirmed by an actual
+// failing cancel test, not assumed). Returns the new thread id (wrap in
+// makeTask(id, vm) to hand a Value back to script code), or -1 with
+// *cleanup* already invoked on failure -- unlike vmSpawnCallbackThread,
+// whose failure contract leaves that to the caller only for the narrow
+// (!vm || !callback) case; callers of THIS function may assume cleanup
+// always runs exactly once, success or failure.
+int vmTaskCreateNative(VM* vm, VMThreadCallback work_fn, void* user_data, VMThreadCleanup cleanup);
+// Called by a native work_fn (e.g. HTTP async's curl progress callback) to
+// publish progress; called by anything holding a task Value (e.g.
+// HttpGetAsyncProgress/Total) to read it back. total==0 conventionally
+// means "unknown," matching HTTP's pre-existing dl_total contract.
+void vmTaskReportProgress(VM* threadVm, long long now, long long total);
+bool vmTaskGetProgress(VM* owner, int threadId, long long* outNow, long long* outTotal);
 int vmSpawnBuiltinThread(VM* vm, int builtinId, const char* builtinName, int argCount,
                          const Value* args, bool submitOnly, const char* threadName);
 void vmThreadStoreResult(VM* vm, const Value* result, bool success);

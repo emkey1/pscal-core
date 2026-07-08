@@ -2675,16 +2675,28 @@ typedef struct HttpAsyncJob_s {
     char* last_headers;
     int   last_error_code;
     char* last_error_msg;
-    // Cancellation + progress
-    volatile int cancel_requested;
+    // Progress (cancellation is read directly off the owning Thread's
+    // cancelRequested atomic via httpJobCancelRequested() below -- see that
+    // helper's comment for why there's no job-local cancel flag).
     long long dl_now;
     long long dl_total;
-    int done;
+    int done; // no longer read by anything (superseded by the owning
+              // Thread's statusReady, set when vmThreadStoreResult runs in
+              // httpAsyncFinish) -- kept only because a couple of internal
+              // early-exit sites still set it defensively; harmless.
+    VM* threadVm; // set once at the top of httpAsyncWork so curl's
+                  // progress callbacks (which only receive this job as
+                  // clientp, not threadVm) can still call
+                  // vmTaskReportProgress.
 } HttpAsyncJob;
 
-#define MAX_HTTP_ASYNC 32
-static HttpAsyncJob g_http_async[MAX_HTTP_ASYNC];
-static pthread_mutex_t g_http_async_mutex = PTHREAD_MUTEX_INITIALIZER;
+/* VM 2.0 Phase 5a checkpoint 5a-iii (Docs/pscal_vm2_plan.md Sec 6.1): the
+ * old 32-slot g_http_async[]/g_http_async_mutex pool is retired outright --
+ * no deprecation wrapper, matching this codebase's established retirement
+ * convention (see e.g. Phase 2b's retired GET_GLOBAL family). Each async
+ * request now heap-allocates its own HttpAsyncJob and rides the VM's
+ * growable thread pool (vmTaskCreateNative, VM 2.0 Phase 5a checkpoint
+ * 5a-ii) instead of a fixed-size array + raw pthread_create. */
 
 /* Now that HttpAsyncJob is defined, provide helpers that reference it */
 static size_t headerAccumJob(char *buffer, size_t size, size_t nitems, void *userdata) {
@@ -2699,6 +2711,23 @@ static size_t headerAccumJob(char *buffer, size_t size, size_t nitems, void *use
     return real_size;
 }
 
+// VM 2.0 Phase 5a checkpoint 5a-iii: native work has no interpreter safe
+// points to cooperatively observe Thread.cancelRequested at (unlike
+// bytecode, which the interpreter loop already polls), but it can poll the
+// flag directly itself at its own natural safe points -- which is exactly
+// what this helper does. An earlier draft instead threaded a job-local
+// cancel_requested flag set by a vmTaskCreateNative cancel_fn callback
+// (httpAsyncJobCancel), but that write raced against this exact worker's
+// own threadStart job-pickup code resetting the slot on its first loop
+// iteration -- confirmed via a failing cancel-demo run (status came back
+// 200 instead of aborting), not just theorized. Reading Thread.cancelRequested
+// directly needs no new plumbing since every native work_fn already has its
+// own Thread* via VM.owningThread.
+static int httpJobCancelRequested(HttpAsyncJob* j) {
+    if (!j || !j->threadVm || !j->threadVm->owningThread) return 0;
+    return atomic_load(&j->threadVm->owningThread->cancelRequested) ? 1 : 0;
+}
+
 #if LIBCURL_VERSION_NUM >= 0x072000
 static int xferInfoCallback(void* clientp, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) {
     (void)ultotal; (void)ulnow;
@@ -2706,7 +2735,8 @@ static int xferInfoCallback(void* clientp, curl_off_t dltotal, curl_off_t dlnow,
     if (!j) return 0;
     j->dl_total = (long long)dltotal;
     j->dl_now = (long long)dlnow;
-    if (j->cancel_requested) return 1; // abort transfer
+    vmTaskReportProgress(j->threadVm, j->dl_now, j->dl_total);
+    if (httpJobCancelRequested(j)) return 1; // abort transfer
     return 0;
 }
 #else
@@ -2716,48 +2746,184 @@ static int progressCallback(void* clientp, double dltotal, double dlnow, double 
     if (!j) return 0;
     j->dl_total = (long long)dltotal;
     j->dl_now = (long long)dlnow;
-    if (j->cancel_requested) return 1; // abort transfer
+    vmTaskReportProgress(j->threadVm, j->dl_now, j->dl_total);
+    if (httpJobCancelRequested(j)) return 1; // abort transfer
     return 0;
 }
 #endif
 
-static int httpAllocAsync(void) {
-    pthread_mutex_lock(&g_http_async_mutex);
-    for (int i = 0; i < MAX_HTTP_ASYNC; i++) {
-        if (!g_http_async[i].active) {
-            memset(&g_http_async[i], 0, sizeof(HttpAsyncJob));
-            g_http_async[i].active = 1;
-            /* Keep mutex locked for caller to initialize job safely */
-            return i;
-        }
+// Appends one named field to a FieldValue list under construction -- same
+// shape as builtin.c's appendThreadField (static there, not visible here),
+// duplicated locally rather than exported since this is the only file that
+// needs it for now. On failure, frees `value` itself (caller must not); the
+// list built so far (*head) is still the caller's to free.
+static bool httpAppendRecordField(FieldValue** head, FieldValue** tail, const char* name, Value value) {
+    if (!head || !tail || !name) {
+        freeValue(&value);
+        return false;
     }
-    pthread_mutex_unlock(&g_http_async_mutex);
-    return -1;
+    FieldValue* field = (FieldValue*)calloc(1, sizeof(FieldValue));
+    if (!field) {
+        freeValue(&value);
+        return false;
+    }
+    field->name = strdup(name);
+    if (!field->name) {
+        free(field);
+        freeValue(&value);
+        return false;
+    }
+    field->value = value;
+    field->storage = &field->value;
+    field->type_def = NULL;
+    field->declared_type = VALUE_TYPE(value);
+    field->slot_index = (*tail) ? ((*tail)->slot_index + 1) : 0;
+    field->owns_storage = true;
+    field->next = NULL;
+    if (!*head) { *head = field; } else { (*tail)->next = field; }
+    *tail = field;
+    return true;
 }
 
-static void* httpAsyncThread(void* arg) {
-    int id = (int)(intptr_t)arg;
-    HttpAsyncJob* job = &g_http_async[id];
+// Reads a named field out of a TYPE_RECORD Value built by
+// httpAppendRecordField above. Returns NULL if not found -- caller must not
+// free anything through the returned pointer (it points at storage owned
+// by `record`).
+static Value* httpFindRecordField(Value record, const char* name) {
+    if (VALUE_TYPE(record) != TYPE_RECORD) {
+        return NULL;
+    }
+    for (FieldValue* fv = AS_RECORD(record); fv; fv = fv->next) {
+        if (fv->name && strcmp(fv->name, name) == 0) {
+            return &fv->value;
+        }
+    }
+    return NULL;
+}
+
+// Shared tail for every exit path in httpAsyncWork (below): propagates
+// status/headers/error onto the owning HttpSession (mirrors what
+// vmBuiltinHttpAwait/vmBuiltinHttpTryAwait used to do at consumption time
+// in the pre-5a-iii design -- moved here, to job-completion time, so it
+// happens exactly once regardless of how many times the resulting task is
+// polled/awaited; matches this file's pre-existing no-dedicated-
+// session-lock discipline, which this migration does not change -- see the
+// plan doc's checkpoint 5a-iii writeup for why), then stores the result as
+// a small {status, body} record via the generic Task result-handoff
+// (vmThreadStoreResult). A bare MStream isn't enough here (unlike a plain
+// TaskSpawn'd function's single return value): HttpAwait's callers need
+// BOTH the numeric HTTP status and the body back, and reaching into `job`
+// itself from the awaiting thread to read job->session (the way the
+// pre-5a-iii design read g_http_async[id].session under a shared array
+// lock) is NOT safe here -- job is heap-allocated per request and freed by
+// httpAsyncJobFree shortly after this function returns, on this same
+// worker thread, with no synchronization forcing that free to wait for a
+// concurrent reader on another thread. Packing both pieces into the one
+// Value the result-handoff already carries sidesteps the problem entirely.
+static void httpAsyncFinish(VM* threadVm, HttpAsyncJob* job) {
+    bool success = job->status >= 0;
+    HttpSession* s = httpGet(job->session);
+    if (s) {
+        s->last_status = job->status;
+        if (s->last_headers) { free(s->last_headers); s->last_headers = NULL; }
+        if (job->last_headers) s->last_headers = strdup(job->last_headers);
+        s->last_error_code = job->last_error_code;
+        if (s->last_error_msg) { free(s->last_error_msg); s->last_error_msg = NULL; }
+        if (job->last_error_msg) s->last_error_msg = strdup(job->last_error_msg);
+    }
+    Value bodyValue = job->result ? makeMStream(job->result) : makeNil();
+    job->result = NULL; // ownership transferred into bodyValue
+
+    FieldValue* head = NULL;
+    FieldValue* tail = NULL;
+    bool ok = httpAppendRecordField(&head, &tail, "status", makeInt(job->status));
+    ok = ok && httpAppendRecordField(&head, &tail, "body", bodyValue);
+    Value resultValue = ok ? makeRecord(head) : makeNil();
+    if (!ok) {
+        freeFieldValue(head);
+    }
+    vmThreadStoreResult(threadVm, &resultValue, success);
+    freeValue(&resultValue); // vmThreadStoreResult deep-copies (core/utils.c's
+                              // makeCopyOfValue, TYPE_RECORD case), so this
+                              // releases exactly the reference built above,
+                              // not a shared one.
+    job->done = 1;
+}
+
+// Frees every heap field HttpRequestAsync[ToFile] may have populated, plus
+// the job struct itself. Used both as the vmTaskCreateNative cleanup
+// callback (normal path, called exactly once whether or not work ever ran
+// -- see vmTaskCreateNative's contract) and directly by the two spawn
+// builtins on their own pre-spawn failure paths (argument validation,
+// vmTaskCreateNative itself returning -1 for a reason other than the
+// cleanup-guaranteed cases). Deliberately frees every field either
+// vmBuiltinHttpAwait or vmBuiltinHttpTryAwait used to free in the old
+// design -- the two had drifted out of sync there (HttpTryAwait was
+// missing proxy_userpwd/ciphers/pinned_pubkey/resolve_slist, a real
+// pre-existing leak), unified here into one path both new code paths share.
+static void httpAsyncJobFree(void* user_data) {
+    HttpAsyncJob* job = (HttpAsyncJob*)user_data;
+    if (!job) {
+        return;
+    }
+    if (job->result) {
+        if (job->result->buffer) free(job->result->buffer);
+        free(job->result);
+    }
+    free(job->method);
+    free(job->url);
+    free(job->body);
+    free(job->error);
+    free(job->user_agent);
+    free(job->basic_auth);
+    free(job->accept_encoding);
+    free(job->cookie_file);
+    free(job->cookie_jar);
+    free(job->upload_file);
+    free(job->ca_path);
+    free(job->client_cert);
+    free(job->client_key);
+    free(job->proxy);
+    free(job->proxy_userpwd);
+    free(job->ciphers);
+    free(job->pinned_pubkey);
+    free(job->out_file);
+    if (job->headers_slist) curl_slist_free_all(job->headers_slist);
+    if (job->resolve_slist) curl_slist_free_all(job->resolve_slist);
+    free(job->last_headers);
+    free(job->last_error_msg);
+    free(job);
+}
+
+static void httpAsyncWork(VM* threadVm, void* user_data) {
+    HttpAsyncJob* job = (HttpAsyncJob*)user_data;
+    if (!job || !threadVm) {
+        return;
+    }
+    job->threadVm = threadVm; // so xferInfoCallback/progressCallback (which
+                               // only receive `job` as clientp) can call
+                               // vmTaskReportProgress
     HttpSession* s = httpGet(job->session);
     if (!s) {
         job->status = -1;
         job->error = strdup("invalid session");
-        job->done = 1;
-        return NULL;
+        httpAsyncFinish(threadVm, job);
+        return;
     }
     // Set up output mstream
     job->result = createMStream();
     if (!job->result) {
         job->status = -1;
         job->error = strdup("malloc failed");
-        job->done = 1;
-        return NULL;
+        httpAsyncFinish(threadVm, job);
+        return;
     }
     job->result->buffer = (unsigned char*)malloc(16);
     if (!job->result->buffer) {
         releaseMStream(job->result);
         job->result = NULL;
-        job->status = -1; job->error = strdup("malloc failed"); job->done = 1; return NULL;
+        job->status = -1; job->error = strdup("malloc failed"); httpAsyncFinish(threadVm, job);
+        return;
     }
     job->result->buffer[0] = '\0'; job->result->size = 0; job->result->capacity = 16;
     // file:// fast-path
@@ -2767,33 +2933,39 @@ static void* httpAsyncThread(void* arg) {
         if (!in) {
             job->status = -1;
             job->error = strdup("cannot open local file");
-            job->done = 1;
-            return NULL;
+            httpAsyncFinish(threadVm, job);
+        return;
         }
         size_t total = 0; unsigned char buf[8192]; size_t n;
         while (1) {
-            if (job->cancel_requested) {
+            if (httpJobCancelRequested(job)) {
                 fclose(in);
                 if (job->out_file && job->out_file[0]) remove(job->out_file);
                 job->status = -1;
                 if (job->last_error_msg) { free(job->last_error_msg); job->last_error_msg = NULL; }
                 job->last_error_msg = strdup("canceled");
-                job->done = 1;
-                return NULL;
+                httpAsyncFinish(threadVm, job);
+        return;
             }
             n = fread(buf, 1, sizeof(buf), in);
             if (n == 0) break;
             writeCallback(buf, 1, n, job->result);
             total += n;
             job->dl_now = (long long)total;
-            if (job->cancel_requested) {
+            // VM 2.0 Phase 5a checkpoint 5a-iii: the file:// fast-path
+            // updates progress directly rather than through curl's
+            // xferInfoCallback/progressCallback (which only run for the
+            // real network path below) -- must publish here too, or
+            // HttpGetAsyncProgress always reads 0 for file:// transfers.
+            vmTaskReportProgress(threadVm, job->dl_now, job->dl_total);
+            if (httpJobCancelRequested(job)) {
                 fclose(in);
                 if (job->out_file && job->out_file[0]) remove(job->out_file);
                 job->status = -1;
                 if (job->last_error_msg) { free(job->last_error_msg); job->last_error_msg = NULL; }
                 job->last_error_msg = strdup("canceled");
-                job->done = 1;
-                return NULL;
+                httpAsyncFinish(threadVm, job);
+        return;
             }
             if (job->max_recv_speed > 0) {
                 unsigned long long delay_ms = 0;
@@ -2805,26 +2977,26 @@ static void* httpAsyncThread(void* arg) {
                     if (slice > 50ULL) slice = 50ULL;
                     sleep_ms((long)slice);
                     delay_ms -= slice;
-                    if (job->cancel_requested) {
+                    if (httpJobCancelRequested(job)) {
                         fclose(in);
                         if (job->out_file && job->out_file[0]) remove(job->out_file);
                         job->status = -1;
                         if (job->last_error_msg) { free(job->last_error_msg); job->last_error_msg = NULL; }
                         job->last_error_msg = strdup("canceled");
-                        job->done = 1;
-                        return NULL;
+                        httpAsyncFinish(threadVm, job);
+        return;
                     }
                 }
             }
         }
         fclose(in);
-        if (job->cancel_requested) {
+        if (httpJobCancelRequested(job)) {
             if (job->out_file && job->out_file[0]) remove(job->out_file);
             job->status = -1;
             if (job->last_error_msg) { free(job->last_error_msg); job->last_error_msg = NULL; }
             job->last_error_msg = strdup("canceled");
-            job->done = 1;
-            return NULL;
+            httpAsyncFinish(threadVm, job);
+        return;
         }
         if (job->out_file && job->out_file[0] && job->result && job->result->buffer) {
             FILE* of = fopen(job->out_file, "wb");
@@ -2843,8 +3015,8 @@ static void* httpAsyncThread(void* arg) {
         int hdrlen = snprintf(hdr, sizeof(hdr), "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nContent-Type: %s\r\n\r\n", total, content_type);
         if (hdrlen > 0) { job->last_headers = strndup(hdr, (size_t)hdrlen); }
         job->status = 200;
-        job->done = 1;
-        return NULL;
+        httpAsyncFinish(threadVm, job);
+        return;
     } else if (job->url && strncasecmp(job->url, "data:", 5) == 0) {
         DataUrlPayload payload = {0};
         char* err_msg = NULL;
@@ -2856,8 +3028,8 @@ static void* httpAsyncThread(void* arg) {
             job->last_error_msg = strdup(msg);
             if (err_msg) free(err_msg);
             dataUrlPayloadFree(&payload);
-            job->done = 1;
-            return NULL;
+            httpAsyncFinish(threadVm, job);
+        return;
         }
 
         size_t required = payload.length + 1;
@@ -2872,8 +3044,8 @@ static void* httpAsyncThread(void* arg) {
                 job->last_error_msg = strdup(msg);
                 dataUrlPayloadFree(&payload);
                 if (err_msg) free(err_msg);
-                job->done = 1;
-                return NULL;
+                httpAsyncFinish(threadVm, job);
+        return;
             }
             job->result->buffer = newbuf;
             job->result->capacity = (int)required;
@@ -2908,15 +3080,17 @@ static void* httpAsyncThread(void* arg) {
         job->last_error_code = 0;
         job->dl_now = (long long)payload.length;
         job->dl_total = (long long)payload.length;
+        vmTaskReportProgress(threadVm, job->dl_now, job->dl_total);
         dataUrlPayloadFree(&payload);
         if (err_msg) free(err_msg);
-        job->done = 1;
-        return NULL;
+        httpAsyncFinish(threadVm, job);
+        return;
     }
 
     // Configure CURL with per-job easy handle
     CURL* eh = curl_easy_init();
-    if (!eh) { job->status = -1; job->error = strdup("curl init failed"); job->done = 1; return NULL; }
+    if (!eh) { job->status = -1; job->error = strdup("curl init failed"); httpAsyncFinish(threadVm, job);
+        return; }
     curl_easy_setopt(eh, CURLOPT_URL, job->url);
     /* Restrict protocols to HTTP/HTTPS to prevent SSRF via redirects to file:// etc. */
 #if LIBCURL_VERSION_NUM >= 0x075500
@@ -2980,7 +3154,8 @@ static void* httpAsyncThread(void* arg) {
             job->status = -1; job->error = strdup("cannot open upload file");
             if (tmp_file) fclose(tmp_file);
             if (eh) curl_easy_cleanup(eh);
-            job->done = 1; return NULL;
+            httpAsyncFinish(threadVm, job);
+        return;
         }
         curl_easy_setopt(eh, CURLOPT_UPLOAD, 1L);
         curl_easy_setopt(eh, CURLOPT_READDATA, upload_fp);
@@ -3146,8 +3321,8 @@ static void* httpAsyncThread(void* arg) {
     }
     if (tmp_file) fclose(tmp_file);
     if (eh) curl_easy_cleanup(eh);
-    job->done = 1;
-    return NULL;
+    httpAsyncFinish(threadVm, job);
+        return;
 }
 
 // HttpRequestAsync(session, method, url, bodyStrOrMStreamOrNil): Integer (async id)
@@ -3155,11 +3330,10 @@ Value vmBuiltinHttpRequestAsync(VM* vm, int arg_count, Value* args) {
     if (arg_count != 4 || !IS_INTLIKE(args[0]) ||
         !isPascalStringType(VALUE_TYPE(args[1])) || !isPascalStringType(VALUE_TYPE(args[2]))) {
         runtimeError(vm, "httpRequestAsync expects (session:int, method:string, url:string, body:string|mstream|nil).");
-        return makeInt(-1);
+        return makeNil();
     }
-    int id = httpAllocAsync();
-    if (id < 0) { runtimeError(vm, "httpRequestAsync: no free slots."); return makeInt(-1); }
-    HttpAsyncJob* job = &g_http_async[id]; /* g_http_async_mutex is locked */
+    HttpAsyncJob* job = (HttpAsyncJob*)calloc(1, sizeof(HttpAsyncJob));
+    if (!job) { runtimeError(vm, "httpRequestAsync: out of memory."); return makeNil(); }
     job->session = (int)AS_INTEGER(args[0]);
     job->method = strdup(AS_STRING(args[1]) ? AS_STRING(args[1]) : "GET");
     job->url = strdup(AS_STRING(args[2]) ? AS_STRING(args[2]) : "");
@@ -3220,33 +3394,16 @@ Value vmBuiltinHttpRequestAsync(VM* vm, int arg_count, Value* args) {
             p = p->next;
         }
     }
-    if (pthread_create(&job->th, NULL, httpAsyncThread, (void*)(intptr_t)id) != 0) {
-        if (job->method) free(job->method);
-        if (job->url) free(job->url);
-        if (job->body) free(job->body);
-        if (job->user_agent) free(job->user_agent);
-        if (job->basic_auth) free(job->basic_auth);
-        if (job->accept_encoding) free(job->accept_encoding);
-        if (job->cookie_file) free(job->cookie_file);
-        if (job->cookie_jar) free(job->cookie_jar);
-        if (job->upload_file) free(job->upload_file);
-        if (job->ca_path) free(job->ca_path);
-        if (job->client_cert) free(job->client_cert);
-        if (job->client_key) free(job->client_key);
-        if (job->proxy) free(job->proxy);
-        if (job->proxy_userpwd) free(job->proxy_userpwd);
-        if (job->ciphers) free(job->ciphers);
-        if (job->pinned_pubkey) free(job->pinned_pubkey);
-        if (job->out_file) free(job->out_file);
-        if (job->headers_slist) curl_slist_free_all(job->headers_slist);
-        if (job->resolve_slist) curl_slist_free_all(job->resolve_slist);
-        job->active = 0;
-        pthread_mutex_unlock(&g_http_async_mutex);
-        runtimeError(vm, "httpRequestAsync: pthread_create failed.");
-        return makeInt(-1);
+    // VM 2.0 Phase 5a checkpoint 5a-iii: spawn over the growable thread pool
+    // (vmTaskCreateNative) instead of a raw pthread_create -- job cleanup on
+    // failure is httpAsyncJobFree's job now (vmTaskCreateNative guarantees
+    // it runs exactly once, success or failure), not this call site's.
+    int id = vmTaskCreateNative(vm, httpAsyncWork, job, httpAsyncJobFree);
+    if (id < 0) {
+        runtimeError(vm, "httpRequestAsync: failed to spawn task.");
+        return makeNil();
     }
-    pthread_mutex_unlock(&g_http_async_mutex);
-    return makeInt(id);
+    return makeTask(id, vm);
 }
 
 // HttpRequestAsyncToFile(session, method, url, bodyStrOrMStreamOrNil, outPath): Integer (async id)
@@ -3254,11 +3411,10 @@ Value vmBuiltinHttpRequestAsyncToFile(VM* vm, int arg_count, Value* args) {
     if (arg_count != 5 || !IS_INTLIKE(args[0]) ||
         !isPascalStringType(VALUE_TYPE(args[1])) || !isPascalStringType(VALUE_TYPE(args[2]))) {
         runtimeError(vm, "httpRequestAsyncToFile expects (session:int, method:string, url:string, body:string|mstream|nil, out:string).");
-        return makeInt(-1);
+        return makeNil();
     }
-    int id = httpAllocAsync();
-    if (id < 0) { runtimeError(vm, "httpRequestAsyncToFile: no free slots."); return makeInt(-1); }
-    HttpAsyncJob* job = &g_http_async[id]; /* g_http_async_mutex is locked */
+    HttpAsyncJob* job = (HttpAsyncJob*)calloc(1, sizeof(HttpAsyncJob));
+    if (!job) { runtimeError(vm, "httpRequestAsyncToFile: out of memory."); return makeNil(); }
     job->session = (int)AS_INTEGER(args[0]);
     job->method = strdup(AS_STRING(args[1]) ? AS_STRING(args[1]) : "GET");
     job->url = strdup(AS_STRING(args[2]) ? AS_STRING(args[2]) : "");
@@ -3276,13 +3432,8 @@ Value vmBuiltinHttpRequestAsyncToFile(VM* vm, int arg_count, Value* args) {
     }
     if (!isPascalStringType(VALUE_TYPE(args[4])) || !AS_STRING(args[4])) {
         runtimeError(vm, "httpRequestAsyncToFile: out must be a filename string.");
-        // free partial
-        if (job->method) free(job->method);
-        if (job->url) free(job->url);
-        if (job->body) free(job->body);
-        job->active = 0;
-        pthread_mutex_unlock(&g_http_async_mutex);
-        return makeInt(-1);
+        httpAsyncJobFree(job);
+        return makeNil();
     }
     job->out_file = strdup(AS_STRING(args[4]));
     // Snapshot session options for thread safety
@@ -3313,219 +3464,138 @@ Value vmBuiltinHttpRequestAsyncToFile(VM* vm, int arg_count, Value* args) {
             p = p->next;
         }
     }
-    if (pthread_create(&job->th, NULL, httpAsyncThread, (void*)(intptr_t)id) != 0) {
-        if (job->method) free(job->method);
-        if (job->url) free(job->url);
-        if (job->body) free(job->body);
-        if (job->user_agent) free(job->user_agent);
-        if (job->basic_auth) free(job->basic_auth);
-        if (job->accept_encoding) free(job->accept_encoding);
-        if (job->cookie_file) free(job->cookie_file);
-        if (job->cookie_jar) free(job->cookie_jar);
-        if (job->upload_file) free(job->upload_file);
-        if (job->ca_path) free(job->ca_path);
-        if (job->client_cert) free(job->client_cert);
-        if (job->client_key) free(job->client_key);
-        if (job->proxy) free(job->proxy);
-        if (job->out_file) free(job->out_file);
-        if (job->headers_slist) curl_slist_free_all(job->headers_slist);
-        job->active = 0;
-        pthread_mutex_unlock(&g_http_async_mutex);
-        runtimeError(vm, "httpRequestAsyncToFile: pthread_create failed.");
-        return makeInt(-1);
+    // VM 2.0 Phase 5a checkpoint 5a-iii: see vmBuiltinHttpRequestAsync's
+    // matching comment.
+    int id = vmTaskCreateNative(vm, httpAsyncWork, job, httpAsyncJobFree);
+    if (id < 0) {
+        runtimeError(vm, "httpRequestAsyncToFile: failed to spawn task.");
+        return makeNil();
     }
-    pthread_mutex_unlock(&g_http_async_mutex);
-    return makeInt(id);
+    return makeTask(id, vm);
 }
 
-// HttpAwait(asyncId, out:mstream): Integer (status)
+// Shared arg-validation + result-extraction for HttpAwait/HttpTryAwait: both
+// take (task, out:mstream); once the task's {status, body} record result
+// (built by httpAsyncFinish) is available, this copies the body MStream
+// into the caller-supplied `out` and returns the numeric HTTP status.
+// Blocks (vmThreadTakeResult's own wait loop) until the task completes --
+// callers that need a non-blocking check (HttpTryAwait) must call
+// vmTaskIsDone first and only reach this once that's true.
+static int httpTaskAwaitAndExtract(TaskObj* t, Value* outMstream) {
+    Value result = makeNil();
+    bool status_flag = false;
+    if (!vmThreadTakeResult(t->owner, t->threadId, &result, true, &status_flag, true)) {
+        return -1;
+    }
+    int status = -1;
+    Value* statusField = httpFindRecordField(result, "status");
+    if (statusField && IS_INTLIKE(*statusField)) {
+        status = (int)AS_INTEGER(*statusField);
+    }
+    Value* bodyField = httpFindRecordField(result, "body");
+    if (bodyField && VALUE_TYPE(*bodyField) == TYPE_MEMORYSTREAM &&
+        AS_MSTREAM(*bodyField) && AS_MSTREAM(*bodyField)->buffer) {
+        MStream* src = AS_MSTREAM(*bodyField);
+        MStream* out = AS_MSTREAM(*outMstream);
+        if ((size_t)out->capacity < (size_t)src->size + 1) {
+            unsigned char* nb = realloc(out->buffer, (size_t)src->size + 1);
+            if (nb) { out->buffer = nb; out->capacity = (int)(src->size + 1); }
+        }
+        memcpy(out->buffer, src->buffer, (size_t)src->size);
+        out->size = src->size;
+        out->buffer[out->size] = '\0';
+    }
+    freeValue(&result);
+    return status;
+}
+
+// HttpAwait(task, out:mstream): Integer (status)
 Value vmBuiltinHttpAwait(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 2 || !IS_INTLIKE(args[0]) || VALUE_TYPE(args[1]) != TYPE_MEMORYSTREAM || !AS_MSTREAM(args[1])) {
-        runtimeError(vm, "httpAwait expects (id:int, out:mstream).");
+    if (arg_count != 2 || VALUE_TYPE(args[0]) != TYPE_TASK ||
+        VALUE_TYPE(args[1]) != TYPE_MEMORYSTREAM || !AS_MSTREAM(args[1])) {
+        runtimeError(vm, "httpAwait expects (task, out:mstream).");
         return makeInt(-1);
     }
-    int id = (int)AS_INTEGER(args[0]);
-    if (id < 0 || id >= MAX_HTTP_ASYNC) { runtimeError(vm, "httpAwait: invalid id."); return makeInt(-1); }
-    pthread_mutex_lock(&g_http_async_mutex);
-    HttpAsyncJob* job = &g_http_async[id];
-    if (!job->active) { pthread_mutex_unlock(&g_http_async_mutex); runtimeError(vm, "httpAwait: job not active."); return makeInt(-1); }
-    pthread_mutex_unlock(&g_http_async_mutex);
-    pthread_join(job->th, NULL);
-    pthread_mutex_lock(&g_http_async_mutex);
-    int status = (int)job->status;
-    // Copy result into provided mstream
-    if (job->result && job->result->buffer) {
-        MStream* out = AS_MSTREAM(args[1]);
-        // ensure capacity
-        if ((size_t)out->capacity < job->result->size + 1) {
-            unsigned char* nb = realloc(out->buffer, job->result->size + 1);
-            if (nb) { out->buffer = nb; out->capacity = (int)(job->result->size + 1); }
-        }
-        memcpy(out->buffer, job->result->buffer, job->result->size);
-        out->size = (int)job->result->size;
-        out->buffer[out->size] = '\0';
+    TaskObj* t = AS_TASK(args[0]);
+    if (!t || !t->owner) {
+        runtimeError(vm, "httpAwait received an invalid task.");
+        return makeInt(-1);
     }
-    // Update session last_* fields from job
-    HttpSession* s = httpGet(job->session);
-    if (s) {
-        s->last_status = job->status;
-        if (s->last_headers) { free(s->last_headers); s->last_headers = NULL; }
-        if (job->last_headers) s->last_headers = strdup(job->last_headers);
-        s->last_error_code = job->last_error_code;
-        if (s->last_error_msg) { free(s->last_error_msg); s->last_error_msg = NULL; }
-        if (job->last_error_msg) s->last_error_msg = strdup(job->last_error_msg);
-    }
-    // Free job resources
-    if (job->result) { if (job->result->buffer) free(job->result->buffer); free(job->result); }
-    if (job->method) free(job->method);
-    if (job->url) free(job->url);
-    if (job->body) free(job->body);
-    if (job->error) free(job->error);
-    if (job->user_agent) free(job->user_agent);
-    if (job->basic_auth) free(job->basic_auth);
-    if (job->accept_encoding) free(job->accept_encoding);
-    if (job->cookie_file) free(job->cookie_file);
-    if (job->cookie_jar) free(job->cookie_jar);
-    if (job->upload_file) free(job->upload_file);
-    if (job->ca_path) free(job->ca_path);
-    if (job->client_cert) free(job->client_cert);
-    if (job->client_key) free(job->client_key);
-    if (job->proxy) free(job->proxy);
-    if (job->proxy_userpwd) free(job->proxy_userpwd);
-    if (job->ciphers) free(job->ciphers);
-    if (job->pinned_pubkey) free(job->pinned_pubkey);
-    if (job->out_file) free(job->out_file);
-    if (job->headers_slist) curl_slist_free_all(job->headers_slist);
-    if (job->resolve_slist) curl_slist_free_all(job->resolve_slist);
-    if (job->last_headers) free(job->last_headers);
-    if (job->last_error_msg) free(job->last_error_msg);
-    memset(job, 0, sizeof(HttpAsyncJob));
-    pthread_mutex_unlock(&g_http_async_mutex);
-    return makeInt(status);
+    return makeInt(httpTaskAwaitAndExtract(t, &args[1]));
 }
 
-// HttpTryAwait(asyncId, out:mstream): Integer (-2: pending; otherwise status)
+// HttpTryAwait(task, out:mstream): Integer (-2: pending; otherwise status)
 Value vmBuiltinHttpTryAwait(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 2 || !IS_INTLIKE(args[0]) || VALUE_TYPE(args[1]) != TYPE_MEMORYSTREAM || !AS_MSTREAM(args[1])) {
-        runtimeError(vm, "httpTryAwait expects (id:int, out:mstream).");
+    if (arg_count != 2 || VALUE_TYPE(args[0]) != TYPE_TASK ||
+        VALUE_TYPE(args[1]) != TYPE_MEMORYSTREAM || !AS_MSTREAM(args[1])) {
+        runtimeError(vm, "httpTryAwait expects (task, out:mstream).");
         return makeInt(-1);
     }
-    int id = (int)AS_INTEGER(args[0]);
-    if (id < 0 || id >= MAX_HTTP_ASYNC) { runtimeError(vm, "httpTryAwait: invalid id."); return makeInt(-1); }
-    pthread_mutex_lock(&g_http_async_mutex);
-    HttpAsyncJob* job = &g_http_async[id];
-    if (!job->active) { pthread_mutex_unlock(&g_http_async_mutex); runtimeError(vm, "httpTryAwait: job not active."); return makeInt(-1); }
-    if (!job->done) { pthread_mutex_unlock(&g_http_async_mutex); return makeInt(-2); }
-    pthread_mutex_unlock(&g_http_async_mutex);
-    // Same as await: join and harvest
-    pthread_join(job->th, NULL);
-    pthread_mutex_lock(&g_http_async_mutex);
-    int status = (int)job->status;
-    if (job->result && job->result->buffer) {
-        MStream* out = AS_MSTREAM(args[1]);
-        if ((size_t)out->capacity < job->result->size + 1) {
-            unsigned char* nb = realloc(out->buffer, job->result->size + 1);
-            if (nb) { out->buffer = nb; out->capacity = (int)(job->result->size + 1); }
-        }
-        memcpy(out->buffer, job->result->buffer, job->result->size);
-        out->size = (int)job->result->size;
-        out->buffer[out->size] = '\0';
+    TaskObj* t = AS_TASK(args[0]);
+    if (!t || !t->owner) {
+        runtimeError(vm, "httpTryAwait received an invalid task.");
+        return makeInt(-1);
     }
-    HttpSession* s = httpGet(job->session);
-    if (s) {
-        s->last_status = job->status;
-        if (s->last_headers) { free(s->last_headers); s->last_headers = NULL; }
-        if (job->last_headers) s->last_headers = strdup(job->last_headers);
-        s->last_error_code = job->last_error_code;
-        if (s->last_error_msg) { free(s->last_error_msg); s->last_error_msg = NULL; }
-        if (job->last_error_msg) s->last_error_msg = strdup(job->last_error_msg);
+    if (!vmTaskIsDone(t->owner, t->threadId)) {
+        return makeInt(-2);
     }
-    if (job->result) { if (job->result->buffer) free(job->result->buffer); free(job->result); }
-    if (job->method) free(job->method);
-    if (job->url) free(job->url);
-    if (job->body) free(job->body);
-    if (job->error) free(job->error);
-    if (job->user_agent) free(job->user_agent);
-    if (job->basic_auth) free(job->basic_auth);
-    if (job->accept_encoding) free(job->accept_encoding);
-    if (job->cookie_file) free(job->cookie_file);
-    if (job->cookie_jar) free(job->cookie_jar);
-    if (job->upload_file) free(job->upload_file);
-    if (job->ca_path) free(job->ca_path);
-    if (job->client_cert) free(job->client_cert);
-    if (job->client_key) free(job->client_key);
-    if (job->proxy) free(job->proxy);
-    if (job->out_file) free(job->out_file);
-    if (job->headers_slist) curl_slist_free_all(job->headers_slist);
-    if (job->last_headers) free(job->last_headers);
-    if (job->last_error_msg) free(job->last_error_msg);
-    memset(job, 0, sizeof(HttpAsyncJob));
-    pthread_mutex_unlock(&g_http_async_mutex);
-    return makeInt(status);
+    return makeInt(httpTaskAwaitAndExtract(t, &args[1]));
 }
 
-// HttpIsDone(asyncId): Integer (0/1)
+// HttpIsDone(task): Integer (0/1)
 Value vmBuiltinHttpIsDone(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || !IS_INTLIKE(args[0])) {
-        runtimeError(vm, "httpIsDone expects (id:int).");
+    if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_TASK) {
+        runtimeError(vm, "httpIsDone expects (task).");
         return makeInt(0);
     }
-    int id = (int)AS_INTEGER(args[0]);
-    if (id < 0 || id >= MAX_HTTP_ASYNC) return makeInt(0);
-    pthread_mutex_lock(&g_http_async_mutex);
-    HttpAsyncJob* job = &g_http_async[id];
-    if (!job->active) { pthread_mutex_unlock(&g_http_async_mutex); return makeInt(0); }
-    int done = job->done ? 1 : 0;
-    pthread_mutex_unlock(&g_http_async_mutex);
-    return makeInt(done);
+    TaskObj* t = AS_TASK(args[0]);
+    if (!t || !t->owner) {
+        return makeInt(0);
+    }
+    return makeInt(vmTaskIsDone(t->owner, t->threadId) ? 1 : 0);
 }
 
-// HttpCancel(asyncId): Integer (1 on success, 0 otherwise)
+// HttpCancel(task): Integer (1 on success, 0 otherwise)
 Value vmBuiltinHttpCancel(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || !IS_INTLIKE(args[0])) {
-        runtimeError(vm, "httpCancel expects (id:int).");
+    if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_TASK) {
+        runtimeError(vm, "httpCancel expects (task).");
         return makeInt(0);
     }
-    int id = (int)AS_INTEGER(args[0]);
-    if (id < 0 || id >= MAX_HTTP_ASYNC) return makeInt(0);
-    pthread_mutex_lock(&g_http_async_mutex);
-    HttpAsyncJob* job = &g_http_async[id];
-    if (!job->active) { pthread_mutex_unlock(&g_http_async_mutex); return makeInt(0); }
-    job->cancel_requested = 1;
-    pthread_mutex_unlock(&g_http_async_mutex);
-    return makeInt(1);
+    TaskObj* t = AS_TASK(args[0]);
+    if (!t || !t->owner) {
+        return makeInt(0);
+    }
+    return makeInt(vmThreadCancel(t->owner, t->threadId) ? 1 : 0);
 }
 
-// httpGetAsyncProgress(asyncId): Integer (bytes downloaded so far)
+// httpGetAsyncProgress(task): Integer (bytes downloaded so far)
 Value vmBuiltinHttpGetAsyncProgress(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || !IS_INTLIKE(args[0])) {
-        runtimeError(vm, "httpGetAsyncProgress expects (id:int).");
+    if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_TASK) {
+        runtimeError(vm, "httpGetAsyncProgress expects (task).");
         return makeInt(0);
     }
-    int id = (int)AS_INTEGER(args[0]);
-    if (id < 0 || id >= MAX_HTTP_ASYNC) return makeInt(0);
-    pthread_mutex_lock(&g_http_async_mutex);
-    HttpAsyncJob* job = &g_http_async[id];
-    if (!job->active) { pthread_mutex_unlock(&g_http_async_mutex); return makeInt(0); }
-    int progress = (int)job->dl_now;
-    pthread_mutex_unlock(&g_http_async_mutex);
-    return makeInt(progress);
+    TaskObj* t = AS_TASK(args[0]);
+    if (!t || !t->owner) {
+        return makeInt(0);
+    }
+    long long now = 0, total = 0;
+    vmTaskGetProgress(t->owner, t->threadId, &now, &total);
+    return makeInt((int)now);
 }
 
-// httpGetAsyncTotal(asyncId): Integer (total bytes expected; 0 if unknown)
+// httpGetAsyncTotal(task): Integer (total bytes expected; 0 if unknown)
 Value vmBuiltinHttpGetAsyncTotal(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || !IS_INTLIKE(args[0])) {
-        runtimeError(vm, "httpGetAsyncTotal expects (id:int).");
+    if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_TASK) {
+        runtimeError(vm, "httpGetAsyncTotal expects (task).");
         return makeInt(0);
     }
-    int id = (int)AS_INTEGER(args[0]);
-    if (id < 0 || id >= MAX_HTTP_ASYNC) return makeInt(0);
-    pthread_mutex_lock(&g_http_async_mutex);
-    HttpAsyncJob* job = &g_http_async[id];
-    if (!job->active) { pthread_mutex_unlock(&g_http_async_mutex); return makeInt(0); }
-    int total = (int)job->dl_total;
-    pthread_mutex_unlock(&g_http_async_mutex);
-    return makeInt(total);
+    TaskObj* t = AS_TASK(args[0]);
+    if (!t || !t->owner) {
+        return makeInt(0);
+    }
+    long long now = 0, total = 0;
+    vmTaskGetProgress(t->owner, t->threadId, &now, &total);
+    return makeInt((int)total);
 }
 
 // HttpLastError(session): String

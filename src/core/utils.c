@@ -1304,6 +1304,7 @@ VarType lookupBuiltinPascalTypeName(const char *name) {
         strcasecmp(name, "text") == 0 ||
         strcasecmp(name, "textfile") == 0) return TYPE_FILE;
     if (strcasecmp(name, "thread") == 0) return TYPE_THREAD;
+    if (strcasecmp(name, "task") == 0) return TYPE_TASK;
     if (strcasecmp(name, "mstream") == 0) return TYPE_MEMORYSTREAM;
 
     return TYPE_VOID;
@@ -2360,6 +2361,14 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
         }
         case TYPE_THREAD:
             SET_INT_VALUE(&v, -1);
+            break;
+        case TYPE_TASK:
+            // No live task yet -- a NULL heap pointer, same "nil until
+            // assigned" convention as TYPE_POINTER's wrapper-with-NULL-
+            // address, except TASK's ObjHeader-tagged-pointer scheme uses
+            // no-wrapper-at-all-when-empty (freeValue/AS_TASK already treat
+            // a NULL PSCAL_VALUE_PTR as the empty/unset case).
+            pscalValueSetHeapPtrBits(&v, NULL);
             break;
         case TYPE_INTERFACE: {
             InterfaceObj *iface = pscalInterfaceObjCreate();
