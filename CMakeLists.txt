@@ -1,8 +1,9 @@
 # pscal-core — the shared PSCAL runtime (VM, bytecode compiler, AST, lexer,
 # symbol table, builtin backend). Builds standalone; front ends consume it.
 #
-# Minimal config (SDL / curl / sqlite OFF). The optional graphics/network/db
-# features are added behind options as the extraction matures.
+# Minimal config (SDL / curl / sqlite OFF by default). The optional
+# graphics/network/db features are added behind options as the extraction
+# matures.
 cmake_minimum_required(VERSION 3.18)
 project(pscal_core C)
 
@@ -23,6 +24,7 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang")
 endif()
 
 option(PSCAL_SDL "Enable the SDL graphics/audio backend (sdl/gl/audio + 3D)" OFF)
+option(PSCAL_CURL "Enable libcurl-based networking (apiSend/HTTP session builtins)" OFF)
 option(PSCAL_VALUE_ACCESS_LINT
     "Poison raw Value payload field names outside the representation layer (VM 2.0 Phase 0 accessor-sweep lint)" OFF)
 if(PSCAL_VALUE_ACCESS_LINT)
@@ -48,6 +50,13 @@ endif()
 set(SRC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 
 find_package(Threads REQUIRED)
+
+if(PSCAL_CURL)
+    find_package(CURL REQUIRED)
+    set(_PSCAL_NETWORK_API_SRC ${SRC}/backend_ast/builtin_network_api.c)
+else()
+    set(_PSCAL_NETWORK_API_SRC ${SRC}/backend_ast/builtin_network_api_stub.c)
+endif()
 
 # Generate pscal_paths.h (install-path fallbacks).
 set(PSCAL_INSTALL_ROOT "/usr/local/pscal" CACHE PATH "Default PSCAL install root")
@@ -80,7 +89,7 @@ set(PSCAL_CORE_SOURCES
     ${SRC}/ast/ast.c ${SRC}/ast/closure_registry.c
     ${SRC}/symbol/symbol.c
     ${SRC}/lexer/lexer.c
-    ${SRC}/backend_ast/builtin.c ${SRC}/backend_ast/builtin_network_api_stub.c
+    ${SRC}/backend_ast/builtin.c ${_PSCAL_NETWORK_API_SRC}
     ${SRC}/backend_ast/shell_runtime_stub.c ${SRC}/backend_ast/thread_wrappers.c
     ${SRC}/compiler/bytecode.c ${SRC}/compiler/bytecode_verify.c ${SRC}/compiler/bytecode_link.c ${SRC}/compiler/compiler.c
     ${SRC}/core/cache.c
@@ -161,6 +170,15 @@ if(PSCAL_SDL)
             "-framework Metal" "-framework QuartzCore" "-framework Foundation")
     endif()
     message(STATUS "pscal-core: SDL backend ENABLED (sdl/gl/audio + 3D)")
+endif()
+
+# ---- Optional libcurl networking backend -------------------------------------
+# Swaps in the real HTTP/socket builtins (apiSend, HttpSession, etc.) in place
+# of the no-op stub. CURL::libcurl is PUBLIC so consumers (e.g. aether) inherit
+# the link requirement. Mirrors the SDL recipe above.
+if(PSCAL_CURL)
+    target_link_libraries(pscal_core_static PUBLIC CURL::libcurl)
+    message(STATUS "pscal-core: libcurl networking ENABLED")
 endif()
 
 # ---- Install ----------------------------------------------------------------
