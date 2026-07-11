@@ -3170,6 +3170,21 @@ static void emitEmptyArrayLiteralForType(AST* targetType, BytecodeChunk* chunk, 
     emitConstant(chunk, constIdx, line);
 }
 
+// True if `element` is something evaluateCompileTimeValue can actually fold
+// (a literal, a compiler constant/enum reference, a foldable unary op, ...)
+// rather than falling through to its `default: return makeVoid();` case.
+// Used to catch primitive-typed elements (bare variables, expressions,
+// function-call results) that would otherwise silently become TYPE_VOID in
+// a "compile-time constant" array literal (pscal-core#4) -- the pointer/
+// record check below only ever caught this for object-typed elements.
+static bool arrayLiteralElementIsCompileTimeConstant(AST* element) {
+    if (!element) return true;
+    Value v = evaluateCompileTimeValue(element);
+    bool isConstant = (VALUE_TYPE(v) != TYPE_VOID && VALUE_TYPE(v) != TYPE_UNKNOWN);
+    freeValue(&v);
+    return isConstant;
+}
+
 // A non-empty array literal whose elements are heap objects (class/record
 // pointers) cannot be materialized as a compile-time constant: `new T {...}`
 // and references to runtime variables are not compile-time evaluable, so the
@@ -3184,6 +3199,9 @@ static bool arrayLiteralRequiresRuntimeInit(AST* arrayLiteral) {
             return true;
         }
         if (el->type == AST_NEW) {
+            return true;
+        }
+        if (!arrayLiteralElementIsCompileTimeConstant(el)) {
             return true;
         }
     }
@@ -3228,15 +3246,25 @@ static VarType resolveArrayLiteralElementType(AST* arrayLiteral, AST** out_type_
 // the stack. Mirrors the working append path (setlength + indexed store).
 // Requires a function-compiler context for the scratch local; returns false so
 // the caller can fall back to the constant path otherwise.
-static bool emitArrayLiteralRuntime(AST* arrayLiteral, BytecodeChunk* chunk, int line) {
+// Shared core of emitArrayLiteralRuntime: builds an array of the given
+// element type/bounds in a scratch local, fills every slot with a full
+// r-value evaluation of its literal element (so heap objects keep their
+// pointer identity and non-constant primitive elements -- bare variables,
+// expressions, call results -- get their real value instead of silently
+// becoming TYPE_VOID, pscal-core#4), and leaves the finished array on the
+// stack. Takes the element type/bounds explicitly so callers that already
+// know the array's *declared* type (e.g. a `let x: Int[] = [...]` local's
+// own type annotation) can use that instead of inferring it from the
+// literal's own elements, which can disagree (e.g. an Aether integer
+// literal's compile-time-value type vs. the declared element's runtime
+// type) and previously corrupted the array.
+static bool emitArrayLiteralRuntimeWithType(AST* arrayLiteral, VarType elemType, AST* elemTypeNode,
+                                             int lower, int upper, BytecodeChunk* chunk, int line) {
     if (!current_function_compiler) {
         return false;
     }
 
     int count = arrayLiteral->child_count;
-
-    AST* elemTypeNode = NULL;
-    VarType elemType = resolveArrayLiteralElementType(arrayLiteral, &elemTypeNode);
 
     // Reserve a scratch local slot to hold the array while we fill it.
     int slot = current_function_compiler->local_count;
@@ -3247,8 +3275,6 @@ static bool emitArrayLiteralRuntime(AST* arrayLiteral, BytecodeChunk* chunk, int
 
     // Allocate the backing array (N default-initialized slots of elemType) and
     // store it into the scratch local.
-    int lower = 0;
-    int upper = count - 1;
     Value arrVal = makeArrayND(1, &lower, &upper, elemType, elemTypeNode);
     int constIdx = addConstantToChunk(chunk, &arrVal);
     freeValue(&arrVal);
@@ -3280,6 +3306,14 @@ static bool emitArrayLiteralRuntime(AST* arrayLiteral, BytecodeChunk* chunk, int
     writeBytecodeChunk(chunk, GET_LOCAL, line);
     writeBytecodeChunk(chunk, (uint8_t)slot, line);
     return true;
+}
+
+static bool emitArrayLiteralRuntime(AST* arrayLiteral, BytecodeChunk* chunk, int line) {
+    AST* elemTypeNode = NULL;
+    VarType elemType = resolveArrayLiteralElementType(arrayLiteral, &elemTypeNode);
+    int lower = 0;
+    int upper = arrayLiteral->child_count - 1;
+    return emitArrayLiteralRuntimeWithType(arrayLiteral, elemType, elemTypeNode, lower, upper, chunk, line);
 }
 
 static bool emitArrayLiteralConstant(AST* arrayLiteral, BytecodeChunk* chunk, int line) {
@@ -7430,18 +7464,35 @@ static void compileNode(AST* node, BytecodeChunk* chunk, int current_line_approx
                                 int low = (int)low_ord;
                                 int high = (int)high_ord;
                                 freeValue(&low_v); freeValue(&high_v);
-                                int lb[1] = { low };
-                                int ub[1] = { high };
                                 AST* elem_type_node = array_type->right;
                                 VarType elem_type = elem_type_node->var_type;
-                                Value arr_val = makeArrayND(1, lb, ub, elem_type, elem_type_node);
-                                if (!populateCompileTimeArrayLiteral(&arr_val, node->left, getLine(node->left))) {
+                                // A non-constant element (bare variable,
+                                // expression, call result) must not take the
+                                // compile-time-constant path below -- it would
+                                // silently store TYPE_VOID (pscal-core#4).
+                                // Build it at runtime instead, but still using
+                                // this variable's own *declared* element type/
+                                // bounds rather than inferring them from the
+                                // literal's elements (which can disagree, e.g.
+                                // an integer literal's compile-time-value type
+                                // vs. the declared element type, and corrupt
+                                // the array).
+                                if (arrayLiteralRequiresRuntimeInit(node->left) &&
+                                    emitArrayLiteralRuntimeWithType(node->left, elem_type, elem_type_node,
+                                                                     low, high, chunk, getLine(node->left))) {
+                                    // Element assignment already emitted; nothing more to do here.
+                                } else {
+                                    int lb[1] = { low };
+                                    int ub[1] = { high };
+                                    Value arr_val = makeArrayND(1, lb, ub, elem_type, elem_type_node);
+                                    if (!populateCompileTimeArrayLiteral(&arr_val, node->left, getLine(node->left))) {
+                                        freeValue(&arr_val);
+                                        break;
+                                    }
+                                    int constIdx = addConstantToChunk(chunk, &arr_val);
                                     freeValue(&arr_val);
-                                    break;
+                                    emitConstant(chunk, constIdx, getLine(node));
                                 }
-                                int constIdx = addConstantToChunk(chunk, &arr_val);
-                                freeValue(&arr_val);
-                                emitConstant(chunk, constIdx, getLine(node));
                             } else {
                                 compileRValue(node->left, chunk, getLine(node->left));
                                 maybeAutoBoxInterfaceForType(actual_type_def_node, node->left, chunk, getLine(node->left), true, false);
@@ -7474,7 +7525,13 @@ static void compileNode(AST* node, BytecodeChunk* chunk, int current_line_approx
             if (node->var_type == TYPE_ARRAY && node->left && node->left->type == AST_ARRAY_LITERAL && actual_type_def_node) {
                 if (actual_type_def_node->type == AST_ARRAY_TYPE) {
                     int dimension_count = actual_type_def_node->child_count;
-                    if (dimension_count == 1) {
+                    // If any element isn't actually compile-time constant,
+                    // fall through to evaluateCompileTimeValue(node->left)
+                    // below, which yields TYPE_VOID for an AST_ARRAY_LITERAL
+                    // and trips the "must be compile-time evaluable" error
+                    // just below -- instead of silently storing TYPE_VOID
+                    // per non-constant element (pscal-core#4).
+                    if (dimension_count == 1 && !arrayLiteralRequiresRuntimeInit(node->left)) {
                         AST* sub = actual_type_def_node->children[0];
                         Value low_v = evaluateCompileTimeValue(sub->left);
                         Value high_v = evaluateCompileTimeValue(sub->right);
@@ -8425,7 +8482,8 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                 if (node->var_type == TYPE_ARRAY && node->left &&
                     node->left->type == AST_ARRAY_LITERAL &&
                     actual_type_def_node && actual_type_def_node->type == AST_ARRAY_TYPE &&
-                    actual_type_def_node->child_count == 1) {
+                    actual_type_def_node->child_count == 1 &&
+                    !arrayLiteralRequiresRuntimeInit(node->left)) {
                     AST *sub = actual_type_def_node->children[0];
                     Value low_v = evaluateCompileTimeValue(sub->left);
                     Value high_v = evaluateCompileTimeValue(sub->right);
@@ -8444,7 +8502,21 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                         break;
                     }
                 } else {
+                    // Falls here for non-array consts, and also (since the
+                    // branch above now excludes it) for an array literal
+                    // with a non-constant element -- evaluateCompileTimeValue
+                    // does not handle AST_ARRAY_LITERAL, so this yields
+                    // TYPE_VOID and the check below reports it instead of
+                    // silently storing a void element (pscal-core#4).
                     const_val = evaluateCompileTimeValue(node->left);
+                }
+
+                if (VALUE_TYPE(const_val) == TYPE_VOID || VALUE_TYPE(const_val) == TYPE_UNKNOWN) {
+                    fprintf(stderr, "L%d: Constant '%s' must be compile-time evaluable.\n",
+                            getLine(node), node->token->value);
+                    compiler_had_error = true;
+                    freeValue(&const_val);
+                    break;
                 }
 
                 Symbol *sym = insertLocalSymbol(node->token->value,

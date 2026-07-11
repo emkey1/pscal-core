@@ -1988,14 +1988,29 @@ Value makeArrayND(int dimensions, int *lower_bounds, int *upper_bounds, VarType 
             goto fail;
         }
 
-        // Initialize each element with its default value
+        // Initialize each element with its default value.
+        //
+        // "Simple" here means a zeroed Value.bits is itself a valid default
+        // for that type -- true for the tagged-immediate/NaN-boxed types
+        // (INT8..UINT32, DOUBLE via pscalBoxDouble(0.0) == 0 bits, etc.).
+        // It is NOT true for INT64/UINT64/LONG_DOUBLE: those are heap-boxed
+        // (Int64Box/LongDoubleBox) as of VM 2.0 Phase 4i, and bits=0 with
+        // one of those types set is a documented nil-pointer *placeholder*,
+        // not a usable value (core/types.h's pscalValueSetIntBits/RealBits
+        // comments) -- reading it dereferences a null Int64Box/LongDoubleBox
+        // pointer. Route them through makeValueForType below instead, which
+        // calls SET_INT_VALUE/SET_REAL_VALUE and actually allocates the box.
+        // Previously dormant because every existing caller either filled
+        // every slot immediately (compile-time array-literal population) or
+        // never constructed a primitive-typed array through the "elements
+        // must be evaluated at runtime" path -- pscal-core#4's fix started
+        // doing the latter and exposed this.
         bool isSimple = (element_type == TYPE_INT32 || element_type == TYPE_DOUBLE ||
                          element_type == TYPE_BOOLEAN || element_type == TYPE_CHAR ||
                          element_type == TYPE_BYTE || element_type == TYPE_INT8 ||
                          element_type == TYPE_UINT8 || element_type == TYPE_INT16 ||
                          element_type == TYPE_UINT16 || element_type == TYPE_UINT32 ||
-                         element_type == TYPE_INT64 || element_type == TYPE_UINT64 ||
-                         element_type == TYPE_FLOAT || element_type == TYPE_LONG_DOUBLE);
+                         element_type == TYPE_FLOAT);
         if (isSimple && total_size > 0) {
             memset(arr->elements, 0, sizeof(Value) * total_size);
             for (size_t i = 0; i < total_size; i++) {
