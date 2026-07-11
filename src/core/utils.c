@@ -1821,7 +1821,13 @@ Value makeStringLen(const char *val, size_t len) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_STRING;
-    StringObj *s = pscalStringObjCreate((int)len, TYPE_STRING);
+    // -1 = dynamic string; `len` here is only how many bytes to copy from
+    // `val` (the buffer may not be null-terminated), not a fixed capacity --
+    // passing it as max_length previously baked in a legacy Pascal
+    // fixed-length string sized to the literal's own initial length, which
+    // broke any later write of a different-length/typed string into the
+    // same slot (pscal-core#3).
+    StringObj *s = pscalStringObjCreate(-1, TYPE_STRING);
     pscalValueSetHeapPtrBits(&v, s);
     if (val && len > 0) {
         s->buffer = (char*)malloc(len + 1);
