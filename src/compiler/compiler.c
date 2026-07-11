@@ -4213,6 +4213,20 @@ static bool typesMatch(AST* param_type, AST* arg_node, bool allow_coercion) {
     // bound as long as the element types match.
     if (param_actual->var_type == TYPE_ARRAY) {
         if (arg_vt != TYPE_ARRAY) return false;
+        if (!arg_actual && arg_node->type == AST_ARRAY_LITERAL) {
+            // Inline array-literal arguments (e.g. f(["x", "y"])) never get a
+            // structural type_def annotated onto the AST_ARRAY_LITERAL node
+            // itself, so compareTypeNodes has nothing to compare against here.
+            // Fall back to checking each element against the parameter's
+            // declared element type instead of rejecting the call outright.
+            AST* param_elem = resolveTypeAlias(param_actual->right);
+            if (!param_elem) return false;
+            for (int i = 0; i < arg_node->child_count; i++) {
+                AST* elem = arg_node->children[i];
+                if (!elem || !typesMatch(param_elem, elem, allow_coercion)) return false;
+            }
+            return true;
+        }
         return compareTypeNodes(param_actual, arg_actual);
     }
 
