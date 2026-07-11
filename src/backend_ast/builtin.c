@@ -1652,6 +1652,16 @@ static Value vmBuiltinToByte(VM* vm, int arg_count, Value* args) {
         b = VAL_INT(v) ? 1 : 0;
     } else if (VALUE_TYPE(v) == TYPE_CHAR) {
         b = (unsigned char)AS_CHAR(v);
+    } else if (isPascalStringType(VALUE_TYPE(v)) && AS_STRING(v) && AS_STRING(v)[0] != '\0') {
+        /* byte(Text) had no case at all, so any Text argument silently fell
+         * through to the `else { b = 0; }` default below -- no error, just
+         * wrong data (byte("a") returned 0, not 97). A Byte is inherently an
+         * 8-bit value, so this takes the raw first byte rather than
+         * decoding a full UTF-8 codepoint (unlike ord(), which returns the
+         * full codepoint) -- correct for the common single-char-Text case
+         * this builtin exists for, and a defined (if lossy) truncation for
+         * a non-ASCII leading byte, consistent with Byte's 0-255 range. */
+        b = (unsigned char)AS_STRING(v)[0];
     } else {
         b = 0;
     }
@@ -6847,7 +6857,13 @@ Value vmBuiltinOrd(VM* vm, int arg_count, Value* args) {
         size_t len = strlen(AS_STRING(arg));
         uint32_t codepoint = 0;
         size_t advance = 0;
-        if (len > 1 && decodeUtf8Codepoint(AS_STRING(arg), len, &codepoint, &advance) && advance == len) {
+        /* `len > 0` (not `len > 1`): a single-byte ASCII string (the common
+         * case, e.g. ord("a")) is exactly 1 byte long and decodes in one
+         * step (decodeUtf8Codepoint sets advance=1 for any byte <= 0x7F).
+         * The old `len > 1` bound excluded every single-character ASCII
+         * string from this branch entirely, so ord() fell through to the
+         * "not an ordinal type" error for the most common input shape. */
+        if (len > 0 && decodeUtf8Codepoint(AS_STRING(arg), len, &codepoint, &advance) && advance == len) {
             return makeInt((long long)codepoint);
         }
     }
