@@ -928,7 +928,13 @@ static void arrayObjDestroy(ObjHeader *header) {
         } else {
             total = 0;
         }
-        for (int i = 0; i < total; i++) {
+        // `capacity` may over-allocate beyond the logical bounds (amortized
+        // SetLength growth, see types.h's ArrayObj comment) -- every slot up
+        // to capacity was eagerly given a valid Value via makeValueForType
+        // when the buffer was grown, so every one of them must be freed here
+        // too, not just the logically-visible `total`.
+        int free_count = (a->capacity > total) ? a->capacity : total;
+        for (int i = 0; i < free_count; i++) {
             freeValue(&a->elements[i]);
         }
         free(a->elements);

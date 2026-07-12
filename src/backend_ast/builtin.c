@@ -3535,6 +3535,117 @@ static bool resizeDynamicArrayValue(VM* vm,
         }
     }
 
+    // Amortized in-place growth fast path. The general path below always
+    // publishes a brand-new ArrayObj sized to exactly new_total, deep-
+    // copying (makeCopyOfValue) every surviving element and freshly
+    // constructing (makeValueForType) every slot -- correct, but O(current
+    // length) per call, which makes a tight `arr = arr + [x]` loop (lowered
+    // by ast_parser.c's buildArrayAppend to setlength(arr, length(arr)+1))
+    // O(n^2) over n appends. That is exactly deb.aether's parsePackages
+    // hot loop (pkgs = pkgs + [pr.pkg], once per Packages-index stanza) --
+    // confirmed via a synthetic 40k-append benchmark scaling ~4.8x when n
+    // doubled, matching quadratic growth, not the O(1)-amortized append
+    // the compiler-level self-reassignment lowering was meant to enable.
+    //
+    // When this ArrayObj is the SOLE owner (refcount==1 -- no other Value,
+    // PointerObj, or in-flight copyDynamicArraySnapshotValue() snapshot
+    // shares it) and this is a pure 1-D grow-or-noop (same lower bound,
+    // new_total >= old_total), there is nothing to protect via copy-on-
+    // write: mutate `old` directly, over-allocating capacity geometrically
+    // (doubling) so most calls need no reallocation at all, turning n
+    // one-at-a-time appends into O(n) total instead of O(n^2). Every slot
+    // up to `capacity` (not just the logically-visible ones) is kept a
+    // valid, freeable Value at all times -- arrayObjDestroy frees up to
+    // max(capacity, logical total) accordingly (see types.h's ArrayObj
+    // comment). Checked and mutated entirely under
+    // dynamic_array_refcount_mutex, matching copyDynamicArraySnapshotValue's
+    // own read-then-retain critical section, so a concurrent snapshot can't
+    // observe a torn grow and can't race this thread into wrongly taking
+    // the fast path on a suddenly-shared array.
+    //
+    // Falls through to the general path (unchanged) whenever any condition
+    // doesn't hold -- multi-dimensional resizes, shrinks, view arrays, and
+    // shared (aliased) arrays are all untouched by this fast path.
+    if (dimension_count == 1 && !old->view_of && is_dynamic &&
+        (old->dimensions == 0 || old->dimensions == 1) &&
+        new_lower[0] == 0 &&
+        (old_total == 0 || (old_lower_bounds && old_lower_bounds[0] == 0)) &&
+        new_total >= old_total) {
+        pthread_mutex_lock(&dynamic_array_refcount_mutex);
+        // This function already took its own defensive retain on `old`
+        // (top of function, before dimension/type validation) so a truly
+        // sole-owned array -- nothing but the live Value cell holding it --
+        // reads refcount==2 here (1 original + this function's own), not 1.
+        bool sole_owner =
+            atomic_load_explicit(&old->header.refcount, memory_order_acquire) == 2;
+        bool grew_in_place = false;
+        if (sole_owner) {
+            size_t old_capacity = (size_t)((old->capacity > (int)old_total) ? old->capacity : (int)old_total);
+            bool alloc_ok = true;
+            if (new_total > old_capacity) {
+                size_t new_capacity = (old_capacity == 0) ? 4 : old_capacity * 2;
+                if (new_capacity < new_total) new_capacity = new_total;
+                if (use_packed) {
+                    unsigned char* grown = (unsigned char*)realloc(old->raw, new_capacity * sizeof(unsigned char));
+                    if (grown) {
+                        memset(grown + old_capacity, 0, (new_capacity - old_capacity) * sizeof(unsigned char));
+                        old->raw = grown;
+                        old->capacity = (int)new_capacity;
+                    } else {
+                        alloc_ok = false;
+                    }
+                } else {
+                    Value* grown = (Value*)realloc(old->elements, new_capacity * sizeof(Value));
+                    if (grown) {
+                        old->elements = grown;
+                        for (size_t i = old_capacity; i < new_capacity; ++i) {
+                            old->elements[i] = makeValueForType(element_type, element_type_def, NULL);
+                        }
+                        old->capacity = (int)new_capacity;
+                    } else {
+                        alloc_ok = false;
+                    }
+                }
+            } else if (old->capacity == 0 && old_total > 0) {
+                old->capacity = (int)old_total;
+            }
+            if (alloc_ok) {
+                if (old->dimensions == 0) {
+                    old->lower_bounds = (int*)malloc(sizeof(int));
+                    old->upper_bounds = (int*)malloc(sizeof(int));
+                    if (!old->lower_bounds || !old->upper_bounds) {
+                        alloc_ok = false;
+                    } else {
+                        old->dimensions = 1;
+                        old->element_type = element_type;
+                        old->element_type_def = element_type_def;
+                        old->is_packed = use_packed;
+                        old->lower_bounds[0] = 0;
+                    }
+                }
+                if (alloc_ok) {
+                    old->upper_bounds[0] = new_upper[0];
+                    old->lower_bound = 0;
+                    old->upper_bound = new_upper[0];
+                    grew_in_place = true;
+                }
+            }
+        }
+        pthread_mutex_unlock(&dynamic_array_refcount_mutex);
+        if (grew_in_place) {
+            free(new_lower);
+            free(new_upper);
+            pscalObjRelease(&old->header);
+            return true;
+        }
+        // sole_owner was false, or an allocation failed and left `old`
+        // untouched (realloc(NULL-on-failure) never frees/moves the
+        // original buffer) -- fall through to the general path below,
+        // which still has valid old_array_val/old_array_raw/old_total
+        // captured above and will handle this resize correctly, just
+        // without this fast path's O(1)-amortized benefit for this call.
+    }
+
     Value* new_elements = NULL;
     unsigned char* new_raw = NULL;
     int* copy_lower = NULL;

@@ -228,6 +228,18 @@ typedef struct ArrayObj {
         uint8_t *raw;               // packed-byte storage
         struct ValueStruct *elements; // flat buffer of Value elements
     };
+    // Physical element-slot count backing `raw`/`elements`, when it exceeds
+    // the logical size implied by lower_bounds/upper_bounds (0 means "not
+    // tracked, treat as equal to the logical size" -- every construction
+    // site except resizeDynamicArrayValue's amortized-growth fast path
+    // leaves this at its calloc-zero default). Lets a 1-D dynamic array
+    // grown via repeated SetLength(a, length(a)+1) (the `a = a + [x]`
+    // self-append idiom's compiled lowering, see ast_parser.c's
+    // buildArrayAppend) over-allocate geometrically instead of resizing to
+    // the exact requested length on every single call -- see
+    // resizeDynamicArrayValue's "in-place amortized growth" fast path and
+    // arrayObjDestroy's use of max(capacity, logical total) when freeing.
+    int capacity;
     // VM 2.0 Phase 4e/4f: non-NULL marks this ArrayObj as a lightweight
     // VIEW produced by makeDynamicArraySliceValue's flat-multi-dimensional
     // case (a partial index into a static array[..,..] yields a sub-array
