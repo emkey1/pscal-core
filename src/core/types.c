@@ -31,6 +31,17 @@ void setTypeValue(Value *val, VarType type) {
         }
     }
     val->type = type;
+    // Checkpoint 3d's Int64Box/LongDoubleBox decode path treats `bits` as
+    // either 0 ("no box yet") or a live box pointer from an earlier call
+    // through this same box-owning type. Retyping INTO one of these types
+    // from a different family (e.g. TYPE_DOUBLE, whose `bits` is raw
+    // NaN-boxed payload, not a pointer) leaves stale non-box bits behind;
+    // the next SET_INT_VALUE/SET_REAL_VALUE call would misread them as a
+    // live box and pass garbage to pscalObjRelease. Zero it so callers see
+    // the documented "no box yet" state.
+    if (type == TYPE_INT64 || type == TYPE_UINT64 || type == TYPE_LONG_DOUBLE) {
+        val->bits = 0;
+    }
 }
 
 // Infer the type of a binary operation based on operand types
