@@ -6365,6 +6365,25 @@ static InterpretResult returnFromCall(VM* vm, bool* halted) {
         Value returnValue = pop(vm);
         safeReturnValue = copyValueForStack(&returnValue);
         freeValue(&returnValue);
+
+        // The declared return type is a coercion sink just like parameter
+        // slots (CALL_USER_PROC argument setup) and SET_LOCAL/SET_GLOBAL
+        // targets: a function declared to return an int-like type can end
+        // its body with a Real-producing expression (Int/Int division boxes
+        // a Real), and vice versa. Align the value with the declaration
+        // here so `ret expr` behaves like assigning expr to a typed result
+        // variable; otherwise the raw Real escapes to the caller (e.g. an
+        // Int-declared mean prints "24.000000").
+        VarType declared_ret = currentFrame->function_symbol->type;
+        if (isRealType(declared_ret) && isIntlikeType(VALUE_TYPE(safeReturnValue))) {
+            long double tmp = asLd(safeReturnValue);
+            setTypeValue(&safeReturnValue, declared_ret);
+            SET_REAL_VALUE(&safeReturnValue, tmp);
+        } else if (isIntlikeType(declared_ret) && isRealType(VALUE_TYPE(safeReturnValue))) {
+            long double tmp = asLd(safeReturnValue);
+            setTypeValue(&safeReturnValue, declared_ret);
+            assignRealToIntChecked(vm, &safeReturnValue, tmp);
+        }
     }
 
     for (Value* slot = currentFrame->slots; slot < vm->stackTop; slot++) {
