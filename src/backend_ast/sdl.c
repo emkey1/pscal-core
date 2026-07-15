@@ -103,7 +103,7 @@ static void sdlDumpEvent(const char *label, const SDL_Event *event) {
     if (!label || !event) {
         return;
     }
-    SDL_DEBUG_LOG("%s: %s (%u)", label, sdlDescribeEventType(VALUE_TYPE(*event)), VALUE_TYPE(*event));
+    SDL_DEBUG_LOG("%s: %s (%u)", label, sdlDescribeEventType(event->type), event->type);
 }
 #else
 #define sdlDumpEvent(label, event) ((void)0)
@@ -114,7 +114,7 @@ static void sdlLogEvent(const char *label, const SDL_Event *event) {
     if (!label || !event) {
         return;
     }
-    SDL_DEBUG_LOG("%s: %s (%u)", label, sdlDescribeEventType(VALUE_TYPE(*event)), VALUE_TYPE(*event));
+    SDL_DEBUG_LOG("%s: %s (%u)", label, sdlDescribeEventType(event->type), event->type);
 }
 #else
 static void sdlLogEvent(const char *label, const SDL_Event *event) {
@@ -282,7 +282,7 @@ static const int kTextureAccessInvalid = -1;
 
 #if defined(PSCALI_SDL3)
 static bool isWindowCloseEvent(const SDL_Event* event) {
-    return event && VALUE_TYPE(*event) == SDL_EVENT_WINDOW_CLOSE_REQUESTED;
+    return event && event->type == SDL_EVENT_WINDOW_CLOSE_REQUESTED;
 }
 #else
 static bool isWindowCloseEvent(const SDL_Event* event) {
@@ -467,7 +467,7 @@ static void enqueueUtf8Text(const char* text) {
 #if PSCALI_HAS_SYSWM
 static void handleSysWmEvent(const SDL_Event* event) {
 #ifdef SDL_VIDEO_DRIVER_X11
-    if (!event || VALUE_TYPE(*event) != SDL_SYSWMEVENT) {
+    if (!event || event->type != SDL_SYSWMEVENT) {
         return;
     }
 
@@ -477,7 +477,7 @@ static void handleSysWmEvent(const SDL_Event* event) {
     }
 
     XEvent* xevent = &msg->msg.x11.event;
-    if (!xevent || VALUE_TYPE(*xevent) != ClientMessage) {
+    if (!xevent || xevent->type != ClientMessage) {
         return;
     }
 
