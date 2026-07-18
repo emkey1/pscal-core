@@ -9711,12 +9711,23 @@ comparison_error_label:
                         }
                     }
                     else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_STRING && STRING_MAX_LENGTH(*target_lvalue_ptr) > 0) {
-                        if (VALUE_TYPE(value_to_set) == TYPE_STRING && AS_STRING(value_to_set)) {
+                        if (isPascalStringType(VALUE_TYPE(value_to_set)) && AS_STRING(value_to_set)) {
                             strncpy(AS_STRING(*target_lvalue_ptr), AS_STRING(value_to_set), STRING_MAX_LENGTH(*target_lvalue_ptr));
                             AS_STRING(*target_lvalue_ptr)[STRING_MAX_LENGTH(*target_lvalue_ptr)] = '\0'; // Ensure null termination
-                        } else if (VALUE_TYPE(value_to_set) == TYPE_CHAR) {
-                            AS_STRING(*target_lvalue_ptr)[0] = AS_CHAR(value_to_set);
-                            AS_STRING(*target_lvalue_ptr)[1] = '\0';
+                        } else if (VALUE_TYPE(value_to_set) == TYPE_CHAR ||
+                                   VALUE_TYPE(value_to_set) == TYPE_WIDECHAR) {
+                            char encoded[5] = {0};
+                            size_t encoded_len;
+                            if (VALUE_TYPE(value_to_set) == TYPE_CHAR) {
+                                encoded[0] = (char)AS_CHAR(value_to_set);
+                                encoded_len = 1;
+                            } else {
+                                encoded_len = encodeUtf8Codepoint((uint32_t)AS_CHAR(value_to_set), encoded);
+                            }
+                            size_t cap = (size_t)STRING_MAX_LENGTH(*target_lvalue_ptr);
+                            if (encoded_len > cap) encoded_len = cap;
+                            memcpy(AS_STRING(*target_lvalue_ptr), encoded, encoded_len);
+                            AS_STRING(*target_lvalue_ptr)[encoded_len] = '\0';
                         } else {
                             runtimeError(vm, "Type mismatch: Cannot assign this type to a fixed-length string.");
                         }
