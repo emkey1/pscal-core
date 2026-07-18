@@ -8679,16 +8679,17 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                         // Logic for range: (case_val >= lower) AND (case_val <= upper)
                         // This is a more direct and correct translation.
 
+                        // Comparisons pop b then a and compute a OP b, so the
+                        // case value must sit BELOW the bound on the stack.
+
                         // Check lower bound
-                        writeBytecodeChunk(chunk, DUP, line);                   // Stack: [case, case]
-                        compileRValue(label->left, chunk, getLine(label));      // Stack: [case, case, lower]
-                        writeBytecodeChunk(chunk, SWAP, line);                   // Stack: [case, lower, case]
+                        writeBytecodeChunk(chunk, DUP, line);                   // Stack: [case, case, case]
+                        compileRValue(label->left, chunk, getLine(label));      // Stack: [case, case, case, lower]
                         writeBytecodeChunk(chunk, GREATER_EQUAL, line);          // Stack: [case, case, bool1]
 
                         // Check upper bound
                         writeBytecodeChunk(chunk, SWAP, line);                   // Stack: [case, bool1, case]
                         compileRValue(label->right, chunk, getLine(label));     // Stack: [case, bool1, case, upper]
-                        writeBytecodeChunk(chunk, SWAP, line);                   // Stack: [case, bool1, upper, case]
                         writeBytecodeChunk(chunk, LESS_EQUAL, line);           // Stack: [case, bool1, bool2]
 
                         // Combine the two boolean results
