@@ -3286,12 +3286,24 @@ Value vmBuiltinCopy(VM* vm, int arg_count, Value* args) {
 }
 
 Value vmBuiltinTrim(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || !builtinValueIsStringLike(&args[0])) {
+    if (arg_count != 1 || (!builtinValueIsStringLike(&args[0]) && !isPascalCharType(VALUE_TYPE(args[0])))) {
         runtimeError(vm, "Trim expects 1 string argument.");
         return makeString("");
     }
 
-    const char *source = builtinValueToCString(&args[0]);
+    char char_buf[5];
+    const char *source;
+    if (VALUE_TYPE(args[0]) == TYPE_CHAR) {
+        char_buf[0] = AS_CHAR(args[0]);
+        char_buf[1] = '\0';
+        source = char_buf;
+    } else if (VALUE_TYPE(args[0]) == TYPE_WIDECHAR) {
+        size_t n = encodeUtf8Codepoint((uint32_t)AS_CHAR(args[0]), char_buf);
+        char_buf[n] = '\0';
+        source = char_buf;
+    } else {
+        source = builtinValueToCString(&args[0]);
+    }
     if (!source) {
         runtimeError(vm, "Trim expects a valid string argument.");
         return makeString("");

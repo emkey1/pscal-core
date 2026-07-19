@@ -13,14 +13,21 @@
 #include "backend_ast/builtin.h"
 
 // Returns a C-string view of a text-like argument. A single-character literal
-// (e.g. the "," separator) arrives as TYPE_CHAR, so materialize it into the
-// caller-provided 2-byte scratch buffer. Returns NULL for non-text values.
-static const char* string_arg(Value* v, char* scratch2) {
+// (e.g. the "," separator) arrives as TYPE_CHAR, and indexing a Text/UnicodeString
+// value (e.g. `s[i]`) arrives as TYPE_WIDECHAR -- both are materialized into the
+// caller-provided 5-byte scratch buffer (large enough for a 4-byte UTF-8 sequence
+// plus NUL, matching encodeUtf8Codepoint's contract). Returns NULL for non-text values.
+static const char* string_arg(Value* v, char scratch5[5]) {
     if (VALUE_TYPE(*v) == TYPE_STRING || VALUE_TYPE(*v) == TYPE_UNICODE_STRING) return AS_STRING(*v);
     if (VALUE_TYPE(*v) == TYPE_CHAR) {
-        scratch2[0] = (char)AS_CHAR(*v);
-        scratch2[1] = '\0';
-        return scratch2;
+        scratch5[0] = (char)AS_CHAR(*v);
+        scratch5[1] = '\0';
+        return scratch5;
+    }
+    if (VALUE_TYPE(*v) == TYPE_WIDECHAR) {
+        size_t n = encodeUtf8Codepoint((uint32_t)AS_CHAR(*v), scratch5);
+        scratch5[n] = '\0';
+        return scratch5;
     }
     return NULL;
 }
@@ -30,7 +37,7 @@ static Value vmBuiltinParseInt(struct VM_s* vm, int arg_count, Value* args) {
         runtimeError(vm, "parse_int expects exactly 1 argument.");
         return makeInt(0);
     }
-    char sb[2];
+    char sb[5];
     const char* s = string_arg(&args[0], sb);
     if (!s) {
         runtimeError(vm, "parse_int argument must be a string.");
@@ -44,7 +51,7 @@ static Value vmBuiltinParseFloat(struct VM_s* vm, int arg_count, Value* args) {
         runtimeError(vm, "parse_float expects exactly 1 argument.");
         return makeReal(0.0L);
     }
-    char sb[2];
+    char sb[5];
     const char* s = string_arg(&args[0], sb);
     if (!s) {
         runtimeError(vm, "parse_float argument must be a string.");
@@ -58,7 +65,7 @@ static Value vmBuiltinParseBool(struct VM_s* vm, int arg_count, Value* args) {
         runtimeError(vm, "parse_bool expects exactly 1 argument.");
         return makeBoolean(0);
     }
-    char sb[2];
+    char sb[5];
     const char* s = string_arg(&args[0], sb);
     if (!s) {
         runtimeError(vm, "parse_bool argument must be a string.");
@@ -79,9 +86,9 @@ static Value vmBuiltinSplit(struct VM_s* vm, int arg_count, Value* args) {
         int lo = 0, hi = 0;
         return makeArrayND(1, &lo, &hi, TYPE_STRING, NULL);
     }
-    char sb[2];
+    char sb[5];
     const char* s = string_arg(&args[0], sb);
-    char pb[2];
+    char pb[5];
     const char* sep = string_arg(&args[1], pb);
     if (!s) s = "";
 
