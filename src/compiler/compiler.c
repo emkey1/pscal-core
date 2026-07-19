@@ -6348,6 +6348,18 @@ static void compileLValue(AST* node, BytecodeChunk* chunk, int current_line_appr
             compileRValue(node->left, chunk, getLine(node->left));
             break;
         }
+        case AST_ADDR_OF: {
+            // `&x` (clike) / `@x` (pascal) in a VAR-parameter slot: the
+            // reference to bind is the operand's address, which is exactly
+            // the operand's own L-Value (matching this node's R-Value case).
+            if (!node->left) {
+                fprintf(stderr, "L%d: Compiler error: '&' requires an addressable operand.\n", line);
+                compiler_had_error = true;
+                break;
+            }
+            compileLValue(node->left, chunk, getLine(node->left));
+            break;
+        }
         default:
             fprintf(stderr, "L%d: Compiler error: Invalid expression cannot be used as a variable reference (L-Value).\n",
                     line);
@@ -10475,6 +10487,25 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                 proc_symbol = lookupProcedure(calleeName);
             }
             if (!proc_symbol || !proc_symbol->is_defined) {
+                // Forward reference: the target's bytecode address isn't
+                // known yet (its body compiles later in the program). Emit
+                // the callee name as a string; vmHostCreateThreadAddr
+                // resolves it via the procedure table at spawn time, when
+                // every routine is defined.
+                if (calleeName) {
+                    char lowerName[MAX_SYMBOL_LENGTH];
+                    strncpy(lowerName, calleeName, sizeof(lowerName) - 1);
+                    lowerName[sizeof(lowerName) - 1] = '\0';
+                    toLowerString(lowerName);
+                    emitConstant(chunk, addStringConstant(chunk, lowerName), line);
+                    for (int i = 0; i < call->child_count; i++) {
+                        compileRValue(call->children[i], chunk, getLine(call->children[i]));
+                    }
+                    emitConstant(chunk, addIntConstant(chunk, call->child_count), line);
+                    writeBytecodeChunk(chunk, CALL_HOST, line);
+                    writeBytecodeChunk(chunk, (uint8_t)HOST_FN_CREATE_THREAD_ADDR, line);
+                    break;
+                }
                 fprintf(stderr, "L%d: Compiler error: Undefined procedure '%s' in spawn.\n", line, calleeName ? calleeName : "<anonymous>");
                 compiler_had_error = true;
                 break;
