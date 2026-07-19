@@ -7877,7 +7877,14 @@ static void compileDefinedFunction(AST* func_decl_node, BytecodeChunk* chunk, in
         return_value_slot = fc.local_count - 1;
         emitRoutineResultSlotInit(func_decl_node->right, return_value_slot, chunk, line);
 
-        addLocal(&fc, "result", line, false);
+        // The `result` return-value alias is a Pascal surface feature that
+        // Aether's `ret` lowering also targets. For clike/rea/shell,
+        // `result` is an ordinary identifier; registering the alias local
+        // would silently shadow a user global of that name inside every
+        // value-returning function.
+        if (frontendIsPascal() || frontendIsAether()) {
+            addLocal(&fc, "result", line, false);
+        }
     }
     
     // Step 3: Add all other local variables.
@@ -8249,10 +8256,14 @@ static void compileInlineRoutine(Symbol* proc_symbol, AST* call_node, BytecodeCh
                           decl->right ? decl->right->var_type : TYPE_UNKNOWN,
                           decl->right,
                           true);
-        insertLocalSymbol("result",
-                          decl->right ? decl->right->var_type : TYPE_UNKNOWN,
-                          decl->right,
-                          true);
+        // Same frontend gate as the non-inline path: `result` is only a
+        // return-value alias for Pascal/Aether surfaces.
+        if (frontendIsPascal() || frontendIsAether()) {
+            insertLocalSymbol("result",
+                              decl->right ? decl->right->var_type : TYPE_UNKNOWN,
+                              decl->right,
+                              true);
+        }
     }
 
     LabelTableState inline_labels;
