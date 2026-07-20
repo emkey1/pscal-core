@@ -1,6 +1,9 @@
 #include "common/runtime_tty.h"
 
+#include <errno.h>
+#include <signal.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 #if defined(PSCAL_TARGET_IOS)
@@ -66,6 +69,48 @@ bool pscalRuntimeStdoutHasRealTTY(void) {
 
 bool pscalRuntimeStderrHasRealTTY(void) {
     return pscalRuntimeFdHasRealTTY(STDERR_FILENO);
+}
+
+void pscalRuntimeReclaimForegroundTerminal(int fd) {
+#if defined(PSCAL_TARGET_IOS)
+    /* iOS has no real fork/exec, so no child can ever steal the (virtual)
+     * terminal's foreground process group out from under us here. */
+    (void)fd;
+#else
+    if (!pscalRuntimeFdHasRealTTY(fd)) {
+        return;
+    }
+
+    /* tcsetpgrp() itself delivers SIGTTOU to the caller if the caller is
+     * currently in a background process group with respect to `fd' --
+     * exactly the state we're in right after a child has taken the
+     * terminal for its own process group and exited without giving it
+     * back. Ignore SIGTTOU/SIGTTIN for the duration of the call so we
+     * can't be stopped by the very syscall meant to fix that. */
+    struct sigaction ignore_action, saved_ttou, saved_ttin;
+    memset(&ignore_action, 0, sizeof(ignore_action));
+    sigemptyset(&ignore_action.sa_mask);
+    ignore_action.sa_handler = SIG_IGN;
+    if (sigaction(SIGTTOU, &ignore_action, &saved_ttou) != 0) {
+        return;
+    }
+    if (sigaction(SIGTTIN, &ignore_action, &saved_ttin) != 0) {
+        sigaction(SIGTTOU, &saved_ttou, NULL);
+        return;
+    }
+
+    pid_t pgrp = getpgrp();
+    while (tcsetpgrp(fd, pgrp) != 0 && errno == EINTR) {
+        /* retry */
+    }
+    /* Any other failure (e.g. ENOTTY if `fd' isn't our controlling
+     * terminal) is expected in non-interactive contexts and is silently
+     * ignored -- exec()-style builtins run outside interactive sessions
+     * plenty of the time. */
+
+    sigaction(SIGTTOU, &saved_ttou, NULL);
+    sigaction(SIGTTIN, &saved_ttin, NULL);
+#endif
 }
 
 static int pscalRuntimeParseEnvInt(const char *name) {

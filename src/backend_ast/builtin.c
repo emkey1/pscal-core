@@ -9005,6 +9005,13 @@ Value vmBuiltinDosExec(VM* vm, int arg_count, Value* args) {
                     if (WIFEXITED(status)) {
                         result = WEXITSTATUS(status);
                     }
+                    // The child may have been an interactive, job-control
+                    // shell that seized the controlling terminal for its
+                    // own process group and exited without giving it back
+                    // (many shells never restore it). Reclaim it here so
+                    // this process's own next terminal read doesn't stop
+                    // or fail; a no-op if the child never touched it.
+                    pscalRuntimeReclaimForegroundTerminal(STDIN_FILENO);
                 }
             }
         }
