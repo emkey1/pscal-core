@@ -3273,6 +3273,23 @@ static bool emitArrayLiteralRuntimeWithType(AST* arrayLiteral, VarType elemType,
         return false; // addLocal failed (e.g. too many locals)
     }
 
+    // This slot number is reused across sibling lexical scopes within the
+    // same function (each scope's local_count resets to its starting value
+    // on exit, so a later scope's own scratch/named local can land on the
+    // exact same physical slot a prior, differently-typed sibling used).
+    // Unlike a named `let`, this scratch local has no declaration-time
+    // RESET_LOCAL/INIT_LOCAL_* of its own, so the slot's stale runtime type
+    // tag (e.g. Int, left behind by an unrelated intlike local that
+    // previously occupied this slot) survives into this array-literal's
+    // first write here. SET_LOCAL's runtime type check treats "already
+    // holds an intlike value" as "must stay intlike", so writing an array
+    // into a recycled intlike slot spuriously fails with "Type mismatch:
+    // Cannot assign ARRAY to integer." RESET_LOCAL clears the slot to Nil
+    // first so SET_LOCAL takes its untyped/general path instead.
+    noteLocalSlotUse(current_function_compiler, slot);
+    writeBytecodeChunk(chunk, RESET_LOCAL, line);
+    writeBytecodeChunk(chunk, (uint8_t)slot, line);
+
     // Allocate the backing array (N default-initialized slots of elemType) and
     // store it into the scratch local.
     Value arrVal = makeArrayND(1, &lower, &upper, elemType, elemTypeNode);
