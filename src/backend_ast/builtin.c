@@ -2582,11 +2582,14 @@ Value vmBuiltinChr(VM* vm, int arg_count, Value* args) {
         return makeChar('\0');
     }
     long long code = AS_INTEGER(args[0]);
-    if (code < 0 || code > PASCAL_CHAR_MAX) {
-        runtimeError(vm, "Chr argument out of range.");
+    if (code < 0 || code > UNICODE_MAX) {
+        runtimeError(vm, "Chr argument out of range (0-0x10FFFF).");
         return makeChar('\0');
     }
-    return makeChar((int)code);
+    if (code <= PASCAL_CHAR_MAX) {
+        return makeChar((int)code);
+    }
+    return makeWideChar((int)code);
 }
 
 Value vmBuiltinSucc(VM* vm, int arg_count, Value* args) {
