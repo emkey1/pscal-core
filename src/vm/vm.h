@@ -385,8 +385,11 @@ typedef struct VM_s {
 
     /* Frontend-specific context; e.g., exsh per-VM shell state. */
     void* frontendContext;
-    /* String indexing mode: true for shell-style (0-based), false for Pascal/REA (1-based). */
-    bool shellIndexing;
+    /* String indexing mode: true for 0-based frontends (shell, Aether), false
+     * for Pascal/REA/clike (1-based). Cached per-VM from
+     * frontendIsZeroBasedStrings(); was named shellIndexing back when shell was
+     * the only 0-based frontend, which became a trap once Aether joined. */
+    bool zeroBasedIndexing;
 
     // Optional tracing: when >0, print execution of first N instructions
     int trace_head_instructions;

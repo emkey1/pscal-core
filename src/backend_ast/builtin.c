@@ -2705,17 +2705,26 @@ Value vmBuiltinPos(VM* vm, int arg_count, Value* args) {
         needle = AS_STRING(args[0]);
     }
     const char* haystack = AS_STRING(args[1]);
-    if (!needle || !haystack) return makeInt(0);
+
+    /* The result follows the frontend's string base, and so does the "absent"
+     * sentinel: 1-based frontends return 0 (which cannot be a valid 1-based
+     * index), but 0 IS a valid index for a 0-based frontend -- a match at the
+     * very start -- so those return -1 instead. Keeping 0 there would make a
+     * prefix match indistinguishable from "not found". */
+    const long long pos_base = frontendIsZeroBasedStrings() ? 0 : 1;
+    const long long pos_absent = frontendIsZeroBasedStrings() ? -1 : 0;
+
+    if (!needle || !haystack) return makeInt(pos_absent);
 
     const char* found = strstr(haystack, needle);
     if (!found) {
-        return makeInt(0);
+        return makeInt(pos_absent);
     }
     if (VALUE_TYPE(args[1]) == TYPE_UNICODE_STRING) {
         size_t prefix_len = (size_t)(found - haystack);
-        return makeInt((long long)utf8CodepointCount(haystack, prefix_len) + 1);
+        return makeInt((long long)utf8CodepointCount(haystack, prefix_len) + pos_base);
     }
-    return makeInt((long long)(found - haystack) + 1);
+    return makeInt((long long)(found - haystack) + pos_base);
 }
 
 Value vmBuiltinPrintf(VM* vm, int arg_count, Value* args) {
@@ -3248,16 +3257,21 @@ Value vmBuiltinCopy(VM* vm, int arg_count, Value* args) {
     long long start_idx = AS_INTEGER(args[1]);
     long long count = AS_INTEGER(args[2]);
 
-    if (!source || start_idx < 1 || count < 0) {
+    /* `start` follows the frontend's string base: 0-based for Aether/shell,
+     * 1-based for Pascal/rea/clike. Everything below works in 0-based byte and
+     * codepoint offsets, so normalise once here. */
+    const long long start_base = frontendIsZeroBasedStrings() ? 0 : 1;
+
+    if (!source || start_idx < start_base || count < 0) {
         return (VALUE_TYPE(args[0]) == TYPE_UNICODE_STRING) ? makeUnicodeString("") : makeString("");
     }
 
     size_t source_len = strlen(source);
     if (VALUE_TYPE(args[0]) == TYPE_UNICODE_STRING) {
         size_t source_cp_len = utf8CodepointCount(source, source_len);
-        if ((size_t)start_idx > source_cp_len) return makeUnicodeString("");
+        size_t start_0based = (size_t)(start_idx - start_base);
+        if (start_0based >= source_cp_len) return makeUnicodeString("");
 
-        size_t start_0based = (size_t)(start_idx - 1);
         size_t start_byte = utf8ByteOffsetForCodepointIndex(source, source_len, start_0based);
         size_t end_index = start_0based + (size_t)count;
         if (end_index > source_cp_len) {
@@ -3267,9 +3281,9 @@ Value vmBuiltinCopy(VM* vm, int arg_count, Value* args) {
         return makeUnicodeStringLen(source + start_byte, end_byte - start_byte);
     }
 
-    if ((size_t)start_idx > source_len) return makeString("");
+    size_t start_0based = (size_t)(start_idx - start_base);
+    if (start_0based >= source_len) return makeString("");
 
-    size_t start_0based = start_idx - 1;
     size_t len_to_copy = count;
     if (start_0based + len_to_copy > source_len) {
         len_to_copy = source_len - start_0based;

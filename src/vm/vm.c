@@ -163,7 +163,7 @@ static void vmProcFillSnapshot(const VM* vm, VMProcSnapshot* out) {
     out->procedure_symbol_count = vmCountTableSymbols(vm->procedureTable);
     out->is_root_vm = (vm->threadOwner == NULL || vm->threadOwner == vm);
     out->has_job_queue = (vm->jobQueue != NULL);
-    out->shell_indexing = vm->shellIndexing;
+    out->shell_indexing = vm->zeroBasedIndexing;
     out->exit_requested = vm->exit_requested;
     out->abort_requested = vm->abort_requested;
     out->suspend_unwind_requested = vm->suspend_unwind_requested;
@@ -998,9 +998,9 @@ static bool vmResolveStringIndex(VM* vm,
                                  size_t* out_offset,
                                  bool allow_length_query,
                                  bool* out_length_query) {
-    bool is_shell_frontend = vm ? vm->shellIndexing : frontendIsShell();
+    bool is_zero_based = vm ? vm->zeroBasedIndexing : frontendIsZeroBasedStrings();
 
-    if (!is_shell_frontend)
+    if (!is_zero_based)
     {
         if (allow_length_query && raw_index == 0) {
             if (out_length_query) {
@@ -1085,7 +1085,7 @@ static Value makeOwnedString(char* data, size_t len) {
 }
 
 static unsigned long long vmDisplayIndexFromOffset(size_t offset) {
-    if (frontendIsShell()) {
+    if (frontendIsZeroBasedStrings()) {
         return (unsigned long long)offset;
     }
     return (unsigned long long)(offset + 1);
@@ -6212,7 +6212,7 @@ void initVM(VM* vm) { // As in all.txt, with frameCount
     vm->owningThread = NULL;
     vm->threadId = 0;
     vm->frontendContext = NULL;
-    vm->shellIndexing = frontendIsShell();
+    vm->zeroBasedIndexing = frontendIsZeroBasedStrings();
 
     for (int i = 0; i < MAX_HOST_FUNCTIONS; i++) {
         vm->host_functions[i] = NULL;
@@ -7061,7 +7061,7 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
     vm->lastInstruction = vm->ip;
     vm->abort_requested = false;
     vm->suspend_unwind_requested = false;
-    vm->shellIndexing = frontendIsShell();
+    vm->zeroBasedIndexing = frontendIsZeroBasedStrings();
 
     vm->vmGlobalSymbols = globals;    // Store globals table (ensure this is the intended one)
     vm->vmConstGlobalSymbols = const_globals; // Table of constant globals (no locking)
@@ -8659,7 +8659,7 @@ comparison_error_label:
                             return INTERPRET_RUNTIME_ERROR;
                         }
 
-                        if (!frontendIsShell() && wants_length) {
+                        if (!frontendIsZeroBasedStrings() && wants_length) {
                             push(vm, makePointer(base_val, STRING_LENGTH_SENTINEL));
                             freeValue(&operand);
                             break;
@@ -9145,7 +9145,7 @@ comparison_error_label:
                             return INTERPRET_RUNTIME_ERROR;
                         }
 
-                        if (!frontendIsShell() && wants_length) {
+                        if (!frontendIsZeroBasedStrings() && wants_length) {
                             push(vm, makeInt((long long)len));
                             freeValue(&operand);
                             break;
@@ -9603,7 +9603,7 @@ comparison_error_label:
                     }
                     *byte_target_addr = (uint8_t)stored;
                 } else if (PTR_BASE_TYPE_NODE(pointer_to_lvalue) == STRING_LENGTH_SENTINEL) {
-                    if (!frontendIsShell()) {
+                    if (!frontendIsZeroBasedStrings()) {
                         runtimeError(vm, "VM Error: Cannot assign to string length.");
                         freeValue(&value_to_set);
                         freeValue(&pointer_to_lvalue);
@@ -9964,7 +9964,7 @@ comparison_error_label:
                         return INTERPRET_RUNTIME_ERROR;
                     }
                     push(vm, makeByte(*byte_target_addr));
-                } else if (PTR_BASE_TYPE_NODE(pointer_val) == STRING_LENGTH_SENTINEL && !frontendIsShell()) {
+                } else if (PTR_BASE_TYPE_NODE(pointer_val) == STRING_LENGTH_SENTINEL && !frontendIsZeroBasedStrings()) {
                     // Special case: request for string length via element 0.
                     Value* str_val = (Value*)AS_POINTER(pointer_val);
                     size_t len = 0;
@@ -10008,7 +10008,7 @@ comparison_error_label:
                      const char* str = AS_STRING(base_val) ? AS_STRING(base_val) : "";
                      size_t len = strlen(str);
                      size_t cp_count = utf8CodepointCount(str, len);
-                     long long expected_index = frontendIsShell() ? 0 : 1;
+                     long long expected_index = frontendIsZeroBasedStrings() ? 0 : 1;
                      if (pscal_index < expected_index ||
                          (size_t)(pscal_index - expected_index) >= cp_count) {
                          runtimeError(vm, "Runtime Error: String index %lld out of bounds for UnicodeString length %zu.",
@@ -10038,7 +10038,7 @@ comparison_error_label:
                      }
                      result_char = str[char_offset];
                      } else if (VALUE_TYPE(base_val) == TYPE_CHAR) {
-                    long long expected_index = frontendIsShell() ? 0 : 1;
+                    long long expected_index = frontendIsZeroBasedStrings() ? 0 : 1;
                     if (pscal_index != expected_index) {
                         runtimeError(vm,
                                      "Runtime Error: Index for a CHAR type must be %lld, got %lld.",
@@ -10050,7 +10050,7 @@ comparison_error_label:
                     }
                     result_char = AS_CHAR(base_val);
                      } else if (VALUE_TYPE(base_val) == TYPE_WIDECHAR) {
-                         long long expected_index = frontendIsShell() ? 0 : 1;
+                         long long expected_index = frontendIsZeroBasedStrings() ? 0 : 1;
                          if (pscal_index != expected_index) {
                              runtimeError(vm,
                                           "Runtime Error: Index for a WIDECHAR type must be %lld, got %lld.",
