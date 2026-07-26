@@ -7818,7 +7818,17 @@ static void compileDefinedFunction(AST* func_decl_node, BytecodeChunk* chunk, in
     }
 
     // --- FIX: Look up the symbol *before* trying to use it ---
-    if (current_compilation_unit_name) {
+    // A name that already carries a dot is a class-mangled method ("Class.method"),
+    // and that mangled name is the ONLY one the rest of the compiler knows it by:
+    // the semantic pass registers methods as "class.method", emitVTables derives the
+    // vtable global "<class>_vtable" from the text before the first dot, and call
+    // sites resolve through the same "class.method" symbol. Prefixing the enclosing
+    // unit/module name here would define a second, differently-named symbol
+    // ("module.class.method"), leaving the canonical one with no bytecode address --
+    // so the class's vtable was emitted under the module's name (or skipped as
+    // unresolved) and any dispatch through it died with "Global '<class>_vtable' not
+    // found". Only unqualified routine names get the unit prefix.
+    if (current_compilation_unit_name && strchr(func_name, '.') == NULL) {
         snprintf(name_for_lookup, sizeof(name_for_lookup), "%s.%s", current_compilation_unit_name, func_name);
         toLowerString(name_for_lookup);
     } else {
@@ -7862,6 +7872,19 @@ static void compileDefinedFunction(AST* func_decl_node, BytecodeChunk* chunk, in
 
     proc_symbol->bytecode_address = func_bytecode_start_address;
     proc_symbol->is_defined = true;
+    // Mark a value-less routine VOID on whichever symbol we ended up with, not just
+    // the one materialized above: a pre-existing symbol (methods, which the semantic
+    // pass registers as "class.method" before any address is known) can still be
+    // carrying TYPE_UNKNOWN from its calloc. That type is serialized into the
+    // bytecode cache, and the verifier reads it back to decide whether a RETURN must
+    // leave a value on the stack -- a Void method left at TYPE_UNKNOWN makes every
+    // cached chunk containing it fail verification and get discarded. Only the
+    // VOID/non-VOID distinction is corrected here; a value-returning function's
+    // recorded type also drives return-value coercion at runtime, and overwriting a
+    // resolved one with the declared type would change what such calls evaluate to.
+    if (proc_symbol->type == TYPE_UNKNOWN && func_decl_node->type == AST_PROCEDURE_DECL) {
+        proc_symbol->type = TYPE_VOID;
+    }
     fc.function_symbol = proc_symbol;
     proc_symbol->enclosing = fc.enclosing ? fc.enclosing->function_symbol : NULL;
 
