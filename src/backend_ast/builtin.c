@@ -8672,19 +8672,33 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
                     io_error = 1;
                     break;
                 }
-                StringObj* dst_str_obj = PSCAL_VALUE_PTR(*dst, StringObj);
                 VarType dst_str_retype = (VALUE_TYPE(*dst) == TYPE_UNICODE_STRING) ? TYPE_UNICODE_STRING : TYPE_STRING;
-                if (isPascalStringType(VALUE_TYPE(*dst)) && dst_str_obj && dst_str_obj->buffer) {
-                    free(dst_str_obj->buffer);
-                }
+                // Rebind to a FRESH StringObj rather than overwriting the one
+                // already attached.
+                //
+                // Copying a string Value copies the StringObj pointer, so any
+                // number of Values can share one object. Reusing it here --
+                // free(old buffer), install the new one, re-tag the same
+                // wrapper -- mutated every one of those sharers at once. In
+                // Aether that made the ordinary read-and-keep loop silently
+                // wrong:
+                //
+                //     readln(f, line); a = line;   // "one"
+                //     readln(f, line); b = line;   // "two"
+                //     readln(f, line);             // "three"
+                //     -> a, b and line all read "three"
+                //
+                // Reading a file into an array produced N copies of the last
+                // line, with no error. Allocating a new object leaves earlier
+                // copies pointing at the value they were given, which is what
+                // plain assignment already does (`s = t;` then `t = "x";`
+                // never disturbed `s`). The previous object is header-managed
+                // and is no longer freed here precisely because a sharer may
+                // still hold it.
+                StringObj* fresh_str_obj = pscalStringObjCreate(-1, dst_str_retype);
+                fresh_str_obj->buffer = tmp;
                 SET_VALUE_TYPE(dst, dst_str_retype);
-                // dst reached this switch case via VALUE_TYPE(*dst), so it
-                // was already a real string wrapper before the retype above
-                // reset .bits to a nil-pointer placeholder -- re-tag with
-                // the wrapper that's still there (never reallocated here,
-                // captured in dst_str_obj before the retype wiped .bits).
-                pscalValueSetHeapPtrBits(dst, dst_str_obj);
-                AS_STRING(*dst) = tmp;
+                pscalValueSetHeapPtrBits(dst, fresh_str_obj);
                 i = arg_count; // consume the line; ignore trailing params
                 break;
             }
