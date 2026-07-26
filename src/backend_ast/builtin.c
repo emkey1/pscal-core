@@ -1399,7 +1399,76 @@ static Value SDL_UNUSED_FUNC vmBuiltinSDLUnavailable(VM* vm, int arg_count, Valu
 
 // Per-thread state to keep core builtins thread-safe
 static _Thread_local DIR* dos_dir = NULL; // Used by dosFindfirst/findnext
+
+/* Random number seeding.
+ *
+ * rand_seed is per-thread, which is what keeps rand_r thread-safe -- but a
+ * worker thread that never seeds itself starts from the same constant as every
+ * other worker and draws an IDENTICAL stream. That made every `par` branch
+ * produce the same "random" numbers, so a parallel sampler silently computed
+ * the same draws in each branch and reported a confidently wrong aggregate.
+ * Randomize() only ever touched the calling thread, so it could not fix this,
+ * and calling it inside each branch did not help either: it seeded from
+ * time(NULL), whose whole-second resolution handed both branches the same value.
+ *
+ * Each thread now derives its own seed on first use from a shared base mixed
+ * with a unique per-thread index. That gives all three properties at once:
+ *   - branches diverge, because their indices differ;
+ *   - with no Randomize() the base stays at its default, so a run is still
+ *     bit-for-bit reproducible (each thread deterministically from its index);
+ *   - Randomize() moves the base using sub-second entropy, so back-to-back runs
+ *     differ -- time(NULL) alone repeats for anything launched twice in a second.
+ *
+ * Thread indices are handed out in the order threads first draw a number, so
+ * *which* branch gets which stream is not deterministic across runs. The
+ * streams themselves are independent, which is the property that matters here;
+ * pinning a stream to a particular branch would need a branch id the VM does
+ * not expose to builtins.
+ */
 static _Thread_local unsigned int rand_seed = 1;
+static _Thread_local int rand_seed_ready = 0;
+static _Thread_local unsigned int rand_thread_index = 0;
+static _Thread_local int rand_thread_index_ready = 0;
+static atomic_uint gRandBaseSeed = 1u;
+static atomic_uint gRandThreadCounter = 0u;
+
+/* splitmix32-style avalanche: adjacent indices must not yield adjacent seeds,
+ * or rand_r's early outputs stay visibly correlated between branches. */
+static unsigned int randMixSeed(unsigned int base, unsigned int index) {
+    unsigned int x = base + index * 0x9E3779B9u;
+    x ^= x >> 16;
+    x *= 0x7FEB352Du;
+    x ^= x >> 15;
+    x *= 0x846CA68Bu;
+    x ^= x >> 16;
+    return x;
+}
+
+static unsigned int randThreadIndex(void) {
+    if (!rand_thread_index_ready) {
+        rand_thread_index = atomic_fetch_add(&gRandThreadCounter, 1u);
+        rand_thread_index_ready = 1;
+    }
+    return rand_thread_index;
+}
+
+static void randEnsureSeeded(void) {
+    if (!rand_seed_ready) {
+        rand_seed = randMixSeed(atomic_load(&gRandBaseSeed), randThreadIndex());
+        rand_seed_ready = 1;
+    }
+}
+
+/* time(NULL) has whole-second resolution; fold in nanoseconds so two runs
+ * started inside the same second do not replay the same sequence. */
+static unsigned int randEntropy(void) {
+    unsigned int entropy = (unsigned int)time(NULL);
+    struct timeval tv;
+    if (gettimeofday(&tv, NULL) == 0) {
+        entropy ^= (unsigned int)tv.tv_usec * 0x9E3779B9u;
+    }
+    return entropy;
+}
 
 // Terminal cursor helper
 static int getCursorPosition(int *row, int *col);
@@ -8871,17 +8940,25 @@ Value vmBuiltinIoresult(VM* vm, int arg_count, Value* args) {
 
 Value vmBuiltinRandomize(VM* vm, int arg_count, Value* args) {
     if (arg_count != 0) { runtimeError(vm, "Randomize requires 0 arguments."); return makeVoid(); }
-    rand_seed = (unsigned int)time(NULL);
+    unsigned int base = randEntropy();
+    atomic_store(&gRandBaseSeed, base);
+    /* Reseed the caller right away, mixed with its own thread index, so two
+     * par branches that each call Randomize() still diverge even though they
+     * read the same base. */
+    rand_seed = randMixSeed(base, randThreadIndex());
+    rand_seed_ready = 1;
     return makeVoid();
 }
 
 Value vmBuiltinRandom(VM* vm, int arg_count, Value* args) {
     if (arg_count == 0) {
+        randEnsureSeeded();
         return makeReal((double)rand_r(&rand_seed) / ((double)RAND_MAX + 1.0));
     }
     if (arg_count == 1 && IS_INTLIKE(args[0])) {
         long long n = AS_INTEGER(args[0]);
         if (n <= 0) { runtimeError(vm, "Random argument must be > 0."); return makeInt(0); }
+        randEnsureSeeded();
         return makeInt(rand_r(&rand_seed) % n);
     }
     runtimeError(vm, "Random requires 0 arguments, or 1 integer argument.");
