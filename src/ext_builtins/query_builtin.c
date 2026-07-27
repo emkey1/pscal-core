@@ -726,8 +726,24 @@ static Value vmBuiltinHasExtBuiltin(struct VM_s *vm, int arg_count,
   }
   const char *category = AS_STRING(args[0]);
   const char *func = AS_STRING(args[1]);
-  int present = extBuiltinHasFunction(category, func);
-  return makeBoolean(present);
+  if (extBuiltinHasFunction(category, func)) {
+    return makeBoolean(1);
+  }
+  /* Fall back to the core VM registry.
+   *
+   * Searching only the extended registry made this probe *inverted* for core
+   * builtins rather than merely unhelpful: has_builtin("network",
+   * "SocketCreate") answered false on a build where socketcreate(0) returns a
+   * working handle, so a guard written the obvious way reported a working
+   * capability as missing and skipped the code that would have worked. Callers
+   * ask "can I call this?", and for a core builtin the answer is always yes.
+   *
+   * The category is deliberately ignored on this path: core builtins are not
+   * filed under one, so there is no category that could match. That makes
+   * has_builtin("anything", "socketcreate") true, which is the honest reading --
+   * the function is the question, and the category only ever narrowed the
+   * extended registry. */
+  return makeBoolean(getVmBuiltinID(func) >= 0);
 }
 
 static size_t countFunctionsAcrossGroups(const char *category) {
