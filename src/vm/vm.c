@@ -8777,7 +8777,7 @@ comparison_error_label:
                 } else if (VALUE_TYPE(operand) == TYPE_ARRAY) {
                     array_val_ptr = &operand;
                 } else {
-                    runtimeError(vm, "VM Error: Expected a pointer to an array for element access.");
+                    runtimeError(vm, "[AETH-RUNTIME-INDEX-NOT-ARRAY] cannot index this value: it is not an array. hint: indexing a 1-D array two-dimensionally (dp[i][j]) does this -- a `let dp: Int[]` is flat, so use a single index dp[i * width + j], or build an array of arrays.");
                     free(indices);
                     freeValue(&operand);
                     return INTERPRET_RUNTIME_ERROR;
@@ -9031,7 +9031,7 @@ comparison_error_label:
                 } else if (VALUE_TYPE(operand) == TYPE_ARRAY) {
                     array_val_ptr = &operand;
                 } else {
-                    runtimeError(vm, "VM Error: Expected a pointer to an array for element access.");
+                    runtimeError(vm, "[AETH-RUNTIME-INDEX-NOT-ARRAY] cannot index this value: it is not an array. hint: indexing a 1-D array two-dimensionally (dp[i][j]) does this -- a `let dp: Int[]` is flat, so use a single index dp[i * width + j], or build an array of arrays.");
                     freeValue(&operand);
                     return INTERPRET_RUNTIME_ERROR;
                 }
@@ -9263,7 +9263,7 @@ comparison_error_label:
                 } else if (VALUE_TYPE(operand) == TYPE_ARRAY) {
                     array_val_ptr = &operand;
                 } else {
-                    runtimeError(vm, "VM Error: Expected a pointer to an array for element access.");
+                    runtimeError(vm, "[AETH-RUNTIME-INDEX-NOT-ARRAY] cannot index this value: it is not an array. hint: indexing a 1-D array two-dimensionally (dp[i][j]) does this -- a `let dp: Int[]` is flat, so use a single index dp[i * width + j], or build an array of arrays.");
                     free(indices);
                     freeValue(&operand);
                     return INTERPRET_RUNTIME_ERROR;
@@ -9460,7 +9460,7 @@ comparison_error_label:
                 } else if (VALUE_TYPE(operand) == TYPE_ARRAY) {
                     array_val_ptr = &operand;
                 } else {
-                    runtimeError(vm, "VM Error: Expected a pointer to an array for element access.");
+                    runtimeError(vm, "[AETH-RUNTIME-INDEX-NOT-ARRAY] cannot index this value: it is not an array. hint: indexing a 1-D array two-dimensionally (dp[i][j]) does this -- a `let dp: Int[]` is flat, so use a single index dp[i * width + j], or build an array of arrays.");
                     freeValue(&operand);
                     return INTERPRET_RUNTIME_ERROR;
                 }

@@ -321,7 +321,7 @@ static Value vmBuiltinYyjsonRead(struct VM_s *vm, int arg_count, Value *args) {
     yyjson_read_err err;
     yyjson_doc *doc = yyjson_read_opts((char *)json, strlen(json), 0, NULL, &err);
     if (!doc) {
-        runtimeError(vm, "YyjsonRead failed at position %zu: %s", err.pos, err.msg ? err.msg : "unknown error");
+        runtimeError(vm, "[AETH-RUNTIME-TOON-PARSE] toon_parse could not parse the input at position %zu: %s. hint: the text must be valid JSON; check for unquoted keys, trailing commas, or single quotes.", err.pos, err.msg ? err.msg : "unknown error");
         return makeInt(YYJSON_UNUSED_HANDLE);
     }
     int handle = jsonAllocDocHandle(doc);
@@ -415,7 +415,7 @@ cleanup:
 
 static Value vmBuiltinYyjsonGetKey(struct VM_s *vm, int arg_count, Value *args) {
     if (arg_count != 2 || !IS_INTLIKE(args[0]) || !isPascalStringType(VALUE_TYPE(args[1]))) {
-        runtimeError(vm, "YyjsonGetKey expects (value_handle:int, key:string).");
+        runtimeError(vm, "[AETH-RUNTIME-TOON-KEY-ARGS] toon_key expects (node: ToonNode, key: Text). hint: pass a node from toon_root/toon_at/toon_key, not a ToonDoc -- use toon_root(doc) first.");
         return makeInt(YYJSON_UNUSED_HANDLE);
     }
     int handle = (int)AS_INTEGER(args[0]);
@@ -487,14 +487,15 @@ static Value vmBuiltinYyjsonGetIndex(struct VM_s *vm, int arg_count, Value *args
         const char *suggestedField = jsonFindSuggestedArrayField(val);
         if (suggestedField && *suggestedField) {
             runtimeError(vm,
-                         "[AETH-RUNTIME-TOON-GET-INDEX-ARRAY] YyjsonGetIndex requires an array value handle, got %s. "
-                         "If this is an object root, extract its array field first, for example "
+                         "[AETH-RUNTIME-TOON-GET-INDEX-ARRAY] toon_at expects an array ToonNode, but got %s. "
+                         "hint: if this is an object root, extract its array field first, for example "
                          "toon_key(root, \"%s\").",
                          actualType,
                          suggestedField);
         } else {
             runtimeError(vm,
-                         "[AETH-RUNTIME-TOON-GET-INDEX-ARRAY] YyjsonGetIndex requires an array value handle, got %s.",
+                         "[AETH-RUNTIME-TOON-GET-INDEX-ARRAY] toon_at expects an array ToonNode, but got %s. "
+                         "hint: use toon_key(node, \"field\") to reach the array first.",
                          actualType);
         }
         goto cleanup;
@@ -712,7 +713,7 @@ cleanup:
 
 static Value vmBuiltinYyjsonGetInt(struct VM_s *vm, int arg_count, Value *args) {
     if (arg_count != 1 || !IS_INTLIKE(args[0])) {
-        runtimeError(vm, "[AETH-RUNTIME-TOON-GET-INT-ARITY] YyjsonGetInt expects a single value handle.");
+        runtimeError(vm, "[AETH-RUNTIME-TOON-GET-INT-ARITY] toon_int_value expects a single ToonNode. hint: to read a keyed field use toon_get_int(node, key).");
         return makeInt64(0);
     }
     int handle = (int)AS_INTEGER(args[0]);
