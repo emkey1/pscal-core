@@ -4234,6 +4234,65 @@ void runtimeWarning(VM* vm, const char* format, ...) {
     }
 }
 
+/* Per-dimension bounds check for an indexed array access.
+ *
+ * computeFlatOffset() (core/utils.c) already bounds-checks every dimension, but
+ * it takes only (Value*, int*) and has no VM pointer, so all it can do on a
+ * violation is fprintf a bare line and EXIT_FAILURE_HANDLER():
+ *
+ *     Runtime error: Index 1 out of bounds [0..0] in dimension 1.
+ *
+ * No source path, no line, no diagnostic code -- and it exits before the VM's
+ * own flat-offset check downstream can produce a located error. That cost a real
+ * benchmark case: a generated edit-distance program wrote `dp[i][j-1]` where it
+ * meant `row[j-1]` (row i is not appended to dp until after the inner loop), and
+ * the message named none of the four dp[...] accesses in the function. Three
+ * repair rounds failed to find a one-token bug because nothing said *where*.
+ *
+ * Checking here, where `vm` is in scope, lets the failure go through
+ * runtimeError(), which prefixes `source:line:` when the chunk knows them.
+ *
+ * Mirrors computeFlatOffset()'s own loop exactly -- same descending dimension
+ * order, same lower_bounds/upper_bounds arrays -- so it cannot disagree about
+ * what is in bounds. Those per-dimension arrays are authoritative: ArrayObj also
+ * carries singular lower_bound/upper_bound convenience fields, which are NOT
+ * folded into element [0] (see core/types.h) and must not be used here.
+ * computeFlatOffset()'s check stays as a backstop for its non-VM callers.
+ */
+static bool vmCheckArrayIndexBounds(VM* vm, Value* array_val_ptr, int* indices) {
+    if (!array_val_ptr || !indices) return true;
+    ArrayObj* a = PSCAL_VALUE_PTR(*array_val_ptr, ArrayObj);
+    if (!a || !a->lower_bounds || !a->upper_bounds) return true;
+
+    for (int i = a->dimensions - 1; i >= 0; i--) {
+        int idx = indices[i];
+        int lo = a->lower_bounds[i];
+        int hi = a->upper_bounds[i];
+        if (idx >= lo && idx <= hi) continue;
+
+        /* Dimension numbering is 1-based here to match the long-standing
+         * wording in computeFlatOffset(); the indices themselves keep whatever
+         * base the array declares (Aether arrays are 0-based, but Pascal
+         * frontends may declare any lower bound, which is why the valid range
+         * is printed rather than assumed). */
+        if (frontendIsAether()) {
+            runtimeError(vm,
+                         "[ARR-003] array index %d is out of bounds in dimension %d of %d: "
+                         "valid indices are %d..%d.\n"
+                         "hint: the index is past the end of what has been appended so far -- "
+                         "check the loop bound, and whether you meant the row currently being "
+                         "built rather than one already stored.\n"
+                         "help: see ARR-003 in the Aether guide",
+                         idx, i + 1, a->dimensions, lo, hi);
+        } else {
+            runtimeError(vm, "Index %d out of bounds [%d..%d] in dimension %d.",
+                         idx, lo, hi, i + 1);
+        }
+        return false;
+    }
+    return true;
+}
+
 // runtimeError - Assuming your existing one is fine.
 void runtimeError(VM* vm, const char* format, ...) {
     if (vm) {
@@ -8842,6 +8901,21 @@ comparison_error_label:
                     break;
                 }
 
+                /* Bounds-check before computeFlatOffset(), which would otherwise
+                 * print a location-less line and exit. See
+                 * vmCheckArrayIndexBounds(). */
+                if (!vmCheckArrayIndexBounds(vm, array_val_ptr, indices)) {
+                    free(indices);
+                    freeValue(&operand);
+                    if (using_wrapper) {
+                        vmFreeArrayIndexWrapper(&temp_wrapper);
+                    }
+                    if (using_snapshot) {
+                        freeValue(&shared_snapshot);
+                    }
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+
                 int offset = computeFlatOffset(array_val_ptr, indices);
                 free(indices);
 
@@ -9305,6 +9379,21 @@ comparison_error_label:
                         freeValue(&shared_snapshot);
                     }
                     break;
+                }
+
+                /* Bounds-check before computeFlatOffset(), which would otherwise
+                 * print a location-less line and exit. Note this site's operand
+                 * cleanup is conditional, unlike the other call site's. */
+                if (!vmCheckArrayIndexBounds(vm, array_val_ptr, indices)) {
+                    free(indices);
+                    if (VALUE_TYPE(operand) == TYPE_POINTER) freeValue(&operand);
+                    if (using_wrapper) {
+                        vmFreeArrayIndexWrapper(&temp_wrapper);
+                    }
+                    if (using_snapshot) {
+                        freeValue(&shared_snapshot);
+                    }
+                    return INTERPRET_RUNTIME_ERROR;
                 }
 
                 int offset = computeFlatOffset(array_val_ptr, indices);
