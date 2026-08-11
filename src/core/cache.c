@@ -2299,6 +2299,11 @@ static bool loadProceduresFromStream(Cursor* in, int proc_count, uint32_t chunk_
         sym->closure_captures = (bool)closure_captures;
         sym->closure_escapes = (bool)closure_escapes;
         sym->is_defined = true;
+        /* A cached chunk is fully compiled: every address in it is final, so the
+         * "body emitted yet?" question the compiler asks during codegen is already
+         * settled. Nothing re-emits code against these symbols, but keep the two
+         * flags consistent so a stale-address gate never mis-fires on a cache hit. */
+        sym->is_body_compiled = true;
         sym->enclosing = NULL;
 
         bool upvalues_ok = true;

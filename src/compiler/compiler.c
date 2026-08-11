@@ -1340,6 +1340,7 @@ static void syncVirtualMethodSymbolToGlobalTable(Symbol* source) {
 
     target->type = resolved->type;
     target->is_defined = resolved->is_defined;
+    target->is_body_compiled = resolved->is_body_compiled;
     target->bytecode_address = resolved->bytecode_address;
     target->arity = resolved->arity;
     target->locals_count = resolved->locals_count;
@@ -7872,6 +7873,15 @@ static void compileDefinedFunction(AST* func_decl_node, BytecodeChunk* chunk, in
 
     proc_symbol->bytecode_address = func_bytecode_start_address;
     proc_symbol->is_defined = true;
+    // Only a decl that actually carries a body makes bytecode_address final. A
+    // body-less prototype compiles to an empty JUMP/RETURN stub here and the real
+    // definition overwrites the address later, so leave is_body_compiled alone on
+    // the prototype pass -- never clear it, since the two passes can arrive in
+    // either order and a prototype must not un-finalize an address already emitted.
+    if ((func_decl_node->type == AST_PROCEDURE_DECL) ? (func_decl_node->right != NULL)
+                                                     : (func_decl_node->extra != NULL)) {
+        proc_symbol->is_body_compiled = true;
+    }
     // Mark a value-less routine VOID on whichever symbol we ended up with, not just
     // the one materialized above: a pre-existing symbol (methods, which the semantic
     // pass registers as "class.method" before any address is known) can still be
@@ -10537,12 +10547,20 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
             if (!proc_symbol && calleeName) {
                 proc_symbol = lookupProcedure(calleeName);
             }
-            if (!proc_symbol || !proc_symbol->is_defined) {
+            if (!proc_symbol || !proc_symbol->is_defined || !proc_symbol->is_body_compiled) {
                 // Forward reference: the target's bytecode address isn't
                 // known yet (its body compiles later in the program). Emit
                 // the callee name as a string; vmHostCreateThreadAddr
                 // resolves it via the procedure table at spawn time, when
                 // every routine is defined.
+                //
+                // is_defined alone is NOT sufficient: a frontend that forward-declares
+                // (Aether emits a prototype for every top-level fn; Pascal has
+                // `forward`) sets is_defined on an empty stub, so both branches below
+                // would bake in the stub's address and the spawned thread would return
+                // immediately -- the branch silently doing nothing, exit 0, no
+                // diagnostic. is_body_compiled is the flag that actually means
+                // "bytecode_address is final".
                 if (calleeName) {
                     char lowerName[MAX_SYMBOL_LENGTH];
                     strncpy(lowerName, calleeName, sizeof(lowerName) - 1);

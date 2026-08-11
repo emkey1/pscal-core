@@ -31,6 +31,16 @@ struct Symbol_s {
     struct Symbol_s *next;     // Self-referential pointer using the tag
     // --- New fields for compiled procedures/functions ---
     bool is_defined;              // Flag to indicate if the body has been compiled (useful for forward declarations)
+    // True only once the routine's REAL body has been emitted, so bytecode_address
+    // is final. is_defined does not carry that guarantee despite its comment: a
+    // body-less prototype (Aether forward-declares every top-level fn, and Pascal
+    // has `forward`) is compiled as an empty JUMP/RETURN stub that sets is_defined
+    // and a placeholder bytecode_address, which the real body later overwrites.
+    // Codegen that bakes an address in eagerly instead of resolving by name must
+    // gate on THIS flag -- see AST_THREAD_SPAWN, where trusting is_defined silently
+    // spawned the stub (a thread that returns immediately) for any target defined
+    // below the spawning routine.
+    bool is_body_compiled;
     int bytecode_address;         // Starting address (offset) in the bytecode chunk
     uint8_t arity;                // Number of parameters
     uint16_t locals_count;        // Number of local variables (excluding parameters)

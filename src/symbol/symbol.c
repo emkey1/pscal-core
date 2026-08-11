@@ -390,6 +390,7 @@ void insertGlobalSymbol(const char *name, VarType type, AST *type_def) {
     new_symbol->enclosing = NULL;
     new_symbol->type_def = type_def ? copyAST(type_def) : NULL; // Store a DEEP COPY of the type definition
     new_symbol->is_defined = false; // Flag to indicate if the body has been compiled (useful for forward declarations)
+    new_symbol->is_body_compiled = false;
     new_symbol->bytecode_address = 0; // Starting address (offset) in the bytecode chunk
     new_symbol->arity = 0; // Number of parameters
     new_symbol->locals_count = 0; // Number of local variables (excluding parameters)
@@ -485,6 +486,7 @@ void insertGlobalAlias(const char *name, Symbol *target) {
     alias->is_alias = true;
     alias->real_symbol = resolved;
     alias->is_defined = resolved->is_defined;
+    alias->is_body_compiled = resolved->is_body_compiled;
     alias->bytecode_address = resolved->bytecode_address;
     alias->arity = resolved->arity;
     alias->locals_count = resolved->locals_count;
@@ -591,6 +593,7 @@ void insertConstGlobalSymbol(const char *name, Value val) {
     new_symbol->enclosing = NULL;
     new_symbol->real_symbol = NULL;
     new_symbol->is_defined = false;
+    new_symbol->is_body_compiled = false;
     new_symbol->bytecode_address = 0;
     new_symbol->arity = 0;
     new_symbol->locals_count = 0;
@@ -645,6 +648,7 @@ void insertConstSymbolIn(HashTable *table, const char *name, Value val) {
     new_symbol->enclosing = NULL;
     new_symbol->real_symbol = NULL;
     new_symbol->is_defined = false;
+    new_symbol->is_body_compiled = false;
     new_symbol->bytecode_address = 0;
     new_symbol->arity = 0;
     new_symbol->locals_count = 0;
