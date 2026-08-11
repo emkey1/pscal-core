@@ -10554,13 +10554,15 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                 // resolves it via the procedure table at spawn time, when
                 // every routine is defined.
                 //
-                // is_defined alone is NOT sufficient: a frontend that forward-declares
-                // (Aether emits a prototype for every top-level fn; Pascal has
-                // `forward`) sets is_defined on an empty stub, so both branches below
-                // would bake in the stub's address and the spawned thread would return
-                // immediately -- the branch silently doing nothing, exit 0, no
+                // is_defined alone is NOT sufficient: a frontend whose prototypes
+                // reach the backend as declaration nodes (Aether appends one per
+                // top-level fn) sets is_defined on an empty stub, so both branches
+                // below would bake in the stub's address and the spawned thread would
+                // return immediately -- the branch silently doing nothing, exit 0, no
                 // diagnostic. is_body_compiled is the flag that actually means
-                // "bytecode_address is final".
+                // "bytecode_address is final". Rea and CLike never emitted prototypes
+                // and Pascal's `forward` emits no stub, so all three already took this
+                // path and their bytecode is unchanged.
                 if (calleeName) {
                     char lowerName[MAX_SYMBOL_LENGTH];
                     strncpy(lowerName, calleeName, sizeof(lowerName) - 1);

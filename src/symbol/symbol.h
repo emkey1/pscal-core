@@ -33,9 +33,12 @@ struct Symbol_s {
     bool is_defined;              // Flag to indicate if the body has been compiled (useful for forward declarations)
     // True only once the routine's REAL body has been emitted, so bytecode_address
     // is final. is_defined does not carry that guarantee despite its comment: a
-    // body-less prototype (Aether forward-declares every top-level fn, and Pascal
-    // has `forward`) is compiled as an empty JUMP/RETURN stub that sets is_defined
-    // and a placeholder bytecode_address, which the real body later overwrites.
+    // frontend can hand the backend a body-less prototype AS A DECLARATION NODE,
+    // which compiles to an empty JUMP/RETURN stub that sets is_defined and a
+    // placeholder bytecode_address the real body later overwrites. Aether does
+    // exactly this -- its parser appends a prototype for every top-level fn so
+    // forward references resolve. (Pascal's `forward` does NOT: it emits no stub,
+    // leaves is_defined false, and was never affected. Verified, not assumed.)
     // Codegen that bakes an address in eagerly instead of resolving by name must
     // gate on THIS flag -- see AST_THREAD_SPAWN, where trusting is_defined silently
     // spawned the stub (a thread that returns immediately) for any target defined
