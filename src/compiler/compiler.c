@@ -3610,6 +3610,73 @@ static void emitDefaultFieldInitializers(AST* recordType, BytecodeChunk* chunk, 
     }
 }
 
+// True when `sym` is the constructor of the class `lowerClassName` names.
+//
+// A constructor is a *method* whose simple name repeats its class's -- `Widget.Widget`,
+// or `Mod.Widget.Widget` when module-qualified. That is exactly the shape
+// restoreConstructorAliasesImpl() (core/cache.c) matches when it publishes a
+// constructor under its bare class name, so this is the same rule read backwards.
+//
+// The distinction matters because the bare name is a shared namespace. Aether and Rea
+// identifiers are case-insensitive (PSCAL heritage), so a free function `fn widget`
+// occupies the very slot `type Widget`'s constructor would be published under. Treating
+// whatever sits there as the constructor made `new Widget()` call that free function
+// with the raw object as its first argument: a crash when the arities disagreed
+// ("Local slot index N out of range"), and silent execution of unrelated user code when
+// they happened to agree. An undotted name is a free function, never a constructor.
+static bool symbolIsConstructorFor(const Symbol* sym, const char* lowerClassName) {
+    if (!sym || !sym->name || !lowerClassName || !*lowerClassName) return false;
+
+    const char* last_dot = strrchr(sym->name, '.');
+    if (!last_dot || last_dot == sym->name) return false;  // undotted => a free function
+    const char* method_name = last_dot + 1;
+    if (*method_name == '\0') return false;
+
+    size_t prefix_len = (size_t)(last_dot - sym->name);
+    char class_buf[MAX_SYMBOL_LENGTH];
+    if (prefix_len == 0 || prefix_len >= sizeof(class_buf)) return false;
+    memcpy(class_buf, sym->name, prefix_len);
+    class_buf[prefix_len] = '\0';
+
+    // Compare on simple names so a module-qualified constructor still matches.
+    const char* class_simple = strrchr(class_buf, '.');
+    class_simple = class_simple ? class_simple + 1 : class_buf;
+    const char* want_simple = strrchr(lowerClassName, '.');
+    want_simple = want_simple ? want_simple + 1 : lowerClassName;
+    if (!*class_simple || !*want_simple) return false;
+
+    return strcasecmp(method_name, class_simple) == 0 &&
+           strcasecmp(class_simple, want_simple) == 0;
+}
+
+// Resolve the procedure name `new <lowerClassName>(...)` should call, or NULL when the
+// class has no constructor. Shared by the AST_NEW cases in compileLValue() and
+// compileRValue() so the two cannot drift apart.
+static const char* resolveConstructorCallName(const char* lowerClassName) {
+    if (!lowerClassName || !*lowerClassName) return NULL;
+
+    Symbol* ctorSymbol = lookupProcedure(lowerClassName);
+    Symbol* resolvedCtor = resolveSymbolAlias(ctorSymbol);
+    if (symbolIsConstructorFor(resolvedCtor, lowerClassName)) return resolvedCtor->name;
+    if (symbolIsConstructorFor(ctorSymbol, lowerClassName)) return ctorSymbol->name;
+
+    // The bare name is either free or taken by something that is not this class's
+    // constructor. ensureProcedureAlias() declines to overwrite a non-alias, so when a
+    // free function got there first a real constructor is still reachable under its own
+    // dotted name -- look there before concluding the class has none.
+    const char* want_simple = strrchr(lowerClassName, '.');
+    want_simple = want_simple ? want_simple + 1 : lowerClassName;
+    char dotted[MAX_SYMBOL_LENGTH];
+    if (snprintf(dotted, sizeof(dotted), "%s.%s", lowerClassName, want_simple) >=
+        (int)sizeof(dotted)) {
+        return NULL;
+    }
+    Symbol* dottedSym = resolveSymbolAlias(lookupProcedure(dotted));
+    if (symbolIsConstructorFor(dottedSym, lowerClassName)) return dottedSym->name;
+
+    return NULL;
+}
+
 // Emit the field-setting bytecode for a record-literal initializer attached to an
 // AST_NEW node (`new T { field: value, ... }`). The freshly constructed object is
 // already on top of the stack when this is called; for each named field we emit
@@ -6335,16 +6402,20 @@ static void compileLValue(AST* node, BytecodeChunk* chunk, int current_line_appr
             emitDefaultFieldInitializers(classType, chunk, line, hasVTable);
             emitArrayFieldInitializers(classType, chunk, line, hasVTable);
 
-            Symbol* ctorSymbol = lookupProcedure(lowerClassName);
-            Symbol* resolvedCtor = resolveSymbolAlias(ctorSymbol);
-            const char* ctorLookupName = lowerClassName;
-            if (resolvedCtor && resolvedCtor->name) {
-                ctorLookupName = resolvedCtor->name;
-            } else if (ctorSymbol && ctorSymbol->name) {
-                ctorLookupName = ctorSymbol->name;
-            }
+            const char* ctorLookupName = resolveConstructorCallName(lowerClassName);
 
-            if (resolvedCtor || ctorSymbol || node->child_count > 0) {
+            if (ctorLookupName || node->child_count > 0) {
+                // No constructor but arguments were supplied: keep emitting a call so the
+                // "no such procedure" diagnostic still fires, but name the constructor we
+                // wanted rather than the bare class name, which a same-named free function
+                // would otherwise answer.
+                char missingCtor[MAX_SYMBOL_LENGTH];
+                if (!ctorLookupName) {
+                    const char* simple = strrchr(lowerClassName, '.');
+                    simple = simple ? simple + 1 : lowerClassName;
+                    snprintf(missingCtor, sizeof(missingCtor), "%s.%s", lowerClassName, simple);
+                    ctorLookupName = missingCtor;
+                }
                 writeBytecodeChunk(chunk, DUP, line);
                 for (int i = 0; i < node->child_count; i++) {
                     compileRValue(node->children[i], chunk, getLine(node->children[i]));
@@ -7839,6 +7910,19 @@ static void compileDefinedFunction(AST* func_decl_node, BytecodeChunk* chunk, in
     }
     
     proc_symbol = lookupProcedure(name_for_lookup);
+
+    // lookupProcedure() follows aliases transparently, and a class publishes its
+    // constructor under the bare class name (restoreProcedureConstructorAliases,
+    // core/cache.c). Defining a free function whose name collides with a class would
+    // therefore bind to that class's constructor and overwrite its bytecode address,
+    // so the class's own `new` ran the free function's body instead. A free function
+    // is never a constructor: leave the constructor alone and give the definition its
+    // own symbol below. Method definitions arrive dotted and are unaffected, as is the
+    // constructor's own definition ("Class.Class").
+    if (proc_symbol && strchr(name_for_lookup, '.') == NULL &&
+        symbolIsConstructorFor(proc_symbol, name_for_lookup)) {
+        proc_symbol = NULL;
+    }
 
     if (!proc_symbol) {
         /* In REA we allow implementations without prior interface declarations.
@@ -10302,16 +10386,20 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
             emitDefaultFieldInitializers(classType, chunk, line, hasVTable);
             emitArrayFieldInitializers(classType, chunk, line, hasVTable);
 
-            Symbol* ctorSymbol = lookupProcedure(lowerClassName);
-            Symbol* resolvedCtor = resolveSymbolAlias(ctorSymbol);
-            const char* ctorLookupName = lowerClassName;
-            if (resolvedCtor && resolvedCtor->name) {
-                ctorLookupName = resolvedCtor->name;
-            } else if (ctorSymbol && ctorSymbol->name) {
-                ctorLookupName = ctorSymbol->name;
-            }
+            const char* ctorLookupName = resolveConstructorCallName(lowerClassName);
 
-            if (resolvedCtor || ctorSymbol || node->child_count > 0) {
+            if (ctorLookupName || node->child_count > 0) {
+                // No constructor but arguments were supplied: keep emitting a call so the
+                // "no such procedure" diagnostic still fires, but name the constructor we
+                // wanted rather than the bare class name, which a same-named free function
+                // would otherwise answer.
+                char missingCtor[MAX_SYMBOL_LENGTH];
+                if (!ctorLookupName) {
+                    const char* simple = strrchr(lowerClassName, '.');
+                    simple = simple ? simple + 1 : lowerClassName;
+                    snprintf(missingCtor, sizeof(missingCtor), "%s.%s", lowerClassName, simple);
+                    ctorLookupName = missingCtor;
+                }
                 writeBytecodeChunk(chunk, DUP, line);
                 for (int i = 0; i < node->child_count; i++) {
                     compileRValue(node->children[i], chunk, getLine(node->children[i]));
