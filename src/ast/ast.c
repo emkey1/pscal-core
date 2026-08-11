@@ -401,6 +401,12 @@ AST *newASTNode(ASTNodeType type, Token *token) {
     node->is_inline = false;
     node->is_forward_decl = false;
     node->is_virtual = false;
+    /* Only ever set to true (by the rea/aether parsers, on `export`ed module
+     * decls), so leaving it uninitialised left every other node reading
+     * malloc garbage here. collectModuleExports() is the sole reader and
+     * treats any non-zero byte as "exported" -- benign only while fresh pages
+     * happened to be zero. UBSan caught it as a load of 190 into a bool. */
+    node->is_exported = false;
     node->i_val = 0; // Initialize i_val
     node->symbol_table = NULL; // Initialize symbol_table
     node->unit_list = NULL; // Initialize unit_list
@@ -543,24 +549,19 @@ void setExtra(AST *parent, AST *child) {
 void freeAST(AST *node) {
     if (!node) return;
 
-    static AST** freed_nodes = NULL;
-    static size_t freed_count = 0;
-    static size_t freed_capacity = 0;
-    for (size_t i = 0; i < freed_count; i++) {
-        if (freed_nodes[i] == node) {
-            return;
-        }
-    }
-
+    /* node->freed is the double-free guard. It is set below BEFORE recursing
+     * into the children and the node is not free()d until the very end, so a
+     * node revisited during its own walk -- a cycle, or a subtree reachable by
+     * two paths within one tree -- reads a still-live flag here and bails.
+     *
+     * This used to be backed by a file-static list of every address ever
+     * freed, scanned linearly on entry. That made teardown quadratic, never
+     * released the list, and -- the real defect -- silently refused to free a
+     * NEW node that malloc happened to place at a recycled address. Its one
+     * unique capability was catching a freeAST() call on an already-free()d
+     * pointer, which the in-node flag cannot do; that is a genuine double free
+     * and should crash rather than be absorbed by an address compare. */
     if (node->freed) {
-        if (freed_count == freed_capacity) {
-            size_t new_cap = freed_capacity == 0 ? 64 : freed_capacity * 2;
-            AST** new_buf = realloc(freed_nodes, new_cap * sizeof(AST*));
-            if (!new_buf) return;
-            freed_nodes = new_buf;
-            freed_capacity = new_cap;
-        }
-        freed_nodes[freed_count++] = node;
         return;
     }
     if (isNodeInTypeTable(node)) {
@@ -583,22 +584,45 @@ void freeAST(AST *node) {
     bool skip_left_free = (node->type == AST_TYPE_DECL);
     bool skip_right_free = (node->type == AST_TYPE_REFERENCE);
 
+    /* A node's edge set can name the SAME pointer twice, so remember what the
+     * single edges pointed at and release each distinct pointer exactly once.
+     *
+     * The case that occurs is a lowered method call: `recv.m(a)` becomes
+     * AST_PROCEDURE_CALL(token=m, left=recv, children=[recv, a]) -- the
+     * compiler reads the receiver from `left` to pick the method and from
+     * `children[0]` as the implicit first argument. Both rea's parser.c and
+     * aether's ast_parser.c build it that way (`setLeft(call, recv);
+     * addChild(call, recv);`). Walking left and then children therefore
+     * reached the receiver twice and freed it twice. */
+    AST *left_edge = node->left;
+    AST *right_edge = node->right;
+    AST *extra_edge = node->extra;
+    bool left_walked = false, right_walked = false, extra_walked = false;
+
     if (node->left) {
-        if (!skip_left_free) freeAST(node->left);
+        if (!skip_left_free) { freeAST(node->left); left_walked = true; }
         node->left = NULL;
     }
     if (node->right) {
-        if (!skip_right_free) freeAST(node->right);
+        if (!skip_right_free) { freeAST(node->right); right_walked = true; }
         node->right = NULL;
     }
     if (node->extra) {
         freeAST(node->extra);
+        extra_walked = true;
         node->extra = NULL;
     }
     if (node->children) {
         for (int i = 0; i < node->child_count; i++) {
-            if (node->children[i]) freeAST(node->children[i]);
+            AST *child = node->children[i];
             node->children[i] = NULL;
+            if (!child) continue;
+            if ((left_walked && child == left_edge) ||
+                (right_walked && child == right_edge) ||
+                (extra_walked && child == extra_edge)) {
+                continue;  /* already walked through the single edge above */
+            }
+            freeAST(child);
         }
         free(node->children);
         node->children = NULL;
@@ -618,17 +642,6 @@ void freeAST(AST *node) {
         freeToken(node->token);
         node->token = NULL;
     }
-    if (freed_count == freed_capacity) {
-        size_t new_cap = freed_capacity == 0 ? 64 : freed_capacity * 2;
-        AST** new_buf = realloc(freed_nodes, new_cap * sizeof(AST*));
-        if (!new_buf) {
-            free(node);
-            return;
-        }
-        freed_nodes = new_buf;
-        freed_capacity = new_cap;
-    }
-    freed_nodes[freed_count++] = node;
     free(node);
 }
 
