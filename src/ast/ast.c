@@ -563,11 +563,22 @@ void freeAST(AST *node) {
         freed_nodes[freed_count++] = node;
         return;
     }
-    node->freed = true;
-
     if (isNodeInTypeTable(node)) {
+        /* The shared type registry still owns this node. Only
+         * freeTypeTableASTNodes() may release it, and it unlinks the entry
+         * first so this guard no longer matches.
+         *
+         * Return WITHOUT marking the node freed. Stray callers do hit this
+         * path -- insertType() on a redefinition, and the freeAST(sym->type_def)
+         * calls in every frontend when a symbol's type_def aliases a table node
+         * rather than owning a copy. Stamping node->freed here would make the
+         * eventual teardown free a silent no-op via the node->freed check
+         * above, which is exactly how every user-defined type's definition AST
+         * used to leak. */
         return;
     }
+
+    node->freed = true;
 
     bool skip_left_free = (node->type == AST_TYPE_DECL);
     bool skip_right_free = (node->type == AST_TYPE_REFERENCE);
@@ -2137,8 +2148,20 @@ void freeTypeTableASTNodes(void) {
              fprintf(stderr, "[DEBUG]  - Freeing AST for type '%s' at %p\n",
                      entry->name ? entry->name : "?", (void*)entry->typeAST);
              #endif
-             freeAST(entry->typeAST);
+             /* Unlink BEFORE freeing. freeAST() refuses to release any node
+              * still reachable from type_table, so clearing the entry first is
+              * what lets the free actually happen -- freeing first and clearing
+              * afterwards (as this did) tripped that guard on every entry and
+              * released nothing.
+              *
+              * Deliberately per-entry rather than NULLing every entry up front:
+              * the guard keeps protecting the entries not yet reached, so if
+              * this subtree aliases another entry's still-linked root it bails
+              * out there and that root is freed on its own iteration instead of
+              * being freed twice. */
+             AST *typeAST = entry->typeAST;
              entry->typeAST = NULL;
+             freeAST(typeAST);
          }
          entry = entry->next;
      }

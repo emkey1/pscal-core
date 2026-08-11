@@ -78,6 +78,20 @@ void insertType(const char *name, AST *typeAST) {
 
     if (existing) {
         if (existing->typeAST) {
+            /* Intentionally an inert call: the entry is still linked and still
+             * points at this node, so freeAST() bails out on isNodeInTypeTable()
+             * without releasing anything (and, since that guard no longer stamps
+             * node->freed, without poisoning it either).
+             *
+             * Do NOT "fix" this by unlinking first the way freeTypeTableASTNodes
+             * does. This branch is mostly placeholder promotion
+             * (reserveTypePlaceholder() then insertType()), and anything parsed
+             * in between -- forward references, recursive records, Aether class
+             * members -- captured the placeholder pointer in a
+             * TYPE_REFERENCE->right or a symbol's type_def. Genuinely freeing it
+             * here would dangle every one of those. The superseded node is
+             * orphaned instead: a small leak bounded by the number of type
+             * redefinitions, traded for not handing out dangling pointers. */
             freeAST(existing->typeAST);
         }
         existing->typeAST = copy;
