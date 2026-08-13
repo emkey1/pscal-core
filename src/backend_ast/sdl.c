@@ -2422,11 +2422,11 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinWaitkeyevent) {
 #endif
 
 #if defined(PSCAL_TARGET_IOS)
-            if (VALUE_TYPE(event) == SDL_QUIT) {
+            if (event.type == SDL_QUIT) {
                 continue;
             } else if (isWindowCloseEvent(&event)) {
                 continue;
-            } else if (VALUE_TYPE(event) == SDL_KEYDOWN) {
+            } else if (event.type == SDL_KEYDOWN) {
                 SDL_Keycode sym = event.key.keysym.sym;
                 if (sym == SDLK_q) {
                     SDL_DEBUG_SET_BREAK_REQUESTED(1, "WaitKey(iOS) SDL_KEYDOWN q");
@@ -2437,7 +2437,7 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinWaitkeyevent) {
                     enqueuePendingKeycode(sym);
                     waiting = 0;
                 }
-            } else if (VALUE_TYPE(event) == SDL_TEXTINPUT) {
+            } else if (event.type == SDL_TEXTINPUT) {
                 enqueueUtf8Text(event.text.text);
                 waiting = 0;
             }
