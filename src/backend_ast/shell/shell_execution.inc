@@ -3401,11 +3401,21 @@ static void shellRestoreExecRedirections(ShellExecRedirBackup *backups, size_t c
     for (size_t i = 0; i < count; ++i) {
         ShellExecRedirBackup *backup = &backups[i];
         if (backup->saved_valid && backup->saved_fd >= 0) {
+            bool host_restored = false;
             if (!skip_host_restore) {
-                vprocHostDup2(backup->saved_fd, backup->target_fd);
+                host_restored = (vprocHostDup2(backup->saved_fd, backup->target_fd) >= 0);
             }
             if (backup->use_vproc && active_vp) {
                 (void)vprocRestoreHostFd(active_vp, backup->target_fd, backup->saved_fd);
+            } else if (host_restored && active_vp) {
+                /* shellDupOntoTarget() retargets the current vproc's fd table
+                 * whenever a vproc exists, but shellEnsureExecRedirBackup()
+                 * forces use_vproc off for in-process pipeline stages, so the
+                 * backup only snapshotted the host descriptor. Re-sync the
+                 * vproc entry from the freshly restored host fd; otherwise it
+                 * keeps pointing at the redirection target and silently
+                 * swallows every later write to that descriptor. */
+                (void)vprocRestoreHostFd(active_vp, backup->target_fd, backup->target_fd);
             }
             if (!skip_host_restore) {
                 shellResetStandardStream(backup->target_fd);
