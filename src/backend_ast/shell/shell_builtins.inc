@@ -4544,6 +4544,7 @@ Value vmBuiltinShellLs(VM *vm, int arg_count, Value *args) {
 extern int pascal_main(int argc, char *argv[]);
 extern int clike_main(int argc, char *argv[]);
 extern int rea_main(int argc, char *argv[]);
+extern int aether_main(int argc, char *argv[]);
 extern int pscalvm_main(int argc, char *argv[]);
 extern int pscaljson2bc_main(int argc, char **argv);
 extern int exsh_main(int argc, char *argv[]);
@@ -4571,6 +4572,10 @@ Value vmBuiltinShellClike(VM *vm, int arg_count, Value *args) {
 
 Value vmBuiltinShellRea(VM *vm, int arg_count, Value *args) {
     return shellRunToolBuiltin(vm, "rea", rea_main, FRONTEND_KIND_REA, arg_count, args);
+}
+
+Value vmBuiltinShellAether(VM *vm, int arg_count, Value *args) {
+    return shellRunToolBuiltin(vm, "aether", aether_main, FRONTEND_KIND_AETHER, arg_count, args);
 }
 
 Value vmBuiltinShellPscalVm(VM *vm, int arg_count, Value *args) {

@@ -289,6 +289,7 @@ Value vmBuiltinShellDascal(struct VM_s* vm, int arg_count, Value* args);
 #endif
 Value vmBuiltinShellClike(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinShellRea(struct VM_s* vm, int arg_count, Value* args);
+Value vmBuiltinShellAether(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinShellPscalVm(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinShellPscalJson2bc(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinShellExshTool(struct VM_s* vm, int arg_count, Value* args);

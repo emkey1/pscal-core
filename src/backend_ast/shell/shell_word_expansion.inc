@@ -2514,6 +2514,8 @@ static bool shellDispatchIOSFrontendBuiltin(VM *vm, ShellCommand *cmd) {
         handler = vmBuiltinShellPascal;
     } else if (strcasecmp(name, "rea") == 0) {
         handler = vmBuiltinShellRea;
+    } else if (strcasecmp(name, "aether") == 0) {
+        handler = vmBuiltinShellAether;
     } else if (strcasecmp(name, "pscalvm") == 0) {
         handler = vmBuiltinShellPscalVm;
     } else if (strcasecmp(name, "pscaljson2bc") == 0) {
@@ -2747,6 +2749,8 @@ static bool shellInvokeBuiltin(VM *vm, ShellCommand *cmd) {
             handler = vmBuiltinShellPascal;
         } else if (strcasecmp(canonical, "rea") == 0) {
             handler = vmBuiltinShellRea;
+        } else if (strcasecmp(canonical, "aether") == 0) {
+            handler = vmBuiltinShellAether;
         } else if (strcasecmp(canonical, "pscalvm") == 0) {
             handler = vmBuiltinShellPscalVm;
         } else if (strcasecmp(canonical, "pscaljson2bc") == 0) {

@@ -118,6 +118,7 @@ void registerShellFrontendBuiltins(void) {
 #endif
     registerShellBuiltin(category, command_group, "clike", vmBuiltinShellClike);
     registerShellBuiltin(category, command_group, "rea", vmBuiltinShellRea);
+    registerShellBuiltin(category, command_group, "aether", vmBuiltinShellAether);
     registerShellBuiltin(category, command_group, "exsh", vmBuiltinShellExshTool);
     registerShellBuiltin(category, command_group, "pscalvm", vmBuiltinShellPscalVm);
     registerShellBuiltin(category, command_group, "pscaljson2bc", vmBuiltinShellPscalJson2bc);
