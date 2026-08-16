@@ -4625,6 +4625,23 @@ static void vmRestoreTerminal(void) {
 }
 
 // Query terminal for current color (OSC 10/11) and store result in dest
+/* Wait up to the OSC-response timeout for stdin to become readable. Returns
+ * false on timeout or error, meaning the terminal is not going to answer. */
+static bool vmQueryColorWaitReadable(int fd) {
+    const int timeout_ms = 500; /* matches the VTIME=5 intent above */
+    for (;;) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+        int rc = poll(&pfd, 1, timeout_ms);
+        if (rc > 0)
+            return (pfd.revents & (POLLIN | POLLHUP | POLLERR)) != 0;
+        if (rc == 0)
+            return false; /* terminal did not answer */
+        if (errno == EINTR)
+            continue;
+        return false;
+    }
+}
+
 static int vmQueryColor(const char *query, char *dest, size_t dest_size) {
     struct termios oldt, raw;
     char buf[64];
@@ -4652,13 +4669,23 @@ static int vmQueryColor(const char *query, char *dest, size_t dest_size) {
         return -1;
     }
 
+    /* VMIN=0/VTIME=5 bounds this read on a real tty, but stdin here can be a
+     * vproc session PTY whose read shim waits on a condition variable and
+     * ignores VMIN/VTIME. A terminal that never answers the OSC query -- the
+     * app's hterm session, for one -- would block the program forever before
+     * it executed a single statement. Gate every read on poll() so the wait is
+     * bounded no matter which read path is underneath. */
     while (i < sizeof(buf) - 1) {
+        if (!vmQueryColorWaitReadable(STDIN_FILENO))
+            break;
         ssize_t n = read(STDIN_FILENO, &ch, 1);
         if (n <= 0)
             break;
         if (ch == '\a')
             break; // BEL terminator
         if (ch == '\x1B') {
+            if (!vmQueryColorWaitReadable(STDIN_FILENO))
+                break;
             ssize_t n2 = read(STDIN_FILENO, &ch, 1);
             if (n2 <= 0)
                 break;

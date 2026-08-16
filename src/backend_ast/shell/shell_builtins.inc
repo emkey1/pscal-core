@@ -3980,32 +3980,40 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
         return 0;
     }
 
-    ShellToolThreadContext context;
-    memset(&context, 0, sizeof(context));
-    context.entry = entry;
-    context.argc = argc;
-    context.argv = argv;
-    context.status = 127;
-    context.finished = 0;
-    context.main_thread = pthread_self();
-    context.frontend_kind = frontend_kind;
-    context.use_shell_context = use_shell_context;
-    context.session_stdio = vprocSessionStdioCurrent();
-    context.session_vproc = vprocCurrent();
-    context.runtime_ctx = PSCALRuntimeGetCurrentRuntimeContext
+    /* Heap-allocated rather than a stack local: the worker, waiter and SIGINT
+     * catcher threads all receive this pointer, and on the iOS/vproc path their
+     * lifetime is not strictly contained by this frame -- a stack local left
+     * them dereferencing unmapped memory. The background path above already
+     * heap-allocates for the same reason. Freed once the helpers are joined. */
+    ShellToolThreadContext *context =
+        (ShellToolThreadContext *)calloc(1, sizeof(ShellToolThreadContext));
+    if (!context) {
+        return entry(argc, argv);
+    }
+    context->entry = entry;
+    context->argc = argc;
+    context->argv = argv;
+    context->status = 127;
+    context->finished = 0;
+    context->main_thread = pthread_self();
+    context->frontend_kind = frontend_kind;
+    context->use_shell_context = use_shell_context;
+    context->session_stdio = vprocSessionStdioCurrent();
+    context->session_vproc = vprocCurrent();
+    context->runtime_ctx = PSCALRuntimeGetCurrentRuntimeContext
         ? PSCALRuntimeGetCurrentRuntimeContext()
         : NULL;
 #if defined(PSCAL_TARGET_IOS)
-    context.suspend_checkpoint = gShellToolSuspendCheckpoint;
+    context->suspend_checkpoint = gShellToolSuspendCheckpoint;
 #endif
     /* Foreground runs keep the caller's stdio; use -1 to skip dup2. */
-    context.stdout_fd = -1;
-    context.stderr_fd = -1;
+    context->stdout_fd = -1;
+    context->stderr_fd = -1;
     if (getenv("PSCALI_VPROC_DEBUG")) {
         fprintf(stderr,
                 "[tool-thread] spawn fg stdio=%p vproc=%p\n",
-                (void *)context.session_stdio,
-                (void *)context.session_vproc);
+                (void *)context->session_stdio,
+                (void *)context->session_vproc);
     }
     struct termios stdin_termios;
     bool stdin_termios_valid = shellToolTcgetattr(STDIN_FILENO, &stdin_termios);
@@ -4020,7 +4028,7 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, SHELL_TOOL_THREAD_STACK_SZ);
-    int create_rc = pthread_create(&context.worker_thread, &attr, shellToolThreadMain, &context);
+    int create_rc = pthread_create(&context->worker_thread, &attr, shellToolThreadMain, context);
     pthread_attr_destroy(&attr);
     if (create_rc != 0) {
         pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
@@ -4029,6 +4037,7 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
             if (stdin_termios_valid) {
                 shellToolTcsetattr(STDIN_FILENO, TCSAFLUSH, &stdin_termios);
             }
+            free(context);
             return status;
         }
         ShellRuntimeState *ctx = shellRuntimeCreateContext();
@@ -4039,27 +4048,30 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
         if (stdin_termios_valid) {
             shellToolTcsetattr(STDIN_FILENO, TCSAFLUSH, &stdin_termios);
         }
+        free(context);
         return status;
     }
 
     /* Spawn waiter */
     pthread_t waiter_thread;
-    if (pthread_create(&waiter_thread, NULL, shellToolWaiterMain, &context) != 0) {
+    if (pthread_create(&waiter_thread, NULL, shellToolWaiterMain, context) != 0) {
         /* If waiter fails, just join worker directly (SIGINT won't work properly but we can't do much) */
-        pthread_join(context.worker_thread, NULL);
+        pthread_join(context->worker_thread, NULL);
         pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
         if (stdin_termios_valid) {
             shellToolTcsetattr(STDIN_FILENO, TCSAFLUSH, &stdin_termios);
         }
-        return context.status;
+        int waiter_failed_status = context->status;
+        free(context);
+        return waiter_failed_status;
     }
 
 #if defined(PSCAL_TARGET_IOS)
     /* Dedicated SIGINT catcher (sigwait): owns the foreground Ctrl-C. */
-    context.sigint_catcher_stop = 0;
-    context.sigint_catcher_active =
-        (pthread_create(&context.sigint_catcher_thread, NULL,
-                        shellToolSigintCatcherMain, &context) == 0);
+    context->sigint_catcher_stop = 0;
+    context->sigint_catcher_active =
+        (pthread_create(&context->sigint_catcher_thread, NULL,
+                        shellToolSigintCatcherMain, context) == 0);
 #endif
 
     /* Main Loop */
@@ -4068,7 +4080,7 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
     sigaddset(&wait_mask, SIGINT);
     sigaddset(&wait_mask, SIGURG);
 
-    while (!context.finished) {
+    while (!context->finished) {
         sigset_t pending;
         sigemptyset(&pending);
 #if defined(PSCAL_TARGET_IOS)
@@ -4079,13 +4091,13 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
         }
 #else
         if (pscalRuntimeConsumeSigint()) {
-            pthread_kill(context.worker_thread, SIGINT);
+            pthread_kill(context->worker_thread, SIGINT);
         }
         if (pscalRuntimeConsumeSigtstp()) {
             (void)vprocRequestControlSignal(SIGTSTP);
         }
         if (sigpending(&pending) == 0 && sigismember(&pending, SIGINT)) {
-            pthread_kill(context.worker_thread, SIGINT);
+            pthread_kill(context->worker_thread, SIGINT);
         }
 #endif
         struct timespec ts;
@@ -4096,12 +4108,12 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
     }
 
 #if defined(PSCAL_TARGET_IOS)
-    if (context.sigint_catcher_active) {
-        context.sigint_catcher_stop = 1;
+    if (context->sigint_catcher_active) {
+        context->sigint_catcher_stop = 1;
         /* Break the catcher's blocking sigwait() with one directed SIGINT. */
-        pthread_kill(context.sigint_catcher_thread, SIGINT);
-        pthread_join(context.sigint_catcher_thread, NULL);
-        context.sigint_catcher_active = false;
+        pthread_kill(context->sigint_catcher_thread, SIGINT);
+        pthread_join(context->sigint_catcher_thread, NULL);
+        context->sigint_catcher_active = false;
     }
 #endif
     pthread_join(waiter_thread, NULL);
@@ -4110,9 +4122,11 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
         shellToolTcsetattr(STDIN_FILENO, TCSAFLUSH, &stdin_termios);
     }
     if (out_frontend_reset) {
-        *out_frontend_reset = context.frontend_reset_done;
+        *out_frontend_reset = context->frontend_reset_done;
     }
-    return context.status;
+    int final_status = context->status;
+    free(context);
+    return final_status;
 }
 
 static const int kShellToolRunnerUnavailable = -32768;
