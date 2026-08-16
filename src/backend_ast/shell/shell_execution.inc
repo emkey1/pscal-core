@@ -3151,8 +3151,16 @@ static bool shellEnsureExecRedirBackup(int target_fd,
     backup.saved_valid = false;
     backup.was_closed = false;
     backup.use_vproc = false;
+    backup.vproc_saved_fd = -1;
 #if defined(PSCAL_TARGET_IOS)
-    VProc *active_vp = vprocCurrent();
+    /* shellDupOntoTarget() rewrites the fd table of whatever vproc is current,
+     * so snapshot that entry against the same vproc -- not `active_vp` below,
+     * which is deliberately blanked for in-process pipeline stages. */
+    VProc *vp_mutated = vprocCurrent();
+    if (vp_mutated) {
+        backup.vproc_saved_fd = vprocDup(vp_mutated, target_fd);
+    }
+    VProc *active_vp = vp_mutated;
     bool want_vproc_restore = gShellSkipHostStdio;
     if (gShellRuntime.pipeline.in_process && !gShellBackgroundWorkerActive && !want_vproc_restore) {
         /* In-process pipelines run with a synthetic vproc whose stdio does not
@@ -3400,31 +3408,41 @@ static void shellRestoreExecRedirections(ShellExecRedirBackup *backups, size_t c
 #endif
     for (size_t i = 0; i < count; ++i) {
         ShellExecRedirBackup *backup = &backups[i];
+        bool touched = false;
         if (backup->saved_valid && backup->saved_fd >= 0) {
-            bool host_restored = false;
             if (!skip_host_restore) {
-                host_restored = (vprocHostDup2(backup->saved_fd, backup->target_fd) >= 0);
+                (void)vprocHostDup2(backup->saved_fd, backup->target_fd);
+                touched = true;
             }
             if (backup->use_vproc && active_vp) {
                 (void)vprocRestoreHostFd(active_vp, backup->target_fd, backup->saved_fd);
-            } else if (host_restored && active_vp) {
-                /* shellDupOntoTarget() retargets the current vproc's fd table
-                 * whenever a vproc exists, but shellEnsureExecRedirBackup()
-                 * forces use_vproc off for in-process pipeline stages, so the
-                 * backup only snapshotted the host descriptor. Re-sync the
-                 * vproc entry from the freshly restored host fd; otherwise it
-                 * keeps pointing at the redirection target and silently
-                 * swallows every later write to that descriptor. */
-                (void)vprocRestoreHostFd(active_vp, backup->target_fd, backup->target_fd);
-            }
-            if (!skip_host_restore) {
-                shellResetStandardStream(backup->target_fd);
+                touched = true;
             }
         } else if (backup->was_closed) {
             if (!skip_host_restore) {
                 vprocHostClose(backup->target_fd);
-                shellResetStandardStream(backup->target_fd);
+                touched = true;
             }
+        }
+#if defined(PSCAL_TARGET_IOS)
+        /* Put the vproc's own fd entry back. This is the exact inverse of the
+         * vprocDup2() in shellDupOntoTarget(), and it is the only restore that
+         * works when the entry is a PTY-backed pscal_fd -- an app session's
+         * stdio -- because there the host descriptor carries no equivalent and
+         * the entry would otherwise keep pointing at the redirection target,
+         * silently swallowing every later write. */
+        if (backup->vproc_saved_fd >= 0) {
+            if (active_vp) {
+                if (vprocDup2(active_vp, backup->vproc_saved_fd, backup->target_fd) >= 0) {
+                    touched = true;
+                }
+                (void)vprocClose(active_vp, backup->vproc_saved_fd);
+            }
+            backup->vproc_saved_fd = -1;
+        }
+#endif
+        if (touched) {
+            shellResetStandardStream(backup->target_fd);
         }
     }
 }
@@ -3438,6 +3456,18 @@ static void shellFreeExecRedirBackups(ShellExecRedirBackup *backups, size_t coun
             vprocHostClose(backups[i].saved_fd);
             backups[i].saved_fd = -1;
         }
+#if defined(PSCAL_TARGET_IOS)
+        /* Drop the vproc snapshot without restoring it. Freeing without a
+         * restore is the `exec >file` path, where the redirection is meant to
+         * outlive the command, so the slot must be released, not reinstated. */
+        if (backups[i].vproc_saved_fd >= 0) {
+            VProc *vp = vprocCurrent();
+            if (vp) {
+                (void)vprocClose(vp, backups[i].vproc_saved_fd);
+            }
+            backups[i].vproc_saved_fd = -1;
+        }
+#endif
     }
     free(backups);
 }

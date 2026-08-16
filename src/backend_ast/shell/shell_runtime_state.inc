@@ -2538,6 +2538,12 @@ typedef struct {
     bool saved_valid;
     bool was_closed;
     bool use_vproc;
+    /* Slot in the current vproc's fd table holding a dup of the entry as it
+     * was before the redirection. The host descriptor alone is not enough on
+     * iOS: a session's stdio can be a PTY-backed pscal_fd that has no
+     * meaningful host-fd equivalent, so restoring only the host side leaves
+     * the vproc pointing at the redirection target. -1 when unused. */
+    int vproc_saved_fd;
 } ShellExecRedirBackup;
 
 static void shellRestoreExecRedirections(ShellExecRedirBackup *backups, size_t count);
