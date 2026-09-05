@@ -40,6 +40,97 @@
 #if defined(__APPLE__)
 #include <dlfcn.h>
 #endif
+
+/* ---- Deep array equality ---------------------------------------------------
+ * The EQUAL/NOT_EQUAL opcode used to reject two array operands outright
+ * ("Operands not comparable"), which made `xs == ys` a runtime error in every
+ * front end. Two arrays are equal when they have the same rank and bounds and
+ * every element pair is equal under the same rules the scalar comparison
+ * applies; nested arrays recurse. Return values: 1 equal, 0 not equal, -1 when
+ * an element pair has no defined equality (the caller then reports exactly what
+ * it would for those scalars on their own). */
+int calculateArrayTotalSize(const Value* array_val);
+static int pscalValuesDeepEqual(const Value *a, const Value *b);
+
+static const char *pscalTextForCompare(const Value *v, char *buf /* >= 5 bytes */) {
+    if (IS_STRING(*v)) {
+        return AS_STRING(*v) ? AS_STRING(*v) : "";
+    }
+    if (VALUE_TYPE(*v) == TYPE_WIDECHAR) {
+        encodeUtf8Codepoint((uint32_t)AS_CHAR(*v), buf);
+        return buf;
+    }
+    buf[0] = (char)AS_CHAR(*v);
+    buf[1] = '\0';
+    return buf;
+}
+
+static int pscalArraysDeepEqual(const Value *a, const Value *b) {
+    ArrayObj *pa = PSCAL_VALUE_PTR(*a, ArrayObj);
+    ArrayObj *pb = PSCAL_VALUE_PTR(*b, ArrayObj);
+    if (pa == pb) return 1;
+    if (!pa || !pb) return 0;
+    if (pa->dimensions != pb->dimensions) return 0;
+    if (pa->dimensions > 0 && (!pa->lower_bounds || !pb->lower_bounds ||
+                               !pa->upper_bounds || !pb->upper_bounds)) {
+        return 0;
+    }
+    for (int d = 0; d < pa->dimensions; d++) {
+        if (pa->lower_bounds[d] != pb->lower_bounds[d] ||
+            pa->upper_bounds[d] != pb->upper_bounds[d]) {
+            return 0;
+        }
+    }
+    int total = calculateArrayTotalSize(a);
+    if (total != calculateArrayTotalSize(b)) return 0;
+    if (total <= 0) return 1;
+    if (pa->is_packed && pb->is_packed) {
+        if (!pa->raw || !pb->raw) return (pa->raw == pb->raw) ? 1 : 0;
+        return memcmp(pa->raw, pb->raw, (size_t)total) == 0 ? 1 : 0;
+    }
+    if (pa->is_packed || pb->is_packed) {
+        /* One packed byte buffer against one boxed buffer: compare as integers. */
+        const ArrayObj *packed = pa->is_packed ? pa : pb;
+        const ArrayObj *boxed = pa->is_packed ? pb : pa;
+        if (!packed->raw || !boxed->elements) return 0;
+        for (int i = 0; i < total; i++) {
+            const Value *e = &boxed->elements[i];
+            if (!IS_INTLIKE(*e) && !IS_CHAR(*e) && !IS_BOOLEAN(*e)) return -1;
+            if ((long long)packed->raw[i] != asI64(*e)) return 0;
+        }
+        return 1;
+    }
+    if (!pa->elements || !pb->elements) return (pa->elements == pb->elements) ? 1 : 0;
+    for (int i = 0; i < total; i++) {
+        int r = pscalValuesDeepEqual(&pa->elements[i], &pb->elements[i]);
+        if (r != 1) return r;
+    }
+    return 1;
+}
+
+static int pscalValuesDeepEqual(const Value *a, const Value *b) {
+    VarType ta = VALUE_TYPE(*a), tb = VALUE_TYPE(*b);
+    if (ta == TYPE_ARRAY && tb == TYPE_ARRAY) return pscalArraysDeepEqual(a, b);
+    if (ta == TYPE_NIL && tb == TYPE_NIL) return 1;
+    if (ta == TYPE_NIL || tb == TYPE_NIL) {
+        const Value *other = (ta == TYPE_NIL) ? b : a;
+        if (VALUE_TYPE(*other) == TYPE_POINTER) return AS_POINTER(*other) == NULL ? 1 : 0;
+        return 0;
+    }
+    if (IS_NUMERIC(*a) && IS_NUMERIC(*b)) {
+        if (isRealType(ta) || isRealType(tb)) return asLd(*a) == asLd(*b) ? 1 : 0;
+        return asI64(*a) == asI64(*b) ? 1 : 0;
+    }
+    if (IS_BOOLEAN(*a) && IS_BOOLEAN(*b)) return AS_BOOLEAN(*a) == AS_BOOLEAN(*b) ? 1 : 0;
+    if ((IS_STRING(*a) || IS_CHAR(*a)) && (IS_STRING(*b) || IS_CHAR(*b))) {
+        char abuf[5] = {0}, bbuf[5] = {0};
+        return strcmp(pscalTextForCompare(a, abuf), pscalTextForCompare(b, bbuf)) == 0 ? 1 : 0;
+    }
+    if (ta == TYPE_POINTER && tb == TYPE_POINTER) return AS_POINTER(*a) == AS_POINTER(*b) ? 1 : 0;
+    if (ta == TYPE_MEMORYSTREAM && tb == TYPE_MEMORYSTREAM) return AS_MSTREAM(*a) == AS_MSTREAM(*b) ? 1 : 0;
+    return -1;
+}
+
 #if defined(PSCAL_TARGET_IOS)
 #include <os/log.h>
 #endif
@@ -391,6 +482,7 @@ static bool s_vmVerboseErrors = false;
 static const char *const kOpcodeNames[OPCODE_COUNT] = {
 #define OP(name, value, operands, stack_in, stack_out) [value] = #name,
 #include "compiler/opcodes.def"
+
 #undef OP
 };
 
@@ -8308,6 +8400,20 @@ dispatch_switch:
                         freeValue(&a_val); freeValue(&b_val); return INTERPRET_RUNTIME_ERROR;
                     }
                     comparison_succeeded = true;
+                }
+                // Arrays: deep structural equality, '=' and '<>' only (see
+                // pscalArraysDeepEqual above). Ordering has no meaning for arrays
+                // and stays an error.
+                else if (VALUE_TYPE(a_val) == TYPE_ARRAY && VALUE_TYPE(b_val) == TYPE_ARRAY) {
+                    if (instruction_val == EQUAL || instruction_val == NOT_EQUAL) {
+                        int eq = pscalArraysDeepEqual(&a_val, &b_val);
+                        if (eq < 0) goto comparison_error_label;
+                        result_val = makeBoolean(instruction_val == EQUAL ? (eq == 1) : (eq == 0));
+                        comparison_succeeded = true;
+                    } else {
+                        runtimeError(vm, "Runtime Error: Invalid operator for array comparison. Only '=' and '<>' are allowed. Got opcode %d.", instruction_val);
+                        freeValue(&a_val); freeValue(&b_val); return INTERPRET_RUNTIME_ERROR;
+                    }
                 }
                 // Any other concrete value compared against NIL: builtins
                 // like ChannelReceive/TaskAwait return TYPE_NIL to signal a
