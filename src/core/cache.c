@@ -1079,8 +1079,20 @@ static bool writeValue(ByteBuf* out, const Value* v) {
         case TYPE_LONG_DOUBLE:
             bufF64LE(out, (double)VAL_REAL_LD(*v)); break;
         case TYPE_CHAR:
+        case TYPE_WIDECHAR:
             bufU32LE(out, (uint32_t)AS_CHAR(*v)); break;
-        case TYPE_STRING: {
+        case TYPE_THREAD:
+            bufU64LE(out, (uint64_t)VAL_INT(*v)); break;
+        case TYPE_TASK:
+        case TYPE_CHANNEL:
+            // Only the unset handle a declaration pools (makeValueForType); a
+            // live task or channel has no meaning outside the process.
+            if (PSCAL_VALUE_PTR(*v, void)) return false;
+            break;
+        case TYPE_VOID:
+            break;
+        case TYPE_STRING:
+        case TYPE_UNICODE_STRING: {
             /* varint length prefix; NULL vs empty string distinguished by a
              * leading presence byte (varint length alone can't represent -1). */
             StringObj *str_obj = PSCAL_VALUE_PTR(*v, StringObj);
@@ -1142,6 +1154,19 @@ static bool writeValue(ByteBuf* out, const Value* v) {
                 for (int i = 0; i < total; i++) {
                     if (!writeValue(out, &AS_ARRAY(*v)[i])) return false;
                 }
+            }
+            break;
+        }
+        case TYPE_MEMORYSTREAM: {
+            // The compiler pools the default value of an mstream variable
+            // (makeValueForType), so a program that merely declares one has a
+            // stream constant. Encoded like TYPE_STRING: presence byte, then
+            // the contents.
+            const MStream *ms = PSCAL_VALUE_PTR(*v, MStream);
+            bufU8(out, ms ? 1 : 0);
+            if (ms) {
+                size_t n = (ms->buffer && ms->size > 0) ? (size_t)ms->size : 0;
+                bufLenPrefixedBytes(out, ms->buffer, n);
             }
             break;
         }
@@ -1262,11 +1287,14 @@ static bool readLinesSection(Cursor* in, BytecodeChunk* chunk) {
     return true;
 }
 
-static void writeConstSection(ByteBuf* out, const BytecodeChunk* chunk) {
+// False when a constant has no encoding. writeValue has already emitted its
+// type tag by then, so the section is unreadable and must not be written.
+static bool writeConstSection(ByteBuf* out, const BytecodeChunk* chunk) {
     bufVarint(out, (uint64_t)chunk->constants_count);
     for (int i = 0; i < chunk->constants_count; ++i) {
-        writeValue(out, &chunk->constants[i]);
+        if (!writeValue(out, &chunk->constants[i])) return false;
     }
+    return true;
 }
 
 static bool readConstSection(Cursor* in, BytecodeChunk* chunk, int* out_read_consts) {
@@ -1458,7 +1486,10 @@ static bool writeChunkCoreInline(ByteBuf* out, const BytecodeChunk* chunk) {
     g_astCacheVersion = chunk->version;
     writeCodeSection(out, chunk);
     writeLinesSection(out, chunk);
-    writeConstSection(out, chunk);
+    if (!writeConstSection(out, chunk)) {
+        g_astCacheVersion = prev_version;
+        return false;
+    }
     writeBmapSection(out, chunk);
     writeProcsSection(out);
     writeTypesSection(out);
@@ -1655,7 +1686,8 @@ static void hashValue(uint64_t* hash, const Value* v, ChunkHashContext* ctx) {
             fnv1aUpdate(hash, &c_val, sizeof(c_val));
             break;
         }
-        case TYPE_STRING: {
+        case TYPE_STRING:
+        case TYPE_UNICODE_STRING: {
             StringObj *str_obj = PSCAL_VALUE_PTR(*v, StringObj);
             const char *buf = (str_obj && str_obj->buffer) ? str_obj->buffer : NULL;
             int len = buf ? (int)strlen(buf) : -1;
@@ -1756,8 +1788,19 @@ static void hashValue(uint64_t* hash, const Value* v, ChunkHashContext* ctx) {
             fnv1aUpdateUInt64(hash, (uint64_t)(uintptr_t)address);
             break;
         }
+        case TYPE_MEMORYSTREAM: {
+            // By content, as the PSB3 codec stores it: the address differs in
+            // the process that loads the cache, so hashing it rejected every
+            // cached chunk that pools a stream (any `mstream` declaration).
+            const MStream *ms = PSCAL_VALUE_PTR(*v, MStream);
+            int len = ms ? ((ms->buffer && ms->size > 0) ? ms->size : 0) : -1;
+            fnv1aUpdateInt(hash, len);
+            if (len > 0) {
+                fnv1aUpdate(hash, ms->buffer, (size_t)len);
+            }
+            break;
+        }
         case TYPE_FILE:
-        case TYPE_MEMORYSTREAM:
         case TYPE_THREAD:
             fnv1aUpdateUInt64(hash, (uint64_t)(uintptr_t)PSCAL_VALUE_PTR(*v, void));
             break;
@@ -1817,10 +1860,27 @@ static bool readValue(Cursor* in, Value* out) {
             SET_INT_VALUE(out, c_val);
             break;
         }
-        case TYPE_STRING: {
+        case TYPE_WIDECHAR: {
+            uint32_t cp = curU32LE(in);
+            if (in->error) return false;
+            *out = makeWideChar((int)cp);
+            break;
+        }
+        case TYPE_THREAD:
+            SET_INT_VALUE(out, (long long)curU64LE(in));
+            break;
+        case TYPE_TASK:
+        case TYPE_CHANNEL:
+            pscalValueSetHeapPtrBits(out, NULL);
+            break;
+        case TYPE_VOID:
+            out->bits = pscalTagVoid();
+            break;
+        case TYPE_STRING:
+        case TYPE_UNICODE_STRING: {
             uint8_t present = curU8(in);
             if (in->error) return false;
-            StringObj *str_obj = pscalStringObjCreate(-1, TYPE_STRING);
+            StringObj *str_obj = pscalStringObjCreate(-1, out->type);
             pscalValueSetHeapPtrBits(out, str_obj);
             if (present) {
                 size_t len = 0;
@@ -1910,6 +1970,28 @@ static bool readValue(Cursor* in, Value* out) {
                         if (!readValue(in, &a->elements[i])) return false;
                     }
                 }
+            }
+            break;
+        }
+        case TYPE_MEMORYSTREAM: {
+            uint8_t present = curU8(in);
+            if (in->error) return false;
+            if (!present) {  // a NULL stream, as written
+                pscalValueSetHeapPtrBits(out, NULL);
+                break;
+            }
+            size_t len = 0;
+            char *bytes = curLenPrefixedString(in, &len);
+            if (in->error || !bytes) return false;
+            MStream *ms = createMStream();
+            pscalValueSetHeapPtrBits(out, ms);
+            if (len > 0) {
+                // NUL-terminated, capacity size+1: makeCopyOfValue's layout.
+                ms->buffer = (unsigned char *)bytes;
+                ms->size = (int)len;
+                ms->capacity = (int)len + 1;
+            } else {
+                free(bytes);
             }
             break;
         }
@@ -2534,7 +2616,7 @@ static bool psb3Write(FILE* f, const BytecodeChunk* chunk,
     g_astCacheVersion = chunk->version;
     writeCodeSection(&code_buf, chunk);
     writeLinesSection(&lines_buf, chunk);
-    writeConstSection(&const_buf, chunk);
+    bool consts_ok = writeConstSection(&const_buf, chunk);
     writeBmapSection(&bmap_buf, chunk);
     writeProcsSection(&procs_buf);
     writeTypesSection(&types_buf);
@@ -2582,8 +2664,8 @@ static bool psb3Write(FILE* f, const BytecodeChunk* chunk,
         bufU32LE(&directory, (uint32_t)sections[i].buf->len);
     }
 
-    bool ok = true;
-    if (fwrite(header.data, 1, header.len, f) != header.len) ok = false;
+    bool ok = consts_ok;
+    if (ok && fwrite(header.data, 1, header.len, f) != header.len) ok = false;
     if (ok && fwrite(directory.data, 1, directory.len, f) != directory.len) ok = false;
 
     size_t written = header.len + directory.len;
@@ -2998,5 +3080,6 @@ bool saveBytecodeToFile(const char* file_path, const char* source_path, const By
     if (!f) return false;
     bool ok = serializeBytecodeChunk(f, source_path, chunk, source_hash, combined_hash, false);
     fclose(f);
+    if (!ok) unlink(file_path);  // as saveBytecodeToCache: no truncated file left behind
     return ok;
 }

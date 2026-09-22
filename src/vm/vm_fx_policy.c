@@ -170,6 +170,23 @@ static bool readRawBlob(FILE *f, unsigned char **out_data, uint32_t *out_len) {
  * decide "substitutable" without corrupting the real journal on failure --
  * writes to a scratch temp file that's discarded either way. */
 static bool valueIsGenericSerializable(const Value *v) {
+    switch (VALUE_TYPE(*v)) {
+        // The codec encodes these for the bytecode cache's constant pool
+        // (declaration defaults), but encodable is not substitutable: VOID is
+        // every procedure's result -- substituting assign/reset/rewrite skips
+        // the live file opens later calls rely on -- and the rest are live
+        // handles or not yet vetted for replay. They keep running live.
+        case TYPE_VOID:
+        case TYPE_THREAD:
+        case TYPE_TASK:
+        case TYPE_CHANNEL:
+        case TYPE_MEMORYSTREAM:
+        case TYPE_UNICODE_STRING:
+        case TYPE_WIDECHAR:
+            return false;
+        default:
+            break;
+    }
     FILE *scratch = tmpfile();
     if (!scratch) return false;
     bool ok = pscalCacheWriteValueFramed(scratch, v);
