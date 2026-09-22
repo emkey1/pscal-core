@@ -11666,7 +11666,12 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                                 param_type_hint = param_node->type_def ? param_node->type_def
                                                                        : (param_node->right ? param_node->right : param_node);
                             }
-                        } else if (functionName && param_index == 0 && strcasecmp(functionName, "eof") == 0) {
+                        } else if (functionName && param_index == 0 &&
+                                   (strcasecmp(functionName, "eof") == 0 ||
+                                    // Returns success, so it is called as a value
+                                    // (`ok := ...`, `if (...)`) as often as a statement;
+                                    // the statement path's var-param list has it too.
+                                    strcasecmp(functionName, "mstreamloadfromfile") == 0)) {
                             is_var_param = true;
                         } else if (!func_symbol && functionName) {
                             if ((strcasecmp(functionName, "GetMouseState") == 0 && param_index <= 3) ||
