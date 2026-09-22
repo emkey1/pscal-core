@@ -22,10 +22,14 @@
 //      operand (including those inside the "?" variable-length payloads)
 //      is in range (or is the 0xFFFF "no element type" sentinel a file
 //      declaration uses in place of a type name).
-//   3. Per procedure (as delimited by `procedures`' bytecode_address
-//      entries, plus the implicit top-level entry at pc 0), an abstract
-//      walk of the operand stack never goes negative, never exceeds
-//      VM_STACK_MAX, and agrees at control-flow join points. Call targets
+//   3. From each entry point -- the top-level program at pc 0, every
+//      bytecode_address in `procedures`, every THREAD_CREATE target -- an
+//      abstract walk of the operand stack follows control flow wherever it
+//      leads, and never goes negative, never exceeds VM_STACK_MAX, and
+//      agrees at control-flow join points. Each reachable instruction
+//      belongs to exactly one entry: control that falls off the end of the
+//      code or reaches another entry's code (other than by a call) is
+//      rejected. Call targets
 //      that cannot be resolved statically (closures, virtual dispatch,
 //      CALL_HOST) are tracked as "unknown" rather than guessed at -- the
 //      runtime's own checked push()/pop() remain the backstop there (see

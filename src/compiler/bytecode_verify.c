@@ -303,48 +303,76 @@ static bool verifyOperands(VCtx* ctx) {
     return true;
 }
 
-// ============== Pass 3: per-procedure abstract stack-depth walk ============
-
-typedef struct {
-    int start;
-    int end; // exclusive
-    Symbol* symbol; // NULL for the implicit top-level/main segment
-} ProcSegment;
+// ============== Pass 3: per-entry abstract stack-depth walk ================
+//
+// Each walk starts at depth 0 from an entry point where the VM begins a
+// frame: pc 0 (the top-level program), every procedure's bytecode_address,
+// and every THREAD_CREATE target. It follows control flow wherever it leads
+// in the chunk. Procedure addresses are not extents: Pascal-family compilers
+// lay a program out as
+//     prologue; JUMP L1; proc A; L1: JUMP L2; proc B; L2: main block; HALT
+// and a routine with nested routines as JUMP-over-nested + body, so the code
+// a JUMP lands on usually lies after some other routine's start address while
+// still belonging to the routine that jumped. Treating "next procedure's
+// address" as the end of a routine (and dropping edges that crossed it) left
+// every Pascal main block, and the body of every routine with nested
+// routines, unwalked.
+//
+// Every instruction a walk reaches belongs to that walk alone. Reaching
+// another walk's entry or instructions, or falling off the end of the code,
+// is rejected: routines are entered only by calls, and no compiler emits a
+// jump or fall-through from one routine's code into another's. That keeps
+// each instruction's depth tied to one frame, and keeps the pass linear,
+// since no instruction is walked by more than one entry.
 
 typedef struct {
     uint32_t addr;
-    Symbol* sym;
+    Symbol* sym; // NULL for pc 0's top-level program, or an unnamed thread entry
 } AddrSym;
 
-static void collectProcedures(HashTable* table, AddrSym** arr, int* count, int* cap) {
-    if (!table) return;
+// Appends one entry; false only on allocation failure.
+static bool appendAddrSym(AddrSym** arr, int* count, int* cap, uint32_t addr, Symbol* sym) {
+    if (*count == *cap) {
+        int new_cap = (*cap == 0) ? 16 : (*cap * 2);
+        AddrSym* grown = (AddrSym*)realloc(*arr, sizeof(AddrSym) * (size_t)new_cap);
+        if (!grown) return false;
+        *arr = grown;
+        *cap = new_cap;
+    }
+    (*arr)[*count].addr = addr;
+    (*arr)[*count].sym = sym;
+    (*count)++;
+    return true;
+}
+
+static bool collectProcedures(HashTable* table, AddrSym** arr, int* count, int* cap) {
+    if (!table) return true;
     for (int i = 0; i < HASHTABLE_SIZE; i++) {
         for (Symbol* s = table->buckets[i]; s; s = s->next) {
             if (!s->is_alias && s->is_defined && s->bytecode_address >= 0) {
-                if (*count == *cap) {
-                    int new_cap = (*cap == 0) ? 16 : (*cap * 2);
-                    AddrSym* grown = (AddrSym*)realloc(*arr, sizeof(AddrSym) * (size_t)new_cap);
-                    if (!grown) continue; // best-effort; skip growth on OOM
-                    *arr = grown;
-                    *cap = new_cap;
-                }
-                (*arr)[*count].addr = (uint32_t)s->bytecode_address;
-                (*arr)[*count].sym = s;
-                (*count)++;
+                if (!appendAddrSym(arr, count, cap, (uint32_t)s->bytecode_address, s)) return false;
             }
             if (s->type_def && s->type_def->symbol_table) {
-                collectProcedures((HashTable*)s->type_def->symbol_table, arr, count, cap);
+                if (!collectProcedures((HashTable*)s->type_def->symbol_table, arr, count, cap)) return false;
             }
         }
     }
+    return true;
 }
 
+// Orders by address, and a named entry ahead of an unnamed one at the same
+// address, so deduplication keeps the procedure's symbol.
 static int cmpAddrSym(const void* a, const void* b) {
-    uint32_t aa = ((const AddrSym*)a)->addr;
-    uint32_t bb = ((const AddrSym*)b)->addr;
-    if (aa < bb) return -1;
-    if (aa > bb) return 1;
+    const AddrSym* x = (const AddrSym*)a;
+    const AddrSym* y = (const AddrSym*)b;
+    if (x->addr != y->addr) return (x->addr < y->addr) ? -1 : 1;
+    if ((x->sym != NULL) != (y->sym != NULL)) return x->sym ? -1 : 1;
     return 0;
+}
+
+static const char* entryName(const AddrSym* entry) {
+    if (entry->sym && entry->sym->name) return entry->sym->name;
+    return (entry->addr == 0) ? "the top-level program" : "an unnamed thread entry";
 }
 
 // Finds the defined, non-alias procedure whose bytecode_address == address,
@@ -375,8 +403,8 @@ static Symbol* findProcByName(HashTable* table, const char* lowered_name) {
 // Tri-state abstract depth: a call through an unresolvable target (closure,
 // vtable dispatch) or CALL_HOST (opaque per-host-id convention) makes the
 // exact depth unknowable; from that point on this walk stops asserting
-// bounds until the next segment (the VM's own checked push()/pop() remain
-// the runtime backstop for that region -- see bytecode_verify.h).
+// bounds along that path (the VM's own checked push()/pop() remain the
+// runtime backstop for that region -- see bytecode_verify.h).
 typedef struct {
     bool known;
     int value;
@@ -397,7 +425,7 @@ typedef struct {
 } Effect;
 
 static bool classifyInstruction(VCtx* ctx, int pc, int len, const OpcodeInfo* info,
-                                 Symbol* segment_symbol, Effect* eff) {
+                                 Symbol* entry_symbol, Effect* eff) {
     const uint8_t* code = ctx->chunk->code;
     uint8_t opcode = code[pc];
     eff->req = 0;
@@ -407,7 +435,7 @@ static bool classifyInstruction(VCtx* ctx, int pc, int len, const OpcodeInfo* in
     switch (opcode) {
         case RETURN:
         case EXIT: {
-            bool is_function = segment_symbol && segment_symbol->type != TYPE_VOID;
+            bool is_function = entry_symbol && entry_symbol->type != TYPE_VOID;
             eff->req = is_function ? 1 : 0;
             eff->delta = 0; // terminal: no successor consumes the post-state
             return true;
@@ -479,8 +507,8 @@ static bool classifyInstruction(VCtx* ctx, int pc, int len, const OpcodeInfo* in
                 // The caller's view once the call returns: returnFromCall()
                 // collapses the frame -- args and callee locals alike -- back
                 // to frame->slots, then pushes a result only for a function.
-                // (locals_count is what the callee's own segment starts with,
-                // not a net effect here; that segment is walked separately.)
+                // (locals_count is what the callee's own walk starts with,
+                // not a net effect here; that walk runs separately.)
                 eff->delta = -(int)arity + (target->type != TYPE_VOID ? 1 : 0);
             } else {
                 // Unresolvable (stale/foreign cache entry): don't guess.
@@ -527,14 +555,41 @@ static bool classifyInstruction(VCtx* ctx, int pc, int len, const OpcodeInfo* in
     }
 }
 
-// Successor PCs within the *current segment only*; a computed successor
-// landing outside [start,end) is dropped rather than followed (segment
-// boundaries are inferred from procedure_table addresses, not verified to
-// be jump-tight, so this is a conservative safety valve, not a hard error).
-static void addSuccessor(int target, const ProcSegment* seg, int* out, int* out_count) {
-    if (target >= seg->start && target < seg->end) {
-        out[(*out_count)++] = target;
+// Per-walk state shared across entries. owner[pc] is 1 + the index (into
+// entries) of the walk that reached pc, or 0 if none has; entry pcs are
+// claimed by their own walk before any walk runs, so reaching one from
+// elsewhere trips the same ownership check as reaching another walk's code.
+typedef struct {
+    const AddrSym* entries;
+    int* owner;
+    uint8_t* visited;
+    Depth* depths;
+    WorkItem* worklist;
+    int worklist_cap;
+} WalkState;
+
+// Accepts `target` as a successor of `pc` in walk `walk_id`, or fails the
+// chunk if control would leave the code section or enter another walk's
+// code (see the Pass 3 comment above).
+static bool addSuccessor(VCtx* ctx, const WalkState* ws, int walk_id, int pc,
+                         const OpcodeInfo* info, int target, int* out, int* out_count) {
+    if (target < 0 || target >= ctx->chunk->count || !ctx->boundary[target]) {
+        return vfail(ctx, "pc %d: %s continues to pc %d, past the end of the code section",
+                     pc, info->name, target);
     }
+    int other = ws->owner[target];
+    if (other != 0 && other != walk_id) {
+        const AddrSym* here = &ws->entries[walk_id - 1];
+        const AddrSym* there = &ws->entries[other - 1];
+        if ((int)there->addr == target) {
+            return vfail(ctx, "pc %d: %s in %s enters %s at pc %d without a call",
+                         pc, info->name, entryName(here), entryName(there), target);
+        }
+        return vfail(ctx, "pc %d: %s in %s reaches pc %d, which belongs to %s (entry pc %u)",
+                     pc, info->name, entryName(here), target, entryName(there), there->addr);
+    }
+    out[(*out_count)++] = target;
+    return true;
 }
 
 // Per-pc visit state. A pc is re-checked at most once for a known depth and
@@ -549,19 +604,20 @@ static void addSuccessor(int target, const ProcSegment* seg, int* out, int* out_
 // finding 1's FAST_PUSH/POP issue).
 enum { VISITED_KNOWN = 1u << 0, VISITED_UNKNOWN = 1u << 1 };
 
-static bool verifySegment(VCtx* ctx, const ProcSegment* seg, uint8_t* visited, Depth* depths,
-                           WorkItem* worklist, int worklist_cap) {
-    for (int pc = seg->start; pc < seg->end; pc++) {
-        visited[pc] = 0;
-    }
+static bool verifyWalk(VCtx* ctx, const WalkState* ws, int walk_id) {
+    const AddrSym* entry = &ws->entries[walk_id - 1];
+    uint8_t* visited = ws->visited;
+    Depth* depths = ws->depths;
+    WorkItem* worklist = ws->worklist;
+    int worklist_cap = ws->worklist_cap;
 
     int wl_count = 0;
-    worklist[wl_count++] = (WorkItem){ seg->start, (Depth){ true, 0 } };
+    worklist[wl_count++] = (WorkItem){ (int)entry->addr, (Depth){ true, 0 } };
 
     while (wl_count > 0) {
         WorkItem item = worklist[--wl_count];
         int pc = item.pc;
-        if (pc < seg->start || pc >= seg->end || !ctx->boundary[pc]) continue;
+        ws->owner[pc] = walk_id; // addSuccessor admitted pc only if unowned or already ours
 
         if (item.depth.known) {
             if (visited[pc] & VISITED_KNOWN) {
@@ -584,7 +640,7 @@ static bool verifySegment(VCtx* ctx, const ProcSegment* seg, uint8_t* visited, D
         pscalDecodeInstructionLength(ctx->chunk, pc, &len); // already known-good (pass 1)
 
         Effect eff;
-        if (!classifyInstruction(ctx, pc, len, info, seg->symbol, &eff)) return false;
+        if (!classifyInstruction(ctx, pc, len, info, entry->sym, &eff)) return false;
 
         Depth next_depth = item.depth;
         if (item.depth.known) {
@@ -617,21 +673,20 @@ static bool verifySegment(VCtx* ctx, const ProcSegment* seg, uint8_t* visited, D
 
         int succ[2];
         int succ_count = 0;
-        if (opcode == JUMP) {
+        if (opcode == JUMP || opcode == JUMP_IF_FALSE) {
             int32_t disp = (int32_t)verifyReadU32BE(ctx->chunk->code, pc + 1);
-            addSuccessor((int)((long)(pc + len) + disp), seg, succ, &succ_count);
-        } else if (opcode == JUMP_IF_FALSE) {
-            int32_t disp = (int32_t)verifyReadU32BE(ctx->chunk->code, pc + 1);
-            addSuccessor((int)((long)(pc + len) + disp), seg, succ, &succ_count);
-            addSuccessor(pc + len, seg, succ, &succ_count);
-        } else {
-            addSuccessor(pc + len, seg, succ, &succ_count);
+            if (!addSuccessor(ctx, ws, walk_id, pc, info, (int)((long)(pc + len) + disp), succ, &succ_count)) {
+                return false;
+            }
+        }
+        if (opcode != JUMP) {
+            if (!addSuccessor(ctx, ws, walk_id, pc, info, pc + len, succ, &succ_count)) return false;
         }
 
         for (int i = 0; i < succ_count; i++) {
             // wl_count is bounded by 2 * (instructions processed so far) + 1,
-            // which is <= worklist_cap (2 * chunk->count + 8, see caller) for
-            // any segment; this check is a defensive backstop, not expected
+            // which is <= worklist_cap (4 * chunk->count + 8, see caller)
+            // for any walk; this check is a defensive backstop, not expected
             // to ever trip.
             if (wl_count < worklist_cap) {
                 worklist[wl_count++] = (WorkItem){ succ[i], next_depth };
@@ -645,59 +700,64 @@ static bool verifyStackDepths(VCtx* ctx) {
     const BytecodeChunk* chunk = ctx->chunk;
     AddrSym* addrs = NULL;
     int addr_count = 0, addr_cap = 0;
-    collectProcedures(ctx->procedures, &addrs, &addr_count, &addr_cap);
+    int* owner = NULL;
+    uint8_t* visited = NULL;
+    Depth* depths = NULL;
+    WorkItem* worklist = NULL;
+    bool ok = true;
+
+    // Entries: the top-level program at pc 0, every procedure, and every
+    // THREAD_CREATE target (a thread starts a fresh frame at its operand,
+    // whether or not a procedure is registered there; pass 2 has already
+    // proven the operand is an instruction boundary).
+    bool collected = appendAddrSym(&addrs, &addr_count, &addr_cap, 0, NULL) &&
+                     collectProcedures(ctx->procedures, &addrs, &addr_count, &addr_cap);
+    for (int pc = 0; collected && pc < chunk->count; pc++) {
+        if (ctx->boundary[pc] && chunk->code[pc] == THREAD_CREATE) {
+            uint32_t target = verifyReadU32BE(chunk->code, pc + 1);
+            collected = appendAddrSym(&addrs, &addr_count, &addr_cap, target,
+                                      findProcByAddress(ctx->procedures, target));
+        }
+    }
+    if (!collected) {
+        ok = vfail(ctx, "out of memory collecting verifier entry points");
+        goto done;
+    }
     qsort(addrs, (size_t)addr_count, sizeof(AddrSym), cmpAddrSym);
 
-    // Dedupe identical addresses (aliases resolving to the same target) and
-    // drop any that fall outside the chunk (stale cross-chunk metadata).
+    // Dedupe identical addresses (aliases resolving to the same target, a
+    // procedure at pc 0, a thread entry at a procedure) and drop any that are
+    // not an instruction start of this chunk (stale cross-chunk metadata).
     int n = 0;
     for (int i = 0; i < addr_count; i++) {
-        if (addrs[i].addr >= (uint32_t)chunk->count) continue;
+        if (addrs[i].addr >= (uint32_t)chunk->count || !ctx->boundary[addrs[i].addr]) continue;
         if (n > 0 && addrs[n - 1].addr == addrs[i].addr) continue;
         addrs[n++] = addrs[i];
     }
     addr_count = n;
 
-    int segment_count = (addrs != NULL && addr_count > 0 && addrs[0].addr == 0) ? addr_count : addr_count + 1;
-    ProcSegment* segments = (ProcSegment*)calloc((size_t)segment_count, sizeof(ProcSegment));
-    uint8_t* visited = (uint8_t*)calloc((size_t)(chunk->count > 0 ? chunk->count : 1), sizeof(uint8_t));
-    Depth* depths = (Depth*)calloc((size_t)(chunk->count > 0 ? chunk->count : 1), sizeof(Depth));
-    // Any single segment can span up to the whole chunk. Each pc can now be
-    // *processed* (i.e. reach classifyInstruction and push successors) up to
-    // twice -- once for a known depth, once for an unknown one (see
-    // VISITED_KNOWN/VISITED_UNKNOWN above) -- and each processed pc pushes at
-    // most two successors (JUMP_IF_FALSE), so 4*count+8 is a proven upper
-    // bound reusable across every segment (see verifySegment()).
+    owner = (int*)calloc((size_t)chunk->count, sizeof(int));
+    visited = (uint8_t*)calloc((size_t)chunk->count, sizeof(uint8_t));
+    depths = (Depth*)calloc((size_t)chunk->count, sizeof(Depth));
+    // A walk can span up to the whole chunk. Each pc can be *processed*
+    // (i.e. reach classifyInstruction and push successors) up to twice --
+    // once for a known depth, once for an unknown one (see
+    // VISITED_KNOWN/VISITED_UNKNOWN above) -- and each processed pc pushes
+    // at most two successors (JUMP_IF_FALSE), so 4*count+8 is a proven upper
+    // bound reusable across every walk (see verifyWalk()).
     int worklist_cap = chunk->count * 4 + 8;
-    WorkItem* worklist = (WorkItem*)calloc((size_t)worklist_cap, sizeof(WorkItem));
-    bool ok = true;
-
-    if (!segments || !visited || !depths || !worklist) {
-        ok = vfail(ctx, "out of memory building verifier segments");
+    worklist = (WorkItem*)calloc((size_t)worklist_cap, sizeof(WorkItem));
+    if (!owner || !visited || !depths || !worklist) {
+        ok = vfail(ctx, "out of memory building verifier walk state");
         goto done;
     }
 
-    int seg_idx = 0;
-    int prev_addr = 0;
-    bool have_zero = (addr_count > 0 && addrs[0].addr == 0);
-    if (!have_zero) {
-        segments[seg_idx].start = 0;
-        segments[seg_idx].symbol = NULL;
-        segments[seg_idx].end = (addr_count > 0) ? (int)addrs[0].addr : chunk->count;
-        seg_idx++;
-        prev_addr = segments[0].end;
-    }
     for (int i = 0; i < addr_count; i++) {
-        segments[seg_idx].start = (int)addrs[i].addr;
-        segments[seg_idx].symbol = addrs[i].sym;
-        segments[seg_idx].end = (i + 1 < addr_count) ? (int)addrs[i + 1].addr : chunk->count;
-        seg_idx++;
+        owner[addrs[i].addr] = i + 1;
     }
-    (void)prev_addr;
-
-    for (int i = 0; i < seg_idx; i++) {
-        if (segments[i].start >= segments[i].end) continue; // empty segment, nothing to walk
-        if (!verifySegment(ctx, &segments[i], visited, depths, worklist, worklist_cap)) {
+    WalkState ws = { addrs, owner, visited, depths, worklist, worklist_cap };
+    for (int i = 0; i < addr_count; i++) {
+        if (!verifyWalk(ctx, &ws, i + 1)) {
             ok = false;
             goto done;
         }
@@ -705,7 +765,7 @@ static bool verifyStackDepths(VCtx* ctx) {
 
 done:
     free(addrs);
-    free(segments);
+    free(owner);
     free(visited);
     free(depths);
     free(worklist);
