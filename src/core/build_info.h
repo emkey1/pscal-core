@@ -24,6 +24,15 @@
 #define PSCAL_PROGRAM_VERSION_RAW PSCAL_STRINGIFY("undefined.version_DEV")
 #endif
 
+// PSCAL_BUILD_COMMIT_HEADER names a header the umbrella build regenerates on
+// every build, defining PSCAL_BUILD_COMMIT as the frontend component's short
+// commit ("-dirty" with uncommitted changes). Only frontend targets set it, so
+// a new commit recompiles the files that print the version, not the tree --
+// the reason the wall-clock stamp above is fixed per build directory.
+#ifdef PSCAL_BUILD_COMMIT_HEADER
+#include PSCAL_BUILD_COMMIT_HEADER
+#endif
+
 #ifdef PSCAL_GIT_TAG
 #define PSCAL_GIT_TAG_RAW PSCAL_STRINGIFY(PSCAL_GIT_TAG)
 #else
@@ -56,11 +65,26 @@ static inline const char *pscal_normalize_define(const char *raw, char *buffer, 
 
 static inline const char *pscal_program_version_string(void) {
     static int initialized = 0;
+#ifdef PSCAL_BUILD_COMMIT
+    static char storage[sizeof(PSCAL_PROGRAM_VERSION_RAW) + sizeof(PSCAL_BUILD_COMMIT) + 1];
+#else
     static char storage[sizeof(PSCAL_PROGRAM_VERSION_RAW)];
+#endif
     static const char *value = NULL;
 
     if (!initialized) {
+#ifdef PSCAL_BUILD_COMMIT
+        // "<version>+<commit>": VERSION names the semantics, the commit the build.
+        char base[sizeof(PSCAL_PROGRAM_VERSION_RAW)];
+        const char *version = pscal_normalize_define(PSCAL_PROGRAM_VERSION_RAW, base, sizeof(base));
+        size_t version_len = strlen(version);
+        memcpy(storage, version, version_len);
+        storage[version_len] = '+';
+        memcpy(storage + version_len + 1, PSCAL_BUILD_COMMIT, sizeof(PSCAL_BUILD_COMMIT));
+        value = storage;
+#else
         value = pscal_normalize_define(PSCAL_PROGRAM_VERSION_RAW, storage, sizeof(storage));
+#endif
         initialized = 1;
     }
 
