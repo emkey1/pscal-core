@@ -11718,6 +11718,7 @@ static void populateBuiltinRegistry(void) {
     registerBuiltinFunctionUnlocked("MStreamFromString", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("MStreamLoadFromFile", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("MStreamSaveToFile", AST_PROCEDURE_DECL, NULL);
+    registerBuiltinFunctionUnlocked("MStreamAppendByte", AST_PROCEDURE_DECL, NULL);
     registerBuiltinFunctionUnlocked("MStreamBuffer", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("New", AST_PROCEDURE_DECL, NULL);
     registerBuiltinFunctionUnlocked("NormalColors", AST_PROCEDURE_DECL, NULL);
