@@ -20,7 +20,8 @@
 //      target lands on an instruction boundary.
 //   2. Every constant-pool index, host-function id, and code address
 //      operand (including those inside the "?" variable-length payloads)
-//      is in range.
+//      is in range (or is the 0xFFFF "no element type" sentinel a file
+//      declaration uses in place of a type name).
 //   3. Per procedure (as delimited by `procedures`' bytecode_address
 //      entries, plus the implicit top-level entry at pc 0), an abstract
 //      walk of the operand stack never goes negative, never exceeds

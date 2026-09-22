@@ -81,6 +81,11 @@ static bool checkSlotIndex(VCtx* ctx, uint32_t idx, int pc, const char* what) {
     return true;
 }
 
+// A file declaration's element-type-name operand (DEFINE_GLOBAL*'s TYPE_FILE
+// payload, INIT_LOCAL_FILE's K) holds this instead of a constant index for a
+// text or untyped file; the VM tests for it before indexing the pool.
+#define NO_ELEMENT_TYPE_NAME 0xFFFFu
+
 static bool checkCodeTarget(VCtx* ctx, uint32_t target, int pc, const char* what) {
     if (target >= (uint32_t)ctx->chunk->count || !ctx->boundary[target]) {
         return vfail(ctx, "pc %d: %s target %u is not a valid instruction boundary",
@@ -169,7 +174,9 @@ static bool walkVariablePayload(VCtx* ctx, int pc, int* out_dynamic_dims) {
             } else if (declared == TYPE_FILE) {
                 cursor++; // element VarType byte
                 uint32_t elem_name = verifyReadU16BE(code, cursor); cursor += 2;
-                if (!checkConstIndex(ctx, elem_name, pc, "DEFINE_GLOBAL element-name")) return false;
+                // 0xFFFF: no element type (text and untyped files); the VM skips it.
+                if (elem_name != NO_ELEMENT_TYPE_NAME &&
+                    !checkConstIndex(ctx, elem_name, pc, "DEFINE_GLOBAL element-name")) return false;
             }
         }
         return true;
@@ -218,6 +225,13 @@ static bool verifyOperands(VCtx* ctx) {
                 return vfail(ctx, "pc %d: CALL_HOST host id %u out of range (max %d)",
                              pc, host_id, HOST_FN_COUNT);
             }
+            continue;
+        }
+
+        if (opcode == INIT_LOCAL_FILE) { // "bbK": slot, element VarType, element-type name
+            uint32_t elem_name = verifyReadU16BE(code, pc + 3);
+            if (elem_name != NO_ELEMENT_TYPE_NAME &&
+                !checkConstIndex(ctx, elem_name, pc, info->name)) return false;
             continue;
         }
 
