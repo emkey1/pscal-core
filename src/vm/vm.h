@@ -345,6 +345,7 @@ typedef struct VM_s {
 
     bool exit_requested;      // Indicates a builtin requested early exit from the current frame
     bool abort_requested;     // Raised when a builtin requests an immediate interpreter abort
+    bool runtime_error_raised; // Set by runtimeError(); while abort_requested stays set, the dispatch loop stops with INTERPRET_RUNTIME_ERROR
     bool suspend_unwind_requested; // Keep unwinding frames for cooperative Ctrl-Z requests
     const char* current_builtin_name; // Tracks the name of the builtin currently executing (for diagnostics)
     Value threadMyself;       // Per-VM receiver context for Pascal record methods

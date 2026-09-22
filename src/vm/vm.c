@@ -2377,6 +2377,7 @@ static void* threadStart(void* arg) {
         if (!canceled && !killed && workerVm) {
             workerVm->current_builtin_name = NULL;
             workerVm->abort_requested = false;
+            workerVm->runtime_error_raised = false;
             workerVm->exit_requested = false;
             workerVm->suspend_unwind_requested = false;
         }
@@ -4389,6 +4390,12 @@ static bool vmCheckArrayIndexBounds(VM* vm, Value* array_val_ptr, int* indices) 
 void runtimeError(VM* vm, const char* format, ...) {
     if (vm) {
         vm->abort_requested = true;
+        // A handler that reports an error without returning (push()/pop()/
+        // peek() cannot return one) must still stop the program: the
+        // dispatch loop checks this before the next instruction. The abort
+        // flag alone can't tell it so, because interrupts and exits set it
+        // too, and those unwind a single frame and carry on.
+        vm->runtime_error_raised = true;
     }
 
 #ifdef SDL
@@ -4765,6 +4772,10 @@ static Symbol* findProcedureByName(HashTable* table, const char* lookup_name, VM
     return NULL;
 }
 
+// push()/pop()/peek() can't return an error, so on a fault they report and
+// hand back nil (pop/peek) or drop the value (push). The handler finishes on
+// that and the dispatch loop stops before the next instruction (see
+// runtime_error_raised).
 static Value pop(VM* vm) {
     if (vm->stackTop == vm->stack) {
         runtimeError(vm, "VM Error: Stack underflow (pop from empty stack).");
@@ -6217,6 +6228,7 @@ void vmResetExecutionState(VM* vm) {
 
     vm->exit_requested = false;
     vm->abort_requested = false;
+    vm->runtime_error_raised = false;
     vm->suspend_unwind_requested = false;
     vm->current_builtin_name = NULL;
     vm->trace_executed = 0;
@@ -6325,6 +6337,7 @@ void initVM(VM* vm) { // As in all.txt, with frameCount
 
     vm->exit_requested = false;
     vm->abort_requested = false;
+    vm->runtime_error_raised = false;
     vm->suspend_unwind_requested = false;
     vm->current_builtin_name = NULL;
     vm->threadMyself = makeNil();
@@ -6635,6 +6648,21 @@ static inline __attribute__((unused)) Value vmFastPeekChecked(VM* vm, int distan
 #define FAST_PUSH(v) vmFastPushUnchecked(vm, (v))
 #define FAST_POP() vmFastPopUnchecked(vm)
 #define FAST_PEEK(dist) vmFastPeekChecked(vm, (dist))
+
+// For handlers that use their operands in place through vm->stackTop
+// instead of popping them. After a CALL_INDIRECT/CALL_METHOD/CALL_HOST the
+// verifier no longer knows the depth, so the stack can be shorter than the
+// opcode needs, and vm->stackTop - 1 on an empty stack reads whatever is
+// mapped below vm->stack.
+static bool vmStackHasOperands(VM* vm, uint8_t opcode, int depth) {
+    long have = (long)(vm->stackTop - vm->stack);
+    if (have >= depth) {
+        return true;
+    }
+    runtimeError(vm, "VM Error: Stack underflow (%s requires stack depth >= %d but have %ld).",
+                 kOpcodeNames[opcode], depth, have);
+    return false;
+}
 
 static bool vmSizeForVarType(VarType type, long long* out_bytes) {
     if (!out_bytes) {
@@ -7291,6 +7319,7 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
     vm->ip = vm->chunk->code + entry;
     vm->lastInstruction = vm->ip;
     vm->abort_requested = false;
+    vm->runtime_error_raised = false;
     vm->suspend_unwind_requested = false;
     vm->zeroBasedIndexing = frontendIsZeroBasedStrings();
 
@@ -7763,6 +7792,20 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
         if (pending_exit_flag && *pending_exit_flag) {
             shellRuntimeMaybeRequestPendingExit(vm);
         }
+        // The previous instruction reported an error but did not return one
+        // (a push()/pop()/peek() failure, or a handler that reports and
+        // falls through). Stop here. The unwind below is for exits and
+        // interrupts: it leaves one frame and carries on, and at top level
+        // it halts with INTERPRET_OK, so a failed program would exit 0.
+        // Code that clears abort_requested after reporting has handled the
+        // error itself (the shell recovers from some builtin failures that
+        // way), so that case carries on as before.
+        if (vm->runtime_error_raised) {
+            if (vm->abort_requested) {
+                return INTERPRET_RUNTIME_ERROR;
+            }
+            vm->runtime_error_raised = false;
+        }
         if (vm->exit_requested || vm->abort_requested) {
             if (shellRuntimeShouldDeferExit(vm)) {
                 continue;
@@ -7875,6 +7918,9 @@ dispatch_switch:
             }
 
             case GET_CHAR_ADDRESS: {
+                if (!vmStackHasOperands(vm, GET_CHAR_ADDRESS, 2)) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 Value index_val = pop(vm);
                 Value* string_ptr_val = vm->stackTop - 1; // Peek at the string pointer
 
@@ -8611,6 +8657,9 @@ comparison_error_label:
             }
             case GET_FIELD_OFFSET: {
                 uint8_t field_index = READ_BYTE();
+                if (!vmStackHasOperands(vm, GET_FIELD_OFFSET, 1)) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 Value* base_val_ptr = vm->stackTop - 1;
                 bool invalid_type = false;
                 Value* record_struct_ptr = resolveRecord(base_val_ptr, &invalid_type);
@@ -8641,6 +8690,9 @@ comparison_error_label:
             }
             case GET_FIELD_OFFSET16: {
                 uint16_t field_index = READ_SHORT(vm);
+                if (!vmStackHasOperands(vm, GET_FIELD_OFFSET16, 1)) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 Value* base_val_ptr = vm->stackTop - 1;
                 bool invalid_type = false;
                 Value* record_struct_ptr = resolveRecord(base_val_ptr, &invalid_type);
@@ -8687,6 +8739,9 @@ comparison_error_label:
             }
             case GET_FIELD_ADDRESS: {
                 uint8_t field_name_idx = READ_BYTE();
+                if (!vmStackHasOperands(vm, GET_FIELD_ADDRESS, 1)) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 Value* base_val_ptr = vm->stackTop - 1;
                 bool invalid_type = false;
                 Value* record_struct_ptr = resolveRecord(base_val_ptr, &invalid_type);
@@ -8724,6 +8779,9 @@ comparison_error_label:
             }
             case GET_FIELD_ADDRESS16: {
                 uint16_t field_name_idx = READ_SHORT(vm);
+                if (!vmStackHasOperands(vm, GET_FIELD_ADDRESS16, 1)) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 Value* base_val_ptr = vm->stackTop - 1;
                 bool invalid_type = false;
                 Value* record_struct_ptr = resolveRecord(base_val_ptr, &invalid_type);
@@ -8761,6 +8819,9 @@ comparison_error_label:
             }
             case GET_FIELD_ADDRESS_KEEP: {
                 uint8_t field_name_idx = READ_BYTE();
+                if (!vmStackHasOperands(vm, GET_FIELD_ADDRESS_KEEP, 1)) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 Value* base_val_ptr = vm->stackTop - 1;
                 bool invalid_type = false;
                 Value* record_struct_ptr = resolveRecord(base_val_ptr, &invalid_type);
@@ -8796,6 +8857,9 @@ comparison_error_label:
             }
             case GET_FIELD_ADDRESS_KEEP16: {
                 uint16_t field_name_idx = READ_SHORT(vm);
+                if (!vmStackHasOperands(vm, GET_FIELD_ADDRESS_KEEP16, 1)) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 Value* base_val_ptr = vm->stackTop - 1;
                 bool invalid_type = false;
                 Value* record_struct_ptr = resolveRecord(base_val_ptr, &invalid_type);
@@ -11837,33 +11901,42 @@ comparison_error_label:
                 }
 
                 FieldValue* current = AS_RECORD(*objVal);
-                Value* vtable_arr = NULL;
+                const Value* vtable_val = NULL;
                 while (current) {
-                    if (strcmp(current->name, "__vtable") == 0) {
+                    // ALLOC_OBJECT's fields have no name.
+                    if (current->name && strcmp(current->name, "__vtable") == 0) {
                         const Value *fieldValue = fieldValueStorageConst(current);
-                        if (VALUE_TYPE(*fieldValue) == TYPE_ARRAY) {
-                            vtable_arr = AS_ARRAY(*fieldValue);
+                        if (VALUE_TYPE(*fieldValue) == TYPE_ARRAY && !ARRAY_IS_PACKED(*fieldValue) &&
+                            AS_ARRAY(*fieldValue)) {
+                            vtable_val = fieldValue;
                         }
                         break;
                     }
                     current = current->next;
                 }
 
-                if (!vtable_arr) {
+                if (!vtable_val) {
                     runtimeError(vm, "VM Error: Object missing V-table.");
                     return INTERPRET_RUNTIME_ERROR;
                 }
-
-                uint16_t target_address = (uint32_t)VAL_UINT(vtable_arr[method_index]);
-                if (!vmEnsureFrameCapacity(vm)) {
-                    runtimeError(vm, "VM Error: Call stack overflow.");
+                Value* vtable_arr = AS_ARRAY(*vtable_val);
+                int vtable_len = calculateArrayTotalSize(vtable_val);
+                if (method_index >= vtable_len) {
+                    runtimeError(vm, "VM Error: Method index %d is outside the %d-entry V-table.",
+                                 method_index, vtable_len);
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                CallFrame* frame = &vm->frames[vm->frameCount++];
-                frame->return_address = vm->ip;
-                frame->slots = vm->stackTop - declared_arity - 1;
-                frame->vtable = vtable_arr;
-                frame->slotCount = 0;
+
+                // The V-table is data the program can change, so the
+                // verifier never saw this target. Like CALL and
+                // CALL_INDIRECT, only go there if it is a procedure's entry.
+                Value vtable_slot = vtable_arr[method_index];
+                long long slot_address = IS_INTLIKE(vtable_slot) ? AS_INTEGER(vtable_slot) : -1;
+                if (slot_address < 0 || slot_address >= vm->chunk->count) {
+                    runtimeError(vm, "VM Error: V-table entry %d is not a code address.", method_index);
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+                uint32_t target_address = (uint32_t)slot_address;
 
                 Symbol* method_symbol = NULL;
                 const char* className = NULL;
@@ -11885,11 +11958,25 @@ comparison_error_label:
                 if (!method_symbol) {
                     method_symbol = vmGetProcedureByAddress(vm, target_address);
                 }
-                if (!method_symbol) {
-                    runtimeError(vm, "VM Error: Method not found for index %d.", method_index);
-                    vm->frameCount--;
+                // A method found by class name must be the one the V-table
+                // points at, since control goes to target_address.
+                if (!method_symbol || !method_symbol->is_defined ||
+                    method_symbol->bytecode_address < 0 ||
+                    (uint32_t)method_symbol->bytecode_address != target_address) {
+                    runtimeError(vm, "VM Error: V-table entry %d (address %u) is not a procedure entry.",
+                                 method_index, target_address);
                     return INTERPRET_RUNTIME_ERROR;
                 }
+
+                if (!vmEnsureFrameCapacity(vm)) {
+                    runtimeError(vm, "VM Error: Call stack overflow.");
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+                CallFrame* frame = &vm->frames[vm->frameCount++];
+                frame->return_address = vm->ip;
+                frame->slots = vm->stackTop - declared_arity - 1;
+                frame->vtable = vtable_arr;
+                frame->slotCount = 0;
 
                 if (method_symbol->type_def && method_symbol->type_def->child_count >= declared_arity + 1) {
                     for (int i = 0; i < declared_arity; i++) {
@@ -11930,7 +12017,11 @@ comparison_error_label:
                         parent_frame = &vm->frames[vm->frameCount - 2];
                     }
                     if (!parent_frame) {
+                        free(frame->upvalues);
+                        frame->upvalues = NULL;
+                        frame->owns_upvalues = false;
                         runtimeError(vm, "VM Error: Enclosing frame not found for '%s'.", method_symbol->name);
+                        vm->frameCount--;
                         return INTERPRET_RUNTIME_ERROR;
                     }
                     for (int i = 0; i < method_symbol->upvalue_count; i++) {

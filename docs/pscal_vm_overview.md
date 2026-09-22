@@ -35,6 +35,7 @@ The VM's architecture is defined by the `VM` struct in `src/vm/vm.h` and consist
 * **Execution Control Flags:**
     * **`exit_requested`**: Set by a builtin to request early exit from the current frame (similar to `EXIT` but triggerable from C code).
     * **`abort_requested`**: Raised when a builtin requests an immediate interpreter abort (e.g., unrecoverable error).
+    * **`runtime_error_raised`**: Set by `runtimeError()`. While `abort_requested` is still set, the dispatch loop returns `INTERPRET_RUNTIME_ERROR` before the next instruction, so an error reported by code that can't return one (`push()`/`pop()`/`peek()`) stops the program instead of unwinding one frame like an exit.
     * **`suspend_unwind_requested`**: Set for cooperative Ctrl-Z style suspension; the VM continues unwinding frames rather than halting immediately.
 * **Frontend Context:** A `void*` pointer (`frontendContext`) allowing frontends (e.g., exsh) to attach per-VM state.
 * **String Indexing Mode:** A boolean (`shellIndexing`) that controls whether string indexing is 0-based (shell style) or 1-based (Pascal/REA style).
@@ -422,7 +423,7 @@ Bytecode emitted:
     * **Action:** Same as `CALL_INDIRECT`, but runs in statement context — any return value from the callee is discarded. Used for calls to function pointers in procedure position.
 * **`CALL_METHOD`**:
     * **Operands:** 1-byte method index, 1-byte argument count.
-    * **Action:** Virtual method dispatch. The receiver is expected at `stackTop[-arg_count - 1]`. Resolves the method through the object's hidden `__vtable` pointer using the method index. The receiver must be a non-nil pointer to a `TYPE_RECORD`.
+    * **Action:** Virtual method dispatch. The receiver is expected at `stackTop[-arg_count - 1]` and must be a non-nil pointer to a `TYPE_RECORD` with a field named `__vtable` holding an integer array. Entry `method index` of that array must be the entry address of a procedure in the chunk; an index past the array, or an entry that is not a procedure's address, is a runtime error. No compiler emits this opcode today: virtual calls compile to `GET_INDIRECT` loads from the V-table followed by `PROC_CALL_INDIRECT`.
 * **`CALL_BUILTIN`**:
     * **Operands:** 2-byte name constant index, 1-byte argument count.
     * **Action:** Calls a built-in function or procedure by name. Looks up the name in the constant pool, then dispatches to the registered builtin handler. The return value (if any) is pushed onto the stack.
