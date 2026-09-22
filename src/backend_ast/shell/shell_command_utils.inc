@@ -518,7 +518,16 @@ static char *shellRunCommandSubstitution(const char *command) {
     vprocHostClose(pipes[1]);
     pipes[1] = -1;
 
+    /* The reader owns the read end from here on and the drain closes it.
+     * Leaving the number in pipes[0] too made the cleanup below close it a
+     * second time, and a thread that opened an fd in between got its fd
+     * closed under it: a pool worker's first Delay creates the SIGINT
+     * self-pipe lazily, lands on the just-freed number, loses its read end,
+     * and from then on pscalRuntimeConsumeSigint() drains the next
+     * substitution's pipe, which reuses that number
+     * (thread_worker_reuse.exsh: "WaitForThread: expected thread id"). */
     reader.fd = pipes[0];
+    pipes[0] = -1;
 
     memset(&opts, 0, sizeof(opts));
     opts.no_cache = 1;

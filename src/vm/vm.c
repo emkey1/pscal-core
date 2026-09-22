@@ -2286,6 +2286,62 @@ static bool vmGrowMutexStorage(VM* vm, size_t neededCount) {
     return true;
 }
 
+// A slot's job is finished -- and its result safe to hand out -- once the
+// worker has published awaitingReuse, not merely once a status is stored: a
+// job stores its status mid-run (threadStart's job switch, or HTTP async from
+// inside its callback) and the worker then still tears the job down before it
+// parks. joinThreadInternal/vmThreadTakeResult/vmTaskIsDone wait for this, so
+// a completed join always leaves the slot in a state ThreadGetResult accepts
+// (vmThreadIsRunning false), and a release always finds the worker parked for
+// this job. A slot whose worker has gone (!active) counts as finished too.
+// Caller holds thread->resultMutex.
+static bool vmThreadJobFinishedLocked(Thread* thread) {
+    return thread->statusReady && (thread->awaitingReuse || !atomic_load(&thread->active));
+}
+
+// Post-job handoff on the worker: publish the finished job, wait until a
+// consumer releases the slot (vmThreadReleaseForReuse), a cancel/kill sets
+// readyForReuse, or the pool shuts down, then leave the finished state.
+// Returns false when the worker should exit instead of taking another job.
+static bool vmThreadAwaitRelease(Thread* thread, VM* owner) {
+    // awaitingReuse is read under resultMutex by joinThreadInternal/
+    // vmThreadTakeResult -- toggle it under that same lock, never nested
+    // inside stateMutex from this side. See vmThreadResetResult's comment
+    // for the full rationale (TSan-confirmed cross-mutex race). The
+    // broadcast wakes joiners waiting on vmThreadJobFinishedLocked.
+    pthread_mutex_lock(&thread->resultMutex);
+    thread->awaitingReuse = true;
+    pthread_cond_broadcast(&thread->resultCond);
+    pthread_mutex_unlock(&thread->resultMutex);
+
+    pthread_mutex_lock(&thread->stateMutex);
+    pthread_cond_broadcast(&thread->stateCond);
+    while (!thread->readyForReuse && !atomic_load(&thread->killRequested) && !atomic_load(&owner->shuttingDownWorkers)) {
+        pthread_cond_wait(&thread->stateCond, &thread->stateMutex);
+    }
+    bool exitLoop = atomic_load(&thread->killRequested) || atomic_load(&owner->shuttingDownWorkers);
+    thread->readyForReuse = false;
+    // Leave the finished state in the same stateMutex section that consumed
+    // readyForReuse, clearing active before awaitingReuse. A reader holding
+    // resultMutex then never sees this job's slot as running (active &&
+    // !awaitingReuse) once it has finished, and vmThreadReleaseForReuse,
+    // which holds stateMutex, never mistakes a consumed release for a
+    // pending one. Previously awaitingReuse dropped in its own section and
+    // active only after a separate reset, so a late ThreadGetResult could
+    // read "still running" and a second release could leave a stale
+    // readyForReuse behind for the slot's next job.
+    atomic_store(&thread->active, false);
+    if (exitLoop) {
+        pthread_mutex_lock(&thread->resultMutex);
+        thread->awaitingReuse = false;
+        pthread_mutex_unlock(&thread->resultMutex);
+    } else {
+        vmThreadResetResult(thread);
+    }
+    pthread_mutex_unlock(&thread->stateMutex);
+    return !exitLoop;
+}
+
 static void* threadStart(void* arg) {
     ThreadStartArgs* args = (ThreadStartArgs*)arg;
     if (!args) {
@@ -2312,8 +2368,12 @@ static void* threadStart(void* arg) {
         }
         if (!job) {
             pthread_mutex_lock(&owner->threadRegistryLock);
-            owner->availableWorkers++;
-            thread->idle = true;
+            // vmThreadReleaseForReuse may already have counted this worker
+            // as available when it released the slot.
+            if (!thread->idle) {
+                owner->availableWorkers++;
+                thread->idle = true;
+            }
             pthread_mutex_unlock(&owner->threadRegistryLock);
 
             job = vmThreadJobQueuePop(owner->jobQueue, &owner->shuttingDownWorkers, thread);
@@ -2346,6 +2406,11 @@ static void* threadStart(void* arg) {
             vmThreadStoreResultDirect(thread, NULL, false);
             vmThreadJobAwaitConsumedAndDestroy(job);
             job = NULL;
+            // Hand the failure over like any finished job, or a joiner would
+            // wait forever for the awaitingReuse it never published.
+            if (!vmThreadAwaitRelease(thread, owner)) {
+                break;
+            }
             continue;
         }
 
@@ -2617,37 +2682,9 @@ static void* threadStart(void* arg) {
         vmThreadJobAwaitConsumedAndDestroy(job);
         job = NULL;
 
-        // awaitingReuse is read under resultMutex by joinThreadInternal/
-        // vmThreadTakeResult -- toggle it under that same lock (sequentially,
-        // never nested with stateMutex below) rather than stateMutex, which
-        // only readyForReuse/stateCond need. See vmThreadResetResult's
-        // comment for the full rationale (TSan-confirmed cross-mutex race).
-        pthread_mutex_lock(&thread->resultMutex);
-        thread->awaitingReuse = true;
-        pthread_mutex_unlock(&thread->resultMutex);
-
-        pthread_mutex_lock(&thread->stateMutex);
-        pthread_cond_broadcast(&thread->stateCond);
-        while (!thread->readyForReuse && !atomic_load(&thread->killRequested) && !atomic_load(&owner->shuttingDownWorkers)) {
-            pthread_cond_wait(&thread->stateCond, &thread->stateMutex);
-        }
-        bool exitLoop = atomic_load(&thread->killRequested) || atomic_load(&owner->shuttingDownWorkers);
-        thread->readyForReuse = false;
-        pthread_mutex_unlock(&thread->stateMutex);
-
-        pthread_mutex_lock(&thread->resultMutex);
-        thread->awaitingReuse = false;
-        pthread_mutex_unlock(&thread->resultMutex);
-
-        if (exitLoop) {
+        if (!vmThreadAwaitRelease(thread, owner)) {
             break;
         }
-
-        pthread_mutex_lock(&thread->stateMutex);
-        vmThreadResetResult(thread);
-        pthread_mutex_unlock(&thread->stateMutex);
-        atomic_store(&thread->active, false);
-        workerVm = thread->vm;
     }
 
     pthread_mutex_lock(&owner->threadRegistryLock);
@@ -2934,9 +2971,23 @@ bool vmTaskIsDone(VM* vm, int threadId) {
         return false;
     }
     pthread_mutex_lock(&thread->resultMutex);
-    bool done = thread->statusReady;
+    bool done = vmThreadJobFinishedLocked(thread);
     pthread_mutex_unlock(&thread->resultMutex);
     return done;
+}
+
+bool vmThreadIsRunning(VM* vm, int threadId) {
+    if (!vm || threadId <= 0 || (size_t)threadId >= vm->threadsCommittedCount) {
+        return false;
+    }
+    Thread* thread = &vm->threads[threadId];
+    if (!thread->syncInitialized) {
+        return atomic_load(&thread->active);
+    }
+    pthread_mutex_lock(&thread->resultMutex);
+    bool running = atomic_load(&thread->active) && !thread->awaitingReuse;
+    pthread_mutex_unlock(&thread->resultMutex);
+    return running;
 }
 
 int vmSpawnCallbackThread(VM* vm, VMThreadCallback callback, void* user_data, VMThreadCleanup cleanup) {
@@ -3204,6 +3255,33 @@ void vmThreadStoreResult(VM* vm, const Value* result, bool success) {
     pthread_mutex_unlock(&thread->resultMutex);
 }
 
+// Hand a finished slot back to its worker. Lock order is threadRegistryLock
+// -> stateMutex -> resultMutex, as in threadStart's exit path and
+// vmThreadResetResult. Acts only while the worker is parked for this job
+// (awaitingReuse set, readyForReuse not yet), which vmThreadAwaitRelease
+// makes exact, so a repeated or late release is a no-op. It also counts the
+// worker as available here, before waking it: a spawn issued straight after
+// the release (a spawn/wait/consume loop) used to find availableWorkers == 0
+// until the woken worker got back to vmThreadJobQueuePop, and started a
+// second worker instead (thread_worker_reuse.exsh's "unique:2").
+static void vmThreadReleaseForReuse(VM* owner, Thread* thread) {
+    pthread_mutex_lock(&owner->threadRegistryLock);
+    pthread_mutex_lock(&thread->stateMutex);
+    pthread_mutex_lock(&thread->resultMutex);
+    bool parked = thread->awaitingReuse;
+    pthread_mutex_unlock(&thread->resultMutex);
+    if (parked && !thread->readyForReuse) {
+        if (!thread->idle) {
+            thread->idle = true;
+            owner->availableWorkers++;
+        }
+        thread->readyForReuse = true;
+        pthread_cond_broadcast(&thread->stateCond);
+    }
+    pthread_mutex_unlock(&thread->stateMutex);
+    pthread_mutex_unlock(&owner->threadRegistryLock);
+}
+
 bool vmThreadTakeResult(VM* vm, int threadId, Value* outResult, bool takeValue, bool* outStatus, bool takeStatus) {
     if (!vm) {
         return false;
@@ -3217,7 +3295,7 @@ bool vmThreadTakeResult(VM* vm, int threadId, Value* outResult, bool takeValue, 
     }
 
     pthread_mutex_lock(&thread->resultMutex);
-    while (!thread->statusReady) {
+    while (!vmThreadJobFinishedLocked(thread)) {
         if (!atomic_load(&thread->active) && !thread->awaitingReuse) {
             pthread_mutex_unlock(&thread->resultMutex);
             return false;
@@ -3282,10 +3360,7 @@ bool vmThreadTakeResult(VM* vm, int threadId, Value* outResult, bool takeValue, 
     pthread_mutex_unlock(&thread->resultMutex);
 
     if (releaseWorker) {
-        pthread_mutex_lock(&thread->stateMutex);
-        thread->readyForReuse = true;
-        pthread_cond_broadcast(&thread->stateCond);
-        pthread_mutex_unlock(&thread->stateMutex);
+        vmThreadReleaseForReuse(vm, thread);
     }
     return true;
 }
@@ -3303,7 +3378,7 @@ static bool joinThreadInternal(VM* vm, int id) {
         return false;
     }
     pthread_mutex_lock(&thread->resultMutex);
-    while (!thread->statusReady) {
+    while (!vmThreadJobFinishedLocked(thread)) {
         if (!atomic_load(&thread->active) && !thread->awaitingReuse) {
             pthread_mutex_unlock(&thread->resultMutex);
             return false;
@@ -3522,23 +3597,16 @@ bool vmJoinThreadById(VM* vm, int id) {
         vmThreadTakeResult(vm, id, NULL, false, NULL, true);
         Thread *thread = &vm->threads[id];
         if (thread && atomic_load(&thread->inPool) && thread->syncInitialized) {
-            bool mark_ready = false;
+            // vmThreadTakeResult already released the slot if nothing is left
+            // to consume; a status still standing means a result value is
+            // pending for ThreadGetResult, which releases it then. With no
+            // status left, release again: it is a no-op unless the worker
+            // is still parked for this job.
             pthread_mutex_lock(&thread->resultMutex);
-            if (!thread->statusReady) {
-                thread->statusFlag = true;
-                thread->statusReady = false;
-                thread->statusConsumed = true;
-                thread->resultConsumed = true;
-                mark_ready = true;
-            } else if (thread->statusConsumed && (!thread->resultReady || thread->resultConsumed)) {
-                mark_ready = true;
-            }
+            bool nothing_pending = !thread->statusReady;
             pthread_mutex_unlock(&thread->resultMutex);
-            if (mark_ready) {
-                pthread_mutex_lock(&thread->stateMutex);
-                thread->readyForReuse = true;
-                pthread_cond_broadcast(&thread->stateCond);
-                pthread_mutex_unlock(&thread->stateMutex);
+            if (nothing_pending) {
+                vmThreadReleaseForReuse(vm, thread);
             }
         }
     }

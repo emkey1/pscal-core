@@ -10554,13 +10554,9 @@ Value vmBuiltinThreadGetResult(VM* vm, int arg_count, Value* args) {
         thread_vm = vm->threadOwner;
     }
 
-    Thread* slot = NULL;
-    if (thread_vm && thread_id > 0 && (size_t)thread_id < thread_vm->threadsCommittedCount) {
-        slot = &thread_vm->threads[thread_id];
-        if (atomic_load(&slot->active) && !slot->awaitingReuse) {
-            runtimeError(vm, "Thread %d is still running; join it before retrieving the result.", thread_id);
-            return makeNil();
-        }
+    if (vmThreadIsRunning(thread_vm, thread_id)) {
+        runtimeError(vm, "Thread %d is still running; join it before retrieving the result.", thread_id);
+        return makeNil();
     }
 
     bool status = false;
@@ -10570,15 +10566,11 @@ Value vmBuiltinThreadGetResult(VM* vm, int arg_count, Value* args) {
     }
 
     if (thread_vm && thread_vm != vm) {
-        Thread* fallback_slot = NULL;
-        if (thread_id > 0 && (size_t)thread_id < vm->threadsCommittedCount) {
-            fallback_slot = &vm->threads[thread_id];
-            if (atomic_load(&fallback_slot->active) && !fallback_slot->awaitingReuse) {
-                runtimeError(vm,
-                             "Thread %d is still running; join it before retrieving the result.",
-                             thread_id);
-                return makeNil();
-            }
+        if (vmThreadIsRunning(vm, thread_id)) {
+            runtimeError(vm,
+                         "Thread %d is still running; join it before retrieving the result.",
+                         thread_id);
+            return makeNil();
         }
         if (vmThreadTakeResult(vm, thread_id, &result, true, &status, consume_status)) {
             return result;
@@ -10629,7 +10621,7 @@ Value vmBuiltinThreadGetStatus(VM* vm, int arg_count, Value* args) {
     Thread* slot = NULL;
     if (thread_vm && thread_id > 0 && (size_t)thread_id < thread_vm->threadsCommittedCount) {
         slot = &thread_vm->threads[thread_id];
-        if (atomic_load(&slot->active) && !slot->awaitingReuse) {
+        if (vmThreadIsRunning(thread_vm, thread_id)) {
             runtimeError(vm, "Thread %d is still running; join it before querying status.", thread_id);
             return makeBoolean(false);
         }
@@ -10665,7 +10657,7 @@ Value vmBuiltinThreadGetStatus(VM* vm, int arg_count, Value* args) {
         Thread* fallback_slot = NULL;
         if (thread_id > 0 && (size_t)thread_id < vm->threadsCommittedCount) {
             fallback_slot = &vm->threads[thread_id];
-            if (atomic_load(&fallback_slot->active) && !fallback_slot->awaitingReuse) {
+            if (vmThreadIsRunning(vm, thread_id)) {
                 runtimeError(vm, "Thread %d is still running; join it before querying status.", thread_id);
                 if (drop_result) {
                     freeValue(&dropped);

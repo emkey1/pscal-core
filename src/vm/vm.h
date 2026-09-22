@@ -414,6 +414,11 @@ int vmSpawnCallbackThread(VM* vm, VMThreadCallback callback, void* user_data, VM
 // above directly -- no new entry point needed for those.
 int vmHostCreateTaskEntry(VM* vm, Value fnVal, int argc, const Value* argv);
 bool vmTaskIsDone(VM* vm, int threadId);
+// True while threadId's job is still running (active and not yet parked
+// awaiting release), read under the slot's resultMutex. Never true after a
+// join of that job has returned. ThreadGetResult/ThreadGetStatus use it to
+// refuse a slot that has not been joined yet.
+bool vmThreadIsRunning(VM* vm, int threadId);
 // VM 2.0 Phase 5a checkpoint 5a-iii: the "any future builtin needing
 // awaitable async work" entry point the plan calls for (HTTP async is the
 // first caller, retiring its own bespoke 32-slot pool; SQLite busy queries
