@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include <ctype.h>
 #include <limits.h>
+#include <stdarg.h>
 
 #define CACHE_ROOT ".pscal"
 #define CACHE_DIR "bc_cache"
@@ -66,8 +67,16 @@
  * routes this through the normal cache-miss path instead, exactly as it
  * did for format_ver 2 -- the mechanism generalizes to "any change that
  * makes old CODE bytes mean something different or nothing at all",
- * shape changes being only the first instance of that, not the only one. */
-#define PSB3_FORMAT_VERSION 3u
+ * shape changes being only the first instance of that, not the only one.
+ *
+ * format_ver 4: CONS gained pointer kind 4, a nil pointer with its base type
+ * (writePointerValue). Format 3 wrote every nil pointer as kind 3, which
+ * reads back as OPAQUE_POINTER_SENTINEL, and field access through an Aether
+ * array-of-records element built from one crashed. The reader's element
+ * count for a dimensionless array was fixed at the same time, which would
+ * otherwise let format-3 files that used to fail cleanly load and crash.
+ * Bumped so format-3 files are rejected, not misread. */
+#define PSB3_FORMAT_VERSION 4u
 
 /* VM 2.0 Phase 1e (Docs/pscal_vm2_plan.md §5.5): the load-time verifier can
  * only be skipped via `PSCAL_VM_SKIP_VERIFY=1` in the *host process's*
@@ -96,6 +105,33 @@
 #define PSB3_SECTION_ALIGN 8u
 
 static uint32_t g_astCacheVersion = 0;
+
+// Why the most recent loadBytecodeFromCache()/loadBytecodeFromFile()/
+// loadBytecodeFromFileUnlinked() call returned false (pscalCacheLastLoadError).
+// Per thread, like the symbol tables the loaders fill.
+static PSCAL_THREAD_LOCAL char g_loadError[768];
+// Where inside a section its reader gave up ("constant 3 of 9 (ARRAY)");
+// psb3ReadChunk prefixes the section name and cursor position.
+static PSCAL_THREAD_LOCAL char g_loadDetail[128];
+
+static bool loadFail(const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(g_loadError, sizeof(g_loadError), fmt, ap);
+    va_end(ap);
+    return false;
+}
+
+// Prefixes the reason already recorded with the file it concerns.
+static void prefixLoadError(const char* path) {
+    char inner[sizeof(g_loadError)];
+    snprintf(inner, sizeof(inner), "%s", g_loadError);
+    loadFail("%s: %s", path, inner);
+}
+
+const char* pscalCacheLastLoadError(void) {
+    return g_loadError;
+}
 
 #define FNV1A64_OFFSET 1469598103934665603ULL
 #define FNV1A64_PRIME 1099511628211ULL
@@ -939,10 +975,12 @@ static bool verifySourcePathString(const char* stored_path, const char* source_p
     return match || !strict;
 }
 
-static bool isCacheFresh(const char* cache_path, const char* source_path) {
+// NULL when the cache entry is newer than source_path (a frontend binary or a
+// dependency), otherwise why it is not.
+static const char* cacheStaleness(const char* cache_path, const char* source_path) {
     struct stat src_stat, cache_stat;
-    if (stat(source_path, &src_stat) != 0) return false;
-    if (stat(cache_path, &cache_stat) != 0) return false;
+    if (stat(source_path, &src_stat) != 0) return "cannot be found";
+    if (stat(cache_path, &cache_stat) != 0) return "cannot be compared with the cache entry";
 #if defined(__APPLE__)
 #define PSCAL_STAT_SEC(st)  ((st).st_mtimespec.tv_sec)
 #else
@@ -954,9 +992,9 @@ static bool isCacheFresh(const char* cache_path, const char* source_path) {
      * the source file in whole seconds.
      */
     if (PSCAL_STAT_SEC(cache_stat) <= PSCAL_STAT_SEC(src_stat)) {
-        return false;
+        return "is not older than the cache entry";
     }
-    return true;
+    return NULL;
 #undef PSCAL_STAT_SEC
 }
 
@@ -1056,6 +1094,26 @@ static AST* readAst(Cursor* in) {
  * host it truncates precision, which is the accepted risk-register trade
  * documented in Docs/pscal_vm2_plan.md §9 (TYPE_LONG_DOUBLE is rare in
  * generated code per Phase 4's own note). */
+
+// How many elements the codec stores for an array with these bounds: the
+// product of the dimension spans, and 0 for an array with no dimensions (an
+// empty dynamic array, e.g. Aether's `let xs: Int[] = [];`) or no bounds.
+// writeValue, readValue and hashValue must all agree on this count. Before
+// they did, the reader expected one element for a dimensionless array that
+// the writer never wrote, so every later constant was read one value late
+// and the CONS section ran out of bytes. -1 when the product overflows.
+static int arrayCodecElementCount(int dims, const int* lb, const int* ub) {
+    if (dims <= 0 || !lb || !ub) return 0;
+    int total = 1;
+    for (int i = 0; i < dims; i++) {
+        long long span = (long long)ub[i] - (long long)lb[i] + 1;
+        if (span <= 0) return 0;
+        if (span > INT_MAX / total) return -1;
+        total *= (int)span;
+    }
+    return total;
+}
+
 static bool writeValue(ByteBuf* out, const Value* v) {
     bufU32LE(out, (uint32_t)v->type);
     switch (v->type) {
@@ -1134,16 +1192,8 @@ static bool writeValue(ByteBuf* out, const Value* v) {
                 bufI32LE(out, lb);
                 bufI32LE(out, ub);
             }
-            int total = 1;
-            if (!lb_arr || !ub_arr) {
-                total = 0;
-            } else {
-                for (int i = 0; i < dims; i++) {
-                    int span = (ub_arr[i] - lb_arr[i] + 1);
-                    if (span <= 0) { total = 0; break; }
-                    total *= span;
-                }
-            }
+            int total = arrayCodecElementCount(dims, lb_arr, ub_arr);
+            if (total < 0) return false;
             if (total > 0 && arrayUsesPackedBytes(v)) {
                 if (!AS_ARRAY_RAW(*v)) return false;
                 for (int i = 0; i < total; i++) {
@@ -1308,7 +1358,11 @@ static bool readConstSection(Cursor* in, BytecodeChunk* chunk, int* out_read_con
     chunk->constants = (Value*)calloc((size_t)const_count, sizeof(Value));
     if (!chunk->constants) return false;
     for (int i = 0; i < (int)const_count; ++i) {
-        if (!readValue(in, &chunk->constants[i])) return false;
+        if (!readValue(in, &chunk->constants[i])) {
+            snprintf(g_loadDetail, sizeof(g_loadDetail), "constant %d of %d (%s)",
+                     i, (int)const_count, varTypeToString(chunk->constants[i].type));
+            return false;
+        }
         *out_read_consts = i + 1;
     }
     return true;
@@ -1389,7 +1443,8 @@ static bool readBmapSection(Cursor* in, BytecodeChunk* chunk) {
     return true;
 }
 
-static void writeProcsSection(ByteBuf* out) {
+// False when a global constant has no encoding (see writeConstSection).
+static bool writeProcsSection(ByteBuf* out) {
     int proc_count = 0;
     countProceduresRecursive(procedure_table, &proc_count);
     bufVarint(out, (uint64_t)proc_count);
@@ -1411,15 +1466,12 @@ static void writeProcsSection(ByteBuf* out) {
                 if (sym->is_alias || !sym->is_const) continue;
                 bufLenPrefixedBytes(out, sym->name, strlen(sym->name));
                 bufU32LE(out, (uint32_t)sym->type);
-                if (sym->value) {
-                    writeValue(out, sym->value);
-                } else {
-                    Value tmp = makeVoid();
-                    writeValue(out, &tmp);
-                }
+                Value tmp = makeVoid();
+                if (!writeValue(out, sym->value ? sym->value : &tmp)) return false;
             }
         }
     }
+    return true;
 }
 
 static bool readProcsSection(Cursor* in, BytecodeChunk* chunk) {
@@ -1491,10 +1543,10 @@ static bool writeChunkCoreInline(ByteBuf* out, const BytecodeChunk* chunk) {
         return false;
     }
     writeBmapSection(out, chunk);
-    writeProcsSection(out);
+    bool procs_ok = writeProcsSection(out);
     writeTypesSection(out);
     g_astCacheVersion = prev_version;
-    return true;
+    return procs_ok;
 }
 
 static bool readChunkCoreInline(Cursor* in, BytecodeChunk* chunk, uint32_t version) {
@@ -1560,6 +1612,19 @@ static bool writePointerValue(ByteBuf* out, const Value* v) {
         return writeChunkCoreInline(out, &compiled->chunk);
     }
 
+    // A nil pointer with its base type (or none), e.g. each element of an
+    // Aether array-of-records literal before its object is stored. Field
+    // access hydrates records from this type, so it must survive: kind 3
+    // reloads any pointer as OPAQUE_POINTER_SENTINEL, which the VM then
+    // dereferences as an AST. The type is stored as a copy, as the TYPE
+    // section stores types.
+    if (!address && base != OPAQUE_POINTER_SENTINEL &&
+        base != STRING_LENGTH_SENTINEL && base != BYTE_ARRAY_PTR_SENTINEL) {
+        bufU8(out, 4);
+        writeAst(out, base);
+        return true;
+    }
+
     bufU8(out, 3);
     bufU64LE(out, (uint64_t)(uintptr_t)address);
     return true;
@@ -1586,6 +1651,15 @@ static bool readPointerValue(Cursor* in, Value* out) {
         if (in->error) return false;
         AS_POINTER(*out) = (Value*)(uintptr_t)raw_addr;
         PTR_BASE_TYPE_NODE(*out) = OPAQUE_POINTER_SENTINEL;
+        return true;
+    }
+    if (kind == 4) {
+        // Like the program AST in a fresh compile, the copy lives for the
+        // process: a pointer borrows its base type and never frees it.
+        AST* base = readAst(in);  // NULL for an untyped nil pointer
+        if (in->error) { freeAST(base); return false; }
+        AS_POINTER(*out) = NULL;
+        PTR_BASE_TYPE_NODE(*out) = base;
         return true;
     }
     if (kind != 1) {
@@ -1730,15 +1804,7 @@ static void hashValue(uint64_t* hash, const Value* v, ChunkHashContext* ctx) {
                 fnv1aUpdateInt(hash, lb);
                 fnv1aUpdateInt(hash, ub);
             }
-            int total = 0;
-            if (dims > 0 && lb_arr && ub_arr) {
-                total = 1;
-                for (int i = 0; i < dims; ++i) {
-                    int span = ub_arr[i] - lb_arr[i] + 1;
-                    if (span <= 0) { total = 0; break; }
-                    total *= span;
-                }
-            }
+            int total = arrayCodecElementCount(dims, lb_arr, ub_arr);
             // Must check arrayUsesPackedBytes() FIRST: raw/elements are a
             // union inside ArrayObj (VM 2.0 Phase 4e/4f), so AS_ARRAY(*v)
             // is non-NULL for a packed array too (same bits as .raw) --
@@ -1944,15 +2010,14 @@ static bool readValue(Cursor* in, Value* out) {
                 a->lower_bound = a->lower_bounds[0];
                 a->upper_bound = a->upper_bounds[0];
             } else {
+                // As makeEmptyArray builds it: no elements. Bounds 0..0 made
+                // Aether's `[]` one element long once it came from the cache.
                 a->lower_bounds = a->upper_bounds = NULL;
-                a->lower_bound = a->upper_bound = 0;
+                a->lower_bound = 0;
+                a->upper_bound = -1;
             }
-            int total = 1;
-            for (int i = 0; i < dims; i++) {
-                int span = (a->upper_bounds[i] - a->lower_bounds[i] + 1);
-                if (span <= 0) { total = 0; break; }
-                total *= span;
-            }
+            int total = arrayCodecElementCount(dims, a->lower_bounds, a->upper_bounds);
+            if (total < 0) return false;
             if (total > 0) {
                 if (a->is_packed) {
                     a->raw = (uint8_t*)calloc((size_t)total, sizeof(uint8_t));
@@ -2511,6 +2576,15 @@ static void psb3FileFree(Psb3File* pf) {
  * fully inside the file and sections must not overlap, checked once here
  * before any section body is parsed (so a corrupt directory can never send
  * a reader off the end of the buffer). */
+static const char* psb3SectionName(uint32_t id, char out[5]) {
+    for (int i = 0; i < 4; ++i) {
+        char ch = (char)((id >> (8 * i)) & 0xFF);
+        out[i] = isprint((unsigned char)ch) ? ch : '?';
+    }
+    out[4] = '\0';
+    return out;
+}
+
 static bool psb3ParseHeader(Psb3File* pf) {
     Cursor c;
     curInit(&c, pf->file_data, pf->file_size);
@@ -2519,34 +2593,45 @@ static bool psb3ParseHeader(Psb3File* pf) {
     uint16_t vm_ver = curU16LE(&c);
     uint32_t flags = curU32LE(&c);
     uint32_t section_count = curU32LE(&c);
-    if (c.error || magic != PSB3_MAGIC) return false;
-    if (format_ver != PSB3_FORMAT_VERSION) return false; /* no reader for other container-format epochs */
-    if (section_count > 64) return false; /* sanity bound; real files carry <= 7 */
+    if (c.error) return loadFail("truncated header (%zu bytes)", pf->file_size);
+    if (magic != PSB3_MAGIC) return loadFail("not a PSB3 bytecode file");
+    if (format_ver != PSB3_FORMAT_VERSION) { /* no reader for other container-format epochs */
+        return loadFail("container format %u, this build reads format %u",
+                        (unsigned)format_ver, (unsigned)PSB3_FORMAT_VERSION);
+    }
+    if (section_count > 64) { /* sanity bound; real files carry <= 7 */
+        return loadFail("implausible section count %u", section_count);
+    }
     pf->format_version = format_ver;
     pf->vm_version = vm_ver;
     pf->flags = flags;
     pf->section_count = section_count;
     pf->sections = (Psb3SectionEntry*)malloc(sizeof(Psb3SectionEntry) * (section_count ? section_count : 1));
-    if (!pf->sections) return false;
+    if (!pf->sections) return loadFail("out of memory");
     for (uint32_t i = 0; i < section_count; ++i) {
         pf->sections[i].id = curU32LE(&c);
         pf->sections[i].offset = curU32LE(&c);
         pf->sections[i].length = curU32LE(&c);
     }
-    if (c.error) return false;
+    if (c.error) return loadFail("truncated section directory");
 
     for (uint32_t i = 0; i < section_count; ++i) {
         uint64_t start = pf->sections[i].offset;
         uint64_t len = pf->sections[i].length;
+        char name[5];
         if (len > 0 && (start >= pf->file_size || len > pf->file_size - start)) {
-            return false; /* section runs off the end of the file */
+            return loadFail("%s section runs past the end of the file",
+                            psb3SectionName(pf->sections[i].id, name));
         }
         uint64_t end = start + len;
         for (uint32_t j = i + 1; j < section_count; ++j) {
             uint64_t ostart = pf->sections[j].offset;
             uint64_t oend = ostart + (uint64_t)pf->sections[j].length;
             if (start < oend && ostart < end) {
-                return false; /* overlapping sections */
+                char other[5];
+                return loadFail("%s and %s sections overlap",
+                                psb3SectionName(pf->sections[i].id, name),
+                                psb3SectionName(pf->sections[j].id, other));
             }
         }
     }
@@ -2566,18 +2651,18 @@ static bool psb3FindSection(const Psb3File* pf, uint32_t id, Cursor* out) {
 static bool psb3Load(const char* path, Psb3File* pf) {
     memset(pf, 0, sizeof(*pf));
     FILE* f = fopen(path, "rb");
-    if (!f) return false;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return false; }
+    if (!f) return loadFail("cannot open: %s", strerror(errno));
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return loadFail("cannot seek: %s", strerror(errno)); }
     long sz = ftell(f);
-    if (sz < 0) { fclose(f); return false; }
-    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return false; }
+    if (sz < 0) { fclose(f); return loadFail("cannot size: %s", strerror(errno)); }
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return loadFail("cannot seek: %s", strerror(errno)); }
     pf->file_data = (uint8_t*)malloc((size_t)sz > 0 ? (size_t)sz : 1);
-    if (!pf->file_data) { fclose(f); return false; }
+    if (!pf->file_data) { fclose(f); return loadFail("out of memory"); }
     pf->file_size = (size_t)sz;
     if (sz > 0 && fread(pf->file_data, 1, (size_t)sz, f) != (size_t)sz) {
         fclose(f);
         psb3FileFree(pf);
-        return false;
+        return loadFail("short read");
     }
     fclose(f);
     if (!psb3ParseHeader(pf)) {
@@ -2598,23 +2683,34 @@ static bool psb3ReadChunk(const Psb3File* pf, BytecodeChunk* chunk) {
     chunk->caches = NULL;
 
     Cursor code_c, lines_c, const_c, bmap_c, procs_c, types_c;
-    if (!psb3FindSection(pf, PSB3_SEC_CODE, &code_c) ||
-        !psb3FindSection(pf, PSB3_SEC_LINE, &lines_c) ||
-        !psb3FindSection(pf, PSB3_SEC_CONS, &const_c) ||
-        !psb3FindSection(pf, PSB3_SEC_BMAP, &bmap_c) ||
-        !psb3FindSection(pf, PSB3_SEC_PROC, &procs_c) ||
-        !psb3FindSection(pf, PSB3_SEC_TYPE, &types_c)) {
-        return false;
+    static const uint32_t required[] = {
+        PSB3_SEC_CODE, PSB3_SEC_LINE, PSB3_SEC_CONS, PSB3_SEC_BMAP, PSB3_SEC_PROC, PSB3_SEC_TYPE
+    };
+    Cursor* cursors[] = { &code_c, &lines_c, &const_c, &bmap_c, &procs_c, &types_c };
+    for (size_t i = 0; i < sizeof(required) / sizeof(required[0]); ++i) {
+        if (!psb3FindSection(pf, required[i], cursors[i])) {
+            char name[5];
+            return loadFail("no %s section", psb3SectionName(required[i], name));
+        }
     }
 
+    g_loadDetail[0] = '\0';
     int read_consts = 0;
-    if (!readCodeSection(&code_c, chunk)) { resetChunk(chunk, 0); return false; }
-    if (!readLinesSection(&lines_c, chunk)) { resetChunk(chunk, 0); return false; }
-    if (!readConstSection(&const_c, chunk, &read_consts)) { resetChunk(chunk, read_consts); return false; }
-    if (!readBmapSection(&bmap_c, chunk)) { resetChunk(chunk, read_consts); return false; }
-    if (!readProcsSection(&procs_c, chunk)) { resetChunk(chunk, read_consts); return false; }
-    if (!readTypesSection(&types_c)) { resetChunk(chunk, read_consts); return false; }
-    return true;
+    const char* failed = NULL;
+    const Cursor* at = NULL;
+    if (!readCodeSection(&code_c, chunk)) { failed = "CODE"; at = &code_c; }
+    else if (!readLinesSection(&lines_c, chunk)) { failed = "LINE"; at = &lines_c; }
+    else if (!readConstSection(&const_c, chunk, &read_consts)) { failed = "CONS"; at = &const_c; }
+    else if (!readBmapSection(&bmap_c, chunk)) { failed = "BMAP"; at = &bmap_c; }
+    else if (!readProcsSection(&procs_c, chunk)) { failed = "PROC"; at = &procs_c; }
+    else if (!readTypesSection(&types_c)) { failed = "TYPE"; at = &types_c; }
+    if (!failed) return true;
+
+    resetChunk(chunk, read_consts);
+    return loadFail("%s section%s%s: %s at byte %zu of %zu", failed,
+                    g_loadDetail[0] ? ", " : "", g_loadDetail,
+                    at->error ? "read past the end of the section" : "malformed data",
+                    at->pos, at->size);
 }
 
 static bool psb3VerificationSkipped(const Psb3File* pf) {
@@ -2646,7 +2742,7 @@ static bool psb3Write(FILE* f, const BytecodeChunk* chunk,
     writeLinesSection(&lines_buf, chunk);
     bool consts_ok = writeConstSection(&const_buf, chunk);
     writeBmapSection(&bmap_buf, chunk);
-    writeProcsSection(&procs_buf);
+    bool procs_ok = writeProcsSection(&procs_buf);
     writeTypesSection(&types_buf);
     g_astCacheVersion = prev_version;
     if (include_meta) {
@@ -2692,7 +2788,7 @@ static bool psb3Write(FILE* f, const BytecodeChunk* chunk,
         bufU32LE(&directory, (uint32_t)sections[i].buf->len);
     }
 
-    bool ok = consts_ok;
+    bool ok = consts_ok && procs_ok;
     if (ok && fwrite(header.data, 1, header.len, f) != header.len) ok = false;
     if (ok && fwrite(directory.data, 1, directory.len, f) != directory.len) ok = false;
 
@@ -2733,25 +2829,28 @@ bool loadBytecodeFromCache(const char* source_path,
                            const char** dependencies,
                            int dep_count,
                            BytecodeChunk* chunk) {
+    g_loadError[0] = '\0';
     if (!chunk || chunk->count > 0) {
-        return false;
+        // By design (f844805): the Pascal frontend compiles used units into
+        // the chunk while parsing, and a cached chunk cannot replace them.
+        return loadFail("the chunk already holds bytecode (units compiled while parsing)");
     }
 
     char safe_id[32];
     char* dir = ensureCacheDirectory(compiler_id, safe_id, sizeof(safe_id));
-    if (!dir) return false;
+    if (!dir) return loadFail("no usable cache directory under $HOME/" CACHE_ROOT "/" CACHE_DIR);
 
     char* sanitized_base = sanitizeFileComponent(basenameForPath(source_path));
     if (!sanitized_base) {
         free(dir);
-        return false;
+        return loadFail("out of memory");
     }
 
     uint64_t source_hash = 0;
     if (!computeSourceHash(source_path, true, &source_hash)) {
         free(dir);
         free(sanitized_base);
-        return false;
+        return loadFail("cannot read the source %s", source_path);
     }
 
     char source_hex[17];
@@ -2765,7 +2864,7 @@ bool loadBytecodeFromCache(const char* source_path,
     if (!prefix) {
         free(dir);
         free(sanitized_base);
-        return false;
+        return loadFail("out of memory");
     }
     snprintf(prefix, prefix_len, "%s-%s-%s-%s-", safe_id, sanitized_base, path_hex, source_hex);
 
@@ -2789,11 +2888,14 @@ bool loadBytecodeFromCache(const char* source_path,
         free(prefix);
         free(sanitized_base);
         free(dir);
-        return false;
+        return loadFail("cannot find the frontend binary %s to check the cache against", frontend_path);
     }
 
     size_t candidate_count = 0;
     CacheCandidate* candidates = gatherCacheCandidates(dir, prefix, &candidate_count);
+    if (candidate_count == 0) {
+        loadFail("no cache entry for this source");
+    }
 
     bool ok = false;
     bool abort_all = false;
@@ -2812,25 +2914,27 @@ bool loadBytecodeFromCache(const char* source_path,
          * allows those callers to benefit from caching while still invalidating
          * entries when the frontend binary changes.
          */
-        if (frontend_for_cache && !isCacheFresh(cache_path, frontend_for_cache)) {
+        const char* stale = frontend_for_cache ? cacheStaleness(cache_path, frontend_for_cache) : NULL;
+        if (stale) {
+            loadFail("%s: the frontend binary %s %s", cache_path, frontend_for_cache, stale);
             unlink(cache_path);
             continue;
         }
 
-        bool deps_ok = true;
-        for (int dep_idx = 0; dependencies && dep_idx < dep_count; ++dep_idx) {
-            if (!isCacheFresh(cache_path, dependencies[dep_idx])) {
-                deps_ok = false;
-                break;
+        for (int dep_idx = 0; dependencies && dep_idx < dep_count && !stale; ++dep_idx) {
+            stale = cacheStaleness(cache_path, dependencies[dep_idx]);
+            if (stale) {
+                loadFail("%s: the dependency %s %s", cache_path, dependencies[dep_idx], stale);
             }
         }
-        if (!deps_ok) {
+        if (stale) {
             unlink(cache_path);
             continue;
         }
 
         Psb3File pf;
         if (!psb3Load(cache_path, &pf)) {
+            prefixLoadError(cache_path);
             unlink(cache_path);
             continue;
         }
@@ -2841,6 +2945,7 @@ bool loadBytecodeFromCache(const char* source_path,
                 fprintf(stderr,
                         "Cached bytecode requires VM version %u but current VM version is %u\n",
                         ver, vm_ver);
+                loadFail("%s: requires VM version %u, this VM is version %u", cache_path, ver, vm_ver);
                 psb3FileFree(&pf);
                 abort_all = true;
                 break;
@@ -2853,12 +2958,14 @@ bool loadBytecodeFromCache(const char* source_path,
 
         MetaSection meta;
         if (!psb3ReadMeta(&pf, &meta)) {
+            loadFail("%s: no readable META section", cache_path);
             psb3FileFree(&pf);
             unlink(cache_path);
             continue;
         }
 
         if (meta.source_hash != source_hash) {
+            loadFail("%s: written for different source contents", cache_path);
             free(meta.source_path);
             psb3FileFree(&pf);
             unlink(cache_path);
@@ -2866,6 +2973,7 @@ bool loadBytecodeFromCache(const char* source_path,
         }
 
         if (!verifySourcePathString(meta.source_path, source_path, strict)) {
+            loadFail("%s: written for %s", cache_path, meta.source_path ? meta.source_path : "another path");
             free(meta.source_path);
             psb3FileFree(&pf);
             unlink(cache_path);
@@ -2873,7 +2981,12 @@ bool loadBytecodeFromCache(const char* source_path,
         }
         free(meta.source_path);
 
+        // Header and META parsed, so this file came from the current writer:
+        // a body the reader cannot parse is a writer/reader mismatch, never a
+        // stale entry. Say so rather than silently recompiling every run.
         if (!psb3ReadChunk(&pf, chunk)) {
+            prefixLoadError(cache_path);
+            fprintf(stderr, "Warning: rejecting unreadable cached bytecode %s\n", g_loadError);
             psb3FileFree(&pf);
             unlink(cache_path);
             continue;
@@ -2881,6 +2994,7 @@ bool loadBytecodeFromCache(const char* source_path,
 
         uint64_t computed_combined = computeCombinedHash(source_hash, chunk);
         if (computed_combined != meta.combined_hash) {
+            loadFail("%s: the chunk does not match its integrity hash", cache_path);
             resetChunk(chunk, chunk->constants_count);
             psb3FileFree(&pf);
             unlink(cache_path);
@@ -2896,6 +3010,7 @@ bool loadBytecodeFromCache(const char* source_path,
         char link_err[256];
         if (!pscalLinkGlobalSlots(chunk, link_err, sizeof(link_err))) {
             fprintf(stderr, "Warning: rejecting cached bytecode %s: %s\n", cache_path, link_err);
+            loadFail("%s: %s", cache_path, link_err);
             resetChunk(chunk, chunk->constants_count);
             psb3FileFree(&pf);
             unlink(cache_path);
@@ -2907,6 +3022,7 @@ bool loadBytecodeFromCache(const char* source_path,
             if (!pscalVerifyBytecodeChunk(chunk, procedure_table, verify_err, sizeof(verify_err))) {
                 fprintf(stderr, "Warning: rejecting corrupt cached bytecode %s: %s\n",
                         cache_path, verify_err);
+                loadFail("%s: %s", cache_path, verify_err);
                 resetChunk(chunk, chunk->constants_count);
                 psb3FileFree(&pf);
                 unlink(cache_path);
@@ -2918,6 +3034,7 @@ bool loadBytecodeFromCache(const char* source_path,
 
         restoreProcedureConstructorAliases(procedure_table);
 
+        g_loadError[0] = '\0';
         ok = true;
     }
 
@@ -2936,9 +3053,13 @@ bool loadBytecodeFromCache(const char* source_path,
     return ok;
 }
 
+// Reports every failure on stderr itself, with the reason, so callers need
+// not add their own line.
 bool loadBytecodeFromFile(const char* file_path, BytecodeChunk* chunk) {
+    g_loadError[0] = '\0';
     Psb3File pf;
     if (!psb3Load(file_path, &pf)) {
+        fprintf(stderr, "Failed to load bytecode from %s: %s\n", file_path, g_loadError);
         return false;
     }
 
@@ -2950,6 +3071,7 @@ bool loadBytecodeFromFile(const char* file_path, BytecodeChunk* chunk) {
             fprintf(stderr,
                     "Bytecode requires VM version %u but this VM only supports version %u\n",
                     pf.vm_version, vm_ver);
+            loadFail("requires VM version %u, this VM is version %u", (unsigned)pf.vm_version, vm_ver);
             psb3FileFree(&pf);
             return false;
         }
@@ -2959,6 +3081,9 @@ bool loadBytecodeFromFile(const char* file_path, BytecodeChunk* chunk) {
     }
 
     bool ok = psb3ReadChunk(&pf, chunk);
+    if (!ok) {
+        fprintf(stderr, "Failed to load bytecode from %s: %s\n", file_path, g_loadError);
+    }
 
     // VM 2.0 Phase 2b (plan §5.7): link before verify -- see
     // bytecode_link.c's module comment and the loadBytecodeFromCache()
@@ -2967,6 +3092,7 @@ bool loadBytecodeFromFile(const char* file_path, BytecodeChunk* chunk) {
         char link_err[256];
         if (!pscalLinkGlobalSlots(chunk, link_err, sizeof(link_err))) {
             fprintf(stderr, "Failed to load bytecode from %s: %s\n", file_path, link_err);
+            loadFail("%s", link_err);
             resetChunk(chunk, chunk->constants_count);
             ok = false;
         }
@@ -2976,6 +3102,7 @@ bool loadBytecodeFromFile(const char* file_path, BytecodeChunk* chunk) {
         char verify_err[256];
         if (!pscalVerifyBytecodeChunk(chunk, procedure_table, verify_err, sizeof(verify_err))) {
             fprintf(stderr, "Failed to load bytecode from %s: %s\n", file_path, verify_err);
+            loadFail("%s", verify_err);
             resetChunk(chunk, chunk->constants_count);
             ok = false;
         }
@@ -2992,6 +3119,7 @@ bool loadBytecodeFromFile(const char* file_path, BytecodeChunk* chunk) {
 }
 
 bool loadBytecodeFromFileUnlinked(const char* file_path, BytecodeChunk* chunk) {
+    g_loadError[0] = '\0';
     Psb3File pf;
     if (!psb3Load(file_path, &pf)) {
         return false;

@@ -82,8 +82,7 @@ int pscalvm_main(int argc, char* argv[]) {
 
     BytecodeChunk chunk;
     initBytecodeChunk(&chunk);
-    if (!loadBytecodeFromFile(bytecode_path, &chunk)) {
-        fprintf(stderr, "Failed to load bytecode from %s\n", bytecode_path);
+    if (!loadBytecodeFromFile(bytecode_path, &chunk)) {  // reports why itself
         PSCALVM_RETURN(vmExitWithCleanup(EXIT_FAILURE));
     }
 

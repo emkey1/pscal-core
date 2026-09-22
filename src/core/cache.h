@@ -26,6 +26,13 @@ bool loadBytecodeFromFile(const char* file_path, BytecodeChunk* chunk);
 // would bake resolved slot indices back in as if they were name indices.
 bool loadBytecodeFromFileUnlinked(const char* file_path, BytecodeChunk* chunk);
 
+// Why the most recent loadBytecodeFromCache(), loadBytecodeFromFile() or
+// loadBytecodeFromFileUnlinked() call on this thread returned false: a
+// stale or missing cache entry, or which section and value of the file its
+// reader rejected. Empty after a call that succeeded. Frontends print it
+// under --verbose to explain a recompile.
+const char* pscalCacheLastLoadError(void);
+
 // Build the canonical path for the cache file corresponding to a source path.
 // Caller is responsible for freeing the returned string.
 char* buildCachePath(const char* source_path, const char* compiler_id);
