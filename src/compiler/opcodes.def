@@ -285,3 +285,16 @@ OP(DEFINE_GLOBAL_SLOT,         0x64, "?",    0,  0)
 OP(GET_GSLOT,                  0x65, "s",    0,  1)
 OP(SET_GSLOT,                  0x66, "s",    1,  0)
 OP(GET_GSLOT_ADDRESS,          0x67, "s",    0,  1)
+
+// --- Declaration defaults ---
+// PUSH_TYPE_DEFAULT [var_type:b][type_name:K]: push the default value of the
+// type registered under type_name, makeValueForType(var_type,
+// lookupType(type_name)), as DEFINE_GLOBAL_SLOT builds a global. Used for
+// record and interface locals, record literals, and record, interface and
+// pointer field defaults, which the compiler cannot pool as constants: a
+// record carries its fields' type ASTs, an interface its type AST and a
+// pointer its base type AST, none of which the PSB3 constant codec can
+// encode. The type table is serialized (TYPES section), so the chunk stays
+// cacheable. The VM builds each default once per chunk and pushes shared
+// copies, as CONSTANT does.
+OP(PUSH_TYPE_DEFAULT,          0x68, "bK",   0,  1)

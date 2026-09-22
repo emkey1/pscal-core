@@ -6722,6 +6722,86 @@ static Symbol* createSymbolForVM(const char* name, VarType type, AST* type_def_f
     return sym;
 }
 
+// Guards every chunk's type_defaults table: THREAD_CREATE and TaskSpawn run
+// the same chunk on several VMs at once.
+static pthread_mutex_t type_defaults_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// The chunk's prototype of `type` for type-name constant `name_idx`, or NULL
+// if none has been built. Caller holds type_defaults_mutex.
+static TypeDefaultProto* vmFindTypeDefault(const BytecodeChunk* chunk, VarType type, uint16_t name_idx) {
+    if (name_idx >= chunk->type_defaults_count) {
+        return NULL;
+    }
+    TypeDefaultProto* proto = chunk->type_defaults[name_idx];
+    while (proto && proto->type != (uint8_t)type) {
+        proto = proto->next;
+    }
+    return proto;
+}
+
+// PUSH_TYPE_DEFAULT's value: the default of `type` for the type registered
+// under constant `name_idx`, built from the type table as DEFINE_GLOBAL_SLOT
+// builds a global. It is built once per chunk and then shared, so a record
+// default costs what the pooled constant it replaces did: createEmptyRecord
+// scans the whole procedure table, far too slow to repeat on every call of a
+// routine with a record local. Returns NULL after reporting a runtime error.
+static const Value* vmTypeDefaultPrototype(VM* vm, VarType type, uint16_t name_idx) {
+    BytecodeChunk* chunk = vm->chunk;
+    pthread_mutex_lock(&type_defaults_mutex);
+    TypeDefaultProto* proto = vmFindTypeDefault(chunk, type, name_idx);
+    pthread_mutex_unlock(&type_defaults_mutex);
+    if (proto) {
+        return &proto->value;
+    }
+
+    const char* type_name = NULL;
+    if (name_idx < chunk->constants_count && VALUE_TYPE(chunk->constants[name_idx]) == TYPE_STRING) {
+        type_name = AS_STRING(chunk->constants[name_idx]);
+    }
+    AST* type_def = (type_name && type_name[0]) ? lookupType(type_name) : NULL;
+    if (!type_def) {
+        runtimeError(vm, "VM Error: Type '%s' not found for PUSH_TYPE_DEFAULT.", type_name ? type_name : "?");
+        return NULL;
+    }
+    TypeDefaultProto* built = (TypeDefaultProto*)malloc(sizeof(TypeDefaultProto));
+    if (!built) {
+        runtimeError(vm, "VM Error: Malloc failed for PUSH_TYPE_DEFAULT.");
+        return NULL;
+    }
+    built->type = (uint8_t)type;
+    built->value = makeValueForType(type, type_def, NULL);
+
+    pthread_mutex_lock(&type_defaults_mutex);
+    // Another VM may have built the same default meanwhile; keep the first.
+    proto = vmFindTypeDefault(chunk, type, name_idx);
+    if (!proto && name_idx >= chunk->type_defaults_count) {
+        int count = chunk->constants_count > name_idx ? chunk->constants_count : name_idx + 1;
+        TypeDefaultProto** grown = (TypeDefaultProto**)realloc(chunk->type_defaults, sizeof(TypeDefaultProto*) * (size_t)count);
+        if (grown) {
+            memset(grown + chunk->type_defaults_count, 0,
+                   sizeof(TypeDefaultProto*) * (size_t)(count - chunk->type_defaults_count));
+            chunk->type_defaults = grown;
+            chunk->type_defaults_count = count;
+        }
+    }
+    if (!proto && name_idx < chunk->type_defaults_count) {
+        built->next = chunk->type_defaults[name_idx];
+        chunk->type_defaults[name_idx] = built;
+        proto = built;
+        built = NULL;
+    }
+    pthread_mutex_unlock(&type_defaults_mutex);
+    if (built) {
+        freeValue(&built->value);
+        free(built);
+    }
+    if (!proto) {
+        runtimeError(vm, "VM Error: Malloc failed for PUSH_TYPE_DEFAULT.");
+        return NULL;
+    }
+    return &proto->value;
+}
+
 // Shared logic for DEFINE_GLOBAL and DEFINE_GLOBAL16.
 // Assumes the name has already been read (as Value) and the IP is positioned
 // at the declared type byte.
@@ -11001,6 +11081,16 @@ comparison_error_label:
                     runtimeError(vm, "VM Error: Malloc failed for fixed-length string initialization.");
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                break;
+            }
+            case PUSH_TYPE_DEFAULT: {
+                VarType type = (VarType)READ_BYTE();
+                uint16_t type_name_idx = READ_SHORT(vm);
+                const Value* prototype = vmTypeDefaultPrototype(vm, type, type_name_idx);
+                if (!prototype) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+                push(vm, copyValueForStack(prototype));
                 break;
             }
             case JUMP_IF_FALSE: {

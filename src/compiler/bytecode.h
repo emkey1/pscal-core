@@ -91,10 +91,10 @@ enum {
 };
 _Static_assert(PSCAL_OPCODE_DEF_ENTRY_COUNT == OPCODE_COUNT,
                "opcodes.def must define every ordinal exactly once (no holes, no duplicates)");
-_Static_assert(OPCODE_COUNT == 0x68,
-               "published opcode page is 0x00-0x67 (0x64-0x67: VM 2.0 Phase 2b slot-"
-               "addressed globals); append new opcodes after GET_GSLOT_ADDRESS "
-               "and update this assert deliberately");
+_Static_assert(OPCODE_COUNT == 0x69,
+               "published opcode page is 0x00-0x68 (0x64-0x67: VM 2.0 Phase 2b slot-"
+               "addressed globals; 0x68: PUSH_TYPE_DEFAULT); append new opcodes "
+               "after PUSH_TYPE_DEFAULT and update this assert deliberately");
 
 // Per-opcode metadata generated from compiler/opcodes.def.  `operands` is the
 // encoding-spec string documented at the top of opcodes.def ("?" = variable
@@ -112,6 +112,16 @@ const OpcodeInfo* pscalOpcodeInfo(uint8_t opcode);
 // Total operand bytes implied by an encoding-spec string, or -1 for
 // variable-length ("?") specs.
 int pscalOpcodeOperandSpecLength(const char* operands);
+
+// A PUSH_TYPE_DEFAULT site's default value, built on the first execution of
+// any site with the same (type, type-name constant) and then pushed as a
+// shared, copy-on-write copy, exactly as CONSTANT pushes a pooled constant.
+// Chained per type-name constant, one entry per VarType used with it.
+typedef struct TypeDefaultProto {
+    uint8_t type;
+    Value value;
+    struct TypeDefaultProto* next;
+} TypeDefaultProto;
 
 // --- Bytecode Chunk Structure ---
 // A "chunk" represents a compiled piece of code (e.g., a procedure, function, or the main program block)
@@ -137,6 +147,11 @@ typedef struct {
     int cache_count;    // Number of GET/SET_GLOBAL[16] cache sites the compiler emitted (compile-time constant);
                         // always 0 for chunks compiled post-Phase-2b (no opcode carries a 'c' operand anymore)
     CacheSlot* caches;  // Per-chunk runtime side table, sized cache_count; allocated lazily on first execution
+    // PUSH_TYPE_DEFAULT prototypes, built at runtime (vm.c): chains indexed
+    // by type-name constant, sized type_defaults_count. An entry never moves
+    // once built, so a VM can use it after dropping the lock.
+    TypeDefaultProto** type_defaults;
+    int type_defaults_count;
 
     // VM 2.0 Phase 2b (plan §5.7): global-variable slot table. Populated by
     // the load-time link step (compiler/bytecode_link.c), which runs once

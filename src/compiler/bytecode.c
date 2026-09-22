@@ -80,6 +80,8 @@ void initBytecodeChunk(BytecodeChunk* chunk) { // From all.txt
     chunk->builtin_resolved_ids = NULL;
     chunk->cache_count = 0;
     chunk->caches = NULL;
+    chunk->type_defaults = NULL;
+    chunk->type_defaults_count = 0;
     chunk->global_slot_count = 0;
     chunk->global_slots = NULL;
     chunk->global_slot_is_const = NULL;
@@ -127,6 +129,15 @@ void freeBytecodeChunk(BytecodeChunk* chunk) { // From all.txt
     free(chunk->builtin_lowercase_indices);
     free(chunk->builtin_resolved_ids);
     free(chunk->caches);
+    for (int i = 0; i < chunk->type_defaults_count; i++) {
+        for (TypeDefaultProto* proto = chunk->type_defaults[i]; proto;) {
+            TypeDefaultProto* next = proto->next;
+            freeValue(&proto->value);
+            free(proto);
+            proto = next;
+        }
+    }
+    free(chunk->type_defaults);
     if (chunk->global_slot_names) {
         for (int i = 0; i < chunk->global_slot_count; i++) free(chunk->global_slot_names[i]);
         free(chunk->global_slot_names);
@@ -1095,6 +1106,17 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
             uint8_t slot = chunk->code[offset + 1];
             uint16_t name_idx = readU16BE(chunk, offset + 2);
             fprintf(stderr, "%-16s %4d (slot) %4d", "INIT_LOCAL_POINTER", slot, name_idx);
+            if (name_idx < chunk->constants_count &&
+                VALUE_TYPE(chunk->constants[name_idx]) == TYPE_STRING) {
+                fprintf(stderr, " '%s'", AS_STRING(chunk->constants[name_idx]));
+            }
+            fprintf(stderr, "\n");
+            return offset + 4;
+        }
+        case PUSH_TYPE_DEFAULT: {
+            VarType type = (VarType)chunk->code[offset + 1];
+            uint16_t name_idx = readU16BE(chunk, offset + 2);
+            fprintf(stderr, "%-16s %-8s %4d", "PUSH_TYPE_DEFAULT", varTypeToString(type), name_idx);
             if (name_idx < chunk->constants_count &&
                 VALUE_TYPE(chunk->constants[name_idx]) == TYPE_STRING) {
                 fprintf(stderr, " '%s'", AS_STRING(chunk->constants[name_idx]));

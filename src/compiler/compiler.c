@@ -437,6 +437,7 @@ static void addLocal(FunctionCompilerState* fc, const char* name, int line, bool
 static int resolveLocal(FunctionCompilerState* fc, const char* name);
 static AST* resolveTypeAlias(AST* type_node);
 static const char* ensureSerializableTypeName(AST* type_node);
+static void emitDefaultValue(BytecodeChunk* chunk, VarType type, AST* type_node, int line);
 static void recordInlineRoutineExitJump(int jump_opcode_offset);
 
 static void recordInlineRoutineExitJump(int jump_opcode_offset) {
@@ -553,10 +554,7 @@ static void emitRoutineResultSlotInit(AST* type_specifier_node,
     }
 
     if (actual_type_def_node->type == AST_RECORD_TYPE) {
-        Value record_init = makeValueForType(TYPE_RECORD, actual_type_def_node, NULL);
-        int const_idx = addConstantToChunk(chunk, &record_init);
-        freeValue(&record_init);
-        emitConstant(chunk, const_idx, line);
+        emitDefaultValue(chunk, TYPE_RECORD, actual_type_def_node, line);
         noteLocalSlotUse(current_function_compiler, slot);
         writeBytecodeChunk(chunk, SET_LOCAL, line);
         writeBytecodeChunk(chunk, (uint8_t)slot, line);
@@ -2112,6 +2110,113 @@ static const char* getSerializablePointerBaseTypeName(AST* type_node) {
     return "";
 }
 
+// The type-table name for an anonymous pointer type whose pointee is a named
+// reference or absent (an untyped pointer, such as a Rea field typed with a
+// class declared later), registered once per pointee; NULL for any other
+// type. Every class-reference field in Rea and Aether declares its own
+// pointer type node, and a registration per field would put an entry per
+// field in the type table, which every later lookupType scans past.
+static const char* anonymousPointerTypeName(AST* pointer_type) {
+    if (!pointer_type || pointer_type->type != AST_POINTER_TYPE) {
+        return NULL;
+    }
+    AST* pointee = pointer_type->right;
+    if (pointee && ((pointee->type != AST_TYPE_REFERENCE && pointee->type != AST_VARIABLE) ||
+                    !pointee->token || !pointee->token->value)) {
+        return NULL;
+    }
+    char name[256];
+    int written = pointee
+        ? snprintf(name, sizeof(name), "__pscal_anon_pointer_%s", pointee->token->value)
+        : snprintf(name, sizeof(name), "__pscal_anon_pointer");
+    if (written < 0 || (size_t)written >= sizeof(name)) {
+        return NULL;
+    }
+
+    TypeEntry* entry = findTypeEntry(name);
+    if (!entry) {
+        insertType(name, pointer_type);
+        entry = findTypeEntry(name);
+        return (entry && entry->name) ? entry->name : NULL;
+    }
+    // Reuse the entry only for the same pointee; the name lookup ignores case.
+    AST* existing = entry->typeAST;
+    if (!existing || existing->type != AST_POINTER_TYPE || existing->var_type != pointer_type->var_type) {
+        return NULL;
+    }
+    AST* existing_pointee = existing->right;
+    if (!pointee) {
+        return existing_pointee ? NULL : entry->name;
+    }
+    if (existing_pointee && existing_pointee->type == pointee->type &&
+        existing_pointee->var_type == pointee->var_type &&
+        existing_pointee->right == pointee->right &&
+        existing_pointee->token && existing_pointee->token->value &&
+        strcmp(existing_pointee->token->value, pointee->token->value) == 0) {
+        return entry->name;
+    }
+    return NULL;
+}
+
+// The type-table name the VM can rebuild a record, interface or pointer
+// default from, or NULL when `type` is none of those or the type cannot be
+// named. The compiler resolves type names through that same table
+// (resolveTypeAlias), so this is whichever entry `type_node` resolves to; a
+// type with no entry (an anonymous `record ... end` or `^T`) is registered
+// under a generated name.
+static const char* typeDefaultName(VarType type, AST* type_node) {
+    if (type != TYPE_RECORD && type != TYPE_INTERFACE && type != TYPE_POINTER) {
+        return NULL;
+    }
+    AST* resolved = resolveTypeAlias(type_node);
+    if (resolved && resolved->type == AST_TYPE_DECL && resolved->left) {
+        resolved = resolveTypeAlias(resolved->left);
+    }
+    if (!resolved || (type == TYPE_RECORD && resolved->type != AST_RECORD_TYPE)) {
+        return NULL;
+    }
+
+    for (TypeEntry* entry = type_table; entry; entry = entry->next) {
+        AST* entry_ast = entry->typeAST;
+        if (entry_ast == resolved ||
+            (entry_ast && entry_ast->type == AST_TYPE_DECL && entry_ast->left == resolved)) {
+            return entry->name;
+        }
+    }
+    // A reference that did not resolve names nothing the VM could look up.
+    if (resolved->type == AST_TYPE_REFERENCE || resolved->type == AST_VARIABLE) {
+        return NULL;
+    }
+    const char* type_name = anonymousPointerTypeName(resolved);
+    if (!type_name) {
+        type_name = ensureSerializableTypeName(resolved);
+    }
+    return (type_name && type_name[0] != '\0' && lookupType(type_name)) ? type_name : NULL;
+}
+
+// Pushes the default value of a declared `type`, as makeValueForType builds it.
+//
+// Most defaults are pooled as a constant. A record, interface or pointer
+// default is built at runtime by PUSH_TYPE_DEFAULT instead: it carries type
+// ASTs (a record its fields', an interface its own, a pointer its base type)
+// that the PSB3 codec cannot encode. A chunk holding a record or interface
+// constant is never cached, and a cached pointer constant comes back with
+// OPAQUE_POINTER_SENTINEL for a base type, which field access through the
+// pointer dereferences (see opcodes.def).
+static void emitDefaultValue(BytecodeChunk* chunk, VarType type, AST* type_node, int line) {
+    const char* type_name = typeDefaultName(type, type_node);
+    if (type_name) {
+        writeBytecodeChunk(chunk, PUSH_TYPE_DEFAULT, line);
+        writeBytecodeChunk(chunk, (uint8_t)type, line);
+        emitConstantIndex16(chunk, addStringConstant(chunk, type_name), line);
+        return;
+    }
+    Value default_value = makeValueForType(type, type_node, NULL);
+    int const_idx = addConstantToChunk(chunk, &default_value);
+    freeValue(&default_value);
+    emitConstant(chunk, const_idx, line);
+}
+
 // Resolve type references to their concrete definitions.
 static AST* resolveTypeAlias(AST* type_node) {
     AST* last = NULL;
@@ -3556,8 +3661,6 @@ static void emitDefaultFieldInitializers(AST* recordType, BytecodeChunk* chunk, 
 
         for (int j = 0; j < decl->child_count; j++) {
             AST* varNode = decl->children[j];
-            Value defaultValue;
-            int constIdx;
             int offset;
 
             if (!varNode || !varNode->token || !varNode->token->value) continue;
@@ -3569,10 +3672,6 @@ static void emitDefaultFieldInitializers(AST* recordType, BytecodeChunk* chunk, 
             // Type-zero the field from its declared type. This establishes the field's
             // runtime type and (for strings) its dynamic capacity, which the stores
             // below rely on for correct coercion.
-            defaultValue = makeValueForType(decl->var_type, actual_type ? actual_type : type_node, NULL);
-            constIdx = addConstantToChunk(chunk, &defaultValue);
-            freeValue(&defaultValue);
-
             writeBytecodeChunk(chunk, DUP, line);
             if (offset <= UINT8_MAX) {
                 writeBytecodeChunk(chunk, GET_FIELD_OFFSET, line);
@@ -3581,7 +3680,7 @@ static void emitDefaultFieldInitializers(AST* recordType, BytecodeChunk* chunk, 
                 writeBytecodeChunk(chunk, GET_FIELD_OFFSET16, line);
                 emitShort(chunk, (uint16_t)offset, line);
             }
-            emitConstant(chunk, constIdx, line);
+            emitDefaultValue(chunk, decl->var_type, actual_type ? actual_type : type_node, line);
             writeBytecodeChunk(chunk, SET_INDIRECT, line);
 
             // Apply a declared constant default (`field: Type = <const>`) on top of the
@@ -7452,10 +7551,7 @@ static void compileNode(AST* node, BytecodeChunk* chunk, int current_line_approx
                                             addStringConstant(chunk, elem_type_name),
                                             getLine(varNameNode));
                     } else if (is_record_type) {
-                        Value record_init = makeValueForType(TYPE_RECORD, resolved_local_type, NULL);
-                        int const_idx = addConstantToChunk(chunk, &record_init);
-                        freeValue(&record_init);
-                        emitConstant(chunk, const_idx, getLine(varNameNode));
+                        emitDefaultValue(chunk, TYPE_RECORD, resolved_local_type, getLine(varNameNode));
                         noteLocalSlotUse(current_function_compiler, slot);
                         writeBytecodeChunk(chunk, SET_LOCAL, getLine(varNameNode));
                         writeBytecodeChunk(chunk, (uint8_t)slot, getLine(varNameNode));
@@ -7539,10 +7635,7 @@ static void compileNode(AST* node, BytecodeChunk* chunk, int current_line_approx
                         }
                         emitConstantIndex16(chunk, addStringConstant(chunk, type_name), getLine(varNameNode));
                     } else {
-                        Value local_init = makeValueForType(node->var_type, actual_type_def_node, NULL);
-                        int const_idx = addConstantToChunk(chunk, &local_init);
-                        freeValue(&local_init);
-                        emitConstant(chunk, const_idx, getLine(varNameNode));
+                        emitDefaultValue(chunk, node->var_type, actual_type_def_node, getLine(varNameNode));
                         noteLocalSlotUse(current_function_compiler, slot);
                         writeBytecodeChunk(chunk, SET_LOCAL, getLine(varNameNode));
                         writeBytecodeChunk(chunk, (uint8_t)slot, getLine(varNameNode));
@@ -10508,10 +10601,7 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                 break;
             }
 
-            Value recordInit = makeValueForType(TYPE_RECORD, recordType, NULL);
-            int constIndex = addConstantToChunk(chunk, &recordInit);
-            freeValue(&recordInit);
-            emitConstant(chunk, constIndex, line);
+            emitDefaultValue(chunk, TYPE_RECORD, recordType, line);
 
             for (int i = 0; i < node->child_count; i++) {
                 AST *fieldAssign = node->children[i];

@@ -319,6 +319,9 @@ This sequence uses `JUMP_IF_FALSE` to exit the loop and `JUMP` to repeat.
 * **`INIT_FIELD_ARRAY`**:
     * **Operands:** 1-byte field index, 1-byte dimension count, then pairs of `[lower_idx][upper_idx]` per dimension.
     * **Action:** Initializes an array field within an existing object/record. Similar to `INIT_LOCAL_ARRAY` but targets a specific field by index rather than a local slot.
+* **`PUSH_TYPE_DEFAULT`**:
+    * **Operands:** 1-byte `VarType`, 2-byte constant index of a type name.
+    * **Action:** Pushes a fresh default value of the named type, built with `makeValueForType` from the type table, as `DEFINE_GLOBAL_SLOT` does for a global. The compiler uses it instead of a pooled constant for record and interface defaults (locals, function results, record literals, field defaults), whose type ASTs the bytecode cache cannot encode.
 
 #### **Record and Object Opcodes**
 
@@ -529,7 +532,7 @@ end.
 | **Global Variables** | `DEFINE_GLOBAL`, `DEFINE_GLOBAL16`, `GET_GLOBAL`, `SET_GLOBAL`, `GET_GLOBAL_ADDRESS`, `GET_GLOBAL16`, `SET_GLOBAL16`, `GET_GLOBAL_ADDRESS16`, `GET_GLOBAL_CACHED`, `SET_GLOBAL_CACHED`, `GET_GLOBAL16_CACHED`, `SET_GLOBAL16_CACHED` |
 | **Local Variables** | `GET_LOCAL`, `SET_LOCAL`, `GET_LOCAL_ADDRESS`, `INC_LOCAL`, `DEC_LOCAL`, `RESET_LOCAL` |
 | **Upvalues (Closures)** | `GET_UPVALUE`, `SET_UPVALUE`, `GET_UPVALUE_ADDRESS` |
-| **Initialization** | `INIT_LOCAL_ARRAY`, `INIT_LOCAL_FILE`, `INIT_LOCAL_POINTER`, `INIT_LOCAL_STRING`, `INIT_FIELD_ARRAY` |
+| **Initialization** | `INIT_LOCAL_ARRAY`, `INIT_LOCAL_FILE`, `INIT_LOCAL_POINTER`, `INIT_LOCAL_STRING`, `INIT_FIELD_ARRAY`, `PUSH_TYPE_DEFAULT` |
 | **Objects** | `ALLOC_OBJECT`, `ALLOC_OBJECT16`, `GET_FIELD_ADDRESS`, `GET_FIELD_ADDRESS16`, `GET_FIELD_ADDRESS_KEEP`, `GET_FIELD_ADDRESS_KEEP16`, `GET_FIELD_OFFSET`, `GET_FIELD_OFFSET16`, `LOAD_FIELD_VALUE`, `LOAD_FIELD_VALUE16`, `LOAD_FIELD_VALUE_BY_NAME`, `LOAD_FIELD_VALUE_BY_NAME16` |
 | **Arrays / Strings** | `GET_ELEMENT_ADDRESS`, `GET_ELEMENT_ADDRESS_CONST`, `LOAD_ELEMENT_VALUE`, `LOAD_ELEMENT_VALUE_CONST`, `GET_CHAR_ADDRESS`, `GET_CHAR_FROM_STRING` |
 | **Pointer Access** | `SET_INDIRECT`, `GET_INDIRECT` |
