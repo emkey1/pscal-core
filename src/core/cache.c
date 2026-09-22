@@ -2138,7 +2138,14 @@ static bool writeProcedureEntriesRecursive(ByteBuf* out, HashTable* table) {
         for (Symbol* sym = table->buckets[i]; sym; sym = sym->next) {
             if (!sym || sym->is_alias) continue;
             bufLenPrefixedBytes(out, sym->name, strlen(sym->name));
-            bufI32LE(out, (int32_t)sym->bytecode_address);
+            /* Only a compiled routine has an address: the peephole pass remaps
+             * defined routines alone (compiler.c), and an undefined one keeps
+             * whatever it was registered with, usually 0. The loader marks every
+             * entry defined, so a 0 made a bodiless routine callable at the top of
+             * the program -- a call re-ran global initialisation forever instead of
+             * failing with "has no compiled body" as it does uncached. -1 keeps
+             * that refusal. */
+            bufI32LE(out, sym->is_defined ? (int32_t)sym->bytecode_address : -1);
             bufU16LE(out, sym->locals_count);
             bufU8(out, sym->upvalue_count);
             bufU32LE(out, (uint32_t)sym->type);
@@ -2283,6 +2290,33 @@ void restoreProcedureConstructorAliases(HashTable* table) {
     restoreConstructorAliasesImpl(table);
 }
 
+/* The symbol a cached procedure entry describes: the non-alias routine of exactly
+ * that name in `table`, or NULL when there is none.
+ *
+ * The writer skips aliases, so every entry was written from a real routine under
+ * its own name. By the time a cache is loaded the frontend has already parsed the
+ * source and registered its routines, aliases included, and an alias can sit under
+ * the entry's name in front of the routine (hashTableInsert prepends) or instead of
+ * it. Following that alias applied the entry to whatever it points at: a free
+ * function `gadget` landed on class Gadget's constructor `gadget.gadget`,
+ * overwriting its address, type and arity. When no routine of the name exists --
+ * nothing was parsed (pscalvm), or the compiler made the routine after parsing, as
+ * compileDefinedFunction does for a definition the parse did not register -- the
+ * caller creates it, at the head of the bucket just as the compiler did. */
+static Symbol* findCachedRoutineSymbol(HashTable* table, const char* name) {
+    if (!table || !name) return NULL;
+    char lower[MAX_SYMBOL_LENGTH];
+    strncpy(lower, name, sizeof(lower) - 1);
+    lower[sizeof(lower) - 1] = '\0';
+    toLowerString(lower);
+    for (Symbol* sym = table->buckets[hashFunctionName(lower)]; sym; sym = sym->next) {
+        if (!sym->is_alias && sym->name && strcmp(sym->name, lower) == 0) {
+            return sym;
+        }
+    }
+    return NULL;
+}
+
 static bool loadProceduresFromStream(Cursor* in, int proc_count, uint32_t chunk_version) {
     (void)chunk_version; /* PSB3 hard cutover: no pre-PSB3 procedure layouts to branch on. */
     EnclosingFixup* fixups = NULL;
@@ -2337,13 +2371,7 @@ static bool loadProceduresFromStream(Cursor* in, int proc_count, uint32_t chunk_
             }
         }
 
-        Symbol* sym = NULL;
-        if (scope_table) {
-            sym = hashTableLookup(scope_table, name);
-            if (sym) {
-                sym = resolveSymbolAlias(sym);
-            }
-        }
+        Symbol* sym = findCachedRoutineSymbol(scope_table, name);
         if (!sym) {
             sym = (Symbol*)calloc(1, sizeof(Symbol));
             if (!sym) {
