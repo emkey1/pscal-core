@@ -9394,11 +9394,24 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                 methodIdentifier = calleeName;
             }
 
-            // Ensure the target procedure is compiled so its address is available
+            // Ensure the target procedure is compiled so its address is available.
+            // The body lands here, mid-statement, so it must be jumped over:
+            // compileDefinedFunction emits that JUMP itself only inside another
+            // routine, and top-level code would otherwise run straight into it.
             if (proc_symbol && !proc_symbol->is_defined && proc_symbol->type_def &&
                 !proc_symbol->type_def->is_forward_decl) {
+                int jump_over_body_operand_offset = -1;
+                if (current_function_compiler == NULL) {
+                    writeBytecodeChunk(chunk, JUMP, line);
+                    jump_over_body_operand_offset = chunk->count;
+                    emitInt32(chunk, 0xFFFFFFFF, line);
+                }
                 compileDefinedFunction(proc_symbol->type_def, chunk,
                                       getLine(proc_symbol->type_def));
+                if (jump_over_body_operand_offset >= 0) {
+                    patchInt32(chunk, jump_over_body_operand_offset,
+                               (uint32_t)(chunk->count - (jump_over_body_operand_offset + 4)));
+                }
             }
 
             AST* interfaceReceiver = NULL;
