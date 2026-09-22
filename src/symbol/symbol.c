@@ -1364,7 +1364,10 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
             break;
 
         case TYPE_POINTER:
-            AS_POINTER(*sym->value) = AS_POINTER(val);
+            // A nil value's bits are the PSCAL_TAG_NIL immediate, not a
+            // PointerObj, so AS_POINTER(val) would untag them into a wild
+            // address. SET_LOCAL and SET_INDIRECT special-case nil the same way.
+            AS_POINTER(*sym->value) = (VALUE_TYPE(val) == TYPE_NIL) ? NULL : AS_POINTER(val);
             // The `base_type_node` of the variable itself does not change on assignment.
             break;
 
