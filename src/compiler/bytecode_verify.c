@@ -462,7 +462,12 @@ static bool classifyInstruction(VCtx* ctx, int pc, int len, const OpcodeInfo* in
             }
             eff->req = arity;
             if (target) {
-                eff->delta = target->locals_count; // args stay in place, only new locals are pushed
+                // The caller's view once the call returns: returnFromCall()
+                // collapses the frame -- args and callee locals alike -- back
+                // to frame->slots, then pushes a result only for a function.
+                // (locals_count is what the callee's own segment starts with,
+                // not a net effect here; that segment is walked separately.)
+                eff->delta = -(int)arity + (target->type != TYPE_VOID ? 1 : 0);
             } else {
                 // Unresolvable (stale/foreign cache entry): don't guess.
                 eff->unknown_after = true;

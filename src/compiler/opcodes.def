@@ -78,9 +78,10 @@
 //                             function (return type != TYPE_VOID); resolved
 //                             via the procedure_table entry the verifier is
 //                             currently walking, not from the instruction.
-//   CALL, CALL_USER_PROC    - net push = callee's locals_count (resolved by
-//                             address/name via procedure_table); requires
-//                             declared_arity args already on the stack.
+//   CALL, CALL_USER_PROC    - pops declared_arity args; pushes 1 iff the
+//                             callee (resolved by address/name via
+//                             procedure_table) is a function (type !=
+//                             TYPE_VOID) -- RETURN collapses the whole frame.
 //   CALL_INDIRECT,
 //   CALL_METHOD             - callee is a runtime value/vtable slot, not
 //                             statically resolvable; verifier requires the
