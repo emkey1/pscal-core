@@ -12,6 +12,7 @@
 #include "symbol/symbol.h"
 #include "core/compiled_function.h"
 #include "vm/string_sentinels.h"
+#include "common/frontend_kind.h"
 #include "ast/ast.h"
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -76,7 +77,32 @@
  * count for a dimensionless array was fixed at the same time, which would
  * otherwise let format-3 files that used to fail cleanly load and crash.
  * Bumped so format-3 files are rejected, not misread. */
-#define PSB3_FORMAT_VERSION 4u
+/* format_ver 5: the header's `flags` word, reserved and always 0 until now,
+ * gained a frontend field in its low byte (PSB3_FLAG_FRONTEND_MASK below) --
+ * which FrontendKind's conventions the chunk was compiled under. Nothing
+ * outside the header moved, so a format-4 file is not *misread* by this
+ * build (its zero flags decode to FRONTEND_KIND_UNKNOWN, which behaves
+ * exactly like Pascal). The bump is for the other direction: a format-4
+ * reader ignores `flags` entirely, so handing it a format-5 Aether chunk
+ * would run 0-based-string bytecode under 1-based string semantics and fail
+ * at the first `s[i]` -- silently wrong execution, which is precisely what
+ * format_ver rejection exists to prevent. Same reasoning as the format_ver 3
+ * bump above: "any change that makes old CODE bytes mean something
+ * different", here by changing the conventions they are executed under
+ * rather than the bytes themselves. */
+#define PSB3_FORMAT_VERSION 5u
+
+/* Header `flags` layout. Bits 8..31 are still reserved and written 0.
+ *
+ * The frontend kind lives in the fixed header rather than in a section for
+ * two reasons: it has to be readable before any section body is parsed (the
+ * value decides how the chunk *executes*, not how it decodes, but a reader
+ * that rejects the file should be able to name the frontend in the error),
+ * and -- decisively -- META is cache-only, absent from the explicit .bc
+ * files `saveBytecodeToFile()` writes, which are exactly the files
+ * `pscalvm prog.bc` is handed. A META field would have left distributable
+ * bytecode with no frontend at all. */
+#define PSB3_FLAG_FRONTEND_MASK 0x000000FFu
 
 /* VM 2.0 Phase 1e (Docs/pscal_vm2_plan.md §5.5): the load-time verifier can
  * only be skipped via `PSCAL_VM_SKIP_VERIFY=1` in the *host process's*
@@ -2541,6 +2567,7 @@ static bool loadProceduresFromStream(Cursor* in, int proc_count, uint32_t chunk_
 /* ============ Top-level PSB3 container (VM 2.0 plan §5.2) =============
  *
  * [magic u32le 'PSB3'] [format_ver u16] [vm_ver u16] [flags u32] [section_count u32]
+ *   flags bits 0..7: FrontendKind (PSB3_FLAG_FRONTEND_MASK); bits 8..31 reserved
  * section_count * { id:u32  offset:u32  length:u32 }      -- directory
  * section bodies, each starting on an 8-byte boundary
  *
@@ -2562,6 +2589,7 @@ typedef struct {
     uint16_t format_version;
     uint16_t vm_version;
     uint32_t flags;
+    FrontendKind frontend_kind; /* decoded out of `flags`; see psb3ParseHeader */
     Psb3SectionEntry* sections;
     uint32_t section_count;
 } Psb3File;
@@ -2602,9 +2630,18 @@ static bool psb3ParseHeader(Psb3File* pf) {
     if (section_count > 64) { /* sanity bound; real files carry <= 7 */
         return loadFail("implausible section count %u", section_count);
     }
+    /* Rejected rather than clamped to UNKNOWN: a code this build has no
+     * predicate for is a file from a future build, and running it under
+     * Pascal's conventions is the exact silent-miscompile the field exists
+     * to stop. */
+    uint32_t frontend_code = flags & PSB3_FLAG_FRONTEND_MASK;
+    if (!frontendKindIsValid((int)frontend_code)) {
+        return loadFail("unknown frontend kind %u in header", (unsigned)frontend_code);
+    }
     pf->format_version = format_ver;
     pf->vm_version = vm_ver;
     pf->flags = flags;
+    pf->frontend_kind = (FrontendKind)frontend_code;
     pf->section_count = section_count;
     pf->sections = (Psb3SectionEntry*)malloc(sizeof(Psb3SectionEntry) * (section_count ? section_count : 1));
     if (!pf->sections) return loadFail("out of memory");
@@ -2674,6 +2711,10 @@ static bool psb3Load(const char* path, Psb3File* pf) {
 
 static bool psb3ReadChunk(const Psb3File* pf, BytecodeChunk* chunk) {
     chunk->version = pf->vm_version;
+    /* Overwrites what initBytecodeChunk() stamped from the *loading* process's
+     * frontend: the file's own record is what governs, which is the whole
+     * point for a host like pscalvm that has no frontend of its own. */
+    chunk->frontend_kind = pf->frontend_kind;
     chunk->code = NULL;
     chunk->lines = NULL;
     chunk->constants = NULL;
@@ -2766,7 +2807,10 @@ static bool psb3Write(FILE* f, const BytecodeChunk* chunk,
     bufU32LE(&header, PSB3_MAGIC);
     bufU16LE(&header, (uint16_t)PSB3_FORMAT_VERSION);
     bufU16LE(&header, (uint16_t)chunk->version);
-    bufU32LE(&header, 0); /* flags: reserved */
+    /* The chunk's own record, not frontendGetKind(): a chunk can be written
+     * by a process whose pushed kind has since changed (and pscalasm builds
+     * chunks with no frontend at all while pushing Pascal). */
+    bufU32LE(&header, (uint32_t)chunk->frontend_kind & PSB3_FLAG_FRONTEND_MASK);
     bufU32LE(&header, (uint32_t)n);
 
     size_t dir_entry_size = 12;

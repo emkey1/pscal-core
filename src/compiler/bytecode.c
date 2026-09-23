@@ -69,6 +69,13 @@ int pscalOpcodeOperandSpecLength(const char* operands) {
 
 void initBytecodeChunk(BytecodeChunk* chunk) { // From all.txt
     chunk->version = pscal_vm_version();
+    /* Stamp the compiling frontend onto the chunk here, once, so every
+     * producer picks it up for free: each frontend's main() has already
+     * pushed its kind by the time it builds a chunk, and cache.c writes
+     * whatever this says into the PSB3 header. A loader overwrites it from
+     * the header; a tool that assembles a chunk without a frontend (pscalasm)
+     * clears it back to FRONTEND_KIND_UNKNOWN itself. */
+    chunk->frontend_kind = frontendGetKind();
     chunk->count = 0;
     chunk->capacity = 0;
     chunk->code = NULL;

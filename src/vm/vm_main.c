@@ -86,6 +86,21 @@ int pscalvm_main(int argc, char* argv[]) {
         PSCALVM_RETURN(vmExitWithCleanup(EXIT_FAILURE));
     }
 
+    /* Adopt the conventions of the frontend that compiled this chunk, which
+     * the PSB3 header records (cache.c). pscalvm is the one host with no
+     * frontend of its own, so until this existed it ran everything as Pascal
+     * and silently applied Pascal's rules to bytecode compiled under someone
+     * else's: an Aether chunk indexes Text from 0, so `loop ch in s` died on
+     * "String index 0 out of bounds", and copy()/pos() were off by one. The
+     * string base is the loudest of these, but not the only one -- array
+     * out-of-bounds diagnostics and the thread-introspection builtins are
+     * frontend-specific too. FRONTEND_KIND_UNKNOWN means the producer
+     * didn't record one (a hand-assembled .asm, tools/tiny); leaving Pascal
+     * pushed for those keeps their long-standing behaviour exactly. */
+    if (chunk.frontend_kind != FRONTEND_KIND_UNKNOWN) {
+        frontendPushKind(chunk.frontend_kind);
+    }
+
     VM vm;
     initVM(&vm);
     InterpretResult result = interpretBytecode(&vm, &chunk, globalSymbols, constGlobalSymbols, procedure_table, 0);

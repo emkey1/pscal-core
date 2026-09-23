@@ -11,6 +11,7 @@
 
 #include "core/types.h" // For Value struct, as constants will be Values
 #include "symbol/symbol.h" // For HashTable definition
+#include "common/frontend_kind.h" // For the chunk's frontend_kind
 #include <stdatomic.h>
 
 // VM 2.0 Phase 1e legacy width: GET_GLOBAL_CACHED/SET_GLOBAL_CACHED/
@@ -136,6 +137,20 @@ typedef struct TypeDefaultProto {
 // A "chunk" represents a compiled piece of code (e.g., a procedure, function, or the main program block)
 typedef struct {
     uint32_t version;   // VM bytecode version this chunk targets
+    // Which frontend's source-language conventions this chunk was compiled
+    // under -- most visibly whether strings index from 0 (Aether, shell) or
+    // from 1 (Pascal, rea, clike), but also which wording array-bounds
+    // diagnostics use and how the thread-introspection builtins report a
+    // pooled worker. A fresh compile gets frontendGetKind() in
+    // initBytecodeChunk(); a chunk read back off disk gets whatever the PSB3
+    // header recorded (cache.c). This travels with the chunk, rather than
+    // being read out of the process-global frontendGetKind(), because a host
+    // that has no frontend of its own -- `pscalvm prog.bc` -- would otherwise
+    // have to guess, and guessing "Pascal" made every Aether string index and
+    // `loop ch in s` fail with an off-by-one out-of-bounds error.
+    // FRONTEND_KIND_UNKNOWN means the producer didn't say, which every
+    // frontend predicate already treats exactly like Pascal.
+    FrontendKind frontend_kind;
     int count;          // Number of bytes currently in use in 'code'
     int capacity;       // Allocated capacity for 'code'
     uint8_t* code;      // The array of bytecode instructions and operands
