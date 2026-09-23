@@ -56,26 +56,57 @@ diff -u a.disasm b.disasm
 
 ## Notes On `PSCALASM2` Constants
 
-- Primitive constants remain one-line entries (`INT`, `REAL`, `STR`, `CHAR`, `BOOL`, `NIL`).
-- Additional supported serialized forms:
-  - `ENUM`: `const <idx> 10 "<enum_name>" <ordinal>`
-  - `SET`: `const <idx> 14 <count> <ord0> <ord1> ...`
-  - `POINTER`:
-    - null pointer: `const <idx> 15 null`
-    - C-string pointer payload:
-      `const <idx> 15 charptr "<string_data>"`
-    - shell compiled function pointer:
-      `const <idx> 15 shellfn_asm "<escaped_nested_pscalasm2>"`
-    - opaque raw pointer address:
-      `const <idx> 15 opaque_addr <address>`
-  - `ARRAY` (scalar elements):  
-    `const <idx> 11 dims <n> elem <var_type> bounds <lb0> <ub0> ... values <total> <v0> <v1> ...`
+Each constant is `const <idx> <var_type> <payload>`, where `<var_type>` is the
+`VarType` number from `core/var_type.h`. `pscald --emit-asm` writes one payload
+form for every type the bytecode cache can store, so a chunk any frontend
+compiled round-trips through `pscalasm`:
+
+- Integers (`INTEGER` 2, `BYTE` 8, `WORD` 9, `BOOLEAN` 12, `INT8` 18, `INT16` 20,
+  `INT64` 23, `THREAD` 28): `const <idx> <type> <n>`
+- Unsigned integers (`UINT8` 19, `UINT16` 21, `UINT32` 22, `UINT64` 24): the
+  same, over the full unsigned 64-bit range.
+- Reals (`REAL` 3, `FLOAT` 25, `LONG_DOUBLE` 26): `const <idx> <type> <x>`
+- Strings (`STRING` 4, `UNICODESTRING` 30): `const <idx> <type> "<text>"`, or
+  `null` for a string with no buffer at all, which is not the same as `""`.
+- `CHAR` 5: `const <idx> 5 <code>` (-128..255). `WIDECHAR` 29: the code point.
+- No payload: `NIL` 27, `VOID` 1, and the unset handles `TASK` 31 and
+  `CHANNEL` 32 (a live task or channel cannot be stored).
+- `MEMORY_STREAM` 13: `null`, or `bytes <n> <b0> <b1> ...` in decimal.
+- `ENUM` 10: `const <idx> 10 "<enum_name>" <ordinal>`
+- `SET` 14: `const <idx> 14 <count> <ord0> <ord1> ...`
+- `POINTER` 15:
+  - null pointer: `const <idx> 15 null`
+  - C-string pointer payload: `const <idx> 15 charptr "<string_data>"`
+  - shell compiled function pointer:
+    `const <idx> 15 shellfn_asm "<escaped_nested_pscalasm2>"`
+  - nil pointer that keeps its base type (e.g. an Aether array-of-records
+    literal's elements): `const <idx> 15 typed_nil "<json_ast>"`, or
+    `typed_nil none` for an untyped one
+  - opaque raw pointer address: `const <idx> 15 opaque_addr <address>`
+- `ARRAY` 11:
+  `const <idx> 11 dims <n> elem <var_type> bounds <lb0> <ub0> ... values <total> <v0> <v1> ...`
+  - `values` lists scalar or string elements untyped, each read as `elem`.
+  - `typed_values <total>` instead gives each element as `<var_type> <payload>`,
+    so an element can be any constant above, including another array. pscald
+    uses it whenever an element's own type differs from `elem` or has no
+    untyped spelling.
+  - `dims 0 elem <var_type> bounds values 0` is an empty dynamic array
+    (Aether's `[]`).
 - Serialized constant globals are preserved with:
   - `const_symbols <count>`
   - `const_symbol "<name>" <var_type> ...payload...`
 - Serialized type-table entries are preserved with:
   - `types <count>`
   - `type "<name>" "<json_ast>"`
+- Procedures are `proc <idx> "<name>" <address> <locals> <upvalues> <var_type>
+  <arity> <enclosing_idx>`, followed by `captures` and/or `escapes` for a
+  routine the compiler marked as capturing or escaping closure state.
+
+The `<json_ast>` pscald writes is compact JSON that carries every field the
+bytecode cache stores for an AST node (`var_type_id`, `i_val`, `by_ref`,
+`is_inline`, `is_virtual`, `is_global_scope`, token, children), and pscalasm
+reads it exactly as written. The indented `--dump-ast-json` form also loads,
+but it omits some of those fields.
 
 ## Stdin Mode
 
