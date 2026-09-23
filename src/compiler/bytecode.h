@@ -59,6 +59,15 @@ typedef struct {
 // payload's shape).
 typedef struct {
     struct Symbol_s* symbol; // owned; NULL until populated (see bytecode_link.c)
+    // Code offset of the DEFINE_GLOBAL_SLOT instruction that last populated
+    // `symbol`, or -1 if none has (link-time-resolved const/enum/unit slots
+    // keep -1). A block-scoped declaration in a top-level loop body compiles
+    // to a DEFINE inside the loop, so it re-runs every iteration; comparing
+    // this against the executing instruction's offset tells that re-entry
+    // apart from a genuine second declaration of the same name elsewhere in
+    // the program, which comes from a different instruction. Runtime-only
+    // bookkeeping: never serialized, reset to -1 by the link step.
+    int define_pc;
 } GlobalSlot;
 
 // --- Opcode Definitions ---

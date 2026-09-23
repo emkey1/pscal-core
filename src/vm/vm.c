@@ -6924,13 +6924,26 @@ static const Value* vmTypeDefaultPrototype(VM* vm, VarType type, uint16_t name_i
 // The only new step is the last line: mirroring that same Symbol* into
 // chunk->global_slots[slot] as a non-owning fast-path index, so
 // GET_GSLOT/SET_GSLOT never need to consult the hash table at all.
-static InterpretResult handleDefineGlobalSlot(VM* vm, uint16_t slot) {
+//
+// `define_pc` is the code offset of the DEFINE_GLOBAL_SLOT instruction being
+// executed. Finding the slot already populated is only worth a "redefined"
+// warning when some *other* instruction populated it -- a second declaration
+// of the same global name. A declaration in the body of a top-level loop
+// compiles to a DEFINE inside the loop (there is no function frame to hold a
+// local), so the very same instruction legitimately runs once per iteration;
+// re-initializing the value is the intended behaviour there and the warning
+// is noise, so it is suppressed when define_pc matches what the slot already
+// recorded.
+static InterpretResult handleDefineGlobalSlot(VM* vm, uint16_t slot, int define_pc) {
     if (slot >= (uint16_t)vm->chunk->global_slot_count || !vm->chunk->global_slot_names) {
         runtimeError(vm, "VM Error: DEFINE_GLOBAL_SLOT slot %u out of range.", (unsigned)slot);
         return INTERPRET_RUNTIME_ERROR;
     }
     const char* varName = vm->chunk->global_slot_names[slot];
     Symbol* sym = NULL;
+    // True only when a *different* instruction already defined this slot; a
+    // re-run of this same DEFINE (a top-level loop body) is not a redeclaration.
+    const bool warn_on_redefine = (vm->chunk->global_slots[slot].define_pc != define_pc);
     VarType declaredType = (VarType)READ_BYTE();
 
     if (declaredType == TYPE_ARRAY) {
@@ -7030,7 +7043,9 @@ static InterpretResult handleDefineGlobalSlot(VM* vm, uint16_t slot) {
             sym->upvalue_count = 0;
             hashTableInsert(vm->vmGlobalSymbols, sym);
         } else {
-            runtimeWarning(vm, "VM Warning: Global variable '%s' redefined.", varName);
+            if (warn_on_redefine) {
+                runtimeWarning(vm, "VM Warning: Global variable '%s' redefined.", varName);
+            }
             freeValue(sym->value);
             *(sym->value) = array_value;
         }
@@ -7122,7 +7137,7 @@ static InterpretResult handleDefineGlobalSlot(VM* vm, uint16_t slot) {
                 return INTERPRET_RUNTIME_ERROR;
             }
             hashTableInsert(vm->vmGlobalSymbols, sym);
-        } else {
+        } else if (warn_on_redefine) {
             runtimeWarning(vm, "VM Warning: Global variable '%s' redefined.", varName);
         }
 
@@ -7150,6 +7165,7 @@ static InterpretResult handleDefineGlobalSlot(VM* vm, uint16_t slot) {
     // Mirror into the per-chunk slot table (non-owning: vm->vmGlobalSymbols
     // remains the sole owner of `sym`). Caller holds globals_mutex.
     vm->chunk->global_slots[slot].symbol = sym;
+    vm->chunk->global_slots[slot].define_pc = define_pc;
     return INTERPRET_OK;
 }
 
@@ -10490,9 +10506,13 @@ comparison_error_label:
             // through to default: and gets a clean "unknown opcode" error,
             // same as the Phase 2a GET/SET_GLOBAL[16]_CACHED retirement.
             case DEFINE_GLOBAL_SLOT: {
+                // vm->ip is one byte past the opcode here, so this is the
+                // offset of the instruction itself -- its identity, used to
+                // tell a loop body's re-run apart from a second declaration.
+                int define_pc = (int)(vm->ip - vm->chunk->code) - 1;
                 uint16_t slot = READ_SHORT(vm);
                 pthread_mutex_lock(&globals_mutex);
-                InterpretResult r = handleDefineGlobalSlot(vm, slot);
+                InterpretResult r = handleDefineGlobalSlot(vm, slot, define_pc);
                 pthread_mutex_unlock(&globals_mutex);
                 if (r != INTERPRET_OK) return r;
                 break;

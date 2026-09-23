@@ -296,6 +296,7 @@ bool pscalLinkGlobalSlots(BytecodeChunk* chunk, char* err_buf, size_t err_buf_si
     int myself_slot = -1, pending_slot = -1, message_slot = -1;
     for (int i = 0; i < count; i++) {
         names[i] = list.items[i].name; // ownership transferred, do not free via slotListFree below
+        slots[i].define_pc = -1; // calloc's 0 is a valid code offset, so say "never defined" explicitly
 
         Symbol* existing = constGlobalSymbols ? hashTableLookup(constGlobalSymbols, names[i]) : NULL;
         if (!existing && globalSymbols) {
