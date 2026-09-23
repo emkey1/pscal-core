@@ -1,5 +1,6 @@
 #include "common/frontend_kind.h"
 
+#include <stddef.h>  /* NULL: <strings.h> supplies it on macOS but not glibc */
 #include <strings.h>
 
 static FrontendKind gFrontendKind = FRONTEND_KIND_PASCAL;
