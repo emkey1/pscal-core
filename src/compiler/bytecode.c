@@ -11,6 +11,7 @@
 #include "core/utils.h"    // For freeValue, varTypeToString
 #include "symbol/symbol.h" // For Symbol struct, HashTable, lookupSymbolIn
 #include "vm/vm.h"         // For HostFunctionID type (used in CALL_HOST cast)
+#include "vm/string_sentinels.h" // For printing pointer constants
 #include "core/globals.h"
 #include "backend_ast/builtin.h"
 #include "core/version.h"
@@ -638,6 +639,192 @@ static void printEscapedChar(char c) {
     }
 }
 
+// Printable ASCII and the escapes printEscapedChar knows print as themselves,
+// in single quotes when `quoted`. A WIDECHAR is a code point, which that
+// function's char cast would truncate (955 would print as the byte 0xBB), so
+// past ASCII it prints as UTF-8. Anything else (a control character, a CHAR's
+// lone high byte, a value that is no Unicode scalar) prints unquoted in
+// Pascal's #n form rather than as raw bytes.
+static void printConstantChar(const Value* value, bool quoted) {
+    int code = AS_CHAR(*value);
+    bool ascii = code == '\n' || code == '\r' || code == '\t' || (code >= 0x20 && code < 0x7F);
+    if (!ascii && (value->type != TYPE_WIDECHAR || code < 0xA0 || code > 0x10FFFF ||
+                   (code >= 0xD800 && code <= 0xDFFF))) {
+        fprintf(stderr, "#%d", code);
+        return;
+    }
+    if (quoted) {
+        fputc('\'', stderr);
+    }
+    if (ascii) {
+        printEscapedChar((char)code);
+    } else if (code < 0x800) {
+        fprintf(stderr, "%c%c", 0xC0 | (code >> 6), 0x80 | (code & 0x3F));
+    } else if (code < 0x10000) {
+        fprintf(stderr, "%c%c%c", 0xE0 | (code >> 12), 0x80 | ((code >> 6) & 0x3F),
+                0x80 | (code & 0x3F));
+    } else {
+        fprintf(stderr, "%c%c%c%c", 0xF0 | (code >> 18), 0x80 | ((code >> 12) & 0x3F),
+                0x80 | ((code >> 6) & 0x3F), 0x80 | (code & 0x3F));
+    }
+    if (quoted) {
+        fputc('\'', stderr);
+    }
+}
+
+// How many elements of an array constant, or entries of a set constant, a
+// listing line shows before summarizing the rest as "... N more".
+#define CONSTANT_PREVIEW_ITEMS 8
+
+static void printConstantValue(const Value* value);
+
+// An element of an array constant keeps the quotes the Constants table gives
+// a string or char, so the string "1" and the integer 1 stay apart.
+static void printConstantElement(const Value* value) {
+    switch (value->type) {
+        case TYPE_STRING:
+        case TYPE_UNICODE_STRING: {
+            StringObj* str = PSCAL_VALUE_PTR(*value, StringObj);
+            if (!str || !str->buffer) {
+                fprintf(stderr, "null");
+                return;
+            }
+            fprintf(stderr, "\"");
+            printEscapedString(str->buffer);
+            fprintf(stderr, "\"");
+            return;
+        }
+        case TYPE_CHAR:
+        case TYPE_WIDECHAR:
+            printConstantChar(value, true);
+            return;
+        default:
+            printConstantValue(value);
+            return;
+    }
+}
+
+// Pascal's typed-constant form, e.g. `array[0..2] of INTEGER = (10, 20, 30)`,
+// with the elements flattened in storage order. An empty dynamic array (no
+// dimensions, e.g. Aether's `[]`) is `array of INT64 = ()`.
+static void printArrayConstant(const Value* value) {
+    ArrayObj* array = PSCAL_VALUE_PTR(*value, ArrayObj);
+    if (!array) {
+        fprintf(stderr, "array(null)");
+        return;
+    }
+    int dims = array->dimensions;
+    if (dims < 0 || (dims > 0 && (!array->lower_bounds || !array->upper_bounds))) {
+        fprintf(stderr, "array(invalid shape)");
+        return;
+    }
+    fprintf(stderr, "array");
+    for (int i = 0; i < dims; i++) {
+        fprintf(stderr, "%s%d..%d", i == 0 ? "[" : ", ",
+                array->lower_bounds[i], array->upper_bounds[i]);
+    }
+    fprintf(stderr, "%s of %s = (", dims > 0 ? "]" : "",
+            varTypeToString(array->element_type));
+
+    int total = calculateArrayTotalSize(value);
+    bool packed = arrayUsesPackedBytes(value);
+    if (total > 0 && (packed ? !array->raw : !array->elements)) {
+        fprintf(stderr, "%d elements not loaded)", total);
+        return;
+    }
+    int shown = total < CONSTANT_PREVIEW_ITEMS ? total : CONSTANT_PREVIEW_ITEMS;
+    for (int i = 0; i < shown; i++) {
+        if (i > 0) {
+            fprintf(stderr, ", ");
+        }
+        if (packed) {
+            fprintf(stderr, "%u", (unsigned)array->raw[i]);
+        } else {
+            printConstantElement(&array->elements[i]);
+        }
+    }
+    if (total > shown) {
+        fprintf(stderr, ", ... %d more", total - shown);
+    }
+    fprintf(stderr, ")");
+}
+
+// Pascal set notation, with each ascending run of three or more ordinals
+// written as a range: [1..5, 9].
+static void printSetConstant(const Value* value) {
+    SetObj* set = PSCAL_VALUE_PTR(*value, SetObj);
+    int count = (set && set->set_values) ? set->set_size : 0;
+    fprintf(stderr, "[");
+    int shown = 0;
+    int i = 0;
+    while (i < count && shown < CONSTANT_PREVIEW_ITEMS) {
+        long long first = set->set_values[i];
+        int last = i;
+        while (last + 1 < count && set->set_values[last + 1] == set->set_values[last] + 1) {
+            last++;
+        }
+        if (shown > 0) {
+            fprintf(stderr, ", ");
+        }
+        if (last - i >= 2) {
+            fprintf(stderr, "%lld..%lld", first, set->set_values[last]);
+            i = last + 1;
+        } else {
+            fprintf(stderr, "%lld", first);
+            i++;
+        }
+        shown++;
+    }
+    if (i < count) {
+        fprintf(stderr, ", ... %d more", count - i);
+    }
+    fprintf(stderr, "]");
+}
+
+static bool isPointerSentinel(const AST* base) {
+    return base == OWNED_POINTER_SENTINEL || base == STRING_CHAR_PTR_SENTINEL ||
+           base == STRING_LENGTH_SENTINEL || base == BYTE_ARRAY_PTR_SENTINEL ||
+           base == SERIALIZED_CHAR_PTR_SENTINEL || base == SHELL_FUNCTION_PTR_SENTINEL ||
+           base == OPAQUE_POINTER_SENTINEL;
+}
+
+// The pointer kinds core/cache.c stores, as pscald --emit-asm names them:
+// nil, a C-string payload, a compiled shell function, a nil that keeps its
+// base type (shown as `nil ^Name`), and an opaque address.
+static void printPointerConstant(const Value* value) {
+    PointerObj* ptr = PSCAL_VALUE_PTR(*value, PointerObj);
+    if (!ptr) {
+        fprintf(stderr, "nil");
+        return;
+    }
+    AST* base = ptr->base_type_node;
+    void* address = ptr->address;
+    if (base == STRING_CHAR_PTR_SENTINEL || base == SERIALIZED_CHAR_PTR_SENTINEL) {
+        if (!address) {
+            fprintf(stderr, "charptr null");
+            return;
+        }
+        fprintf(stderr, "charptr \"");
+        printEscapedString((const char*)address);
+        fprintf(stderr, "\"");
+    } else if (base == SHELL_FUNCTION_PTR_SENTINEL) {
+        fprintf(stderr, "shell function");
+    } else if (!address && !isPointerSentinel(base)) {
+        // The base type's name, else its VarType, else (an anonymous record,
+        // say, whose node carries TYPE_VOID) the kind of type node it is.
+        fprintf(stderr, "nil");
+        if (base && base->token && base->token->value && base->token->value[0]) {
+            fprintf(stderr, " ^%s", base->token->value);
+        } else if (base && base->var_type != TYPE_VOID && base->var_type != TYPE_UNKNOWN) {
+            fprintf(stderr, " ^%s", varTypeToString(base->var_type));
+        } else if (base) {
+            fprintf(stderr, " ^%s", astTypeToString(base->type));
+        }
+    } else {
+        fprintf(stderr, "opaque 0x%llx", (unsigned long long)(uintptr_t)address);
+    }
+}
+
 static void printConstantValue(const Value* value) {
     if (!value) {
         fprintf(stderr, "<NULL>");
@@ -645,8 +832,20 @@ static void printConstantValue(const Value* value) {
     }
 
     switch (value->type) {
-        case TYPE_INTEGER:
+        case TYPE_INT32:
+        case TYPE_INT8:
+        case TYPE_INT16:
+        case TYPE_INT64:
+        case TYPE_BYTE:
+        case TYPE_WORD:
+        case TYPE_THREAD:
             fprintf(stderr, "%lld", VAL_INT(*value));
+            break;
+        case TYPE_UINT8:
+        case TYPE_UINT16:
+        case TYPE_UINT32:
+        case TYPE_UINT64:
+            fprintf(stderr, "%llu", VAL_UINT(*value));
             break;
         case TYPE_FLOAT:
         case TYPE_DOUBLE:
@@ -662,7 +861,44 @@ static void printConstantValue(const Value* value) {
             }
             break;
         case TYPE_CHAR:
-            printEscapedChar(AS_CHAR(*value));
+        case TYPE_WIDECHAR:
+            printConstantChar(value, false);
+            break;
+        case TYPE_ENUM: {
+            // Pascal's typecast form, Color(2): the enum type's name and the
+            // ordinal, which is all a cached enum constant carries.
+            EnumObj* enum_obj = PSCAL_VALUE_PTR(*value, EnumObj);
+            const char* name = (enum_obj && enum_obj->enum_name) ? enum_obj->enum_name : "";
+            fprintf(stderr, "%s(%d)", name[0] ? name : "enum", enum_obj ? enum_obj->ordinal : 0);
+            break;
+        }
+        case TYPE_SET:
+            printSetConstant(value);
+            break;
+        case TYPE_ARRAY:
+            printArrayConstant(value);
+            break;
+        case TYPE_POINTER:
+            printPointerConstant(value);
+            break;
+        case TYPE_MEMORYSTREAM: {
+            // The pooled default of an mstream variable.
+            MStream* ms = PSCAL_VALUE_PTR(*value, MStream);
+            if (ms) {
+                fprintf(stderr, "mstream(%d bytes)", ms->buffer ? ms->size : 0);
+            } else {
+                fprintf(stderr, "mstream(nil)");
+            }
+            break;
+        }
+        case TYPE_TASK:
+        case TYPE_CHANNEL:
+            // A declaration pools only the unset handle.
+            fprintf(stderr, "%s(%s)", value->type == TYPE_TASK ? "task" : "channel",
+                    PSCAL_VALUE_PTR(*value, void) ? "live" : "unset");
+            break;
+        case TYPE_VOID:
+            fprintf(stderr, "void");
             break;
         case TYPE_BOOLEAN:
             fprintf(stderr, "%s", VAL_INT(*value) ? "true" : "false");
@@ -686,8 +922,25 @@ static void printConstantValue(const Value* value) {
             break;
         }
         default:
-            fprintf(stderr, "Value type %s", varTypeToString(value->type));
+            // Records, files and interfaces never reach a constant pool.
+            fprintf(stderr, "<%s>", varTypeToString(value->type));
             break;
+    }
+}
+
+// The Constants table's type column: the short names it has always used,
+// and otherwise the VarType's own name (INT64, UINT8, ENUM, SET, ARRAY, ...).
+static const char* constantTableTag(VarType type) {
+    switch (type) {
+        case TYPE_INT32:        return "INT";
+        case TYPE_FLOAT:
+        case TYPE_DOUBLE:
+        case TYPE_LONG_DOUBLE:  return "REAL";
+        case TYPE_BOOLEAN:      return "BOOL";
+        case TYPE_CLOSURE:      return "CLOS";
+        case TYPE_POINTER:      return "PTR";
+        case TYPE_MEMORYSTREAM: return "MSTREAM";
+        default:                return varTypeToString(type);
     }
 }
 
@@ -1336,19 +1589,11 @@ void disassembleBytecodeChunk(BytecodeChunk* chunk, const char* name, HashTable*
     fprintf(stderr, "== End Disassembly: %s ==\n\n", name);
 
     if (chunk->constants_count > 0) {
-        fprintf(stderr, "Constants (%d):\\n", chunk->constants_count);
+        fprintf(stderr, "Constants (%d):\n", chunk->constants_count);
         for (int i = 0; i < chunk->constants_count; i++) {
             fprintf(stderr, "  %04d: ", i);
             Value constantValue = chunk->constants[i];
             switch(constantValue.type) {
-                case TYPE_INTEGER:
-                    fprintf(stderr, "INT   %lld\n", VAL_INT(constantValue));
-                    break;
-                case TYPE_FLOAT:
-                case TYPE_DOUBLE:
-                case TYPE_LONG_DOUBLE:
-                    fprintf(stderr, "REAL  %Lf\n", AS_REAL(constantValue));
-                    break;
                 case TYPE_STRING:
                 case TYPE_UNICODE_STRING:
                     fprintf(stderr, "STR   \"");
@@ -1365,29 +1610,24 @@ void disassembleBytecodeChunk(BytecodeChunk* chunk, const char* name, HashTable*
                         (!AS_STRING(constantValue) || strcmp(AS_STRING(constantValue), AS_STRING(chunk->constants[lower_idx])) != 0)) {
                         fprintf(stderr, " (lower -> %04d: \"", lower_idx);
                         printEscapedString(AS_STRING(chunk->constants[lower_idx]));
-                        fprintf(stderr, "\"");
+                        fprintf(stderr, "\")");
                     }
                     fprintf(stderr, "\n");
                     break;
                 case TYPE_CHAR:
                 case TYPE_WIDECHAR:
-                    fprintf(stderr, "CHAR  '");
-                    printEscapedChar(AS_CHAR(constantValue));
-                    fprintf(stderr, "'\n");
-                    break;
-                case TYPE_BOOLEAN:
-                    fprintf(stderr, "BOOL  %s\n", VAL_INT(constantValue) ? "true" : "false");
-                    break;
-                case TYPE_CLOSURE:
-                    fprintf(stderr, "CLOS  ");
-                    printConstantValue(&constantValue);
+                    fprintf(stderr, "CHAR  ");
+                    printConstantChar(&constantValue, true);
                     fprintf(stderr, "\n");
                     break;
                 case TYPE_NIL:
-                    fprintf(stderr, "NIL\n");
+                case TYPE_VOID:
+                    fprintf(stderr, "%s\n", varTypeToString(constantValue.type));
                     break;
                 default:
-                    fprintf(stderr, "Value type %s\n", varTypeToString(constantValue.type));
+                    fprintf(stderr, "%-5s ", constantTableTag(constantValue.type));
+                    printConstantValue(&constantValue);
+                    fprintf(stderr, "\n");
                     break;
             }
         }
