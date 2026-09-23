@@ -668,6 +668,144 @@ static int ordered_global_slot_decl_capacity = 0;
 // Set while such an initializer is emitted at its source position.
 static bool emitting_ordered_global_init = false;
 
+// A declaration inside a block of the main program -- an `if` or loop body, a
+// bare `{ }`, the header of a C-style `for` -- has no function frame to hold
+// it, so it lives in a global slot. Naming that slot after the variable made
+// every such block share it: two sibling blocks that each declared `k`
+// defined one slot twice ("Global variable 'k' redefined", or a type clash
+// when the two declared different types), and a block-local `k` overwrote the
+// real global `k` it only shadows. Each block-scoped declaration therefore gets
+// a slot of its own, "<name>@<n>" ('@' never occurs in an identifier), and a
+// reference to the name from inside that block resolves to it. A second
+// declaration of the name in the *same* block reuses the slot, so the VM still
+// reports it as a redefinition, just as it does for two top-level ones.
+typedef struct {
+    char* name;       // the name as the source spells it
+    char* slot_name;  // the global slot the declaration lives in
+    AST* scope;       // the block that declared it
+} TopLevelBlockVar;
+
+static TopLevelBlockVar* top_level_block_vars = NULL;
+static int top_level_block_var_count = 0;
+static int top_level_block_var_capacity = 0;
+static AST** top_level_block_scopes = NULL;  // innermost last
+static int top_level_block_depth = 0;
+static int top_level_block_scope_capacity = 0;
+// Never reset: modules and the program compile into one chunk, so a slot name
+// must stay unique across every compile in the process.
+static int top_level_block_serial = 0;
+
+// Opens `scope` as a block of the main program; returns the mark that
+// endTopLevelBlockScope() unwinds its declarations to.
+static int beginTopLevelBlockScope(AST* scope) {
+    if (top_level_block_depth >= top_level_block_scope_capacity) {
+        int new_capacity = top_level_block_scope_capacity ? top_level_block_scope_capacity * 2 : 8;
+        AST** resized = realloc(top_level_block_scopes, sizeof(AST*) * (size_t)new_capacity);
+        if (!resized) {
+            fprintf(stderr, "Compiler error: Out of memory tracking block scopes.\n");
+            compiler_had_error = true;
+            return top_level_block_var_count;
+        }
+        top_level_block_scopes = resized;
+        top_level_block_scope_capacity = new_capacity;
+    }
+    top_level_block_scopes[top_level_block_depth++] = scope;
+    return top_level_block_var_count;
+}
+
+static void endTopLevelBlockScope(AST* scope, int mark) {
+    while (top_level_block_var_count > mark) {
+        TopLevelBlockVar* var = &top_level_block_vars[--top_level_block_var_count];
+        free(var->name);
+        free(var->slot_name);
+    }
+    if (top_level_block_depth > 0 && top_level_block_scopes[top_level_block_depth - 1] == scope) {
+        top_level_block_depth--;
+    }
+}
+
+static void resetTopLevelBlockScopes(void) {
+    endTopLevelBlockScope(NULL, 0);
+    top_level_block_depth = 0;
+}
+
+// True while a declaration compiled now belongs to a block of the main program
+// rather than to the program itself or to a routine.
+static bool inTopLevelBlockScope(void) {
+    return top_level_block_depth > 0 && current_function_compiler == NULL;
+}
+
+// The slot for a declaration of `name` in the innermost open block.
+static const char* declareTopLevelBlockVar(const char* name) {
+    AST* scope = top_level_block_scopes[top_level_block_depth - 1];
+    for (int i = top_level_block_var_count - 1;
+         i >= 0 && top_level_block_vars[i].scope == scope; i--) {
+        if (strcasecmp(top_level_block_vars[i].name, name) == 0) {
+            return top_level_block_vars[i].slot_name;
+        }
+    }
+    if (top_level_block_var_count >= top_level_block_var_capacity) {
+        int new_capacity = top_level_block_var_capacity ? top_level_block_var_capacity * 2 : 16;
+        TopLevelBlockVar* resized = realloc(top_level_block_vars,
+                                            sizeof(TopLevelBlockVar) * (size_t)new_capacity);
+        if (!resized) {
+            fprintf(stderr, "Compiler error: Out of memory tracking block-scoped variables.\n");
+            compiler_had_error = true;
+            return name;
+        }
+        top_level_block_vars = resized;
+        top_level_block_var_capacity = new_capacity;
+    }
+    size_t slot_len = strlen(name) + 16;
+    char* slot_name = malloc(slot_len);
+    char* name_copy = strdup(name);
+    if (!slot_name || !name_copy) {
+        free(slot_name);
+        free(name_copy);
+        fprintf(stderr, "Compiler error: Out of memory naming a block-scoped variable.\n");
+        compiler_had_error = true;
+        return name;
+    }
+    snprintf(slot_name, slot_len, "%s@%d", name, ++top_level_block_serial);
+    TopLevelBlockVar* var = &top_level_block_vars[top_level_block_var_count++];
+    var->name = name_copy;
+    var->slot_name = slot_name;
+    var->scope = scope;
+    return slot_name;
+}
+
+// Whether a reference at `ref` sees a declaration made in `scope`: only from
+// inside that block. A routine's body is compiled where it is first called when
+// that comes before its declaration, and an inline routine's body at every call
+// site, so compile order alone would let a block's locals capture the body's
+// references to real globals. A fragment with no parent chain back to the
+// program cannot be placed; it is taken to belong where it is being compiled,
+// unless it is a routine body.
+static bool topLevelBlockScopeEncloses(AST* scope, AST* ref) {
+    if (!ref) return true;
+    bool in_routine = false;
+    AST* root = ref;
+    for (AST* cur = ref; cur; cur = cur->parent) {
+        if (cur == scope) return true;
+        if (cur->type == AST_FUNCTION_DECL || cur->type == AST_PROCEDURE_DECL) in_routine = true;
+        root = cur;
+    }
+    return root->type != AST_PROGRAM && !in_routine;
+}
+
+// The global slot a reference to `name` at `ref` resolves to: that of the
+// innermost enclosing block that declares it, otherwise the global `name`.
+static const char* topLevelBlockSlotName(const char* name, AST* ref) {
+    if (!name) return name;
+    for (int i = top_level_block_var_count - 1; i >= 0; i--) {
+        TopLevelBlockVar* var = &top_level_block_vars[i];
+        if (strcasecmp(var->name, name) == 0 && topLevelBlockScopeEncloses(var->scope, ref)) {
+            return var->slot_name;
+        }
+    }
+    return name;
+}
+
 // Flag indicating we are compiling a global variable initializer. In that
 // situation vtables have not yet been emitted, so NEW expressions should not
 // attempt to resolve their class vtables immediately.
@@ -1600,7 +1738,7 @@ static void emitGlobalInitializerForVar(AST* var_decl, AST* varNameNode,
                     } else {
                         pending_global_vtables = resized;
                         pending_global_vtables[pending_global_vtable_count].var_name =
-                            strdup(varNameNode->token->value);
+                            strdup(topLevelBlockSlotName(varNameNode->token->value, varNameNode));
                         pending_global_vtables[pending_global_vtable_count].class_name = lower_cls;
                         pending_global_vtable_count++;
                     }
@@ -1611,7 +1749,7 @@ static void emitGlobalInitializerForVar(AST* var_decl, AST* varNameNode,
         }
     }
 
-    int name_idx_set = addStringConstant(chunk, varNameNode->token->value);
+    int name_idx_set = addStringConstant(chunk, topLevelBlockSlotName(varNameNode->token->value, varNameNode));
     emitGlobalNameIdx(chunk, SET_GSLOT, SET_GSLOT, name_idx_set, getLine(varNameNode));
 }
 
@@ -1626,7 +1764,10 @@ static void emitGlobalVarDefinition(AST* var_decl,
     }
 
     int line = getLine(varNameNode);
-    int var_name_idx = addStringConstant(chunk, varNameNode->token->value);
+    const char* slot_name = inTopLevelBlockScope()
+                                ? declareTopLevelBlockVar(varNameNode->token->value)
+                                : varNameNode->token->value;
+    int var_name_idx = addStringConstant(chunk, slot_name);
     emitDefineGlobal(chunk, var_name_idx, line);
     writeBytecodeChunk(chunk, (uint8_t)var_decl->var_type, line);
 
@@ -1754,7 +1895,7 @@ static void emitGlobalVarDefinition(AST* var_decl,
         }
     }
 
-    resolveGlobalVariableIndex(chunk, varNameNode->token->value, line);
+    resolveGlobalVariableIndex(chunk, slot_name, line);
 
     if (emit_initializer && var_decl->left) {
         emitGlobalInitializerForVar(var_decl, varNameNode, actual_type_def_node, chunk);
@@ -6433,7 +6574,8 @@ static void compileLValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                     }
                     writeBytecodeChunk(chunk, (uint8_t)upvalue_slot, line);
                 } else {
-                    if (!globalVariableExists(varName) && !lookupGlobalSymbol(varName)) {
+                    const char* slotName = topLevelBlockSlotName(varName, node);
+                    if (!globalVariableExists(slotName) && !lookupGlobalSymbol(slotName)) {
                         fprintf(stderr, "L%d: Undefined variable '%s'.\n", line, varName);
                         if (current_function_compiler && current_function_compiler->name) {
                             DBG_PRINTF("[dbg] in function '%s', locals=", current_function_compiler->name);
@@ -6447,7 +6589,7 @@ static void compileLValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                         compiler_had_error = true;
                         break;
                     }
-                    int nameIndex = addStringConstant(chunk, varName);
+                    int nameIndex = addStringConstant(chunk, slotName);
                     emitGlobalNameIdx(chunk, GET_GSLOT_ADDRESS, GET_GSLOT_ADDRESS,
                                        nameIndex, line);
                 }
@@ -6702,11 +6844,12 @@ static bool emitDirectStoreForVariable(AST* lvalue, BytecodeChunk* chunk, int li
         }
     }
 
-    if (!globalVariableExists(varName) && !lookupGlobalSymbol(varName)) {
+    const char* slotName = topLevelBlockSlotName(varName, lvalue);
+    if (!globalVariableExists(slotName) && !lookupGlobalSymbol(slotName)) {
         return false;
     }
 
-    int nameIdx = addStringConstant(chunk, varName);
+    int nameIdx = addStringConstant(chunk, slotName);
     emitGlobalNameIdx(chunk, SET_GSLOT, SET_GSLOT, nameIdx, line);
     return true;
 }
@@ -7184,6 +7327,7 @@ bool compileASTToBytecode(AST* rootNode, BytecodeChunk* outputChunk) {
     deferred_global_initializer_count = 0;
     deferred_global_initializer_capacity = 0;
     resetOrderedGlobalSlotDecls();
+    resetTopLevelBlockScopes();
 
     ensureMyselfGlobalDefined(outputChunk, rootNode ? getLine(rootNode) : 0);
 
@@ -7264,6 +7408,7 @@ bool compileModuleAST(AST* rootNode, BytecodeChunk* outputChunk) {
     deferred_global_initializer_count = 0;
     deferred_global_initializer_capacity = 0;
     resetOrderedGlobalSlotDecls();
+    resetTopLevelBlockScopes();
 
     ensureMyselfGlobalDefined(outputChunk, rootNode ? getLine(rootNode) : 0);
 
@@ -7990,12 +8135,17 @@ static void compileNode(AST* node, BytecodeChunk* chunk, int current_line_approx
         }
         case AST_COMPOUND: {
             bool enters_scope = current_function_compiler != NULL && !node->is_global_scope;
+            bool enters_top_level_scope = current_function_compiler == NULL && !node->is_global_scope;
             SymbolEnvSnapshot scope_snapshot;
             int starting_local = -1;
+            int top_level_mark = 0;
             if (enters_scope) {
                 compilerBeginScope(current_function_compiler);
                 starting_local = current_function_compiler->local_count;
                 saveLocalEnv(&scope_snapshot);
+            }
+            if (enters_top_level_scope) {
+                top_level_mark = beginTopLevelBlockScope(node);
             }
             // Pass 1: compile nested routine declarations so they are available
             // regardless of where they appear in the block.
@@ -8034,6 +8184,9 @@ static void compileNode(AST* node, BytecodeChunk* chunk, int current_line_approx
                 current_function_compiler->local_count = starting_local;
                 compilerEndScope(current_function_compiler);
                 restoreLocalEnv(&scope_snapshot);
+            }
+            if (enters_top_level_scope) {
+                endTopLevelBlockScope(node, top_level_mark);
             }
             break;
         }
@@ -10523,12 +10676,17 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
         }
         case AST_COMPOUND: {
             bool enters_scope = current_function_compiler != NULL && !node->is_global_scope;
+            bool enters_top_level_scope = current_function_compiler == NULL && !node->is_global_scope;
             SymbolEnvSnapshot scope_snapshot;
             int starting_local = -1;
+            int top_level_mark = 0;
             if (enters_scope) {
                 compilerBeginScope(current_function_compiler);
                 starting_local = current_function_compiler->local_count;
                 saveLocalEnv(&scope_snapshot);
+            }
+            if (enters_top_level_scope) {
+                top_level_mark = beginTopLevelBlockScope(node);
             }
             for (int i = 0; i < node->child_count; i++) {
                 if (node->children[i]) {
@@ -10545,6 +10703,9 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                 current_function_compiler->local_count = starting_local;
                 compilerEndScope(current_function_compiler);
                 restoreLocalEnv(&scope_snapshot);
+            }
+            if (enters_top_level_scope) {
+                endTopLevelBlockScope(node, top_level_mark);
             }
             break;
         }
@@ -11015,7 +11176,7 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                                 break;
                             }
                             DBG_PRINTF("[dbg] RV %s -> global line=%d\n", varName, line);
-                            int nameIndex = addStringConstant(chunk, varName);
+                            int nameIndex = addStringConstant(chunk, topLevelBlockSlotName(varName, node));
                             emitGlobalNameIdx(chunk, GET_GSLOT, GET_GSLOT,
                                                nameIndex, line);
                         }

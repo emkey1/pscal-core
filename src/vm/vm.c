@@ -6944,6 +6944,10 @@ static InterpretResult handleDefineGlobalSlot(VM* vm, uint16_t slot, int define_
     // True only when a *different* instruction already defined this slot; a
     // re-run of this same DEFINE (a top-level loop body) is not a redeclaration.
     const bool warn_on_redefine = (vm->chunk->global_slots[slot].define_pc != define_pc);
+    // A declaration in a block of the main program lives in a slot named
+    // "<name>@<n>" (see TopLevelBlockVar in compiler.c); name the variable in
+    // the warning as the source spells it.
+    const int sourceNameLen = (int)strcspn(varName, "@");
     VarType declaredType = (VarType)READ_BYTE();
 
     if (declaredType == TYPE_ARRAY) {
@@ -7044,7 +7048,7 @@ static InterpretResult handleDefineGlobalSlot(VM* vm, uint16_t slot, int define_
             hashTableInsert(vm->vmGlobalSymbols, sym);
         } else {
             if (warn_on_redefine) {
-                runtimeWarning(vm, "VM Warning: Global variable '%s' redefined.", varName);
+                runtimeWarning(vm, "VM Warning: Global variable '%.*s' redefined.", sourceNameLen, varName);
             }
             freeValue(sym->value);
             *(sym->value) = array_value;
@@ -7138,7 +7142,7 @@ static InterpretResult handleDefineGlobalSlot(VM* vm, uint16_t slot, int define_
             }
             hashTableInsert(vm->vmGlobalSymbols, sym);
         } else if (warn_on_redefine) {
-            runtimeWarning(vm, "VM Warning: Global variable '%s' redefined.", varName);
+            runtimeWarning(vm, "VM Warning: Global variable '%.*s' redefined.", sourceNameLen, varName);
         }
 
         if (declaredType == TYPE_FILE && sym && sym->value) {
