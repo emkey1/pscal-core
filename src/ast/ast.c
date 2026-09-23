@@ -1008,7 +1008,13 @@ static AST* findStaticDeclarationInASTWithRef(const char* varName, AST* currentS
 
     if (!foundDecl && globalProgramNode && globalProgramNode->type == AST_PROGRAM) {
           if (globalProgramNode->right && globalProgramNode->right->type == AST_BLOCK && globalProgramNode->right->child_count > 0) {
-              AST* globalDeclarationsNode = globalProgramNode->right->children[0];
+              // Both halves of the program block hold global declarations. A
+              // Pascal-style frontend puts them all in children[0]; a C-like one
+              // leaves a variable declaration in children[1] among the statements,
+              // because there its position relative to them is what the source
+              // means. Either way the declaration is a global.
+              for (int part = 0; part < 2 && part < globalProgramNode->right->child_count; part++) {
+              AST* globalDeclarationsNode = globalProgramNode->right->children[part];
               if (globalDeclarationsNode && globalDeclarationsNode->type == AST_COMPOUND) {
                    for (int i = 0; i < globalDeclarationsNode->child_count; i++) {
                        AST* declGroup = globalDeclarationsNode->children[i];
@@ -1042,6 +1048,7 @@ static AST* findStaticDeclarationInASTWithRef(const char* varName, AST* currentS
                              }
                        }
                    }
+              }
               }
           }
      }

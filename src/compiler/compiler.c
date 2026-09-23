@@ -657,6 +657,17 @@ static AST** deferred_global_initializers = NULL;
 static int deferred_global_initializer_count = 0;
 static int deferred_global_initializer_capacity = 0;
 
+// Global declarations a C-like frontend left in the program's statement list
+// rather than its declaration section, because there they interleave with
+// executable statements and the order between the two is part of the source's
+// meaning. Their slots are defined up front (see hoistStatementGlobalSlots)
+// and only the initializing store runs at the declaration's own position.
+static AST** ordered_global_slot_decls = NULL;
+static int ordered_global_slot_decl_count = 0;
+static int ordered_global_slot_decl_capacity = 0;
+// Set while such an initializer is emitted at its source position.
+static bool emitting_ordered_global_init = false;
+
 // Flag indicating we are compiling a global variable initializer. In that
 // situation vtables have not yet been emitted, so NEW expressions should not
 // attempt to resolve their class vtables immediately.
@@ -1565,7 +1576,12 @@ static void emitGlobalInitializerForVar(AST* var_decl, AST* varNameNode,
             compileRValue(initializer, chunk, getLine(initializer));
             maybeAutoBoxInterfaceForType(actual_type_def_node, initializer, chunk, getLine(initializer), true, false);
             if (set_global_guard) compiling_global_var_init = prev_global_init;
-        if (set_global_guard && initializer->token && initializer->token->value) {
+        // A source-ordered initializer needs no end-of-declarations vtable
+        // refresh: every vtable is already emitted by the time it runs, AST_NEW
+        // installs the object's vtable pointer inline, and the refresh would
+        // fire after statements that may since have reassigned the global.
+        if (set_global_guard && !emitting_ordered_global_init &&
+            initializer->token && initializer->token->value) {
             char* lower_cls = strdup(initializer->token->value);
             if (!lower_cls) {
                 fprintf(stderr, "Compiler error: Memory allocation failed for class name.\n");
@@ -1787,6 +1803,75 @@ static void emitDeferredGlobalInitializers(BytecodeChunk* chunk) {
         free(deferred_global_initializers);
         deferred_global_initializers = NULL;
         deferred_global_initializer_capacity = 0;
+    }
+}
+
+static bool isOrderedGlobalSlotDecl(AST* decl) {
+    for (int i = 0; i < ordered_global_slot_decl_count; i++) {
+        if (ordered_global_slot_decls[i] == decl) return true;
+    }
+    return false;
+}
+
+static void rememberOrderedGlobalSlotDecl(AST* decl) {
+    if (!decl || isOrderedGlobalSlotDecl(decl)) return;
+    if (ordered_global_slot_decl_count == ordered_global_slot_decl_capacity) {
+        int new_cap = ordered_global_slot_decl_capacity == 0 ? 4
+                                                             : ordered_global_slot_decl_capacity * 2;
+        AST** resized = realloc(ordered_global_slot_decls, sizeof(AST*) * new_cap);
+        if (!resized) {
+            fprintf(stderr, "Compiler error: Out of memory tracking global declarations.\n");
+            compiler_had_error = true;
+            return;
+        }
+        ordered_global_slot_decls = resized;
+        ordered_global_slot_decl_capacity = new_cap;
+    }
+    ordered_global_slot_decls[ordered_global_slot_decl_count++] = decl;
+}
+
+static void resetOrderedGlobalSlotDecls(void) {
+    free(ordered_global_slot_decls);
+    ordered_global_slot_decls = NULL;
+    ordered_global_slot_decl_count = 0;
+    ordered_global_slot_decl_capacity = 0;
+}
+
+// Pascal keeps every global in a `var` section ahead of `begin`, so hoisting
+// its initializers costs nothing. A C-like frontend (Rea, Aether) instead lets
+// a declaration sit between two statements, and those parsers leave such a
+// declaration in the program's statement list so its position survives. Define
+// each one's slot here, before any statement runs -- a declaration's binding is
+// visible to the whole program, exactly as a declaration-section one is -- and
+// leave the initializing store to compileNode(AST_VAR_DECL), which reaches it
+// in source order. Running the store here instead would let a declaration read
+// a global as it stood before an earlier statement assigned to it.
+static void hoistStatementGlobalSlots(AST* statements, BytecodeChunk* chunk) {
+    if (!statements || statements->type != AST_COMPOUND) return;
+    for (int i = 0; i < statements->child_count && !compiler_had_error; i++) {
+        AST* decl = statements->children[i];
+        if (!decl || decl->type != AST_VAR_DECL) continue;
+        if (!isGlobalScopeNode(decl)) continue;
+        if (isOrderedGlobalSlotDecl(decl)) continue;
+
+        AST* type_specifier_node = decl->right;
+        AST* actual_type_def_node = type_specifier_node;
+        if (actual_type_def_node && actual_type_def_node->type == AST_TYPE_REFERENCE) {
+            // An unresolvable type is reported where the declaration is
+            // compiled; stay silent here so it is not reported twice.
+            actual_type_def_node = actual_type_def_node->token
+                                       ? lookupType(actual_type_def_node->token->value)
+                                       : NULL;
+        }
+        if (!actual_type_def_node) continue;
+
+        for (int j = 0; j < decl->child_count; j++) {
+            AST* varNameNode = decl->children[j];
+            if (!varNameNode || !varNameNode->token) continue;
+            emitGlobalVarDefinition(decl, varNameNode, type_specifier_node,
+                                    actual_type_def_node, chunk, false);
+        }
+        rememberOrderedGlobalSlotDecl(decl);
     }
 }
 
@@ -7098,6 +7183,7 @@ bool compileASTToBytecode(AST* rootNode, BytecodeChunk* outputChunk) {
     }
     deferred_global_initializer_count = 0;
     deferred_global_initializer_capacity = 0;
+    resetOrderedGlobalSlotDecls();
 
     ensureMyselfGlobalDefined(outputChunk, rootNode ? getLine(rootNode) : 0);
 
@@ -7177,6 +7263,7 @@ bool compileModuleAST(AST* rootNode, BytecodeChunk* outputChunk) {
     }
     deferred_global_initializer_count = 0;
     deferred_global_initializer_capacity = 0;
+    resetOrderedGlobalSlotDecls();
 
     ensureMyselfGlobalDefined(outputChunk, rootNode ? getLine(rootNode) : 0);
 
@@ -7334,6 +7421,11 @@ static void compileNode(AST* node, BytecodeChunk* chunk, int current_line_approx
                         }
                     }
                 }
+                if (at_program_level) {
+                    // Before any routine is compiled, so that a body naming one
+                    // of these globals resolves it.
+                    hoistStatementGlobalSlots(statements, chunk);
+                }
                 // Pass 2: Compile routines from the declaration block.
                 for (int i = 0; i < declarations->child_count; i++) {
                     AST* decl_child = declarations->children[i];
@@ -7376,6 +7468,10 @@ static void compileNode(AST* node, BytecodeChunk* chunk, int current_line_approx
                 free(pending_global_vtables);
                 pending_global_vtables = NULL;
                 pending_global_vtable_count = 0;
+
+                // Catches a program with no declaration section at all; the
+                // call above has already handled every other case.
+                hoistStatementGlobalSlots(statements, chunk);
             }
 
             // Pass 3: Compile the main statement block.
@@ -7386,6 +7482,9 @@ static void compileNode(AST* node, BytecodeChunk* chunk, int current_line_approx
                                          getLine(statements->children[i]));
                     }
                 }
+            }
+            if (at_program_level) {
+                resetOrderedGlobalSlotDecls();
             }
             break;
         }
@@ -7418,6 +7517,24 @@ static void compileNode(AST* node, BytecodeChunk* chunk, int current_line_approx
                 if (!actual_type_def_node) {
                     fprintf(stderr, "L%d: Compiler error: Could not determine type definition for a variable declaration.\n", getLine(node));
                     compiler_had_error = true;
+                    break;
+                }
+
+                if (isOrderedGlobalSlotDecl(node)) {
+                    // hoistStatementGlobalSlots() already defined the slot; this
+                    // is the declaration's place in source order, so all that is
+                    // left is the initializing store.
+                    if (node->left) {
+                        bool prev_ordered = emitting_ordered_global_init;
+                        emitting_ordered_global_init = true;
+                        for (int i = 0; i < node->child_count; i++) {
+                            AST* varNameNode = node->children[i];
+                            if (!varNameNode || !varNameNode->token) continue;
+                            emitGlobalInitializerForVar(node, varNameNode,
+                                                        actual_type_def_node, chunk);
+                        }
+                        emitting_ordered_global_init = prev_ordered;
+                    }
                     break;
                 }
 
