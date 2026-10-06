@@ -122,6 +122,25 @@ bool pscalFxBeginReplay(const char *path) {
 bool pscalFxRecordActive(void) { return g_fx_record_file != NULL; }
 bool pscalFxReplayActive(void) { return g_fx_replay_file != NULL; }
 
+/* Exact names, not a "socket" prefix: a plugin may register any name through
+ * registerVmBuiltin(), and one that happened to start with "socket" must not
+ * drop out of the journal unnoticed. Keep in step with the socket rows of
+ * kEffectClassifiedNames (backend_ast/builtin.c). */
+static const char *const kFxJournalExemptNames[] = {
+    "socketcreate", "socketbind", "socketbindaddr", "socketlisten",
+    "socketaccept", "socketconnect", "socketsend", "socketreceive",
+    "socketpoll", "socketclose", "socketsetblocking", "socketpeeraddr",
+    "socketlasterror",
+};
+
+bool pscalFxBuiltinIsJournalExempt(const char *canonical_name) {
+    if (!canonical_name) return false;
+    for (size_t i = 0; i < sizeof(kFxJournalExemptNames) / sizeof(kFxJournalExemptNames[0]); ++i) {
+        if (strcasecmp(kFxJournalExemptNames[i], canonical_name) == 0) return true;
+    }
+    return false;
+}
+
 void pscalFxEndSession(void) {
     if (g_fx_record_file) { fclose(g_fx_record_file); g_fx_record_file = NULL; }
     if (g_fx_replay_file) { fclose(g_fx_replay_file); g_fx_replay_file = NULL; }

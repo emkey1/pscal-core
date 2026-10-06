@@ -40,6 +40,16 @@ bool pscalFxRecordActive(void);
 bool pscalFxReplayActive(void);
 void pscalFxEndSession(void);
 
+/* True for an effectful builtin that the --deny sandbox gates but the
+ * record/replay journal must skip, so it runs live on both record and
+ * replay. Raw sockets: a socket handle is a live descriptor, not data, so a
+ * replayed socketcreate leaves later live calls (socketreceive returns an
+ * MStream and is never substitutable) talking to a descriptor that was
+ * never opened. The journal is also one strict sequence, and par branches
+ * race on accept/connect. Takes the canonical (dispatch-table) name and
+ * matches the 13 socket builtins exactly. */
+bool pscalFxBuiltinIsJournalExempt(const char *canonical_name);
+
 /* Called from vm.c right after a live handler call for an effectful builtin
  * (mask != FX_PURE) when recording is active. Journals the call in order:
  * name, arg count, the return Value, and -- for every TYPE_POINTER argument

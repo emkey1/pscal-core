@@ -2364,6 +2364,16 @@ static const EffectClassification kEffectClassifiedNames[] = {
     {"httptryawait", FX_NET}, {"httpcancel", FX_NET},
     {"httpgetasyncprogress", FX_NET}, {"httpgetasynctotal", FX_NET},
     {"httpawait", FX_NET}, {"httplasterror", FX_NET},
+    /* raw sockets: core dispatch-table builtins, so this row is their only
+     * classification. Missing, they were FX_PURE: callable from Aether
+     * @pure and outside fx, and not stopped by --deny net. */
+    {"socketcreate", FX_NET}, {"socketbind", FX_NET},
+    {"socketbindaddr", FX_NET}, {"socketlisten", FX_NET},
+    {"socketaccept", FX_NET}, {"socketconnect", FX_NET},
+    {"socketsend", FX_NET}, {"socketreceive", FX_NET},
+    {"socketpoll", FX_NET}, {"socketclose", FX_NET},
+    {"socketsetblocking", FX_NET}, {"socketpeeraddr", FX_NET},
+    {"socketlasterror", FX_NET},
     /* database (sqlite) */
     {"sqliteopen", FX_IO}, {"sqliteclose", FX_IO}, {"sqliteexec", FX_IO},
     {"sqliteprepare", FX_IO}, {"sqlitefinalize", FX_IO}, {"sqlitestep", FX_IO},

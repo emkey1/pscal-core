@@ -7324,6 +7324,14 @@ static InterpretResult vmApplyFxPolicy(VM* vm, int effective_id, const char* eff
         return INTERPRET_RUNTIME_ERROR;
     }
 
+    /* Denied above if the sandbox says so; otherwise a journal-exempt
+     * builtin runs live and is not recorded (FX_PURE stops the caller's
+     * pscalFxRecordCall). */
+    if (pscalFxBuiltinIsJournalExempt(getVmBuiltinNameById(effective_id))) {
+        *out_mask = FX_PURE;
+        return INTERPRET_OK;
+    }
+
     if (pscalFxReplayActive()) {
         char mismatch[256];
         PscalFxReplayOutcome outcome = pscalFxReplayCall(vm, effective_name ? effective_name : "?", arg_count, args,
