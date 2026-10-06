@@ -2327,6 +2327,13 @@ static const EffectClassification kEffectClassifiedNames[] = {
     {"thread_get_result", FX_PROC}, {"thread_get_status", FX_PROC},
     {"thread_lookup", FX_PROC}, {"thread_stats", FX_PROC},
     {"threadspawnbuiltin", FX_PROC}, {"waitforthread", FX_PROC},
+    /* the raw spellings of the thread_* rows above; only the aliases were
+     * classified, so threadpoolsubmit passed --deny proc as FX_PURE */
+    {"threadpoolsubmit", FX_PROC}, {"threadgetresult", FX_PROC},
+    {"threadgetstatus", FX_PROC}, {"threadcancel", FX_PROC},
+    {"threadlookup", FX_PROC}, {"threadpause", FX_PROC},
+    {"threadresume", FX_PROC}, {"threadsetname", FX_PROC},
+    {"threadstats", FX_PROC}, {"threadstatsjson", FX_PROC},
     /* VM 2.0 Phase 5a checkpoint 5a-i: the new TYPE_TASK builtins -- distinct
      * from the task_* Aether-alias names above, which are Aether's existing
      * frontend sugar over ThreadSpawnBuiltin/ThreadPoolSubmit, not this. */
@@ -10426,6 +10433,18 @@ static Value threadSpawnOrSubmitCommon(VM* vm, int arg_count, Value* args, bool 
             }
             return makeInt(-1);
         }
+
+    /* vmApplyFxPolicy gates a builtin at the CALL_BUILTIN dispatch, but a
+     * spawned or pooled builtin job runs its handler directly on the worker,
+     * so check the target here: --deny net must stop a dnslookup or
+     * httprequest handed to a thread as surely as a direct call. */
+    EffectMask target_mask = getVmBuiltinEffectMaskById(builtin_id);
+    EffectMask denied_mask = pscalFxEffectiveDeniedMask();
+    if (target_mask & denied_mask) {
+        runtimeError(vm, "VM Error: builtin '%s' denied by --deny/PSCAL_VM_DENY policy (effect mask 0x%x intersects denied 0x%x).",
+                     builtin_name, (unsigned)target_mask, (unsigned)denied_mask);
+        return makeInt(-1);
+    }
 
     int options_index = -1;
     ThreadRequestOptions options;
