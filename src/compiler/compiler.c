@@ -9644,10 +9644,13 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                 } else if (node->parent && node->parent->type == AST_ASSIGN && node->parent->left) {
                     AST *lhs = node->parent->left;
                     AST *lhsType = lhs->type_def;
-                    if ((lhsType && (lhsType->type == AST_PROC_PTR_TYPE ||
-                                     (lhsType->type == AST_TYPE_REFERENCE && lhsType->right &&
-                                      lhsType->right->type == AST_PROC_PTR_TYPE))) ||
-                        lhs->var_type == TYPE_POINTER) {
+                    // Only a procedure-pointer lvalue makes a bare zero-argument
+                    // name a routine reference. Any TYPE_POINTER lvalue used to
+                    // count, and record-typed lvalues are TYPE_POINTER, so
+                    // `r = mk();` stored mk's address instead of calling it.
+                    if (lhsType && (lhsType->type == AST_PROC_PTR_TYPE ||
+                                    (lhsType->type == AST_TYPE_REFERENCE && lhsType->right &&
+                                     lhsType->right->type == AST_PROC_PTR_TYPE))) {
                         treat_as_literal = true;
                     }
                 }
@@ -11609,10 +11612,13 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                 } else if (node->parent && node->parent->type == AST_ASSIGN && node->parent->left) {
                     AST *lhs = node->parent->left;
                     AST *lhsType = lhs->type_def;
-                    if ((lhsType && (lhsType->type == AST_PROC_PTR_TYPE ||
-                                     (lhsType->type == AST_TYPE_REFERENCE && lhsType->right &&
-                                      lhsType->right->type == AST_PROC_PTR_TYPE))) ||
-                        lhs->var_type == TYPE_POINTER) {
+                    // Only a procedure-pointer lvalue makes a bare zero-argument
+                    // name a routine reference. Any TYPE_POINTER lvalue used to
+                    // count, and record-typed lvalues are TYPE_POINTER, so
+                    // `r = mk();` stored mk's address instead of calling it.
+                    if (lhsType && (lhsType->type == AST_PROC_PTR_TYPE ||
+                                    (lhsType->type == AST_TYPE_REFERENCE && lhsType->right &&
+                                     lhsType->right->type == AST_PROC_PTR_TYPE))) {
                         treat_as_literal = true;
                     }
                 }
