@@ -4665,7 +4665,10 @@ static int vmQueryColor(const char *query, char *dest, size_t dest_size) {
     size_t i = 0;
     char ch;
 
-    if (!pscalRuntimeStdinIsInteractive())
+    // The query goes out on stdout and the reply comes back on stdin, so both
+    // must be the terminal; with stdout redirected the query would only land
+    // in the output.
+    if (!pscalRuntimeStdinIsInteractive() || !pscalRuntimeStdoutIsInteractive())
         return -1;
 
     if (vmTcgetattr(STDIN_FILENO, &oldt) < 0)
@@ -5245,9 +5248,16 @@ static void vmPrepareCanonicalInput(void) {
     }
     pthread_mutex_unlock(&vm_term_mutex);
     tcflush(STDIN_FILENO, TCIFLUSH);
-    const char show_cursor[] = "\x1B[?25h";
-    if (write(STDOUT_FILENO, show_cursor, sizeof(show_cursor) - 1) != (ssize_t)(sizeof(show_cursor) - 1)) {
-        perror("vmPrepareCanonicalInput: write show_cursor");
+    // The cursor escape is for a terminal. Written into a pipe or a file it
+    // becomes stray bytes in the program's output (every stdin readln added
+    // ESC[?25h ahead of the next line), so it goes out only when stdout is
+    // interactive -- the same gate vmAtExitCleanup uses, which also covers
+    // the iOS session stdio where fd 1 is not a plain tty.
+    if (pscalRuntimeStdoutIsInteractive()) {
+        const char show_cursor[] = "\x1B[?25h";
+        if (write(STDOUT_FILENO, show_cursor, sizeof(show_cursor) - 1) != (ssize_t)(sizeof(show_cursor) - 1)) {
+            perror("vmPrepareCanonicalInput: write show_cursor");
+        }
     }
     fflush(stdout);
 }
