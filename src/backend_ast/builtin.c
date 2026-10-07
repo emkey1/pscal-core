@@ -8813,6 +8813,19 @@ static void vmTraceDescribeValue(const Value *val) {
     }
 }
 
+// One write/writeln call is one locked stdio transaction, so concurrent
+// threads (Aether `par` branches, Rea/Pascal threads) never interleave inside
+// a line. The stdio locks are recursive, so the fputs/fwrite/fprintf calls
+// made while the lock is held still take it themselves without deadlocking.
+// On POSIX the unlock is also a cancellation cleanup handler: a worker
+// thread cancelled inside the write (iOS in-process background jobs are
+// stopped with pthread_cancel) must not leave the stream locked for good.
+#if !defined(_WIN32) || defined(__CYGWIN__)
+static void vmWriteUnlockStream(void *stream) {
+    funlockfile((FILE *)stream);
+}
+#endif
+
 Value vmBuiltinWrite(VM* vm, int arg_count, Value* args) {
     if (arg_count < 1) {
         runtimeError(vm, "Write expects at least a newline flag.");
@@ -8886,6 +8899,14 @@ Value vmBuiltinWrite(VM* vm, int arg_count, Value* args) {
     if (trace_stdout) {
         fprintf(stderr, "[TRACE stdout] write call: newline=%d args=%d\n", newline ? 1 : 0, print_arg_count);
     }
+    // Held from the colour prefix through the newline, the colour reset and
+    // the file flush: every byte this call writes lands as one unit.
+#if defined(_WIN32) && !defined(__CYGWIN__)
+    _lock_file(output_stream);
+#else
+    flockfile(output_stream);
+    pthread_cleanup_push(vmWriteUnlockStream, output_stream);
+#endif
     bool color_was_applied = false;
     if (output_stream == stdout) {
         color_was_applied = applyCurrentTextAttributes(output_stream);
@@ -8981,6 +9002,11 @@ Value vmBuiltinWrite(VM* vm, int arg_count, Value* args) {
     if (output_stream != stdout) {
         fflush(output_stream);
     }
+#if defined(_WIN32) && !defined(__CYGWIN__)
+    _unlock_file(output_stream);
+#else
+    pthread_cleanup_pop(1);
+#endif
     if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[1], TYPE_NIL); pscalValueSetHeapPtrBits(&args[1], NULL); }
 
     return makeVoid();
