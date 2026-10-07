@@ -9092,8 +9092,11 @@ comparison_error_label:
 
                 Value* array_val_ptr = NULL;
                 Value shared_snapshot = makeNil();
+                // Initialised lazily, only on the pointer-to-array-type path
+                // that actually uses it: an eager init callocs an ArrayObj on
+                // every element access and only that path ever frees it.
                 Value temp_wrapper;
-                vmInitArrayIndexWrapper(&temp_wrapper);
+                memset(&temp_wrapper, 0, sizeof(temp_wrapper));
                 bool using_wrapper = false;
                 bool using_snapshot = false;
 
@@ -9125,6 +9128,7 @@ comparison_error_label:
                             array_val_ptr = candidate;
                         }
                     } else if (PTR_BASE_TYPE_NODE(operand) && PTR_BASE_TYPE_NODE(operand)->type == AST_ARRAY_TYPE) {
+                        vmInitArrayIndexWrapper(&temp_wrapper);
                         AST* arrayType = PTR_BASE_TYPE_NODE(operand);
                         int dims = arrayType->child_count;
                         {
@@ -9132,7 +9136,7 @@ comparison_error_label:
                             // placeholder (VM 2.0 Phase 4i checkpoint 3b), but
                             // temp_wrapper already has a real ArrayObj* from
                             // vmInitArrayIndexWrapper's pscalArrayEnsureObj
-                            // call above -- capture it first and re-tag with
+                            // call just above -- capture it first and re-tag with
                             // the wrapper that's actually there, same
                             // "re-tag after retype" fix checkpoint 2 needed
                             // for TYPE_THREAD.
@@ -9378,8 +9382,11 @@ comparison_error_label:
 
                 Value* array_val_ptr = NULL;
                 Value shared_snapshot = makeNil();
+                // Initialised lazily, only on the pointer-to-array-type path
+                // that actually uses it: an eager init callocs an ArrayObj on
+                // every element access and only that path ever frees it.
                 Value temp_wrapper;
-                vmInitArrayIndexWrapper(&temp_wrapper);
+                memset(&temp_wrapper, 0, sizeof(temp_wrapper));
                 bool using_wrapper = false;
                 bool using_snapshot = false;
 
@@ -9397,6 +9404,7 @@ comparison_error_label:
                             array_val_ptr = candidate;
                         }
                     } else if (PTR_BASE_TYPE_NODE(operand) && PTR_BASE_TYPE_NODE(operand)->type == AST_ARRAY_TYPE) {
+                        vmInitArrayIndexWrapper(&temp_wrapper);
                         AST* arrayType = PTR_BASE_TYPE_NODE(operand);
                         int dims = arrayType->child_count;
                         {
@@ -9404,7 +9412,7 @@ comparison_error_label:
                             // placeholder (VM 2.0 Phase 4i checkpoint 3b), but
                             // temp_wrapper already has a real ArrayObj* from
                             // vmInitArrayIndexWrapper's pscalArrayEnsureObj
-                            // call above -- capture it first and re-tag with
+                            // call just above -- capture it first and re-tag with
                             // the wrapper that's actually there, same
                             // "re-tag after retype" fix checkpoint 2 needed
                             // for TYPE_THREAD.
@@ -9598,8 +9606,11 @@ comparison_error_label:
 
                 Value* array_val_ptr = NULL;
                 Value shared_snapshot = makeNil();
+                // Initialised lazily, only on the pointer-to-array-type path
+                // that actually uses it: an eager init callocs an ArrayObj on
+                // every element access and only that path ever frees it.
                 Value temp_wrapper;
-                vmInitArrayIndexWrapper(&temp_wrapper);
+                memset(&temp_wrapper, 0, sizeof(temp_wrapper));
                 bool using_wrapper = false;
                 bool using_snapshot = false;
 
@@ -9626,6 +9637,7 @@ comparison_error_label:
                             array_val_ptr = candidate;
                         }
                     } else if (PTR_BASE_TYPE_NODE(operand) && PTR_BASE_TYPE_NODE(operand)->type == AST_ARRAY_TYPE) {
+                        vmInitArrayIndexWrapper(&temp_wrapper);
                         AST* arrayType = PTR_BASE_TYPE_NODE(operand);
                         int dims = arrayType->child_count;
                         {
@@ -9633,7 +9645,7 @@ comparison_error_label:
                             // placeholder (VM 2.0 Phase 4i checkpoint 3b), but
                             // temp_wrapper already has a real ArrayObj* from
                             // vmInitArrayIndexWrapper's pscalArrayEnsureObj
-                            // call above -- capture it first and re-tag with
+                            // call just above -- capture it first and re-tag with
                             // the wrapper that's actually there, same
                             // "re-tag after retype" fix checkpoint 2 needed
                             // for TYPE_THREAD.
@@ -9813,8 +9825,11 @@ comparison_error_label:
 
                 Value* array_val_ptr = NULL;
                 Value shared_snapshot = makeNil();
+                // Initialised lazily, only on the pointer-to-array-type path
+                // that actually uses it: an eager init callocs an ArrayObj on
+                // every element access and only that path ever frees it.
                 Value temp_wrapper;
-                vmInitArrayIndexWrapper(&temp_wrapper);
+                memset(&temp_wrapper, 0, sizeof(temp_wrapper));
                 bool using_wrapper = false;
                 bool using_snapshot = false;
 
@@ -9841,6 +9856,7 @@ comparison_error_label:
                             array_val_ptr = candidate;
                         }
                     } else if (PTR_BASE_TYPE_NODE(operand) && PTR_BASE_TYPE_NODE(operand)->type == AST_ARRAY_TYPE) {
+                        vmInitArrayIndexWrapper(&temp_wrapper);
                         AST* arrayType = PTR_BASE_TYPE_NODE(operand);
                         int dims = arrayType->child_count;
                         {
@@ -9848,7 +9864,7 @@ comparison_error_label:
                             // placeholder (VM 2.0 Phase 4i checkpoint 3b), but
                             // temp_wrapper already has a real ArrayObj* from
                             // vmInitArrayIndexWrapper's pscalArrayEnsureObj
-                            // call above -- capture it first and re-tag with
+                            // call just above -- capture it first and re-tag with
                             // the wrapper that's actually there, same
                             // "re-tag after retype" fix checkpoint 2 needed
                             // for TYPE_THREAD.
