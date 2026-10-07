@@ -7535,7 +7535,7 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
                      freeValue(&a_val_popped); freeValue(&b_val_popped); \
                      return INTERPRET_RUNTIME_ERROR; \
                  } \
-                 result_val = makeInt(iresult); \
+                 result_val = pscalIntResultNarrow(iresult); \
                  op_is_handled = true; \
             } else { \
                 /* Optimization: Resolve pointers without deep copying for string/char operands */ \
@@ -8217,7 +8217,7 @@ dispatch_switch:
                     }
                     if (ia == INT32_MIN && ib == -1) {
                         // Prevent x86 hardware trap and preserve 64-bit promotion semantics
-                        push(vm, makeInt(2147483648LL));
+                        push(vm, makeInt64(2147483648LL));
                     } else {
                         push(vm, makeInt((long long)(ia / ib)));
                     }

@@ -341,15 +341,27 @@ Value makeUInt64(unsigned long long val);
 // tags TYPE_INT32, whose tagged immediate is a real 32-bit budget (VM 2.0
 // Phase 4i checkpoint 3d made this authoritative), so blindly using it
 // would silently truncate int64/uint64 arithmetic.
+//
+// A result of narrower operands that does not fit INT32 widens to INT64
+// rather than wrapping: the 64-bit result was already overflow-checked by
+// the caller, and re-tagging it INT32 would silently drop the high bits
+// (fact(20) printed -2102132736). A store into a narrower variable still
+// converts at the store, so only unstored intermediates change. makeInt()
+// itself stays non-widening: its many callers assume the result owns no
+// heap box, and an INT64 does.
+static inline Value pscalIntResultNarrow(long long result) {
+    if (result < INT32_MIN || result > INT32_MAX) return makeInt64(result);
+    return makeInt(result);
+}
 static inline Value pscalIntResultLike1(Value a, long long result) {
     if (VALUE_TYPE(a) == TYPE_UINT64) return makeUInt64((unsigned long long)result);
     if (VALUE_TYPE(a) == TYPE_INT64) return makeInt64(result);
-    return makeInt(result);
+    return pscalIntResultNarrow(result);
 }
 static inline Value pscalIntResultLike2(Value a, Value b, long long result) {
     if (VALUE_TYPE(a) == TYPE_UINT64 || VALUE_TYPE(b) == TYPE_UINT64) return makeUInt64((unsigned long long)result);
     if (VALUE_TYPE(a) == TYPE_INT64 || VALUE_TYPE(b) == TYPE_INT64) return makeInt64(result);
-    return makeInt(result);
+    return pscalIntResultNarrow(result);
 }
 
 Value makeByte(unsigned char val);
