@@ -17,6 +17,10 @@ void registerYyjsonGetNumberBuiltin(void);
 void registerYyjsonGetIntBuiltin(void);
 void registerYyjsonGetBoolBuiltin(void);
 void registerYyjsonIsNullBuiltin(void);
+void registerYyjsonGetStringOrBuiltin(void);
+void registerYyjsonGetIntOrBuiltin(void);
+void registerYyjsonGetNumberOrBuiltin(void);
+void registerYyjsonGetBoolOrBuiltin(void);
 
 void registerYyjsonBuiltins(void) {
     const char *category = "yyjson";
@@ -40,6 +44,10 @@ void registerYyjsonBuiltins(void) {
     extBuiltinRegisterFunction(category, "primitives", "YyjsonGetInt");
     extBuiltinRegisterFunction(category, "primitives", "YyjsonGetBool");
     extBuiltinRegisterFunction(category, "primitives", "YyjsonIsNull");
+    extBuiltinRegisterFunction(category, "primitives", "YyjsonGetStringOr");
+    extBuiltinRegisterFunction(category, "primitives", "YyjsonGetIntOr");
+    extBuiltinRegisterFunction(category, "primitives", "YyjsonGetNumberOr");
+    extBuiltinRegisterFunction(category, "primitives", "YyjsonGetBoolOr");
 
     registerYyjsonReadBuiltin();
     registerYyjsonReadFileBuiltin();
@@ -57,4 +65,8 @@ void registerYyjsonBuiltins(void) {
     registerYyjsonGetIntBuiltin();
     registerYyjsonGetBoolBuiltin();
     registerYyjsonIsNullBuiltin();
+    registerYyjsonGetStringOrBuiltin();
+    registerYyjsonGetIntOrBuiltin();
+    registerYyjsonGetNumberOrBuiltin();
+    registerYyjsonGetBoolOrBuiltin();
 }

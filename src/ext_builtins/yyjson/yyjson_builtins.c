@@ -413,6 +413,31 @@ cleanup:
     return result;
 }
 
+/* Resolve `key` under `val`. A dotted key ("meta.code") walks nested objects.
+ * A missing key, an empty key, or a non-object anywhere along the path yields
+ * NULL. */
+static yyjson_val *jsonResolveKeyPath(yyjson_val *val, const char *key) {
+    yyjson_val *child = val;
+    if (!key) {
+        key = "";
+    }
+    if (strchr(key, '.') != NULL) {
+        char *path = strdup(key);
+        if (path == NULL) {
+            return NULL;
+        }
+        char *save = NULL;
+        char *seg = strtok_r(path, ".", &save);
+        while (seg != NULL) {
+            child = (child != NULL && yyjson_is_obj(child)) ? yyjson_obj_get(child, seg) : NULL;
+            seg = strtok_r(NULL, ".", &save);
+        }
+        free(path);
+        return child;
+    }
+    return yyjson_is_obj(val) ? yyjson_obj_get(val, key) : NULL;
+}
+
 static Value vmBuiltinYyjsonGetKey(struct VM_s *vm, int arg_count, Value *args) {
     if (arg_count != 2 || !IS_INTLIKE(args[0]) || !isPascalStringType(VALUE_TYPE(args[1]))) {
         runtimeError(vm, "[AETH-RUNTIME-TOON-KEY-ARGS] toon_key expects (node: ToonNode, key: Text). hint: pass a node from toon_root/toon_at/toon_key, not a ToonDoc -- use toon_root(doc) first.");
@@ -431,23 +456,7 @@ static Value vmBuiltinYyjsonGetKey(struct VM_s *vm, int arg_count, Value *args) 
      * key, or a non-object anywhere along the path yields an absent (invalid)
      * handle that downstream accessors degrade on -- so deep reads need no
      * manual per-level staging, and toon_get_text_or(n, "a.b", d) just works. */
-    yyjson_val *child = val;
-    if (strchr(key, '.') != NULL) {
-        char *path = strdup(key);
-        if (path != NULL) {
-            char *save = NULL;
-            char *seg = strtok_r(path, ".", &save);
-            while (seg != NULL) {
-                child = (child != NULL && yyjson_is_obj(child)) ? yyjson_obj_get(child, seg) : NULL;
-                seg = strtok_r(NULL, ".", &save);
-            }
-            free(path);
-        } else {
-            child = NULL;
-        }
-    } else {
-        child = yyjson_is_obj(val) ? yyjson_obj_get(val, key) : NULL;
-    }
+    yyjson_val *child = jsonResolveKeyPath(val, key);
     if (child == NULL) {
         goto cleanup;
     }
@@ -533,24 +542,7 @@ static Value vmBuiltinYyjsonHasKey(struct VM_s *vm, int arg_count, Value *args) 
 
     Value result = makeInt(0);
     {
-        const char *key = AS_STRING(args[1]) ? AS_STRING(args[1]) : "";
-        yyjson_val *child = val;
-        if (strchr(key, '.') != NULL) {
-            char *path = strdup(key);
-            if (path != NULL) {
-                char *save = NULL;
-                char *seg = strtok_r(path, ".", &save);
-                while (seg != NULL) {
-                    child = (child != NULL && yyjson_is_obj(child)) ? yyjson_obj_get(child, seg) : NULL;
-                    seg = strtok_r(NULL, ".", &save);
-                }
-                free(path);
-            } else {
-                child = NULL;
-            }
-        } else {
-            child = yyjson_is_obj(val) ? yyjson_obj_get(val, key) : NULL;
-        }
+        yyjson_val *child = jsonResolveKeyPath(val, AS_STRING(args[1]));
         result = makeInt(child ? 1 : 0);
     }
 
@@ -609,7 +601,9 @@ static Value vmBuiltinYyjsonGetLength(struct VM_s *vm, int arg_count, Value *arg
     yyjson_doc *doc = NULL;
     yyjson_val *val = NULL;
     if (!jsonAcquireValue(handle, &doc, &val, NULL)) {
-        return makeInt(-1);
+        /* An absent node (a missing key, a dotted miss, toon_at past the end)
+           is an empty collection, like null: toon_len 0, never -1. */
+        return makeInt(0);
     }
 
     Value result = makeInt(-1);
@@ -780,6 +774,91 @@ static Value vmBuiltinYyjsonIsNull(struct VM_s *vm, int arg_count, Value *args) 
     return result;
 }
 
+typedef enum {
+    JSON_GET_OR_TEXT,
+    JSON_GET_OR_INT,
+    JSON_GET_OR_REAL,
+    JSON_GET_OR_BOOL
+} JsonGetOrKind;
+
+/* The fallback, converted to the getter's result type. */
+static Value jsonGetOrFallback(JsonGetOrKind kind, Value fallback) {
+    switch (kind) {
+        case JSON_GET_OR_TEXT:
+            if (IS_CHAR(fallback)) {
+                char ch = (char)AS_CHAR(fallback);
+                return makeStringLen(&ch, 1);
+            }
+            if (isPascalStringType(VALUE_TYPE(fallback))) {
+                return makeString(AS_STRING(fallback) ? AS_STRING(fallback) : "");
+            }
+            return makeString("");
+        case JSON_GET_OR_INT:
+            return makeInt64(IS_NUMERIC(fallback) ? (long long)AS_INTEGER(fallback) : 0);
+        case JSON_GET_OR_REAL:
+            if (IS_REAL(fallback)) {
+                return makeDouble((double)AS_REAL(fallback));
+            }
+            return makeDouble(IS_INTLIKE(fallback) ? (double)AS_INTEGER(fallback) : 0.0);
+        case JSON_GET_OR_BOOL:
+            return makeBoolean(IS_INTLIKE(fallback) && AS_INTEGER(fallback) != 0);
+    }
+    return makeInt(0);
+}
+
+/* toon_get_<type>_or(node, key, fallback): the keyed child's value when it has
+ * the getter's type, else the fallback -- for a missing key, a JSON null and a
+ * wrong-typed value alike. An Int child satisfies the Real getter. The child is
+ * resolved in place, so no value handle is allocated. */
+static Value jsonGetOrCommon(struct VM_s *vm, int arg_count, Value *args,
+                             JsonGetOrKind kind, const char *name) {
+    if (arg_count != 3 || !IS_INTLIKE(args[0]) || !isPascalStringType(VALUE_TYPE(args[1]))) {
+        runtimeError(vm, "%s expects (node: ToonNode, key: Text, fallback).", name);
+        return arg_count >= 3 ? jsonGetOrFallback(kind, args[2]) : jsonGetOrFallback(kind, makeInt(0));
+    }
+    int handle = (int)AS_INTEGER(args[0]);
+    yyjson_doc *doc = NULL;
+    yyjson_val *val = NULL;
+    if (!jsonAcquireValue(handle, &doc, &val, NULL)) {
+        return jsonGetOrFallback(kind, args[2]);
+    }
+
+    yyjson_val *child = jsonResolveKeyPath(val, AS_STRING(args[1]));
+    Value result;
+    if (child && kind == JSON_GET_OR_TEXT && yyjson_is_str(child)) {
+        const char *str = yyjson_get_str(child);
+        result = makeString(str ? str : "");
+    } else if (child && kind == JSON_GET_OR_INT && yyjson_is_int(child)) {
+        result = makeInt64(yyjson_get_sint(child));
+    } else if (child && kind == JSON_GET_OR_REAL && yyjson_is_real(child)) {
+        result = makeDouble(yyjson_get_real(child));
+    } else if (child && kind == JSON_GET_OR_REAL && yyjson_is_int(child)) {
+        result = makeDouble((double)yyjson_get_sint(child));
+    } else if (child && kind == JSON_GET_OR_BOOL && yyjson_is_bool(child)) {
+        result = makeBoolean(yyjson_get_bool(child) ? 1 : 0);
+    } else {
+        result = jsonGetOrFallback(kind, args[2]);
+    }
+    jsonReleaseValue(handle);
+    return result;
+}
+
+static Value vmBuiltinYyjsonGetStringOr(struct VM_s *vm, int arg_count, Value *args) {
+    return jsonGetOrCommon(vm, arg_count, args, JSON_GET_OR_TEXT, "toon_get_text_or");
+}
+
+static Value vmBuiltinYyjsonGetIntOr(struct VM_s *vm, int arg_count, Value *args) {
+    return jsonGetOrCommon(vm, arg_count, args, JSON_GET_OR_INT, "toon_get_int_or");
+}
+
+static Value vmBuiltinYyjsonGetNumberOr(struct VM_s *vm, int arg_count, Value *args) {
+    return jsonGetOrCommon(vm, arg_count, args, JSON_GET_OR_REAL, "toon_get_real_or");
+}
+
+static Value vmBuiltinYyjsonGetBoolOr(struct VM_s *vm, int arg_count, Value *args) {
+    return jsonGetOrCommon(vm, arg_count, args, JSON_GET_OR_BOOL, "toon_get_bool_or");
+}
+
 void registerYyjsonReadBuiltin(void) {
     registerVmBuiltin("yyjsonread", vmBuiltinYyjsonRead, BUILTIN_TYPE_FUNCTION, "YyjsonRead", FX_PURE);
 }
@@ -842,4 +921,20 @@ void registerYyjsonGetBoolBuiltin(void) {
 
 void registerYyjsonIsNullBuiltin(void) {
     registerVmBuiltin("yyjsonisnull", vmBuiltinYyjsonIsNull, BUILTIN_TYPE_FUNCTION, "YyjsonIsNull", FX_PURE);
+}
+
+void registerYyjsonGetStringOrBuiltin(void) {
+    registerVmBuiltin("yyjsongetstringor", vmBuiltinYyjsonGetStringOr, BUILTIN_TYPE_FUNCTION, "YyjsonGetStringOr", FX_PURE);
+}
+
+void registerYyjsonGetIntOrBuiltin(void) {
+    registerVmBuiltin("yyjsongetintor", vmBuiltinYyjsonGetIntOr, BUILTIN_TYPE_FUNCTION, "YyjsonGetIntOr", FX_PURE);
+}
+
+void registerYyjsonGetNumberOrBuiltin(void) {
+    registerVmBuiltin("yyjsongetnumberor", vmBuiltinYyjsonGetNumberOr, BUILTIN_TYPE_FUNCTION, "YyjsonGetNumberOr", FX_PURE);
+}
+
+void registerYyjsonGetBoolOrBuiltin(void) {
+    registerVmBuiltin("yyjsongetboolor", vmBuiltinYyjsonGetBoolOr, BUILTIN_TYPE_FUNCTION, "YyjsonGetBoolOr", FX_PURE);
 }
