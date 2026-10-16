@@ -9098,7 +9098,87 @@ Value vmBuiltinGetenvint(VM* vm, int arg_count, Value* args) {
     return pscalIntResultLike1(args[1], parsed);
 }
 
-// Parse string to numeric value similar to Turbo Pascal's Val procedure
+/* Val's scanners return Pascal's Code: 0 on success, otherwise the 1-based
+ * position of the first character that cannot belong to the number (one past
+ * the end when the text stops early, so "" is an error at 1 and "-" at 2).
+ * Leading blanks and tabs are skipped; anything after the number, trailing
+ * blanks included, is an error. The syntax is checked here rather than read
+ * off strtoll/strtod's errno and endptr: those differ between libcs (glibc
+ * reports "" as a successful 0 where Apple's strtoll sets EINVAL), and Val's
+ * result must not depend on the platform. */
+static size_t valSkipBlanks(const char* s) {
+    size_t i = 0;
+    while (s[i] == ' ' || s[i] == '\t') i++;
+    return i;
+}
+
+static long long valScanInt(const char* s, long long* out) {
+    size_t i = valSkipBlanks(s);
+    bool negative = false;
+    if (s[i] == '+' || s[i] == '-') {
+        negative = (s[i] == '-');
+        i++;
+    }
+    if (!isdigit((unsigned char)s[i])) return (long long)i + 1;
+    unsigned long long limit = negative ? (unsigned long long)LLONG_MAX + 1ULL
+                                        : (unsigned long long)LLONG_MAX;
+    unsigned long long magnitude = 0;
+    for (; isdigit((unsigned char)s[i]); i++) {
+        unsigned long long digit = (unsigned long long)(s[i] - '0');
+        // Overflow: the digit that takes the value out of range is the bad one.
+        if (magnitude > (limit - digit) / 10) return (long long)i + 1;
+        magnitude = magnitude * 10 + digit;
+    }
+    if (s[i] != '\0') return (long long)i + 1;
+    if (!negative) *out = (long long)magnitude;
+    else if (magnitude == (unsigned long long)LLONG_MAX + 1ULL) *out = LLONG_MIN;
+    else *out = -(long long)magnitude;
+    return 0;
+}
+
+static long long valScanReal(const char* s, double* out) {
+    size_t start = valSkipBlanks(s);
+    size_t i = start;
+    bool negative = false;
+    if (s[i] == '+' || s[i] == '-') {
+        negative = (s[i] == '-');
+        i++;
+    }
+    // inf, infinity and nan, which Val has always accepted through strtod.
+    static const char* const words[] = {"infinity", "inf", "nan"};
+    for (size_t w = 0; w < sizeof(words) / sizeof(words[0]); w++) {
+        size_t len = strlen(words[w]);
+        if (strncasecmp(s + i, words[w], len) == 0 && s[i + len] == '\0') {
+            double r = (words[w][0] == 'n' || words[w][0] == 'N') ? (double)NAN : (double)INFINITY;
+            *out = negative ? -r : r;
+            return 0;
+        }
+    }
+    size_t digits = 0;
+    while (isdigit((unsigned char)s[i])) { i++; digits++; }
+    if (s[i] == '.') {
+        i++;
+        while (isdigit((unsigned char)s[i])) { i++; digits++; }
+    }
+    if (digits == 0) return (long long)i + 1;
+    if (s[i] == 'e' || s[i] == 'E') {
+        i++;
+        if (s[i] == '+' || s[i] == '-') i++;
+        if (!isdigit((unsigned char)s[i])) return (long long)i + 1;
+        while (isdigit((unsigned char)s[i])) i++;
+    }
+    if (s[i] != '\0') return (long long)i + 1;
+    // The text is a well-formed decimal, so strtod reads all of it. Underflow
+    // (ERANGE with a tiny or zero result) is a value, not an error; a result
+    // too large for a double has no bad character, so it reports one past the end.
+    double r = strtod(s + start, NULL);
+    if (isinf(r)) return (long long)i + 1;
+    *out = r;
+    return 0;
+}
+
+// Parse string to numeric value with Turbo/Free Pascal Val semantics: on
+// error the destination is left unchanged and Code is the bad position.
 Value vmBuiltinVal(VM* vm, int arg_count, Value* args) {
     if (arg_count != 3) {
         runtimeError(vm, "Val expects 3 arguments.");
@@ -9108,34 +9188,38 @@ Value vmBuiltinVal(VM* vm, int arg_count, Value* args) {
     Value src = args[0];
     Value dstPtr = args[1];
     Value codePtr = args[2];
-    if (!isPascalStringType(VALUE_TYPE(src)) || VALUE_TYPE(dstPtr) != TYPE_POINTER || VALUE_TYPE(codePtr) != TYPE_POINTER) {
+    bool srcIsChar = VALUE_TYPE(src) == TYPE_CHAR;
+    if ((!isPascalStringType(VALUE_TYPE(src)) && !srcIsChar) ||
+        VALUE_TYPE(dstPtr) != TYPE_POINTER || VALUE_TYPE(codePtr) != TYPE_POINTER) {
         runtimeError(vm, "Val expects (string, var numeric, var integer).");
         return makeVoid();
     }
 
     Value* dst = (Value*)AS_POINTER(dstPtr);
     Value* code = (Value*)AS_POINTER(codePtr);
-    const char* s = AS_STRING(src) ? AS_STRING(src) : "";
-
-    char* endptr = NULL;
-    errno = 0;
-    if (VALUE_TYPE(*dst) == TYPE_REAL || VALUE_TYPE(*dst) == TYPE_FLOAT) {
-        double r = strtod(s, &endptr);
-        if (errno != 0 || (endptr && *endptr != '\0')) {
-            *code = makeInt((int)((endptr ? endptr : s) - s) + 1);
-        } else {
-            SET_REAL_VALUE(dst, r);
-            *code = makeInt(0);
-        }
+    // A Char is a one-character string (Pascal passes Val('-', ...) a Char
+    // literal); a character outside ASCII is never part of a number.
+    char charText[2] = {0, 0};
+    const char* s;
+    if (srcIsChar) {
+        int ch = AS_CHAR(src);
+        charText[0] = (ch > 0 && ch < 128) ? (char)ch : '?';
+        s = charText;
     } else {
-        long long n = strtoll(s, &endptr, 10);
-        if (errno != 0 || (endptr && *endptr != '\0')) {
-            *code = makeInt((int)((endptr ? endptr : s) - s) + 1);
-        } else {
-            SET_INT_VALUE(dst, n);
-            *code = makeInt(0);
-        }
+        s = AS_STRING(src) ? AS_STRING(src) : "";
     }
+
+    long long status;
+    if (VALUE_TYPE(*dst) == TYPE_REAL || VALUE_TYPE(*dst) == TYPE_FLOAT) {
+        double r = 0.0;
+        status = valScanReal(s, &r);
+        if (status == 0) SET_REAL_VALUE(dst, r);
+    } else {
+        long long n = 0;
+        status = valScanInt(s, &n);
+        if (status == 0) SET_INT_VALUE(dst, n);
+    }
+    *code = makeInt(status);
     return makeVoid();
 }
 
