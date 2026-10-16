@@ -9942,7 +9942,14 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                 break;
             }
 
-            bool is_read_proc = (strcasecmp(calleeName, "read") == 0 || strcasecmp(calleeName, "readln") == 0);
+            // A user routine that shares a builtin's name (an Aether `fn rename(xs:
+            // Int[])`, a Pascal `procedure Swap`) keeps its own parameter modes:
+            // the by-name VAR-parameter table below describes the builtins only.
+            // Applying it to the user routine passed `rename(a)`'s array by
+            // address, and the callee then failed with "SetLength expects a
+            // string or dynamic array target".
+            bool is_read_proc = !proc_symbol &&
+                                (strcasecmp(calleeName, "read") == 0 || strcasecmp(calleeName, "readln") == 0);
             bool host_thread_helper = (strcasecmp(calleeName, "createthread") == 0 ||
                                        strcasecmp(calleeName, "waitforthread") == 0);
             bool callee_is_builtin = isBuiltin(calleeName) && !proc_symbol && !host_thread_helper;
@@ -10439,7 +10446,7 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                     if (is_read_proc && (param_index > 0 || (param_index == 0 && arg_node->var_type != TYPE_FILE))) {
                         is_var_param = true;
                     }
-                    else if (calleeName && (
+                    else if (calleeName && !proc_symbol && (
                         (param_index == 0 && (strcasecmp(calleeName, "new") == 0 || strcasecmp(calleeName, "dispose") == 0 || strcasecmp(calleeName, "assign") == 0 || strcasecmp(calleeName, "reset") == 0 || strcasecmp(calleeName, "rewrite") == 0 || strcasecmp(calleeName, "append") == 0 || strcasecmp(calleeName, "close") == 0 || strcasecmp(calleeName, "rename") == 0 || strcasecmp(calleeName, "erase") == 0 || strcasecmp(calleeName, "inc") == 0 || strcasecmp(calleeName, "dec") == 0 || strcasecmp(calleeName, "setlength") == 0 || strcasecmp(calleeName, "mstreamloadfromfile") == 0 || strcasecmp(calleeName, "mstreamsavetofile") == 0 || strcasecmp(calleeName, "mstreamfree") == 0 || strcasecmp(calleeName, "eof") == 0 || strcasecmp(calleeName, "readkey") == 0)) ||
                         ((strcasecmp(calleeName, "blockread") == 0 || strcasecmp(calleeName, "blockwrite") == 0) && (param_index == 0 || param_index == 1 || param_index == 3)) ||
                         (strcasecmp(calleeName, "readln") == 0 && (param_index > 0 || (param_index == 0 && arg_node->var_type != TYPE_FILE))) ||
