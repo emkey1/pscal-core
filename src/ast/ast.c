@@ -1947,6 +1947,27 @@ VarType getBuiltinReturnType(const char* name) {
     if (strcasecmp(name, "httpgetlastheaders") == 0) return TYPE_STRING;
     if (strcasecmp(name, "httplasterror") == 0) return TYPE_STRING;
 
+    /* yyjson value getters. Without these a getter passed straight to a user
+     * procedure annotated as VOID and failed the exact argument check. The
+     * handle and integer getters stay unlisted: a VOID argument already
+     * matches an integer parameter. */
+    if (strcasecmp(name, "yyjsongetstring") == 0 ||
+        strcasecmp(name, "yyjsongetstringor") == 0 ||
+        strcasecmp(name, "yyjsongettype") == 0) {
+        return TYPE_STRING;
+    }
+    if (strcasecmp(name, "yyjsongetnumber") == 0 ||
+        strcasecmp(name, "yyjsongetnumberor") == 0) {
+        return TYPE_REAL;
+    }
+    if (strcasecmp(name, "yyjsongetbool") == 0 ||
+        strcasecmp(name, "yyjsongetboolor") == 0 ||
+        strcasecmp(name, "yyjsonhaskey") == 0 ||
+        strcasecmp(name, "yyjsonhasindex") == 0 ||
+        strcasecmp(name, "yyjsonisnull") == 0) {
+        return TYPE_BOOLEAN;
+    }
+
     /* ReadKey and UpCase return a single character */
     if (strcasecmp(name, "readkey") == 0 ||
         strcasecmp(name, "upcase")  == 0) {
