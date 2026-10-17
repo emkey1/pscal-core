@@ -111,7 +111,7 @@ static inline double pscalUnboxDouble(uint64_t bits) {
 // immediate, needs its own sub-kind+payload split" -- see plan §5.10.1
 // for the corrected encoding). This budget was revised from an initial
 // 46-bit design the moment the canary caught a real violation on first
-// deploy: Linux/ARM64 (the claw fleet's GB10 Sparks) returns heap and
+// deploy: Linux/ARM64 (the GPU hosts) returns heap and
 // stack addresses using close to the full 48-bit address space (observed:
 // a malloc'd pointer needing 48 bits, a stack address at 0xfffffc...,
 // both comfortably fitting 50 bits with margin to spare) -- 46 bits was
