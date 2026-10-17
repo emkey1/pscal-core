@@ -136,6 +136,24 @@ static void stdArraySet(Value *arr, int i, Value item) {
     a->elements[i] = item;
 }
 
+/* A value as Aether copies it: arrays are values, so a nested array's rows
+ * are copied too (a dynamic array would otherwise be shared); records are
+ * pointer-backed and stay shared, exactly as `let b = a;` leaves them. */
+static Value stdDeepCopy(const Value *v) {
+    if (v && VALUE_TYPE(*v) == TYPE_ARRAY) {
+        ArrayObj *a = PSCAL_VALUE_PTR(*v, ArrayObj);
+        if (a && a->is_dynamic && !a->is_packed && a->dimensions == 1 &&
+            a->lower_bounds && a->upper_bounds) {
+            int n = a->upper_bounds[0] - a->lower_bounds[0] + 1;
+            if (n < 0) n = 0;
+            Value out = stdNewArray(n, a->element_type, a->element_type_def);
+            for (int i = 0; i < n; i++) stdArraySet(&out, i, stdDeepCopy(&a->elements[i]));
+            return out;
+        }
+    }
+    return makeCopyOfValue(v);
+}
+
 static Value stdTextValue(const char *s) {
     return makeUnicodeString(s ? s : "");
 }
@@ -547,7 +565,7 @@ static Value vmBuiltinStdReversed(struct VM_s *vm, int arg_count, Value *args) {
         int n = 0;
         if (!stdArrayView(vm, "reversed", src, &elems, &n)) return stdNewArray(0, TYPE_INT64, NULL);
         Value out = stdCopyArrayShape(src, n);
-        for (int i = 0; i < n; i++) stdArraySet(&out, i, makeCopyOfValue(&elems[n - 1 - i]));
+        for (int i = 0; i < n; i++) stdArraySet(&out, i, stdDeepCopy(&elems[n - 1 - i]));
         return out;
     }
     char b0[5];
@@ -1271,6 +1289,61 @@ static Value vmBuiltinStdMStreamLoad(struct VM_s *vm, int arg_count, Value *args
     return makeMStream(ms);
 }
 
+/* ------------------------------------------------------------------ */
+/* [v; n]: n copies of v (Aether lowers the literal to this call)       */
+/* ------------------------------------------------------------------ */
+
+/* The element as an Aether value: an Int literal arrives 32-bit and a
+ * one-character Text literal as a Char, so normalise to 64-bit Int and
+ * Text; everything else is copied as Aether copies it. */
+static Value stdAetherElement(const Value *v) {
+    VarType t = VALUE_TYPE(*v);
+    if (isIntegerFamilyType(t)) return makeInt64(asI64(*v));
+    if (t == TYPE_CHAR || t == TYPE_WIDECHAR) {
+        char sb[5];
+        const char *s = stdText((Value *)v, sb);
+        return stdTextValue(s ? s : "");
+    }
+    return stdDeepCopy(v);
+}
+
+static Value vmBuiltinStdRepeatArray(struct VM_s *vm, int arg_count, Value *args) {
+    if (arg_count != 2) {
+        runtimeError(vm, "[v; n] expects a value and a count.");
+        return stdNewArray(0, TYPE_INT64, NULL);
+    }
+    Value *nv = stdArg(&args[1]);
+    if (!IS_INTLIKE(*nv) || isPascalCharType(VALUE_TYPE(*nv)) ||
+        VALUE_TYPE(*nv) == TYPE_BOOLEAN) {
+        runtimeError(vm, "[v; n]: the count n must be an Int.");
+        return stdNewArray(0, TYPE_INT64, NULL);
+    }
+    long long n = asI64(*nv);
+    if (n < 0) n = 0;
+    if (n > 2000000) {
+        runtimeError(vm, "[v; n]: %lld elements is more than an array may hold (2,000,000).", n);
+        return stdNewArray(0, TYPE_INT64, NULL);
+    }
+    Value *v = &args[0];
+    if (VALUE_TYPE(*v) == TYPE_POINTER && AS_POINTER(*v)) {
+        Value *pv = (Value *)AS_POINTER(*v);
+        if (VALUE_TYPE(*pv) == TYPE_ARRAY) v = pv;
+    }
+    if (stdRecordOf(v)) {
+        runtimeError(vm, "[v; n] would put the same record in every slot; build the records in a loop.");
+        return stdNewArray(0, TYPE_INT64, NULL);
+    }
+    Value first = stdAetherElement(v);
+    Value out = stdNewArray((int)n, VALUE_TYPE(first), NULL);
+    if (n == 0) {
+        freeValue(&first);
+        return out;
+    }
+    stdArraySet(&out, 0, first);
+    for (long long i = 1; i < n; i++) stdArraySet(&out, (int)i, stdAetherElement(v));
+    return out;
+}
+
 /* Registered under Aether-private engine names (`aether_upper`, ...): the
  * Aether front end aliases its surface names (`upper`, `count`, `sum`) to
  * them. Plain names would join every front end's namespace, and Pascal
@@ -1289,6 +1362,7 @@ void registerStdlibBuiltins(void) {
     registerVmBuiltin("aether_contains", vmBuiltinStdContains, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
     registerVmBuiltin("aether_index_of", vmBuiltinStdIndexOf, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
     registerVmBuiltin("aether_count", vmBuiltinStdCount, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("aether_repeat_array", vmBuiltinStdRepeatArray, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
     registerVmBuiltin("aether_reversed", vmBuiltinStdReversed, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
     /* Arrays */
     registerVmBuiltin("aether_sum", vmBuiltinStdSum, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
