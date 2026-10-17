@@ -1922,6 +1922,31 @@ VarType getBuiltinReturnType(const char* name) {
         return TYPE_STRING;
     }
 
+    /* The standard-library helpers of ext_builtins/strings/stdlib.c, by their
+     * engine names (Aether's front end aliases `upper` to `aether_upper`). */
+    if (strcasecmp(name, "aether_upper") == 0 || strcasecmp(name, "aether_lower") == 0 ||
+        strcasecmp(name, "aether_replace") == 0 || strcasecmp(name, "aether_repeat") == 0 ||
+        strcasecmp(name, "aether_join") == 0 || strcasecmp(name, "aether_read_file") == 0 ||
+        strcasecmp(name, "aether_read_line") == 0 || strcasecmp(name, "aether_read_all_stdin") == 0 ||
+        strcasecmp(name, "aether_now_text") == 0) {
+        return TYPE_STRING;
+    }
+    if (strcasecmp(name, "aether_contains") == 0 || strcasecmp(name, "aether_starts_with") == 0 ||
+        strcasecmp(name, "aether_ends_with") == 0 || strcasecmp(name, "aether_delete_file") == 0 ||
+        strcasecmp(name, "aether_rename_file") == 0 || strcasecmp(name, "aetherparseintok") == 0 ||
+        strcasecmp(name, "aetherparserealok") == 0) {
+        return TYPE_BOOLEAN;
+    }
+    if (strcasecmp(name, "aether_index_of") == 0 || strcasecmp(name, "aether_count") == 0 ||
+        strcasecmp(name, "aether_clock_ms") == 0 || strcasecmp(name, "aether_mstream_length") == 0 ||
+        strcasecmp(name, "aetherparseintvalue") == 0) {
+        return TYPE_INT64;
+    }
+    if (strcasecmp(name, "aether_round_to") == 0 || strcasecmp(name, "aetherparserealvalue") == 0) {
+        return TYPE_DOUBLE;
+    }
+    if (strcasecmp(name, "aether_mstream_load") == 0) return TYPE_MEMORYSTREAM;
+
     /* Memory stream helpers */
     if (strcasecmp(name, "mstreamcreate") == 0) return TYPE_MEMORYSTREAM;
     if (strcasecmp(name, "mstreamloadfromfile") == 0) return TYPE_BOOLEAN;

@@ -8834,6 +8834,85 @@ static void vmTraceDescribeValue(const Value *val) {
 static void vmWriteUnlockStream(void *stream) {
     funlockfile((FILE *)stream);
 }
+
+/* read_line() -> Text: the next line of stdin without its line break, or ""
+ * at end of input. read_all_stdin() -> Text: the rest of stdin, each line
+ * ending in "\n". Aether's replacements for readln (D60); both go through
+ * readln's own interruptible line reader, so ^C and the iOS session stdin
+ * behave the same. */
+#define VM_STDIN_LINE_MAX ((size_t)1 << 20)
+
+static bool vmReadStdinLineAlloc(VM *vm, char **out_line) {
+    char *buf = (char *)malloc(VM_STDIN_LINE_MAX);
+    *out_line = NULL;
+    if (!buf) {
+        runtimeError(vm, "read_line: out of memory.");
+        return false;
+    }
+    FILE *input_stream = stdin;
+    vmPrepareCanonicalInput();
+    bool ok = vmReadLineInterruptible(vm, input_stream, buf, VM_STDIN_LINE_MAX);
+    vmEnableRawMode();
+    vmCommitLastIoError(ok || feof(input_stream) ? 0 : 1);
+    if (!ok) {
+        free(buf);
+        return false;
+    }
+    *out_line = buf;
+    return true;
+}
+
+static Value vmBuiltinReadLine(VM *vm, int arg_count, Value *args) {
+    (void)args;
+    fflush(stdout);
+    if (arg_count != 0) {
+        runtimeError(vm, "read_line expects no arguments.");
+        return makeUnicodeString("");
+    }
+    char *line = NULL;
+    if (!vmReadStdinLineAlloc(vm, &line)) return makeUnicodeString("");
+    Value v = makeUnicodeString(line);
+    free(line);
+    return v;
+}
+
+static Value vmBuiltinReadAllStdin(VM *vm, int arg_count, Value *args) {
+    (void)args;
+    fflush(stdout);
+    if (arg_count != 0) {
+        runtimeError(vm, "read_all_stdin expects no arguments.");
+        return makeUnicodeString("");
+    }
+    char *acc = NULL;
+    size_t len = 0, cap = 0;
+    char *line = NULL;
+    while (vmReadStdinLineAlloc(vm, &line)) {
+        size_t n = strlen(line);
+        if (len + n + 2 > cap) {
+            size_t ncap = cap ? cap : 4096;
+            while (ncap < len + n + 2) ncap *= 2;
+            char *nb = (char *)realloc(acc, ncap);
+            if (!nb) {
+                free(line);
+                free(acc);
+                runtimeError(vm, "read_all_stdin: out of memory.");
+                return makeUnicodeString("");
+            }
+            acc = nb;
+            cap = ncap;
+        }
+        memcpy(acc + len, line, n);
+        len += n;
+        acc[len++] = '\n';
+        acc[len] = '\0';
+        free(line);
+        line = NULL;
+        if (vm && (vm->abort_requested || vm->exit_requested)) break;
+    }
+    Value v = makeUnicodeStringLen(acc ? acc : "", len);
+    free(acc);
+    return v;
+}
 #endif
 
 Value vmBuiltinWrite(VM* vm, int arg_count, Value* args) {
@@ -11990,6 +12069,8 @@ static void populateBuiltinRegistry(void) {
     registerVmBuiltin("mstreamfromstring", vmBuiltinMstreamFromString, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
     registerVmBuiltin("stringofchar", vmBuiltinStringOfChar, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
     registerVmBuiltin("flush", vmBuiltinFflush, BUILTIN_TYPE_PROCEDURE, "Flush", FX_IO);
+    registerVmBuiltin("aether_read_line", vmBuiltinReadLine, BUILTIN_TYPE_FUNCTION, NULL, FX_IO);
+    registerVmBuiltin("aether_read_all_stdin", vmBuiltinReadAllStdin, BUILTIN_TYPE_FUNCTION, NULL, FX_IO);
     pthread_mutex_unlock(&builtin_registry_mutex);
 }
 void registerAllBuiltins(void) {

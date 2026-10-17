@@ -3,6 +3,7 @@
 
 void registerAtoiBuiltin(void);
 void registerParseBuiltins(void);
+void registerStdlibBuiltins(void);
 
 void registerStringBuiltins(void) {
     const char *category = "strings";
@@ -16,4 +17,5 @@ void registerStringBuiltins(void) {
     extBuiltinRegisterFunction(category, "conversion", "itoa");
     registerAtoiBuiltin();
     registerParseBuiltins();
+    registerStdlibBuiltins();
 }

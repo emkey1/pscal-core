@@ -43,7 +43,7 @@ static Value vmBuiltinParseInt(struct VM_s* vm, int arg_count, Value* args) {
         runtimeError(vm, "parse_int argument must be a string.");
         return makeInt(0);
     }
-    return makeInt((long long)strtoll(s, NULL, 10));
+    return makeInt64((long long)strtoll(s, NULL, 10));
 }
 
 static Value vmBuiltinParseFloat(struct VM_s* vm, int arg_count, Value* args) {
