@@ -10730,6 +10730,25 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
     }
 }
 
+/* One argument of a `spawn` call. A VAR (by-reference) parameter gets the
+ * argument's address, as an ordinary call passes it; compiling every argument
+ * as an rvalue handed the thread a value where it expects an address, and the
+ * callee's first access failed with "GET_INDIRECT requires an address on the
+ * stack". The address is the spawning frame's slot: the front ends join every
+ * thread before that frame ends (Aether's `par` lowering joins at the end of
+ * the block). */
+static void compileSpawnArgument(Symbol* proc_symbol, AST* call, int index, BytecodeChunk* chunk) {
+    AST* arg = call->children[index];
+    AST* param = (proc_symbol && proc_symbol->type_def && index < proc_symbol->type_def->child_count)
+                     ? proc_symbol->type_def->children[index]
+                     : NULL;
+    if (param && param->by_ref) {
+        compileLValue(arg, chunk, getLine(arg));
+    } else {
+        compileRValue(arg, chunk, getLine(arg));
+    }
+}
+
 static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_approx) {
     if (!node) return;
     int line = getLine(node);
@@ -11049,7 +11068,7 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                     toLowerString(lowerName);
                     emitConstant(chunk, addStringConstant(chunk, lowerName), line);
                     for (int i = 0; i < call->child_count; i++) {
-                        compileRValue(call->children[i], chunk, getLine(call->children[i]));
+                        compileSpawnArgument(proc_symbol, call, i, chunk);
                     }
                     emitConstant(chunk, addIntConstant(chunk, call->child_count), line);
                     writeBytecodeChunk(chunk, CALL_HOST, line);
@@ -11077,7 +11096,7 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                     emitConstant(chunk, addrConstIndex, line);
                 }
                 for (int i = 0; i < call->child_count; i++) {
-                    compileRValue(call->children[i], chunk, getLine(call->children[i]));
+                    compileSpawnArgument(proc_symbol, call, i, chunk);
                 }
                 emitConstant(chunk, addIntConstant(chunk, call->child_count), line);
                 writeBytecodeChunk(chunk, CALL_HOST, line);
