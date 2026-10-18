@@ -1239,20 +1239,23 @@ static bool stdMStreamAppend(MStream *ms, const char *data, size_t n) {
     return true;
 }
 
+/* Aether's mstream_write_text(ms, t) (D66; it was mstream_append_text). The
+ * engine-private name below keeps "append" so an Aether front end of either
+ * age resolves against this engine. */
 static Value vmBuiltinStdMStreamAppendText(struct VM_s *vm, int arg_count, Value *args) {
     if (arg_count != 2) {
-        runtimeError(vm, "mstream_append_text expects 2 arguments (ms, text).");
+        runtimeError(vm, "mstream_write_text expects 2 arguments (ms, text).");
         return makeVoid();
     }
-    MStream *ms = stdMStreamArg(vm, &args[0], "mstream_append_text");
+    MStream *ms = stdMStreamArg(vm, &args[0], "mstream_write_text");
     char tb[5];
     const char *t = stdText(&args[1], tb);
     if (!ms) return makeVoid();
     if (!t) {
-        runtimeError(vm, "mstream_append_text expects Text to append.");
+        runtimeError(vm, "mstream_write_text expects Text to write.");
         return makeVoid();
     }
-    if (!stdMStreamAppend(ms, t, strlen(t))) runtimeError(vm, "mstream_append_text: out of memory.");
+    if (!stdMStreamAppend(ms, t, strlen(t))) runtimeError(vm, "mstream_write_text: out of memory.");
     return makeVoid();
 }
 
@@ -1390,7 +1393,7 @@ void registerStdlibBuiltins(void) {
     registerVmBuiltin("aether_args", vmBuiltinStdArgs, BUILTIN_TYPE_FUNCTION, NULL, FX_IO);
     registerVmBuiltin("aether_clock_ms", vmBuiltinStdClockMs, BUILTIN_TYPE_FUNCTION, NULL, FX_CLOCK);
     registerVmBuiltin("aether_now_text", vmBuiltinStdNowText, BUILTIN_TYPE_FUNCTION, NULL, FX_CLOCK);
-    /* MStream */
+    /* MStream (aether_mstream_append_text is the surface's mstream_write_text) */
     registerVmBuiltin("aether_mstream_append_text", vmBuiltinStdMStreamAppendText, BUILTIN_TYPE_PROCEDURE, NULL, FX_PURE);
     registerVmBuiltin("aether_mstream_length", vmBuiltinStdMStreamLength, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
     registerVmBuiltin("aether_mstream_load", vmBuiltinStdMStreamLoad, BUILTIN_TYPE_FUNCTION, NULL, FX_IO);
