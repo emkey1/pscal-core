@@ -1934,7 +1934,10 @@ VarType getBuiltinReturnType(const char* name) {
     if (strcasecmp(name, "aether_contains") == 0 || strcasecmp(name, "aether_starts_with") == 0 ||
         strcasecmp(name, "aether_ends_with") == 0 || strcasecmp(name, "aether_delete_file") == 0 ||
         strcasecmp(name, "aether_rename_file") == 0 || strcasecmp(name, "aetherparseintok") == 0 ||
-        strcasecmp(name, "aetherparserealok") == 0) {
+        strcasecmp(name, "aetherparserealok") == 0 ||
+        strcasecmp(name, "aether_is_digit") == 0 || strcasecmp(name, "aether_is_alpha") == 0 ||
+        strcasecmp(name, "aether_is_alnum") == 0 || strcasecmp(name, "aether_is_space") == 0 ||
+        strcasecmp(name, "aether_is_upper") == 0 || strcasecmp(name, "aether_is_lower") == 0) {
         return TYPE_BOOLEAN;
     }
     if (strcasecmp(name, "aether_index_of") == 0 || strcasecmp(name, "aether_count") == 0 ||

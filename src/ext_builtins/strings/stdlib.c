@@ -386,6 +386,75 @@ static Value vmBuiltinStdEndsWith(struct VM_s *vm, int arg_count, Value *args) {
     return makeBoolean(pl <= sl && memcmp(s + sl - pl, p, pl) == 0);
 }
 
+/* Character classes (Aether D67): is_digit(t), is_alpha(t), ... are true when
+ * t is non-empty and every character of t is in the class, so one test reads
+ * both `is_digit(s[i])` and `is_digit("123")`, as Python's str.isdigit() does.
+ * ASCII only and decided here, byte by byte, never by the host's <ctype.h>
+ * locale: a non-ASCII character (a UTF-8 lead or continuation byte) is in no
+ * class. */
+typedef enum {
+    STD_CC_DIGIT, STD_CC_ALPHA, STD_CC_ALNUM, STD_CC_SPACE, STD_CC_UPPER, STD_CC_LOWER
+} StdCharClass;
+
+static bool stdCharInClass(unsigned char c, StdCharClass cls) {
+    bool upper = c >= 'A' && c <= 'Z';
+    bool lower = c >= 'a' && c <= 'z';
+    bool digit = c >= '0' && c <= '9';
+    switch (cls) {
+        case STD_CC_DIGIT: return digit;
+        case STD_CC_ALPHA: return upper || lower;
+        case STD_CC_ALNUM: return upper || lower || digit;
+        case STD_CC_SPACE:
+            return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v';
+        case STD_CC_UPPER: return upper;
+        case STD_CC_LOWER: return lower;
+    }
+    return false;
+}
+
+static Value stdCharClassTest(struct VM_s *vm, int arg_count, Value *args,
+                              const char *who, StdCharClass cls) {
+    if (arg_count != 1) {
+        runtimeError(vm, "%s expects 1 argument (text).", who);
+        return makeBoolean(0);
+    }
+    char b0[5];
+    const char *s = stdText(&args[0], b0);
+    if (!s) {
+        runtimeError(vm, "%s expects a Text argument.", who);
+        return makeBoolean(0);
+    }
+    if (!*s) return makeBoolean(0);
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (!stdCharInClass(*p, cls)) return makeBoolean(0);
+    }
+    return makeBoolean(1);
+}
+
+static Value vmBuiltinStdIsDigit(struct VM_s *vm, int arg_count, Value *args) {
+    return stdCharClassTest(vm, arg_count, args, "is_digit", STD_CC_DIGIT);
+}
+
+static Value vmBuiltinStdIsAlpha(struct VM_s *vm, int arg_count, Value *args) {
+    return stdCharClassTest(vm, arg_count, args, "is_alpha", STD_CC_ALPHA);
+}
+
+static Value vmBuiltinStdIsAlnum(struct VM_s *vm, int arg_count, Value *args) {
+    return stdCharClassTest(vm, arg_count, args, "is_alnum", STD_CC_ALNUM);
+}
+
+static Value vmBuiltinStdIsSpace(struct VM_s *vm, int arg_count, Value *args) {
+    return stdCharClassTest(vm, arg_count, args, "is_space", STD_CC_SPACE);
+}
+
+static Value vmBuiltinStdIsUpper(struct VM_s *vm, int arg_count, Value *args) {
+    return stdCharClassTest(vm, arg_count, args, "is_upper", STD_CC_UPPER);
+}
+
+static Value vmBuiltinStdIsLower(struct VM_s *vm, int arg_count, Value *args) {
+    return stdCharClassTest(vm, arg_count, args, "is_lower", STD_CC_LOWER);
+}
+
 /* repeat(s, n): s written n times; "" when n <= 0. */
 static Value vmBuiltinStdRepeat(struct VM_s *vm, int arg_count, Value *args) {
     if (arg_count != 2) {
@@ -1361,6 +1430,13 @@ void registerStdlibBuiltins(void) {
     registerVmBuiltin("aether_ends_with", vmBuiltinStdEndsWith, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
     registerVmBuiltin("aether_repeat", vmBuiltinStdRepeat, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
     registerVmBuiltin("aether_join", vmBuiltinStdJoin, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    /* Character classes (D67) */
+    registerVmBuiltin("aether_is_digit", vmBuiltinStdIsDigit, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("aether_is_alpha", vmBuiltinStdIsAlpha, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("aether_is_alnum", vmBuiltinStdIsAlnum, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("aether_is_space", vmBuiltinStdIsSpace, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("aether_is_upper", vmBuiltinStdIsUpper, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("aether_is_lower", vmBuiltinStdIsLower, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
     /* Text and arrays */
     registerVmBuiltin("aether_contains", vmBuiltinStdContains, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
     registerVmBuiltin("aether_index_of", vmBuiltinStdIndexOf, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
