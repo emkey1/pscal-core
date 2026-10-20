@@ -4159,17 +4159,33 @@ static bool destroyMutex(VM* vm, int id) {
 }
 
 // Internal function shared by stack dump helpers
+// Most operand-stack values a dump prints. Runaway recursion leaves hundreds
+// of thousands on the stack (11 MB of stderr, printed twice); the top of the
+// stack is where the error happened.
+#define VM_STACK_DUMP_MAX_SLOTS 32
+
 static void vmDumpStackInternal(VM* vm, bool detailed) {
     if (!vm) return;
 
+    Value* first = vm->stack;
+    ptrdiff_t depth = vm->stackTop - vm->stack;
+    if (depth > VM_STACK_DUMP_MAX_SLOTS) {
+        first = vm->stackTop - VM_STACK_DUMP_MAX_SLOTS;
+        if (detailed) {
+            fprintf(stderr, "  ... %td older value(s) not shown\n", depth - VM_STACK_DUMP_MAX_SLOTS);
+        } else {
+            fprintf(stderr, "[... %td more] ", depth - VM_STACK_DUMP_MAX_SLOTS);
+        }
+    }
+
     if (detailed) {
-        for (Value* slot = vm->stack; slot < vm->stackTop; slot++) {
+        for (Value* slot = first; slot < vm->stackTop; slot++) {
             fprintf(stderr, "  [ ");
             printValueToStream(*slot, stderr);
             fprintf(stderr, " ]\n");
         }
     } else {
-        for (Value* slot = vm->stack; slot < vm->stackTop; slot++) {
+        for (Value* slot = first; slot < vm->stackTop; slot++) {
             fprintf(stderr, "[");
             printValueToStream(*slot, stderr);
             fprintf(stderr, "] ");
@@ -4809,6 +4825,47 @@ static inline long long vmShiftInt64(long long a, long long count, bool left, bo
 }
 
 // runtimeError - Assuming your existing one is fine.
+// Instructions shown before the error point in a verbose runtime error.
+#define VM_ERROR_RECENT_INSTRUCTIONS 5
+
+// Offset of the instruction VM_ERROR_RECENT_INSTRUCTIONS before the one at
+// `error_offset`, found by decoding forward from an instruction boundary
+// (the current routine's entry, else the start of the chunk). Backing up a
+// fixed number of bytes usually landed inside an operand and disassembled
+// garbage. Returns error_offset when no boundary walk reaches it.
+static int vmRecentInstructionStart(VM* vm, int error_offset) {
+    if (!vm->chunk || error_offset <= 0 || error_offset > vm->chunk->count) {
+        return error_offset;
+    }
+    int entries[2] = { 0, 0 };
+    int entry_count = 0;
+    CallFrame* frame = (vm->frameCount > 0) ? &vm->frames[vm->frameCount - 1] : NULL;
+    if (frame && frame->function_symbol && frame->function_symbol->bytecode_address > 0 &&
+        frame->function_symbol->bytecode_address < error_offset) {
+        entries[entry_count++] = frame->function_symbol->bytecode_address;
+    }
+    entries[entry_count++] = 0;
+    for (int e = 0; e < entry_count; e++) {
+        int recent[VM_ERROR_RECENT_INSTRUCTIONS];
+        int seen = 0;
+        int offset = entries[e];
+        while (offset < error_offset) {
+            recent[seen % VM_ERROR_RECENT_INSTRUCTIONS] = offset;
+            seen++;
+            int length = getInstructionLength(vm->chunk, offset);
+            if (length <= 0) {
+                break;
+            }
+            offset += length;
+        }
+        if (offset == error_offset && seen > 0) {
+            return (seen < VM_ERROR_RECENT_INSTRUCTIONS) ? recent[0]
+                                                         : recent[seen % VM_ERROR_RECENT_INSTRUCTIONS];
+        }
+    }
+    return error_offset;
+}
+
 void runtimeError(VM* vm, const char* format, ...) {
     if (vm) {
         vm->abort_requested = true;
@@ -4876,10 +4933,12 @@ void runtimeError(VM* vm, const char* format, ...) {
             fprintf(stderr, "  (IP is out of bytecode bounds: %p)\n", (void*)vm->ip);
         }
 
-        int start_dump_offset = (int)instruction_offset - 10;
-        if (!have_runtime_location || start_dump_offset < 0) start_dump_offset = 0;
+        int start_dump_offset = have_runtime_location
+                                    ? vmRecentInstructionStart(vm, (int)instruction_offset)
+                                    : (int)instruction_offset;
 
-        fprintf(stderr, "\nLast Instructions executed (leading to crash, up to %d bytes before error point):\n", (int)instruction_offset - start_dump_offset);
+        fprintf(stderr, "\nLast Instructions executed (leading to crash, up to %d before error point):\n",
+                VM_ERROR_RECENT_INSTRUCTIONS);
         if (vm->chunk) {
             for (int offset = start_dump_offset; offset < (int)instruction_offset; ) {
                 offset = disassembleInstruction(vm->chunk, offset, vm->procedureTable);
