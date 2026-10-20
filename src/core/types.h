@@ -71,9 +71,8 @@ typedef struct MStream {
 // value semantics), a task has no meaningful value semantics at all -- it
 // is a handle to a singular, unrepeatable in-flight computation, so every
 // Value copy of a task must refer to the SAME underlying pool slot
-// (retain-and-share, matching TYPE_FILE's identity contract, but with real
-// refcounting rather than TYPE_FILE's deliberately-untracked-alias
-// exemption -- Task values flow through ordinary CALL_BUILTIN argument/
+// (retain-and-share with real refcounting, the same identity contract
+// TYPE_FILE has -- Task values flow through ordinary CALL_BUILTIN argument/
 // return paths, not VAR-parameter-only, so an untracked alias would leak or
 // double-release). `owner` is always resolved to whichever VM was actually
 // executing TaskSpawn (the same VM createThreadJob indexes `threads[]` on
@@ -390,7 +389,7 @@ typedef struct FileObj {
 // FRESH, independent PointerObj per copy (never pscalObjRetain an
 // existing one). An earlier draft of this file tried a bare, unretained
 // alias instead (reasoning by analogy from FileObj, where CALL_BUILTIN's
-// argument cleanup always skips freeValue for TYPE_FILE specifically) --
+// argument cleanup then skipped freeValue for TYPE_FILE specifically) --
 // that reasoning does NOT transfer to pointers: unlike file arguments,
 // transient TYPE_POINTER copies get freeValue'd directly and
 // unconditionally by plenty of opcodes that carry no such skip (found by
@@ -400,7 +399,7 @@ typedef struct FileObj {
 // real, persistent wrapper out from under it). Every copy must therefore
 // be genuinely independent (refcount 1, never shared) -- which in turn
 // means CALL_BUILTIN's argument cleanup (vm.c) must NOT skip freeValue
-// for TYPE_POINTER the way it still does for TYPE_FILE, since a fresh,
+// for TYPE_POINTER (nor, now that file copies retain, TYPE_FILE), since a fresh,
 // unshared wrapper needs exactly one release to avoid leaking, and
 // nothing else will ever provide it. `base_type_node` is copied forward
 // into the fresh wrapper by makeCopyOfValue exactly as `address` is --
@@ -804,8 +803,17 @@ static inline long double pscalValueDecodeRealLD(Value v) {
     do { pscalValueSetRealBits((dest), (long double)(val)); } while(0)
 #define SET_CHAR_VALUE(dest, val) \
     do { pscalValueSetCharBits((dest), (val)); } while(0)
+// Retypes `dest` and resets `bits` to the new type's zero placeholder. A
+// no-op when `dest` already has type `t`: resetting then would drop a live
+// heap wrapper (StringObj, PointerObj, ...) without releasing it, leaking it
+// and losing what it carries -- e.g. new(p) on a pointer variable lost the
+// PointerObj's base_type_node, so a second new(p) allocated an integer.
 #define SET_VALUE_TYPE(dest, t) \
-    do { PSCAL_VALUE_FIELD(*(dest), type) = (t); pscalValueResetBitsForType((dest), (t)); } while(0)
+    do { Value *_pscal_svt_dest = (dest); VarType _pscal_svt_t = (t); \
+         if (PSCAL_VALUE_FIELD(*_pscal_svt_dest, type) != _pscal_svt_t) { \
+             PSCAL_VALUE_FIELD(*_pscal_svt_dest, type) = _pscal_svt_t; \
+             pscalValueResetBitsForType(_pscal_svt_dest, _pscal_svt_t); \
+         } } while(0)
 
 /*
  * Value tag and payload accessors (VM 2.0 Phase 0 accessor sweep; see

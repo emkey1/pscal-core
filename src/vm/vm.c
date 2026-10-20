@@ -1360,6 +1360,9 @@ static bool adjustLocalByDelta(VM* vm, Value* slot, long long delta, const char*
     }
 
     if (VALUE_TYPE(*slot) == TYPE_ENUM) {
+        // The EnumObj may be shared by reference count with copies of this
+        // local: unshare it before the in-place write.
+        valueEnsureUnique(slot);
         long long new_ord = (long long)AS_ENUM(*slot).ordinal + delta;
         AS_ENUM(*slot).ordinal = (int)new_ord;
         SET_INT_VALUE(slot, AS_ENUM(*slot).ordinal);
@@ -1367,7 +1370,13 @@ static bool adjustLocalByDelta(VM* vm, Value* slot, long long delta, const char*
     }
 
     if (isIntlikeType(VALUE_TYPE(*slot))) {
-        long long new_val = AS_INTEGER(*slot) + delta;
+        // Same check as ADD/SUBTRACT on the GET_LOCAL/CONSTANT/SET_LOCAL
+        // sequence this opcode replaces.
+        long long new_val;
+        if (__builtin_add_overflow(AS_INTEGER(*slot), delta, &new_val)) {
+            runtimeError(vm, "Runtime Error: Integer overflow.");
+            return false;
+        }
         switch (VALUE_TYPE(*slot)) {
             case TYPE_BOOLEAN:
                 SET_INT_VALUE(slot, (new_val != 0));
@@ -9052,6 +9061,18 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
+                // The field address handed out here is the l-value of a
+                // store (SET_INDIRECT) or a VAR argument, exactly like
+                // GET_FIELD_ADDRESS's -- clone a still-shared RecordObj
+                // first, or the write lands in every copy that shares it
+                // (a CLike struct passed by value was mutated in the
+                // caller). Only when the record was reached through a
+                // pointer: a record held directly by this stack slot is a
+                // temporary popped just below, and cloning it would leave
+                // the pushed address pointing into a freed clone.
+                if (record_struct_ptr != base_val_ptr) {
+                    valueEnsureUnique(record_struct_ptr);
+                }
 
                 FieldValue* current = findRecordFieldBySlot(record_struct_ptr, field_index);
                 if (!current) {
@@ -9083,6 +9104,11 @@ comparison_error_label:
                 if (VALUE_TYPE(*record_struct_ptr) != TYPE_RECORD) {
                     runtimeError(vm, "VM Error: Internal - expected to resolve to a record for field access.");
                     return INTERPRET_RUNTIME_ERROR;
+                }
+
+                // Same clone-on-write as GET_FIELD_OFFSET above.
+                if (record_struct_ptr != base_val_ptr) {
+                    valueEnsureUnique(record_struct_ptr);
                 }
 
                 FieldValue* current = findRecordFieldBySlot(record_struct_ptr, field_index);
@@ -10386,13 +10412,16 @@ comparison_error_label:
                     }
 
                     // (Your existing logic for handling fixed-length strings, pointers, reals, etc. goes here)
+                    // Dynamic-string targets get a whole new Value installed
+                    // through replaceValueCell, never a free-then-rebuild of
+                    // the cell in place: another thread copying this cell
+                    // (copyValueForStack, under value_cell_mutex) could
+                    // otherwise retain the StringObj just freed here.
                     if (isPascalStringType(VALUE_TYPE(*target_lvalue_ptr)) && STRING_MAX_LENGTH(*target_lvalue_ptr) <= 0) {
                         if (VALUE_TYPE(value_to_set) == TYPE_CHAR || VALUE_TYPE(value_to_set) == TYPE_WIDECHAR) {
                             VarType destType = VALUE_TYPE(*target_lvalue_ptr) == TYPE_UNICODE_STRING
                                                    ? TYPE_UNICODE_STRING
                                                    : TYPE_STRING;
-                            freeValue(target_lvalue_ptr);
-                            pscalStringEnsureObj(target_lvalue_ptr); // freeValue left s_val NULL
                             char encoded[5] = {0};
                             size_t encoded_len = 0;
                             if (VALUE_TYPE(value_to_set) == TYPE_CHAR) {
@@ -10401,47 +10430,45 @@ comparison_error_label:
                             } else {
                                 encoded_len = encodeUtf8Codepoint((uint32_t)AS_CHAR(value_to_set), encoded);
                             }
-                            AS_STRING(*target_lvalue_ptr) = (char*)malloc(encoded_len + 1);
-                            if (!AS_STRING(*target_lvalue_ptr)) {
-                                runtimeError(vm, "VM Error: Malloc failed for CHAR/WIDECHAR to string assignment.");
-                            } else {
-                                memcpy(AS_STRING(*target_lvalue_ptr), encoded, encoded_len);
-                                AS_STRING(*target_lvalue_ptr)[encoded_len] = '\0';
-                            }
-                            {
-                                // SET_VALUE_TYPE resets .bits to a nil-pointer
-                                // placeholder (VM 2.0 Phase 4i checkpoint 3b) --
-                                // capture the StringObj stored above before that
-                                // happens so it can be re-tagged afterward, same
-                                // "re-tag after retype" fix checkpoint 2 needed
-                                // for TYPE_THREAD.
-                                StringObj *reset_s = PSCAL_VALUE_PTR(*target_lvalue_ptr, StringObj);
-                                SET_VALUE_TYPE(target_lvalue_ptr, destType);
-                                pscalValueSetHeapPtrBits(target_lvalue_ptr, reset_s);
-                            }
-                            STRING_MAX_LENGTH(*target_lvalue_ptr) = -1;
+                            Value replacement = (destType == TYPE_UNICODE_STRING)
+                                                    ? makeUnicodeStringLen(encoded, encoded_len)
+                                                    : makeStringLen(encoded, encoded_len);
+                            replaceValueCell(target_lvalue_ptr, replacement, NULL);
                         } else if (isPascalStringType(VALUE_TYPE(value_to_set)) && AS_STRING(value_to_set)) {
                             VarType destType = VALUE_TYPE(*target_lvalue_ptr);
-                            freeValue(target_lvalue_ptr);
-                            /* Optimization: steal the whole StringObj from the
-                             * temporary value on the stack (not just its
-                             * buffer) -- simpler than allocating a fresh
-                             * wrapper at the destination and copying the
-                             * buffer pointer into it, and avoids needing
-                             * pscalStringEnsureObj here at all. */
-                            StringObj *stolen_s = PSCAL_VALUE_PTR(value_to_set, StringObj);
-                            pscalValueSetHeapPtrBits(&value_to_set, NULL); /* Prevent double-free */
-                            SET_VALUE_TYPE(target_lvalue_ptr, destType);
-                            // Re-tag after the retype above stomped .bits back
-                            // to a nil-pointer placeholder -- see the sibling
-                            // comment a few lines up.
-                            pscalValueSetHeapPtrBits(target_lvalue_ptr, stolen_s);
-                            STRING_MAX_LENGTH(*target_lvalue_ptr) = -1;
+                            StringObj *src_s = PSCAL_VALUE_PTR(value_to_set, StringObj);
+                            Value replacement;
+                            if (src_s->max_length > 0) {
+                                /* A string[N] source's StringObj is still that
+                                 * variable's own fixed buffer (GET_* shares it
+                                 * by reference count). Taking it over would
+                                 * share the buffer with the target and strip
+                                 * its length cap, so copy the text into a
+                                 * fresh dynamic string instead. */
+                                replacement = (destType == TYPE_UNICODE_STRING)
+                                                  ? makeUnicodeString(AS_STRING(value_to_set))
+                                                  : makeString(AS_STRING(value_to_set));
+                            } else {
+                                /* Optimization: take over the temporary's
+                                 * whole (dynamic) StringObj reference rather
+                                 * than copying its buffer. */
+                                pscalValueSetHeapPtrBits(&value_to_set, NULL); /* Prevent double-free */
+                                replacement = makeVoid();
+                                SET_VALUE_TYPE(&replacement, destType);
+                                pscalValueSetHeapPtrBits(&replacement, src_s);
+                            }
+                            replaceValueCell(target_lvalue_ptr, replacement, NULL);
                         } else {
                             runtimeError(vm, "Type mismatch: Cannot assign this type to a dynamic string.");
                         }
                     }
                     else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_STRING && STRING_MAX_LENGTH(*target_lvalue_ptr) > 0) {
+                        // The fixed buffer is written in place (char
+                        // addresses into it stay valid), so first make sure
+                        // this variable is its only holder: GET_* shares a
+                        // StringObj by reference count, and a by-value
+                        // parameter or a copy would otherwise change too.
+                        valueEnsureUnique(target_lvalue_ptr);
                         if (isPascalStringType(VALUE_TYPE(value_to_set)) && AS_STRING(value_to_set)) {
                             strncpy(AS_STRING(*target_lvalue_ptr), AS_STRING(value_to_set), STRING_MAX_LENGTH(*target_lvalue_ptr));
                             AS_STRING(*target_lvalue_ptr)[STRING_MAX_LENGTH(*target_lvalue_ptr)] = '\0'; // Ensure null termination
@@ -11020,7 +11047,10 @@ comparison_error_label:
                     }
                     STRING_MAX_LENGTH(*target_slot) = -1;
                 } else if (VALUE_TYPE(*target_slot) == TYPE_STRING && STRING_MAX_LENGTH(*target_slot) > 0) {
-                    // Special case: Assignment to a fixed-length string.
+                    // Special case: Assignment to a fixed-length string. The
+                    // buffer is written in place, so unshare it first (see
+                    // SET_INDIRECT's fixed-length branch).
+                    valueEnsureUnique(target_slot);
                     const char* source_str = "";
                     char char_buf[2] = {0};
 
@@ -11156,6 +11186,7 @@ comparison_error_label:
                     // Preserve pointer metadata when assigning NIL.
                     AS_POINTER(*target_slot) = NULL;
                 } else if (VALUE_TYPE(*target_slot) == TYPE_STRING && STRING_MAX_LENGTH(*target_slot) > 0) {
+                    valueEnsureUnique(target_slot); // in-place write: unshare first
                     const char* source_str = "";
                     char char_buf[2] = {0};
                     if (isPascalStringType(VALUE_TYPE(value_from_stack)) && AS_STRING(value_from_stack)) {
@@ -11672,9 +11703,6 @@ comparison_error_label:
                     }
                     vm->stackTop -= arg_count;
                     for (int i = 0; i < arg_count; i++) {
-                        if (VALUE_TYPE(args[i]) == TYPE_FILE) {
-                            continue;
-                        }
                         freeValue(&args[i]);
                     }
                     return INTERPRET_RUNTIME_ERROR;
@@ -11704,9 +11732,6 @@ comparison_error_label:
                     vm->current_builtin_name = previous_builtin_name;
                     vm->stackTop -= arg_count;
                     for (int i = 0; i < arg_count; i++) {
-                        if (VALUE_TYPE(args[i]) == TYPE_FILE) {
-                            continue;
-                        }
                         freeValue(&args[i]);
                     }
                     return fx_status;
@@ -11723,9 +11748,6 @@ comparison_error_label:
 
                 vm->stackTop -= arg_count;
                 for (int i = 0; i < arg_count; i++) {
-                    if (VALUE_TYPE(args[i]) == TYPE_FILE) {
-                        continue;
-                    }
                     freeValue(&args[i]);
                 }
 
@@ -11844,9 +11866,6 @@ comparison_error_label:
                         vm->current_builtin_name = previous_builtin_name;
                         vm->stackTop -= arg_count;
                         for (int i = 0; i < arg_count; i++) {
-                            if (VALUE_TYPE(args[i]) == TYPE_FILE) {
-                                continue;
-                            }
                             freeValue(&args[i]);
                         }
                         return fx_status;
@@ -11863,9 +11882,6 @@ comparison_error_label:
 
                     vm->stackTop -= arg_count;
                     for (int i = 0; i < arg_count; i++) {
-                        if (VALUE_TYPE(args[i]) == TYPE_FILE) {
-                            continue;
-                        }
                         freeValue(&args[i]);
                     }
 
@@ -11884,9 +11900,6 @@ comparison_error_label:
                     runtimeError(vm, "VM Error: Unimplemented or unknown built-in '%s' called.", builtin_name_original_case);
                     vm->stackTop -= arg_count;
                     for (int i = 0; i < arg_count; i++) {
-                        if (VALUE_TYPE(args[i]) == TYPE_FILE) {
-                            continue;
-                        }
                         freeValue(&args[i]);
                     }
                     return INTERPRET_RUNTIME_ERROR;

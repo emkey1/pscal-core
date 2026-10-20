@@ -837,6 +837,11 @@ static bool readStructuredValue(FILE* stream, Value* rawValue) {
     if (VALUE_TYPE(*value) == TYPE_POINTER && AS_POINTER(*value)) {
         value = (Value*)AS_POINTER(*value);
     }
+    // Strings, records and static arrays are filled in place (recursively,
+    // field by field), so unshare each level before writing into it: copies
+    // made by assignment or a by-value parameter share these payloads by
+    // reference count and would otherwise change too.
+    valueEnsureUnique(value);
 
     char token[1024];
     switch (VALUE_TYPE(*value)) {
@@ -4004,6 +4009,11 @@ Value vmBuiltinSetlength(VM* vm, int arg_count, Value* args) {
             runtimeError(vm, "SetLength expects a string or dynamic array target.");
             return makeVoid();
         }
+
+        // The buffer is replaced inside the target's StringObj below, which
+        // copies of the variable (and a string literal it was assigned from)
+        // may share by reference count: unshare it first.
+        valueEnsureUnique(target);
 
         size_t alloc_len = (size_t)new_len;
         size_t copy_len = 0;
@@ -7254,6 +7264,10 @@ Value vmBuiltinInc(VM* vm, int arg_count, Value* args) {
         }
 
         case TYPE_ENUM:
+            // The EnumObj may be shared by reference count with copies of
+            // the variable (a by-value parameter): unshare before the
+            // in-place write.
+            valueEnsureUnique(target);
             AS_ENUM(*target).ordinal += (int)delta;
             break;
 
@@ -7359,6 +7373,7 @@ Value vmBuiltinDec(VM* vm, int arg_count, Value* args) {
         }
 
         case TYPE_ENUM:
+            valueEnsureUnique(target); // shared EnumObj: see Inc
             AS_ENUM(*target).ordinal -= (int)delta;
             break;
 
@@ -7633,17 +7648,14 @@ Value vmBuiltinNew(VM* vm, int arg_count, Value* args) {
     *(allocated_memory) = makeValueForType(baseVarType, actualBaseTypeDef, NULL);
     // (debug logging removed)
 
-    // Update the pointer variable that was passed by reference
-    SET_VALUE_TYPE(pointerVarValuePtr, TYPE_POINTER);
+    // Update the pointer variable that was passed by reference. It is
+    // already TYPE_POINTER (checked above): keep its PointerObj, and with it
+    // the base_type_node the next new(p) resolves the pointee type from --
+    // retyping it reset .bits and dropped that wrapper, so a second new(p)
+    // on a record pointer allocated an integer. Pascal pointer variables
+    // start out nil-but-wrappered (makeValueForType); the ensure below only
+    // covers one that has no wrapper yet.
     pscalPointerEnsureObj(pointerVarValuePtr);
-    // SET_VALUE_TYPE just reset .bits to a nil-pointer placeholder (VM 2.0
-    // Phase 4i checkpoint 3b) -- but if this pointer variable already held
-    // a real PointerObj (the common case: Pascal pointer vars start out
-    // nil-but-wrappered via makeValueForType, so pscalPointerEnsureObj
-    // above is a no-op here), .bits is now wrongly out of sync with the
-    // wrapper that's actually there. Re-tag unconditionally; safe whether
-    // ensure just allocated fresh or found one already present.
-    pscalValueSetHeapPtrBits(pointerVarValuePtr, PSCAL_VALUE_PTR(*pointerVarValuePtr, PointerObj));
     AS_POINTER(*pointerVarValuePtr) = allocated_memory;
 
     // Safety: if base type metadata is unknown, treat as integer for subsequent dereferences
@@ -8194,6 +8206,10 @@ Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
                 parameterError = true;
                 goto cleanup;
             }
+            // The elements are overwritten in place: unshare a static array
+            // that copies still share by reference count (dynamic arrays are
+            // reference types and stay shared).
+            valueEnsureUnique(bufferValue);
             if (ARRAY_IS_PACKED(*bufferValue) && ARRAY_ELEMENT_TYPE(*bufferValue) == TYPE_BYTE) {
                 if (!AS_ARRAY_RAW(*bufferValue) && bytesToRead > 0) {
                     runtimeError(vm, "BlockRead: packed byte buffer is NULL.");
@@ -8480,7 +8496,6 @@ cleanup:
 Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
     FILE* input_stream = stdin;
     int var_start_index = 0;
-    bool first_arg_is_file_by_value = false;
     int io_error = 0;
 
     // Determine input stream: allow FILE or ^FILE
@@ -8496,7 +8511,6 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
             }
             input_stream = AS_FILE(*a0);
             var_start_index = 1;
-            if (VALUE_TYPE(args[0]) == TYPE_FILE) first_arg_is_file_by_value = true;
         }
     }
 
@@ -8570,11 +8584,23 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
             }
             case TYPE_STRING:
             case TYPE_NIL: {
+                // Install a fresh StringObj instead of rewriting the current
+                // one, which copies of the variable may share by reference
+                // count, then drop this variable's reference to the old one.
+                // A string[N] variable keeps its cap.
+                StringObj *old_s = (VALUE_TYPE(*dst) == TYPE_STRING) ? PSCAL_VALUE_PTR(*dst, StringObj) : NULL;
+                int max_len = old_s ? old_s->max_length : -1;
+                StringObj *fresh_s = pscalStringObjCreate(max_len, TYPE_STRING);
+                if (max_len > 0) {
+                    fresh_s->buffer = (char *)calloc((size_t)max_len + 1, 1);
+                    if (fresh_s->buffer) strncpy(fresh_s->buffer, buffer, (size_t)max_len);
+                } else {
+                    fresh_s->buffer = strdup(buffer);
+                }
+                if (!fresh_s->buffer) { io_error = 1; }
                 SET_VALUE_TYPE(dst, TYPE_STRING);
-                pscalStringEnsureObj(dst); // dst may have arrived as TYPE_NIL with no wrapper
-                if (AS_STRING(*dst)) { free(AS_STRING(*dst)); }
-                AS_STRING(*dst) = strdup(buffer);
-                if (!AS_STRING(*dst)) { io_error = 1; }
+                pscalValueSetHeapPtrBits(dst, fresh_s);
+                if (old_s) pscalObjRelease(&old_s->header);
                 break;
             }
             default:
@@ -8588,8 +8614,6 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
     if (!io_error && ferror(input_stream)) io_error = 1;
     else if (io_error != 1) io_error = 0;
 
-    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); pscalValueSetHeapPtrBits(&args[0], NULL); }
-
     if (input_stream == stdin) {
         vmEnableRawMode();
     }
@@ -8602,7 +8626,6 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
     fflush(stdout);
     FILE* input_stream = stdin;
     int var_start_index = 0;
-    bool first_arg_is_file_by_value = false;
     // Clear any previous IO error so a successful read won't report stale
     // failures from earlier operations (e.g. failed parse on a prior call).
     int io_error = 0;
@@ -8620,10 +8643,6 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
             }
             input_stream = AS_FILE(*a0);
             var_start_index = 1;
-            // If the actual arg0 on the stack is a FILE by value (not a pointer),
-            // the VM will free it after we return, which would fclose() the stream.
-            // Prevent that by neutering the stack value before we return.
-            if (VALUE_TYPE(args[0]) == TYPE_FILE) first_arg_is_file_by_value = true;   // ***NEW***
         }
     }
 
@@ -8643,8 +8662,6 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
                     vm ? (int)vm->exit_requested : -1,
                     vm ? (int)vm->suspend_unwind_requested : -1);
         }
-        // ***NEW***: prevent VM cleanup from closing the stream we used
-        if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); pscalValueSetHeapPtrBits(&args[0], NULL); }  // ***NEW***
         if (input_stream == stdin) vmEnableRawMode();
         vmCommitLastIoError(io_error);
         return makeVoid();
@@ -8770,12 +8787,28 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
                 // copies pointing at the value they were given, which is what
                 // plain assignment already does (`s = t;` then `t = "x";`
                 // never disturbed `s`). The previous object is header-managed
-                // and is no longer freed here precisely because a sharer may
-                // still hold it.
-                StringObj* fresh_str_obj = pscalStringObjCreate(-1, dst_str_retype);
+                // and only this variable's reference to it is released below
+                // (a sharer still holds its own). A string[N] variable keeps
+                // its cap: the line is truncated to it.
+                StringObj* old_str_obj = PSCAL_VALUE_PTR(*dst, StringObj);
+                int max_len = old_str_obj ? old_str_obj->max_length : -1;
+                if (max_len > 0) {
+                    char* fixed = (char*)calloc((size_t)max_len + 1, 1);
+                    if (!fixed) {
+                        free(tmp);
+                        runtimeError(vm, "Out of memory in Readln.");
+                        io_error = 1;
+                        break;
+                    }
+                    strncpy(fixed, tmp, (size_t)max_len);
+                    free(tmp);
+                    tmp = fixed;
+                }
+                StringObj* fresh_str_obj = pscalStringObjCreate(max_len, dst_str_retype);
                 fresh_str_obj->buffer = tmp;
                 SET_VALUE_TYPE(dst, dst_str_retype);
                 pscalValueSetHeapPtrBits(dst, fresh_str_obj);
+                if (old_str_obj) pscalObjRelease(&old_str_obj->header);
                 i = arg_count; // consume the line; ignore trailing params
                 break;
             }
@@ -8790,9 +8823,6 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
 
     if (!io_error && ferror(input_stream)) io_error = 1;
     else if (io_error != 1) io_error = 0;
-
-    // ***NEW***: neuter FILE-by-value arg so VM cleanup won’t fclose()
-    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); pscalValueSetHeapPtrBits(&args[0], NULL); }  // ***NEW***
 
     if (input_stream == stdin) {
         vmEnableRawMode();
@@ -8964,7 +8994,6 @@ Value vmBuiltinWrite(VM* vm, int arg_count, Value* args) {
 
     FILE* output_stream = stdout;
     int start_index = 1;
-    bool first_arg_is_file_by_value = false;
     const Value* file_value = NULL;
     bool binary_file = false;
     VarType binary_element_type = TYPE_VOID;
@@ -8980,7 +9009,6 @@ Value vmBuiltinWrite(VM* vm, int arg_count, Value* args) {
             }
             output_stream = AS_FILE(*first);
             start_index = 2;
-            if (VALUE_TYPE(args[1]) == TYPE_FILE) first_arg_is_file_by_value = true;
             file_value = first;
             if (FILE_ELEMENT_TYPE(*file_value) != TYPE_VOID && FILE_ELEMENT_TYPE(*file_value) != TYPE_UNKNOWN) {
                 bool has_typed_metadata = FILE_RECORD_SIZE_EXPLICIT(*file_value) || FILE_ELEMENT_TYPE_DEF(*file_value) != NULL;
@@ -9119,7 +9147,6 @@ Value vmBuiltinWrite(VM* vm, int arg_count, Value* args) {
 #else
     pthread_cleanup_pop(1);
 #endif
-    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[1], TYPE_NIL); pscalValueSetHeapPtrBits(&args[1], NULL); }
 
     return makeVoid();
 }

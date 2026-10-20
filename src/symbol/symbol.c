@@ -1261,6 +1261,10 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
             if (!source_str) source_str = "";
 
             if (STRING_MAX_LENGTH(*sym->value) > 0) { // Target is a fixed-length string.
+                // Written in place: unshare the StringObj first, or every
+                // copy sharing it by reference count (a by-value parameter,
+                // `b := g`) changes too.
+                valueEnsureUnique(sym->value);
                 strncpy(AS_STRING(*sym->value), source_str, STRING_MAX_LENGTH(*sym->value));
                 AS_STRING(*sym->value)[STRING_MAX_LENGTH(*sym->value)] = '\0';
             } else { // Target is a dynamic string.
@@ -1297,23 +1301,13 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
 
         case TYPE_FILE:
             if (VALUE_TYPE(val) == TYPE_FILE) {
-                if (AS_FILE(*sym->value)) {
-                    if (!pscalRuntimeVmIsSharedFileStream(AS_FILE(*sym->value))) {
-                        fclose(AS_FILE(*sym->value));
-                    } else {
-                        fflush(AS_FILE(*sym->value));
-                    }
-                }
-                AS_FILE(*sym->value) = AS_FILE(val);
-                if (FILE_FILENAME(*sym->value)) free(FILE_FILENAME(*sym->value));
-                FILE_FILENAME(*sym->value) = FILE_FILENAME(val) ? strdup(FILE_FILENAME(val)) : NULL;
-                // VM 2.0 Phase 4g: `val` (the RHS of `f2 := f1`) is a bare,
-                // untracked alias of f1's own FileObj (see makeCopyOfValue's
-                // TYPE_FILE comment) -- val's payload pointer IS f1's
-                // wrapper, not an independent copy. Detach val's own
-                // pointer to it (so val's eventual freeValue is a no-op)
-                // WITHOUT writing through AS_FILE/FILE_FILENAME, which
-                // would mutate f1's real, still-live FileObj in place.
+                // `val` (the RHS of `f2 := f1`) holds its own reference to
+                // f1's FileObj (makeCopyOfValue retains file copies), and
+                // the target's previous reference was released above --
+                // which closes its handle once nothing else shares it. Move
+                // val's reference in: f2 now shares f1's handle, the same
+                // identity every other copy of a file has.
+                *(sym->value) = val;
                 pscalValueSetHeapPtrBits(&val, NULL);
             }
             break;
