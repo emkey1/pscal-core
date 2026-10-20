@@ -4329,32 +4329,11 @@ static bool vmSetContains(const Value* setVal, const Value* itemVal) {
         return false;
     }
 
+    // The same ordinal mapping MAKE_SET_* used to build the set, so every
+    // ordinal type (int64, shortint, cardinal, widechar, ...) tests
+    // membership the way it was added.
     long long item_ord;
-    bool item_is_ordinal = false;
-
-    // Get ordinal value of the item
-    switch (VALUE_TYPE(*itemVal)) {
-        case TYPE_INTEGER:
-        case TYPE_BYTE:
-        case TYPE_WORD:
-        case TYPE_BOOLEAN:
-            item_ord = VAL_INT(*itemVal);
-            item_is_ordinal = true;
-            break;
-        case TYPE_CHAR:
-            item_ord = (long long)AS_CHAR(*itemVal);
-            item_is_ordinal = true;
-            break;
-        case TYPE_ENUM:
-            item_ord = (long long)AS_ENUM(*itemVal).ordinal;
-            item_is_ordinal = true;
-            break;
-        default:
-            item_is_ordinal = false;
-            break;
-    }
-
-    if (!item_is_ordinal) return false; // Item is not of a type that can be in a set
+    if (!tryValueToOrdinal(itemVal, &item_ord)) return false; // Item is not of a type that can be in a set
 
     // Search for the ordinal value in the set's values array
     if (!AS_SET(*setVal).set_values) return false;
@@ -4396,33 +4375,103 @@ static bool vmBuildSetFromOrdinal(Value* outSet, long long ordinal) {
     return vmAddOrdinalToSet(outSet, ordinal);
 }
 
-static bool vmBuildSetFromRange(Value* outSet, long long start_ord, long long end_ord) {
-    if (!outSet) {
-        return false;
-    }
+// Largest set a range constructor may build. A set is a flat array of
+// ordinals, so `[0..maxint]` would otherwise try to allocate 16 GiB (and
+// overflow SetObj's int size/capacity on the way).
+#define VM_SET_RANGE_MAX_ELEMENTS (1u << 20)
+
+typedef enum {
+    VM_SET_RANGE_OK,
+    VM_SET_RANGE_TOO_LARGE,
+    VM_SET_RANGE_NO_MEMORY
+} VmSetRangeStatus;
+
+// `[start..end]`: every ordinal from start to end, and the empty set when
+// start > end (ISO Pascal 6.7.1). A fresh range holds distinct ordinals, so
+// it is sized once and filled directly rather than through
+// vmAddOrdinalToSet's per-element duplicate scan. On failure *outSet is nil
+// and owns nothing.
+static VmSetRangeStatus vmBuildSetFromRange(Value* outSet, long long start_ord, long long end_ord) {
     *outSet = makeValueForType(TYPE_SET, NULL, NULL);
-    if (start_ord <= end_ord) {
-        for (long long current = start_ord; current <= end_ord; ++current) {
-            if (!vmAddOrdinalToSet(outSet, current)) {
-                return false;
-            }
-            if (current == LLONG_MAX) {
-                break;
-            }
-        }
-        return true;
+    if (start_ord > end_ord) {
+        return VM_SET_RANGE_OK;
     }
-    for (long long current = start_ord;; --current) {
-        if (!vmAddOrdinalToSet(outSet, current)) {
-            return false;
+    // end >= start, so the unsigned difference is exact even across the
+    // whole long long range.
+    unsigned long long span = (unsigned long long)end_ord - (unsigned long long)start_ord;
+    if (span >= VM_SET_RANGE_MAX_ELEMENTS) {
+        freeValue(outSet);
+        *outSet = makeNil();
+        return VM_SET_RANGE_TOO_LARGE;
+    }
+    size_t count = (size_t)span + 1;
+    long long* values = (long long*)malloc(sizeof(long long) * count);
+    if (!values) {
+        freeValue(outSet);
+        *outSet = makeNil();
+        return VM_SET_RANGE_NO_MEMORY;
+    }
+    for (size_t i = 0; i < count; i++) {
+        values[i] = start_ord + (long long)i;
+    }
+    free(AS_SET(*outSet).set_values);
+    AS_SET(*outSet).set_values = values;
+    AS_SET(*outSet).set_size = (int)count;
+    SET_CAPACITY(*outSet) = (int)count;
+    return VM_SET_RANGE_OK;
+}
+
+static int vmCompareOrdinals(const void* x, const void* y) {
+    long long a = *(const long long*)x;
+    long long b = *(const long long*)y;
+    return (a > b) - (a < b);
+}
+
+// Is every member of `sub` also a member of `super`? Membership only, so
+// the order the ordinals were added in does not matter. Small sets are
+// compared pairwise; larger ones against a sorted copy of `super`.
+// Returns -1 if that copy cannot be allocated.
+static int vmSetIsSubset(const Value* sub, const Value* super) {
+    const SetObj* s = PSCAL_VALUE_PTR(*sub, SetObj);
+    const SetObj* t = PSCAL_VALUE_PTR(*super, SetObj);
+    int s_size = (s && s->set_values) ? s->set_size : 0;
+    int t_size = (t && t->set_values) ? t->set_size : 0;
+    if (s_size == 0) {
+        return 1;
+    }
+    if (t_size == 0) {
+        return 0;
+    }
+    if ((long long)s_size * (long long)t_size <= 4096) {
+        for (int i = 0; i < s_size; i++) {
+            bool found = false;
+            for (int j = 0; j < t_size; j++) {
+                if (t->set_values[j] == s->set_values[i]) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                return 0;
+            }
         }
-        if (current == end_ord) {
-            return true;
-        }
-        if (current == LLONG_MIN) {
-            return false;
+        return 1;
+    }
+    long long* sorted = (long long*)malloc(sizeof(long long) * (size_t)t_size);
+    if (!sorted) {
+        return -1;
+    }
+    memcpy(sorted, t->set_values, sizeof(long long) * (size_t)t_size);
+    qsort(sorted, (size_t)t_size, sizeof(long long), vmCompareOrdinals);
+    int result = 1;
+    for (int i = 0; i < s_size; i++) {
+        if (!bsearch(&s->set_values[i], sorted, (size_t)t_size, sizeof(long long), vmCompareOrdinals)) {
+            result = 0;
+            break;
         }
     }
+    free(sorted);
+    return result;
 }
 
 // Scans all global symbols and the entire VM value stack to find and nullify
@@ -8798,6 +8847,38 @@ dispatch_switch:
                         freeValue(&a_val); freeValue(&b_val); return INTERPRET_RUNTIME_ERROR;
                     }
                 }
+                // Pascal sets: '=' and '<>' compare membership (the order
+                // the members were added in does not matter), '<=' is
+                // "is a subset of" and '>=' "is a superset of". '<' and
+                // '>' are not set operators and stay an error.
+                else if (VALUE_TYPE(a_val) == TYPE_SET && VALUE_TYPE(b_val) == TYPE_SET) {
+                    int sub = 1;
+                    int super = 1;
+                    switch (instruction_val) {
+                        case EQUAL:
+                        case NOT_EQUAL:
+                            sub = vmSetIsSubset(&a_val, &b_val);
+                            if (sub == 1) {
+                                super = vmSetIsSubset(&b_val, &a_val);
+                            }
+                            break;
+                        case LESS_EQUAL:
+                            sub = vmSetIsSubset(&a_val, &b_val);
+                            break;
+                        case GREATER_EQUAL:
+                            super = vmSetIsSubset(&b_val, &a_val);
+                            break;
+                        default:
+                            goto comparison_error_label;
+                    }
+                    if (sub < 0 || super < 0) {
+                        runtimeError(vm, "VM Error: Out of memory comparing sets.");
+                        freeValue(&a_val); freeValue(&b_val); return INTERPRET_RUNTIME_ERROR;
+                    }
+                    bool holds = (sub == 1 && super == 1);
+                    result_val = makeBoolean(instruction_val == NOT_EQUAL ? !holds : holds);
+                    comparison_succeeded = true;
+                }
                 // Any other concrete value compared against NIL: builtins
                 // like ChannelReceive/TaskAwait return TYPE_NIL to signal a
                 // degenerate/closed/canceled result even when the receiving
@@ -10518,6 +10599,7 @@ comparison_error_label:
                 Value set_value;
                 if (!vmBuildSetFromOrdinal(&set_value, ordinal)) {
                     runtimeError(vm, "VM Error: Failed to allocate set singleton.");
+                    freeValue(&set_value);
                     freeValue(&item_val);
                     return INTERPRET_RUNTIME_ERROR;
                 }
@@ -10539,8 +10621,14 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 Value set_value;
-                if (!vmBuildSetFromRange(&set_value, start_ord, end_ord)) {
-                    runtimeError(vm, "VM Error: Failed to allocate set range.");
+                VmSetRangeStatus range_status = vmBuildSetFromRange(&set_value, start_ord, end_ord);
+                if (range_status != VM_SET_RANGE_OK) {
+                    if (range_status == VM_SET_RANGE_TOO_LARGE) {
+                        runtimeError(vm, "Runtime Error: Set range [%lld..%lld] is too large (at most %u elements).",
+                                     start_ord, end_ord, (unsigned)VM_SET_RANGE_MAX_ELEMENTS);
+                    } else {
+                        runtimeError(vm, "VM Error: Failed to allocate set range.");
+                    }
                     freeValue(&start_val);
                     freeValue(&end_val);
                     return INTERPRET_RUNTIME_ERROR;
