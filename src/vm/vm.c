@@ -8,6 +8,7 @@
 #include <ctype.h>
 #include <pthread.h>
 #include <limits.h>
+#include <math.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <inttypes.h>
@@ -1122,7 +1123,9 @@ static void hydrateFieldMetadataFromBaseValue(Value* base_val_ptr,
         }
     }
 
-    freeFieldValue(prototype_fields);
+    // The probe's RecordObj owns prototype_fields; freeing only the field
+    // list leaked the RecordObj on every call.
+    freeValue(&prototype_probe);
 }
 
 static bool pushFieldValueByOffset(VM* vm, Value* base_val_ptr, uint16_t field_index) {
@@ -4196,6 +4199,13 @@ static void vmDumpStackInternal(VM* vm, bool detailed) {
 
 static void assignRealToIntChecked(VM* vm, Value* dest, long double real_val) {
     bool range_error = false;
+    // NaN fails no range test below, and converting it to an integer is
+    // undefined: store 0 and report it like any other out-of-range value.
+    bool was_nan = isnan(real_val) && VALUE_TYPE(*dest) != TYPE_BOOLEAN;
+    if (was_nan) {
+        range_error = true;
+        real_val = 0.0L;
+    }
     switch (VALUE_TYPE(*dest)) {
         case TYPE_BOOLEAN: {
             long long tmp = (real_val != 0.0L) ? 1 : 0;
@@ -4308,7 +4318,9 @@ static void assignRealToIntChecked(VM* vm, Value* dest, long double real_val) {
             if (real_val < 0.0L) {
                 range_error = true;
                 tmp = 0ULL;
-            } else if (real_val > (long double)UINT64_MAX) {
+            } else if (real_val >= 18446744073709551616.0L) {
+                // 2^64: (long double)UINT64_MAX rounds up to it where long
+                // double is double, so `>` let 2^64 itself through.
                 range_error = true;
                 tmp = UINT64_MAX;
             } else {
@@ -4329,7 +4341,8 @@ static void assignRealToIntChecked(VM* vm, Value* dest, long double real_val) {
             if (real_val < (long double)LLONG_MIN) {
                 range_error = true;
                 tmp = LLONG_MIN;
-            } else if (real_val > (long double)LLONG_MAX) {
+            } else if (real_val >= 9223372036854775808.0L) {
+                // 2^63, for the same reason as UINT64 above.
                 range_error = true;
                 tmp = LLONG_MAX;
             } else {
@@ -4343,7 +4356,7 @@ static void assignRealToIntChecked(VM* vm, Value* dest, long double real_val) {
             if (real_val < (long double)LLONG_MIN) {
                 range_error = true;
                 tmp = LLONG_MIN;
-            } else if (real_val > (long double)LLONG_MAX) {
+            } else if (real_val >= 9223372036854775808.0L) {
                 range_error = true;
                 tmp = LLONG_MAX;
             } else {
@@ -4353,7 +4366,10 @@ static void assignRealToIntChecked(VM* vm, Value* dest, long double real_val) {
             break;
         }
     }
-    if (range_error) {
+    if (was_nan) {
+        runtimeWarning(vm, "Warning: Range check error assigning REAL NaN to %s.",
+                       varTypeToString(VALUE_TYPE(*dest)));
+    } else if (range_error) {
         runtimeWarning(vm, "Warning: Range check error assigning REAL %Lf to %s.",
                        real_val, varTypeToString(VALUE_TYPE(*dest)));
     }
