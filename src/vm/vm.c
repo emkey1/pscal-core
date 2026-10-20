@@ -7880,16 +7880,19 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
     // name indices to slot indices. That ordering matters here specifically
     // because pscalProtectChunkCode() below makes `code` read-only -- the
     // link step's in-place rewrite would not be safe to run after this.
-    if (!chunk->prepared_for_execution) {
+    // Double-checked: the unlocked read must acquire, pairing with the
+    // release store below, so a thread that sees `true` also sees the
+    // caches table and the protected code it guards.
+    if (!atomic_load_explicit(&chunk->prepared_for_execution, memory_order_acquire)) {
         pthread_mutex_lock(&globals_mutex);
-        if (!chunk->prepared_for_execution) {
+        if (!atomic_load_explicit(&chunk->prepared_for_execution, memory_order_relaxed)) {
             if (chunk->cache_count > 0 && !chunk->caches) {
                 chunk->caches = (CacheSlot*)calloc((size_t)chunk->cache_count, sizeof(CacheSlot));
             }
             bool caches_ok = (chunk->cache_count == 0) || (chunk->caches != NULL);
             bool protect_ok = caches_ok && pscalProtectChunkCode(chunk);
             if (caches_ok && protect_ok) {
-                chunk->prepared_for_execution = true;
+                atomic_store_explicit(&chunk->prepared_for_execution, true, memory_order_release);
             }
             pthread_mutex_unlock(&globals_mutex);
             if (!caches_ok) {

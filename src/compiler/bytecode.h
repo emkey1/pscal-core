@@ -208,8 +208,9 @@ typedef struct {
     int global_pas_exc_message_slot;  // Slot for "__pas_exc_message", or -1
     bool globals_linked;           // One-time guard: has the link step already run for this chunk?
 
-    bool prepared_for_execution; // One-time-init guard for `caches` allocation (and, in PSCAL_VM_CODE_PROTECT
-                                 // builds, for mprotect'ing `code` read-only) -- see interpretBytecode()
+    atomic_bool prepared_for_execution; // One-time-init guard for `caches` allocation (and, in PSCAL_VM_CODE_PROTECT
+                                        // builds, for mprotect'ing `code` read-only) -- see interpretBytecode().
+                                        // Atomic: it is read outside globals_mutex (double-checked).
     bool code_is_mapped;   // true if `code` is an mmap'd buffer (PSCAL_VM_CODE_PROTECT) rather than malloc'd
     size_t code_map_size;  // valid only when code_is_mapped
 
