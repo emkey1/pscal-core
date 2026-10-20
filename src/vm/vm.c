@@ -10929,7 +10929,7 @@ comparison_error_label:
                     // copy keeps alive, so the copy could never be freed.
                     // No compiler emits this.
                     runtimeError(vm, "VM Error: GET_ELEMENT_ADDRESS needs a pointer to the array, not an array value.");
-                    free(indices);
+                    if (indices != indices_inline) free(indices);
                     freeValue(&operand);
                     return INTERPRET_RUNTIME_ERROR;
                 } else {
@@ -10946,7 +10946,7 @@ comparison_error_label:
                     dimension_count > ARRAY_DIMENSIONS(*array_val_ptr)) {
                     runtimeError(vm, "VM Error: %u indices for an array of %d dimension(s).",
                                  dimension_count, ARRAY_DIMENSIONS(*array_val_ptr));
-                    free(indices);
+                    if (indices != indices_inline) free(indices);
                     freeValue(&operand);
                     if (using_wrapper) {
                         vmFreeArrayIndexWrapper(&temp_wrapper);
