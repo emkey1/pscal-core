@@ -8926,6 +8926,18 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
+                // The field address handed out here is the l-value of a
+                // store (SET_INDIRECT) or a VAR argument, exactly like
+                // GET_FIELD_ADDRESS's -- clone a still-shared RecordObj
+                // first, or the write lands in every copy that shares it
+                // (a CLike struct passed by value was mutated in the
+                // caller). Only when the record was reached through a
+                // pointer: a record held directly by this stack slot is a
+                // temporary popped just below, and cloning it would leave
+                // the pushed address pointing into a freed clone.
+                if (record_struct_ptr != base_val_ptr) {
+                    valueEnsureUnique(record_struct_ptr);
+                }
 
                 FieldValue* current = findRecordFieldBySlot(record_struct_ptr, field_index);
                 if (!current) {
@@ -8957,6 +8969,11 @@ comparison_error_label:
                 if (VALUE_TYPE(*record_struct_ptr) != TYPE_RECORD) {
                     runtimeError(vm, "VM Error: Internal - expected to resolve to a record for field access.");
                     return INTERPRET_RUNTIME_ERROR;
+                }
+
+                // Same clone-on-write as GET_FIELD_OFFSET above.
+                if (record_struct_ptr != base_val_ptr) {
+                    valueEnsureUnique(record_struct_ptr);
                 }
 
                 FieldValue* current = findRecordFieldBySlot(record_struct_ptr, field_index);
