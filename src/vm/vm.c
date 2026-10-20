@@ -7679,8 +7679,15 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
                 while (VALUE_TYPE(*final_b) == TYPE_POINTER && AS_POINTER(*final_b)) { \
                     final_b = (Value*)AS_POINTER(*final_b); \
                 } \
-                if ((IS_STRING(*final_a) || IS_CHAR(*final_a)) && \
-                    (IS_STRING(*final_b) || IS_CHAR(*final_b) || current_instruction_code == ADD)) { \
+                /* A string + anything concatenates (the other side is \
+                 * stringified). A char + a non-text value does so only \
+                 * under Aether, whose `s[i]` is a one-character Text and \
+                 * whose Text + number stringifies (D7); everywhere else a \
+                 * char is an ordinal and char +/- int is arithmetic. */ \
+                bool concat_text_any = frontendIsAether(); \
+                if (IS_STRING(*final_a) || \
+                    (IS_CHAR(*final_a) && \
+                     (IS_STRING(*final_b) || IS_CHAR(*final_b) || concat_text_any))) { \
                     char a_buffer[5] = {0}; \
                     char b_buffer[5] = {0}; \
                     char* coerced_b = NULL; \
@@ -7777,7 +7784,7 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
                     free(coerced_b); \
                     freeValue(&a_val_popped); freeValue(&b_val_popped); \
                     op_is_handled = true; \
-                } else if ((IS_STRING(*final_b) || IS_CHAR(*final_b)) && current_instruction_code == ADD) { \
+                } else if (IS_STRING(*final_b) || (IS_CHAR(*final_b) && concat_text_any)) { \
                     char* coerced_a = vmStringifyValueForConcat(final_a); \
                     char b_buffer[5] = {0}; \
                     const char* s_a = NULL; \
