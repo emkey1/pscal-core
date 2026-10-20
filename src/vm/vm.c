@@ -6210,6 +6210,83 @@ static Value vmHostWaitThread(VM* vm) {
     return makeInt(0);
 }
 
+// Base-type nodes for INIT_LOCAL_POINTER's builtin pointee types
+// (`^integer`), which have no registered type to point at. A pointer keeps
+// its base-type node and may outlive the frame, so the node cannot be freed
+// with it; instead one node per type name is built on first use and kept,
+// rather than a new node on every execution (a routine with a `^integer`
+// local leaked one per call).
+typedef struct VmBuiltinPointerBase {
+    char* name;
+    AST* node;
+    struct VmBuiltinPointerBase* next;
+} VmBuiltinPointerBase;
+
+static VmBuiltinPointerBase* gVmBuiltinPointerBases = NULL;
+static pthread_mutex_t gVmBuiltinPointerBasesMutex = PTHREAD_MUTEX_INITIALIZER;
+
+static AST* vmBuiltinPointerBaseNode(const char* tn) {
+    pthread_mutex_lock(&gVmBuiltinPointerBasesMutex);
+    for (VmBuiltinPointerBase* entry = gVmBuiltinPointerBases; entry; entry = entry->next) {
+        if (strcmp(entry->name, tn) == 0) {
+            pthread_mutex_unlock(&gVmBuiltinPointerBasesMutex);
+            return entry->node;
+        }
+    }
+    VmBuiltinPointerBase* entry = (VmBuiltinPointerBase*)calloc(1, sizeof(VmBuiltinPointerBase));
+    char* name = strdup(tn);
+    if (!entry || !name) {
+        free(entry);
+        free(name);
+        pthread_mutex_unlock(&gVmBuiltinPointerBasesMutex);
+        return NULL;
+    }
+    Token* baseTok = newToken(TOKEN_IDENTIFIER, tn, 0, 0);
+    AST* node = newASTNode(AST_VARIABLE, baseTok);
+    if      (strcasecmp(tn, "integer") == 0 || strcasecmp(tn, "int") == 0) setTypeAST(node, TYPE_INT32);
+    else if (strcasecmp(tn, "real")    == 0 || strcasecmp(tn, "double") == 0) setTypeAST(node, TYPE_DOUBLE);
+    else if (strcasecmp(tn, "single")  == 0 || strcasecmp(tn, "float")  == 0) setTypeAST(node, TYPE_FLOAT);
+    else if (strcasecmp(tn, "char")    == 0) setTypeAST(node, TYPE_CHAR);
+    else if (strcasecmp(tn, "widechar")== 0) setTypeAST(node, TYPE_WIDECHAR);
+    else if (strcasecmp(tn, "unicodestring")== 0) setTypeAST(node, TYPE_UNICODE_STRING);
+    else if (strcasecmp(tn, "boolean") == 0 || strcasecmp(tn, "bool") == 0) setTypeAST(node, TYPE_BOOLEAN);
+    else if (strcasecmp(tn, "byte")    == 0) setTypeAST(node, TYPE_BYTE);
+    else if (strcasecmp(tn, "word")    == 0) setTypeAST(node, TYPE_WORD);
+    else if (strcasecmp(tn, "int64")   == 0 || strcasecmp(tn, "longint") == 0) setTypeAST(node, TYPE_INT64);
+    else if (strcasecmp(tn, "cardinal")== 0) setTypeAST(node, TYPE_UINT32);
+    else setTypeAST(node, TYPE_VOID);
+    freeToken(baseTok);
+    entry->name = name;
+    entry->node = node;
+    entry->next = gVmBuiltinPointerBases;
+    gVmBuiltinPointerBases = entry;
+    pthread_mutex_unlock(&gVmBuiltinPointerBasesMutex);
+    return node;
+}
+
+// Checks one dimension of a local or field array before makeArrayND sees
+// it: both bounds must fit an int (a plain cast turned array[1..4294967297]
+// into array[1..1]) and the dimension must hold between 1 and INT_MAX
+// elements (makeArrayND exits the whole process on an empty one). Reports a
+// runtime error and returns false otherwise.
+static bool vmCheckArrayDimension(VM* vm, long long lower, long long upper, int* out_lower, int* out_upper) {
+    if (lower < INT_MIN || lower > INT_MAX || upper < INT_MIN || upper > INT_MAX) {
+        runtimeError(vm, "Runtime Error: Array bounds %lld..%lld are out of range.", lower, upper);
+        return false;
+    }
+    if (upper < lower) {
+        runtimeError(vm, "Runtime Error: Array dimension %lld..%lld has no elements.", lower, upper);
+        return false;
+    }
+    if (upper - lower >= INT_MAX) {
+        runtimeError(vm, "Runtime Error: Array dimension %lld..%lld is too large.", lower, upper);
+        return false;
+    }
+    *out_lower = (int)lower;
+    *out_upper = (int)upper;
+    return true;
+}
+
 // vsnprintf into a fresh heap buffer sized for the whole result (NULL if
 // out of memory). The caller frees it.
 static char* vmFormatAlloc(const char* format, ...) __attribute__((format(printf, 1, 2)));
@@ -11380,9 +11457,16 @@ comparison_error_label:
                                 free(lower_idx); free(upper_idx);
                                 return INTERPRET_RUNTIME_ERROR;
                             }
-                            lower_bounds[i] = 0;
-                            upper_bounds[i] = (int)VAL_INT(size_val) - 1;
+                            long long size = asI64(size_val);
                             freeValue(&size_val);
+                            if (size < 1 || !vmCheckArrayDimension(vm, 0, size - 1, &lower_bounds[i], &upper_bounds[i])) {
+                                if (size < 1) {
+                                    runtimeError(vm, "Runtime Error: Array size %lld must be at least 1.", size);
+                                }
+                                free(lower_bounds); free(upper_bounds);
+                                free(lower_idx); free(upper_idx);
+                                return INTERPRET_RUNTIME_ERROR;
+                            }
                         } else {
                             if (lower_idx[i] >= vm->chunk->constants_count || upper_idx[i] >= vm->chunk->constants_count) {
                                 runtimeError(vm, "VM Error: Array bound constant index out of range.");
@@ -11398,8 +11482,12 @@ comparison_error_label:
                                 free(lower_idx); free(upper_idx);
                                 return INTERPRET_RUNTIME_ERROR;
                             }
-                            lower_bounds[i] = (int)VAL_INT(lower_val);
-                            upper_bounds[i] = (int)VAL_INT(upper_val);
+                            if (!vmCheckArrayDimension(vm, asI64(lower_val), asI64(upper_val),
+                                                       &lower_bounds[i], &upper_bounds[i])) {
+                                free(lower_bounds); free(upper_bounds);
+                                free(lower_idx); free(upper_idx);
+                                return INTERPRET_RUNTIME_ERROR;
+                            }
                         }
                     }
 
@@ -11484,9 +11572,16 @@ comparison_error_label:
                                 free(lower_idx); free(upper_idx);
                                 return INTERPRET_RUNTIME_ERROR;
                             }
-                            lower_bounds[i] = 0;
-                            upper_bounds[i] = (int)VAL_INT(size_val) - 1;
+                            long long size = asI64(size_val);
                             freeValue(&size_val);
+                            if (size < 1 || !vmCheckArrayDimension(vm, 0, size - 1, &lower_bounds[i], &upper_bounds[i])) {
+                                if (size < 1) {
+                                    runtimeError(vm, "Runtime Error: Array size %lld must be at least 1.", size);
+                                }
+                                free(lower_bounds); free(upper_bounds);
+                                free(lower_idx); free(upper_idx);
+                                return INTERPRET_RUNTIME_ERROR;
+                            }
                         } else {
                             if (lower_idx[i] >= vm->chunk->constants_count || upper_idx[i] >= vm->chunk->constants_count) {
                                 runtimeError(vm, "VM Error: Array bound constant index out of range.");
@@ -11502,8 +11597,12 @@ comparison_error_label:
                                 free(lower_idx); free(upper_idx);
                                 return INTERPRET_RUNTIME_ERROR;
                             }
-                            lower_bounds[i] = (int)VAL_INT(lower_val);
-                            upper_bounds[i] = (int)VAL_INT(upper_val);
+                            if (!vmCheckArrayDimension(vm, asI64(lower_val), asI64(upper_val),
+                                                       &lower_bounds[i], &upper_bounds[i])) {
+                                free(lower_bounds); free(upper_bounds);
+                                free(lower_idx); free(upper_idx);
+                                return INTERPRET_RUNTIME_ERROR;
+                            }
                         }
                     }
 
@@ -11594,23 +11693,8 @@ comparison_error_label:
                     if (looked) {
                         type_def = looked;
                     } else {
-                        // Build a simple base type node from the provided name
-                        Token* baseTok = newToken(TOKEN_IDENTIFIER, AS_STRING(type_name_val), 0, 0);
-                        type_def = newASTNode(AST_VARIABLE, baseTok);
-                        const char* tn = AS_STRING(type_name_val);
-                        if      (strcasecmp(tn, "integer") == 0 || strcasecmp(tn, "int") == 0) setTypeAST(type_def, TYPE_INT32);
-                        else if (strcasecmp(tn, "real")    == 0 || strcasecmp(tn, "double") == 0) setTypeAST(type_def, TYPE_DOUBLE);
-                        else if (strcasecmp(tn, "single")  == 0 || strcasecmp(tn, "float")  == 0) setTypeAST(type_def, TYPE_FLOAT);
-                        else if (strcasecmp(tn, "char")    == 0) setTypeAST(type_def, TYPE_CHAR);
-                        else if (strcasecmp(tn, "widechar")== 0) setTypeAST(type_def, TYPE_WIDECHAR);
-                        else if (strcasecmp(tn, "unicodestring")== 0) setTypeAST(type_def, TYPE_UNICODE_STRING);
-                        else if (strcasecmp(tn, "boolean") == 0 || strcasecmp(tn, "bool") == 0) setTypeAST(type_def, TYPE_BOOLEAN);
-                        else if (strcasecmp(tn, "byte")    == 0) setTypeAST(type_def, TYPE_BYTE);
-                        else if (strcasecmp(tn, "word")    == 0) setTypeAST(type_def, TYPE_WORD);
-                        else if (strcasecmp(tn, "int64")   == 0 || strcasecmp(tn, "longint") == 0) setTypeAST(type_def, TYPE_INT64);
-                        else if (strcasecmp(tn, "cardinal")== 0) setTypeAST(type_def, TYPE_UINT32);
-                        else setTypeAST(type_def, TYPE_VOID);
-                        freeToken(baseTok);
+                        // A builtin base type (`^integer`): one shared node per name.
+                        type_def = vmBuiltinPointerBaseNode(AS_STRING(type_name_val));
                     }
                 }
                 CallFrame* frame = &vm->frames[vm->frameCount - 1];
