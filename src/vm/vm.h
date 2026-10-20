@@ -299,9 +299,28 @@ typedef struct {
 typedef void (*VMThreadCallback)(struct VM_s* threadVm, void* user_data);
 typedef void (*VMThreadCleanup)(void* user_data);
 
+// A VM-level mutex (mutex()/rcmutex()). Built on a pthread mutex + condvar
+// rather than handed straight to pthread_mutex_lock so that the VM knows who
+// holds it: lock() by the holder of a non-recursive mutex and unlock() by a
+// thread that does not hold it are reported as runtime errors (a plain
+// pthread mutex self-deadlocks, or on glibc silently releases), a job that
+// ends while holding mutexes releases them (vmReleaseHeldMutexes), and a
+// blocked lock() polls for interrupts and task cancellation instead of
+// waiting forever. `guard`/`released` are constructed once per slot and kept
+// for the life of the VM, so destroy+create on a slot never re-initialises a
+// pthread object another thread may still be touching.
 typedef struct {
-    pthread_mutex_t handle;
-    bool active;
+    pthread_mutex_t guard;    // protects holder/depth/waiters
+    pthread_cond_t released;  // signalled when the mutex becomes free
+    bool initialized;         // guard/released constructed
+    bool active;              // slot handed out by createMutex and not destroyed
+    bool recursive;
+    struct VM_s* holder;      // VM whose code holds the lock, NULL when free
+    int depth;                // lock depth of holder (recursive mutexes)
+    int waiters;              // lock() calls blocked on `released`
+    atomic_int users;         // lock/unlock calls in flight; raised under
+                              // mutexRegistryLock, so destroy can refuse a
+                              // mutex in use
 } Mutex;
 
 // --- Virtual Machine Structure ---
@@ -391,6 +410,10 @@ typedef struct VM_s {
      * frontendIsZeroBasedStrings(); was named shellIndexing back when shell was
      * the only 0-based frontend, which became a trap once Aether joined. */
     bool zeroBasedIndexing;
+
+    // VM mutexes this VM holds (touched only by its own thread), so a job's
+    // end skips the registry scan in the common case of none.
+    int heldMutexCount;
 
     // Optional tracing: when >0, print execution of first N instructions
     int trace_head_instructions;

@@ -1574,6 +1574,7 @@ typedef struct {
 
 static bool vmThreadCaptureUpvaluesForJob(VM* vm, ThreadJob* job);
 static void vmThreadJobDestroy(ThreadJob* job);
+static void vmReleaseHeldMutexes(VM* vm);
 
 static ThreadJobQueue* vmThreadJobQueueCreate(void) {
     ThreadJobQueue* queue = (ThreadJobQueue*)calloc(1, sizeof(ThreadJobQueue));
@@ -2730,6 +2731,14 @@ static void* threadStart(void* arg) {
             }
             default:
                 break;
+        }
+
+        // A job that ends holding VM mutexes (a runtime error or a cancel
+        // between lock and unlock, or a missing unlock) would otherwise keep
+        // them locked forever: the next lock() anywhere, and program exit,
+        // waited on them.
+        if (workerVm) {
+            vmReleaseHeldMutexes(workerVm);
         }
 
         // VM 2.0 Phase 5a checkpoint 5a-i: this read of statusReady was
@@ -3947,12 +3956,46 @@ size_t vmSnapshotProcWorkers(uintptr_t vm_address,
 }
 
 // --- Mutex Helpers ---
+// See Mutex's comment in vm.h. A mutex is held by a VM (the root VM, or the
+// worker VM running a job), not by an OS thread.
+
+typedef enum {
+    VM_MUTEX_OK,
+    VM_MUTEX_INVALID,     // no such mutex
+    VM_MUTEX_DEADLOCK,    // lock() by the holder of a non-recursive mutex
+    VM_MUTEX_NOT_OWNER,   // unlock() by a VM that does not hold the mutex
+    VM_MUTEX_BUSY,        // destroy() while held or waited on
+    VM_MUTEX_INTERRUPTED  // lock() wait ended by an interrupt or a stop request
+} VmMutexStatus;
+
+static VM* vmMutexRegistryOwner(VM* vm) {
+    return vm->mutexOwner ? vm->mutexOwner : vm;
+}
+
+// Looks a mutex up and marks a lock/unlock in flight on it, so destroy
+// refuses it until vmMutexEndUse. NULL when the id names no live mutex.
+static Mutex* vmMutexBeginUse(VM* vm, int id) {
+    VM* owner = vmMutexRegistryOwner(vm);
+    pthread_mutex_lock(&owner->mutexRegistryLock);
+    if (id < 0 || id >= owner->mutexCount || !owner->mutexes[id].active) {
+        pthread_mutex_unlock(&owner->mutexRegistryLock);
+        return NULL;
+    }
+    Mutex* m = &owner->mutexes[id];
+    atomic_fetch_add(&m->users, 1);
+    pthread_mutex_unlock(&owner->mutexRegistryLock);
+    return m;
+}
+
+static void vmMutexEndUse(Mutex* m) {
+    atomic_fetch_sub(&m->users, 1);
+}
+
 static int createMutex(VM* vm, bool recursive) {
-    VM* owner = vm->mutexOwner ? vm->mutexOwner : vm;
+    VM* owner = vmMutexRegistryOwner(vm);
     pthread_mutex_lock(&owner->mutexRegistryLock);
     int id = -1;
     // Look for an inactive slot to reuse.
-
     for (int i = 0; i < owner->mutexCount; i++) {
         if (!owner->mutexes[i].active) {
             id = i;
@@ -3972,114 +4015,200 @@ static int createMutex(VM* vm, bool recursive) {
             return -1;
         }
         id = owner->mutexCount;
-        owner->mutexCount++;
     }
     Mutex* m = &owner->mutexes[id];
-    pthread_mutexattr_t attr;
-    pthread_mutexattr_t* attr_ptr = NULL;
-    if (recursive) {
-        pthread_mutexattr_init(&attr);
-        pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-        attr_ptr = &attr;
+    if (!m->initialized) {
+        if (pthread_mutex_init(&m->guard, NULL) != 0) {
+            pthread_mutex_unlock(&owner->mutexRegistryLock);
+            return -1;
+        }
+        if (pthread_cond_init(&m->released, NULL) != 0) {
+            pthread_mutex_destroy(&m->guard);
+            pthread_mutex_unlock(&owner->mutexRegistryLock);
+            return -1;
+        }
+        m->initialized = true;
     }
-    if (pthread_mutex_init(&m->handle, attr_ptr) != 0) {
-        if (attr_ptr) pthread_mutexattr_destroy(&attr);
-        pthread_mutex_unlock(&owner->mutexRegistryLock);
-        return -1;
-    }
-    if (attr_ptr) pthread_mutexattr_destroy(&attr);
+    m->recursive = recursive;
+    m->holder = NULL;
+    m->depth = 0;
+    m->waiters = 0;
     m->active = true;
+    if (id == owner->mutexCount) {
+        owner->mutexCount++;
+    }
     pthread_mutex_unlock(&owner->mutexRegistryLock);
     return id;
 }
 
-static bool lockMutex(VM* vm, int id) {
-    VM* owner = vm->mutexOwner ? vm->mutexOwner : vm;
-    pthread_mutex_lock(&owner->mutexRegistryLock);
-    if (id < 0 || id >= owner->mutexCount || !owner->mutexes[id].active) {
-        pthread_mutex_unlock(&owner->mutexRegistryLock);
-        return false;
+// A blocked lock() gives up when the waiting VM is told to stop: a worker
+// whose job was cancelled or killed (pool shutdown included), or the root VM
+// on an interrupt. Called with no locks held.
+static bool vmMutexWaitInterrupted(VM* vm) {
+    (void)vmConsumeInterruptRequest(vm);
+    return vm->abort_requested;
+}
+
+static VmMutexStatus lockMutex(VM* vm, int id) {
+    Mutex* m = vmMutexBeginUse(vm, id);
+    if (!m) {
+        return VM_MUTEX_INVALID;
     }
-    Mutex* m = &owner->mutexes[id];
-    pthread_mutex_unlock(&owner->mutexRegistryLock);
+    VmMutexStatus status = VM_MUTEX_OK;
+    pthread_mutex_lock(&m->guard);
+    if (m->holder == vm) {
+        if (m->recursive) {
+            m->depth++;
+        } else {
+            status = VM_MUTEX_DEADLOCK;
+        }
+        pthread_mutex_unlock(&m->guard);
+        vmMutexEndUse(m);
+        return status;
+    }
 #if defined(PSCAL_TARGET_IOS)
-    if (vmIosMutexDebugEnabled()) {
-        int rc = pthread_mutex_trylock(&m->handle);
-        if (rc == 0) {
-            return true;
-        }
-        if (rc != EBUSY) {
-            vmIosDebugLogf("[vm-mutex] trylock failed vm=%p owner=%p mid=%d rc=%d",
-                           (void*)vm, (void*)owner, id, rc);
-            return false;
-        }
-
-        uint64_t start_ns = vmNowMonoNs();
-        uint64_t last_log_ns = start_ns;
-        vmIosDebugLogf("[vm-mutex] wait begin vm=%p owner=%p mid=%d tid=%p",
-                       (void*)vm, (void*)owner, id, (void*)pthread_self());
-        while (true) {
-            struct timespec pause_for = {0, 10000000L}; /* 10ms */
-            nanosleep(&pause_for, NULL);
-            int lock_rc = pthread_mutex_trylock(&m->handle);
-            if (lock_rc == 0) {
-                uint64_t waited_ms = (vmNowMonoNs() - start_ns) / 1000000ull;
-                vmIosDebugLogf("[vm-mutex] wait end vm=%p mid=%d waited_ms=%" PRIu64 " tid=%p",
-                               (void*)vm, id, waited_ms, (void*)pthread_self());
-                return true;
-            }
-            if (lock_rc != EBUSY) {
-                vmIosDebugLogf("[vm-mutex] trylock-loop failed vm=%p owner=%p mid=%d rc=%d",
-                               (void*)vm, (void*)owner, id, lock_rc);
-                return false;
-            }
-
-            uint64_t now_ns = vmNowMonoNs();
-            if (now_ns >= last_log_ns + 1000000000ull) {
-                uint64_t waited_ms = (now_ns - start_ns) / 1000000ull;
-                vmIosDebugLogf("[vm-mutex] wait heartbeat vm=%p mid=%d waited_ms=%" PRIu64 " tid=%p",
-                               (void*)vm, id, waited_ms, (void*)pthread_self());
-                last_log_ns = now_ns;
-            }
-        }
+    bool debug = m->holder != NULL && vmIosMutexDebugEnabled();
+    uint64_t start_ns = debug ? vmNowMonoNs() : 0;
+    if (debug) {
+        vmIosDebugLogf("[vm-mutex] wait begin vm=%p mid=%d tid=%p", (void*)vm, id, (void*)pthread_self());
     }
 #endif
-    return pthread_mutex_lock(&m->handle) == 0;
+    while (m->holder != NULL) {
+        m->waiters++;
+        struct timespec deadline;
+        vmComputeDeadline(&deadline, 100);
+        int rc = pthread_cond_timedwait(&m->released, &m->guard, &deadline);
+        m->waiters--;
+        if (m->holder == NULL) {
+            break;
+        }
+        if (rc == 0) {
+            continue;
+        }
+        pthread_mutex_unlock(&m->guard);
+        bool interrupted = vmMutexWaitInterrupted(vm);
+        pthread_mutex_lock(&m->guard);
+        if (interrupted) {
+            status = VM_MUTEX_INTERRUPTED;
+            break;
+        }
+    }
+    if (status == VM_MUTEX_OK) {
+        m->holder = vm;
+        m->depth = 1;
+        vm->heldMutexCount++;
+    }
+#if defined(PSCAL_TARGET_IOS)
+    if (debug) {
+        vmIosDebugLogf("[vm-mutex] wait end vm=%p mid=%d waited_ms=%" PRIu64 " status=%d",
+                       (void*)vm, id, (vmNowMonoNs() - start_ns) / 1000000ull, (int)status);
+    }
+#endif
+    pthread_mutex_unlock(&m->guard);
+    vmMutexEndUse(m);
+    return status;
 }
 
-static bool unlockMutex(VM* vm, int id) {
-    VM* owner = vm->mutexOwner ? vm->mutexOwner : vm;
+static VmMutexStatus unlockMutex(VM* vm, int id) {
+    Mutex* m = vmMutexBeginUse(vm, id);
+    if (!m) {
+        return VM_MUTEX_INVALID;
+    }
+    VmMutexStatus status = VM_MUTEX_OK;
+    pthread_mutex_lock(&m->guard);
+    if (m->holder != vm) {
+        status = VM_MUTEX_NOT_OWNER;
+    } else if (--m->depth <= 0) {
+        m->holder = NULL;
+        m->depth = 0;
+        vm->heldMutexCount--;
+        if (m->waiters > 0) {
+            pthread_cond_signal(&m->released);
+        }
+    }
+    pthread_mutex_unlock(&m->guard);
+    vmMutexEndUse(m);
+    return status;
+}
+
+// Permanently frees a mutex created by mutex()/rcmutex(), making its ID
+// unusable. Refused while the mutex is held or a lock/unlock is in flight
+// on it: the slot could otherwise be handed out again by createMutex while
+// another thread still waits on it.
+static VmMutexStatus destroyMutex(VM* vm, int id) {
+    VM* owner = vmMutexRegistryOwner(vm);
     pthread_mutex_lock(&owner->mutexRegistryLock);
     if (id < 0 || id >= owner->mutexCount || !owner->mutexes[id].active) {
         pthread_mutex_unlock(&owner->mutexRegistryLock);
-        return false;
+        return VM_MUTEX_INVALID;
     }
     Mutex* m = &owner->mutexes[id];
-    pthread_mutex_unlock(&owner->mutexRegistryLock);
-    return pthread_mutex_unlock(&m->handle) == 0;
-}
-
-// Permanently frees a mutex created by mutex()/rcmutex(), making its ID unusable.
-static bool destroyMutex(VM* vm, int id) {
-    VM* owner = vm->mutexOwner ? vm->mutexOwner : vm;
-    pthread_mutex_lock(&owner->mutexRegistryLock);
-    if (id < 0 || id >= owner->mutexCount || !owner->mutexes[id].active) {
+    pthread_mutex_lock(&m->guard);
+    bool busy = m->holder != NULL || m->waiters > 0 || atomic_load(&m->users) > 0;
+    pthread_mutex_unlock(&m->guard);
+    if (busy) {
         pthread_mutex_unlock(&owner->mutexRegistryLock);
-        return false;
+        return VM_MUTEX_BUSY;
     }
-    if (pthread_mutex_destroy(&owner->mutexes[id].handle) != 0) {
-        pthread_mutex_unlock(&owner->mutexRegistryLock);
-        return false;
-    }
-    owner->mutexes[id].active = false;
+    m->active = false;
 
     // If this was the highest-index mutex, shrink the count so new mutexes can reuse slots.
     while (owner->mutexCount > 0 && !owner->mutexes[owner->mutexCount - 1].active) {
         owner->mutexCount--;
-
     }
     pthread_mutex_unlock(&owner->mutexRegistryLock);
-    return true;
+    return VM_MUTEX_OK;
+}
+
+// Releases every mutex `holder` still holds; called on the worker's own
+// thread when a job ends. Waiters are woken as if unlock() had been called.
+static void vmReleaseHeldMutexes(VM* holder) {
+    if (!holder || holder->heldMutexCount <= 0) {
+        return;
+    }
+    holder->heldMutexCount = 0;
+    VM* owner = vmMutexRegistryOwner(holder);
+    if (!owner || !owner->mutexes) {
+        return;
+    }
+    pthread_mutex_lock(&owner->mutexRegistryLock);
+    for (int i = 0; i < owner->mutexCount; i++) {
+        Mutex* m = &owner->mutexes[i];
+        if (!m->active || !m->initialized) {
+            continue;
+        }
+        pthread_mutex_lock(&m->guard);
+        if (m->holder == holder) {
+            m->holder = NULL;
+            m->depth = 0;
+            if (m->waiters > 0) {
+                pthread_cond_signal(&m->released);
+            }
+        }
+        pthread_mutex_unlock(&m->guard);
+    }
+    pthread_mutex_unlock(&owner->mutexRegistryLock);
+}
+
+// Destroys every constructed mutex slot (VM teardown and reset). Caller
+// holds mutexRegistryLock or owns the VM exclusively.
+static void vmDestroyMutexSlots(VM* vm) {
+    if (!vm->mutexes) {
+        return;
+    }
+    for (size_t i = 0; i < vm->mutexesCommittedCount; i++) {
+        Mutex* m = &vm->mutexes[i];
+        if (m->initialized) {
+            pthread_mutex_destroy(&m->guard);
+            pthread_cond_destroy(&m->released);
+            m->initialized = false;
+        }
+        m->active = false;
+        m->holder = NULL;
+        m->depth = 0;
+        m->waiters = 0;
+        atomic_store(&m->users, 0);
+    }
 }
 
 // Internal function shared by stack dump helpers
@@ -6483,14 +6612,10 @@ void vmResetExecutionState(VM* vm) {
     // Reset mutex registry state so a reused VM behaves like a fresh instance.
     if (vm->mutexOwner == vm) {
         pthread_mutex_lock(&vm->mutexRegistryLock);
-        for (int i = 0; i < vm->mutexCount; ++i) {
-            if (vm->mutexes[i].active) {
-                pthread_mutex_destroy(&vm->mutexes[i].handle);
-                vm->mutexes[i].active = false;
-            }
-        }
+        vmDestroyMutexSlots(vm);
         vm->mutexCount = 0;
         pthread_mutex_unlock(&vm->mutexRegistryLock);
+        vm->heldMutexCount = 0;
     } else {
         vm->mutexCount = 0;
     }
@@ -6576,6 +6701,7 @@ void initVM(VM* vm) { // As in all.txt, with frameCount
     vm->threadId = 0;
     vm->frontendContext = NULL;
     vm->zeroBasedIndexing = frontendIsZeroBasedStrings();
+    vm->heldMutexCount = 0;
 
     for (int i = 0; i < MAX_HOST_FUNCTIONS; i++) {
         vm->host_functions[i] = NULL;
@@ -6670,12 +6796,7 @@ void freeVM(VM* vm) {
     vm->frontendContext = NULL;
 
     if (vm->mutexOwner == vm) {
-        for (int i = 0; i < vm->mutexCount; i++) {
-            if (vm->mutexes[i].active) {
-                pthread_mutex_destroy(&vm->mutexes[i].handle);
-                vm->mutexes[i].active = false;
-            }
-        }
+        vmDestroyMutexSlots(vm);
     }
     // vmFreeThreadStorage below already vmThreadDestroySlot's every
     // committed slot before unmapping -- no separate loop needed here
@@ -12555,8 +12676,18 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 int mid = (int)VAL_INT(midVal);
-                if (!lockMutex(vm, mid)) {
-                    runtimeError(vm, "Invalid mutex id %d.", mid);
+                VmMutexStatus mutex_status = lockMutex(vm, mid);
+                if (mutex_status != VM_MUTEX_OK) {
+                    if (mutex_status == VM_MUTEX_DEADLOCK) {
+                        runtimeError(vm, "Mutex %d is already locked by this thread (deadlock).", mid);
+                    } else if (mutex_status == VM_MUTEX_INTERRUPTED) {
+                        // Stop silently, as an interrupted wait does elsewhere:
+                        // carrying on would run the critical section unlocked.
+                        vm->abort_requested = true;
+                        vm->runtime_error_raised = true;
+                    } else {
+                        runtimeError(vm, "Invalid mutex id %d.", mid);
+                    }
                     Value popped_mid = pop(vm);
                     freeValue(&popped_mid);
                     return INTERPRET_RUNTIME_ERROR;
@@ -12574,8 +12705,13 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 int mid = (int)VAL_INT(midVal);
-                if (!unlockMutex(vm, mid)) {
-                    runtimeError(vm, "Invalid mutex id %d.", mid);
+                VmMutexStatus mutex_status = unlockMutex(vm, mid);
+                if (mutex_status != VM_MUTEX_OK) {
+                    if (mutex_status == VM_MUTEX_NOT_OWNER) {
+                        runtimeError(vm, "Mutex %d is not locked by this thread.", mid);
+                    } else {
+                        runtimeError(vm, "Invalid mutex id %d.", mid);
+                    }
                     Value popped_mid = pop(vm);
                     freeValue(&popped_mid);
                     return INTERPRET_RUNTIME_ERROR;
@@ -12593,8 +12729,13 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 int mid = (int)VAL_INT(midVal);
-                if (!destroyMutex(vm, mid)) {
-                    runtimeError(vm, "Invalid mutex id %d.", mid);
+                VmMutexStatus mutex_status = destroyMutex(vm, mid);
+                if (mutex_status != VM_MUTEX_OK) {
+                    if (mutex_status == VM_MUTEX_BUSY) {
+                        runtimeError(vm, "Mutex %d is locked or in use and cannot be destroyed.", mid);
+                    } else {
+                        runtimeError(vm, "Invalid mutex id %d.", mid);
+                    }
                     Value popped_mid = pop(vm);
                     freeValue(&popped_mid);
                     return INTERPRET_RUNTIME_ERROR;
