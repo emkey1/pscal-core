@@ -1108,7 +1108,16 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
     // as we are about to write into it. For all other types, freeing the
     // old contents before assigning new ones is correct.
     if (!(sym->type == TYPE_STRING && STRING_MAX_LENGTH(*sym->value) > 0)) {
-        freeValue(sym->value);
+        // Detach the old payload under value_cell_mutex and release it
+        // afterwards, as replaceValueCell does: GET_GSLOT copies this cell
+        // under that lock (not globals_mutex, which SET_GSLOT holds here),
+        // so freeing in place let a concurrent reader retain the object
+        // just released.
+        Value old_value = *sym->value;
+        pthread_mutex_lock(&value_cell_mutex);
+        pscalValueResetBitsForType(sym->value, VALUE_TYPE(*sym->value));
+        pthread_mutex_unlock(&value_cell_mutex);
+        freeValue(&old_value);
         if (isPascalStringType(sym->type)) {
             // freeValue just set sym->value->s_val to NULL; the TYPE_STRING/
             // TYPE_UNICODE_STRING case in the switch below immediately reads
