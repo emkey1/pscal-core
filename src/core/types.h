@@ -74,14 +74,10 @@ typedef struct MStream {
 // (retain-and-share with real refcounting, the same identity contract
 // TYPE_FILE has -- Task values flow through ordinary CALL_BUILTIN argument/
 // return paths, not VAR-parameter-only, so an untracked alias would leak or
-// double-release). `owner` is always resolved to whichever VM was actually
-// executing TaskSpawn (the same VM createThreadJob indexes `threads[]` on
-// today -- NOT necessarily the process-root VM: a worker's own per-thread
-// VM has its own independent pool, exactly like a nested THREAD_CREATE
-// call would), so TaskAwait/TaskDone/TaskCancel are unambiguous about which
-// pool a threadId belongs to -- no guessing needed, unlike the historical
-// bare-int-handle callers that fall back between vm->threadOwner and vm
-// itself. Dropping a Task without ever awaiting/canceling it leaks its
+// double-release). `owner` is the root VM of the program that spawned the
+// task: every spawn uses the root's pool, including one issued inside a
+// worker (a worker VM's own pool is reset on its next job and freed when it
+// exits, which a task handle could outlive). Dropping a Task without ever awaiting/canceling it leaks its
 // pool slot exactly as an un-joined THREAD_CREATE handle does today (see
 // checkpoint 5a-i's writeup in the plan) -- pre-existing thread-pool
 // behavior, not a new regression.
@@ -89,6 +85,9 @@ typedef struct TaskObj {
     ObjHeader header; // header.type is always TYPE_TASK
     int threadId;      // slot index in owner->threads[]
     struct VM_s *owner; // VM instance whose threads[] this slot belongs to
+    uint32_t generation; // the job's Thread.jobGeneration; a slot reused by a
+                         // later job no longer matches, so a stale task is
+                         // refused rather than reaching that job
 } TaskObj;
 
 // VM 2.0 Phase 5b checkpoint 5b-i (Docs/pscal_vm2_plan.md Sec 6.2): a

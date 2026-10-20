@@ -714,7 +714,7 @@ static void registerTaskObjDestructor(void) {
     pscalObjRegisterDestructor(TYPE_TASK, taskObjDestroy);
 }
 
-TaskObj *createTaskObj(int threadId, struct VM_s *owner) {
+TaskObj *createTaskObj(int threadId, struct VM_s *owner, uint32_t generation) {
     pthread_once(&g_task_destructor_once, registerTaskObjDestructor);
     TaskObj *t = malloc(sizeof(TaskObj));
     if (!t) {
@@ -724,14 +724,15 @@ TaskObj *createTaskObj(int threadId, struct VM_s *owner) {
     pscalObjHeaderInit(&t->header, TYPE_TASK);
     t->threadId = threadId;
     t->owner = owner;
+    t->generation = generation;
     return t;
 }
 
-Value makeTask(int threadId, struct VM_s *owner) {
+Value makeTask(int threadId, struct VM_s *owner, uint32_t generation) {
     Value v;
     memset(&v, 0, sizeof(Value));
     v.type = TYPE_TASK;
-    pscalValueSetHeapPtrBits(&v, createTaskObj(threadId, owner));
+    pscalValueSetHeapPtrBits(&v, createTaskObj(threadId, owner, generation));
     return v;
 }
 
