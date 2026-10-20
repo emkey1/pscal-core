@@ -4817,18 +4817,7 @@ Value makeCopyOfValue(const Value *src) {
 // every one of these structs embeds `ObjHeader header` as its first member
 // (verified: StringObj/SetObj/RecordObj/EnumObj/ArrayObj), so `&x->header`
 // is always a valid ObjHeader*.
-void valueEnsureUnique(Value *target) {
-    if (!target) return;
-
-    // Serializes against vm.c's copyValueForStack() (the cheap retain-share
-    // copy this function's clone-on-write exists to protect against) and
-    // against a second concurrent valueEnsureUnique() call racing to clone
-    // the SAME shared object -- without this, two threads can each
-    // independently decide "still shared, clone it", then stomp on each
-    // other's install/release (confirmed as a real heap-corruption crash
-    // under a multithreaded stress test before this lock was added).
-    pthread_mutex_lock(&value_cell_mutex);
-
+static ObjHeader *valueCowHeader(const Value *target) {
     ObjHeader *hdr = NULL;
     switch (target->type) {
         case TYPE_STRING:
@@ -4878,14 +4867,39 @@ void valueEnsureUnique(Value *target) {
         // Docs/pscal_vm2_plan.md sec 5.10.5 point 3). Every other type
         // reaching here (scalars, TYPE_FILE, TYPE_POINTER,
         // TYPE_CLOSURE/INTERFACE/MEMORYSTREAM which are reference types by
-        // design, TYPE_INT64/UINT64/LONG_DOUBLE whose "mutation" is always
-        // release-then-allocate-fresh and therefore already CoW-safe) is
-        // not CoW-eligible and needs no action.
+        // design, TYPE_INT64/UINT64 which live inline in bits, TYPE_LONG_DOUBLE
+        // whose "mutation" is always release-then-allocate-fresh and
+        // therefore already CoW-safe) is not CoW-eligible and needs no action.
         default:
             hdr = NULL;
             break;
     }
 
+    return hdr;
+}
+
+void valueEnsureUnique(Value *target) {
+    if (!target) return;
+
+    // Nothing to clone when the payload is not CoW-eligible or this cell
+    // holds its only reference -- the common case, so skip the global lock
+    // for it. The lock never covered the caller's mutation that follows
+    // (that happens after unlock), only the decision to clone.
+    ObjHeader *hdr = valueCowHeader(target);
+    if (!hdr || atomic_load_explicit(&hdr->refcount, memory_order_acquire) <= 1) {
+        return;
+    }
+
+    // Serializes against vm.c's copyValueForStack() (the cheap retain-share
+    // copy this function's clone-on-write exists to protect against) and
+    // against a second concurrent valueEnsureUnique() call racing to clone
+    // the SAME shared object -- without this, two threads can each
+    // independently decide "still shared, clone it", then stomp on each
+    // other's install/release (confirmed as a real heap-corruption crash
+    // under a multithreaded stress test before this lock was added).
+    pthread_mutex_lock(&value_cell_mutex);
+
+    hdr = valueCowHeader(target);
     if (hdr && atomic_load_explicit(&hdr->refcount, memory_order_acquire) > 1) {
         Value fresh = makeCopyOfValue(target);
         freeValue(target);
