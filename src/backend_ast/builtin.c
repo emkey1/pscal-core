@@ -632,6 +632,13 @@ static bool writeBinaryElement(FILE* stream, const Value* rawValue, VarType elem
     if (VALUE_TYPE(*value) == TYPE_POINTER && AS_POINTER(*value)) {
         value = (const Value*)AS_POINTER(*value);
     }
+    // An enum's AS_INTEGER is 0; what goes in the file is its ordinal
+    // (`file of Color` used to come out all zero bytes).
+    Value ordinal_value;
+    if (VALUE_TYPE(*value) == TYPE_ENUM) {
+        ordinal_value = makeInt(AS_ENUM(*value).ordinal);
+        value = &ordinal_value;
+    }
 
     unsigned char buffer[sizeof(long double)] = {0};
     size_t bytes = 0;
@@ -745,8 +752,150 @@ static bool readToken(FILE* stream, char* buffer, size_t bufferSize) {
     return fscanf(stream, "%1023s", buffer) == 1;
 }
 
-static bool writeStructuredValue(FILE* stream, const Value* value);
-static bool readStructuredValue(FILE* stream, Value* value);
+/* Store freshly read text in a string variable by rebinding it to a new
+ * StringObj, never by rewriting the buffer of the one it holds: string
+ * Values share their StringObj (copy-on-write), so a rewrite in place
+ * changed every other variable holding the same text. This Value's
+ * reference to the previous object is released -- not leaked, and not
+ * freed out from under any other holder. A string[N] target keeps its N:
+ * the text is cut to N bytes and the buffer allocated at N + 1, the size
+ * fixed-length assignment later copies into. Takes `len` bytes of `text`. */
+static bool builtinRebindStringValue(Value* dst, const char* text, size_t len) {
+    if (!dst) {
+        return false;
+    }
+    VarType type = (VALUE_TYPE(*dst) == TYPE_UNICODE_STRING) ? TYPE_UNICODE_STRING : TYPE_STRING;
+    StringObj* old = isPascalStringType(VALUE_TYPE(*dst)) ? PSCAL_VALUE_PTR(*dst, StringObj) : NULL;
+    int max_length = old ? old->max_length : -1;
+    if (max_length > 0 && len > (size_t)max_length) {
+        len = (size_t)max_length;
+    }
+    size_t alloc_len = (max_length > 0) ? (size_t)max_length + 1 : len + 1;
+    char* buffer = (char*)malloc(alloc_len);
+    if (!buffer) {
+        return false;
+    }
+    if (len > 0) {
+        memcpy(buffer, text, len);
+    }
+    buffer[len] = '\0';
+    StringObj* fresh = pscalStringObjCreate(max_length, type);
+    fresh->buffer = buffer;
+    pthread_mutex_lock(&value_cell_mutex);
+    PSCAL_VALUE_FIELD(*dst, type) = type;
+    pscalValueSetHeapPtrBits(dst, fresh);
+    pthread_mutex_unlock(&value_cell_mutex);
+    if (old) {
+        pscalObjRelease(&old->header);
+    }
+    return true;
+}
+
+/* Set an enum variable's ordinal, range-checked against its type. The
+ * variable gets a fresh EnumObj rather than having the shared one edited. */
+static bool builtinSetEnumOrdinal(Value* dst, long long ordinal) {
+    if (!dst || VALUE_TYPE(*dst) != TYPE_ENUM) {
+        return false;
+    }
+    if (ordinal < 0 || ordinal > INT_MAX ||
+        (ENUM_META(*dst) && ordinal >= ENUM_META(*dst)->member_count)) {
+        return false;
+    }
+    if (AS_ENUM(*dst).ordinal == (int)ordinal) {
+        return true;
+    }
+    Value fresh = makeEnum(AS_ENUM(*dst).enum_name, (int)ordinal);
+    ENUM_META(fresh) = ENUM_META(*dst);
+    ENUM_TYPE_DEF(fresh) = ENUM_TYPE_DEF(*dst);
+    Value old = *dst;
+    pthread_mutex_lock(&value_cell_mutex);
+    *dst = fresh;
+    pthread_mutex_unlock(&value_cell_mutex);
+    freeValue(&old);
+    return true;
+}
+
+/* Records and arrays written to (and read back from) a non-binary file go
+ * through the two functions below as a sequence of space-separated tokens.
+ *
+ * Strings are written quoted, Pascal-literal style: 'Ada Lovelace', with an
+ * embedded quote doubled ('it''s') and the empty string as ''. Written raw,
+ * a string with a space came back as its first word and every later field
+ * shifted (an empty string shifted them all). The quoted form reads back
+ * whatever was written, including spaces and line breaks, and still reads
+ * the old unquoted form, so files written before this change load as they
+ * did.
+ *
+ * Pointer fields are refused: the old code followed them, so writing one
+ * node of a cyclic list recursed until the stack overflowed, and a nil
+ * pointer field failed anyway. Only the outermost value (a VAR argument)
+ * is dereferenced. */
+static bool writeStructuredValueInner(FILE* stream, const Value* value);
+static bool readStructuredValueInner(FILE* stream, Value* value);
+
+static bool writeQuotedString(FILE* stream, const char* text) {
+    if (fputc('\'', stream) == EOF) return false;
+    for (const char* c = text; *c; ++c) {
+        if (*c == '\'' && fputc('\'', stream) == EOF) return false;
+        if (fputc((unsigned char)*c, stream) == EOF) return false;
+    }
+    return fputs("' ", stream) != EOF;
+}
+
+static bool readStructuredString(FILE* stream, Value* value) {
+    int ch;
+    do {
+        ch = fgetc(stream);
+    } while (ch != EOF && isspace(ch));
+    if (ch == EOF) {
+        return false;
+    }
+    size_t len = 0, cap = 64;
+    char* buf = (char*)malloc(cap);
+    if (!buf) {
+        return false;
+    }
+    bool quoted = (ch == '\'');
+    if (quoted) {
+        for (;;) {
+            ch = fgetc(stream);
+            if (ch == EOF) {
+                free(buf);
+                return false; // unterminated
+            }
+            if (ch == '\'') {
+                int next = fgetc(stream);
+                if (next != '\'') {
+                    if (next != EOF) ungetc(next, stream);
+                    break;
+                }
+            }
+            if (len + 1 >= cap) {
+                char* grown = (char*)realloc(buf, cap * 2);
+                if (!grown) { free(buf); return false; }
+                buf = grown;
+                cap *= 2;
+            }
+            buf[len++] = (char)ch;
+        }
+    } else {
+        // Legacy unquoted token: up to the next whitespace.
+        while (ch != EOF && !isspace(ch)) {
+            if (len + 1 >= cap) {
+                char* grown = (char*)realloc(buf, cap * 2);
+                if (!grown) { free(buf); return false; }
+                buf = grown;
+                cap *= 2;
+            }
+            buf[len++] = (char)ch;
+            ch = fgetc(stream);
+        }
+        if (ch != EOF) ungetc(ch, stream);
+    }
+    bool ok = builtinRebindStringValue(value, buf, len);
+    free(buf);
+    return ok;
+}
 
 static bool writeStructuredValue(FILE* stream, const Value* rawValue) {
     if (!stream || !rawValue) {
@@ -757,7 +906,10 @@ static bool writeStructuredValue(FILE* stream, const Value* rawValue) {
     if (VALUE_TYPE(*value) == TYPE_POINTER && AS_POINTER(*value)) {
         value = (const Value*)AS_POINTER(*value);
     }
+    return writeStructuredValueInner(stream, value);
+}
 
+static bool writeStructuredValueInner(FILE* stream, const Value* value) {
     switch (VALUE_TYPE(*value)) {
         case TYPE_INT8:
         case TYPE_INT16:
@@ -770,18 +922,18 @@ static bool writeStructuredValue(FILE* stream, const Value* rawValue) {
         case TYPE_WORD:
         case TYPE_BYTE:
         case TYPE_BOOLEAN:
-        case TYPE_ENUM:
             return fprintf(stream, "%lld ", (long long)AS_INTEGER(*value)) > 0;
+        case TYPE_ENUM:
+            // AS_INTEGER is 0 for an enum; its value is the ordinal.
+            return fprintf(stream, "%d ", AS_ENUM(*value).ordinal) > 0;
         case TYPE_FLOAT:
         case TYPE_DOUBLE:
         case TYPE_LONG_DOUBLE:
             return fprintf(stream, "%.17Lg ", (long double)AS_REAL(*value)) > 0;
         case TYPE_CHAR:
             return fprintf(stream, "%u ", (unsigned int)(unsigned char)AS_CHAR(*value)) > 0;
-        case TYPE_STRING: {
-            const char* text = AS_STRING(*value) ? AS_STRING(*value) : "";
-            return fprintf(stream, "%s ", text) > 0;
-        }
+        case TYPE_STRING:
+            return writeQuotedString(stream, AS_STRING(*value) ? AS_STRING(*value) : "");
         case TYPE_ARRAY: {
             int total = calculateArrayTotalSize(value);
             // arrayUsesPackedBytes must be checked before AS_ARRAY(*value):
@@ -793,7 +945,7 @@ static bool writeStructuredValue(FILE* stream, const Value* rawValue) {
                 return false;
             }
             for (int i = 0; i < total; ++i) {
-                if (!writeStructuredValue(stream, &AS_ARRAY(*value)[i])) {
+                if (!writeStructuredValueInner(stream, &AS_ARRAY(*value)[i])) {
                     return false;
                 }
             }
@@ -817,7 +969,7 @@ static bool writeStructuredValue(FILE* stream, const Value* rawValue) {
                 if (seen_count < (int)(sizeof(seen_storage) / sizeof(seen_storage[0]))) {
                     seen_storage[seen_count++] = fieldValue;
                 }
-                if (!writeStructuredValue(stream, fieldValue)) {
+                if (!writeStructuredValueInner(stream, fieldValue)) {
                     return false;
                 }
             }
@@ -837,7 +989,10 @@ static bool readStructuredValue(FILE* stream, Value* rawValue) {
     if (VALUE_TYPE(*value) == TYPE_POINTER && AS_POINTER(*value)) {
         value = (Value*)AS_POINTER(*value);
     }
+    return readStructuredValueInner(stream, value);
+}
 
+static bool readStructuredValueInner(FILE* stream, Value* value) {
     char token[1024];
     switch (VALUE_TYPE(*value)) {
         case TYPE_INT8:
@@ -857,6 +1012,10 @@ static bool readStructuredValue(FILE* stream, Value* rawValue) {
             char* endp = NULL;
             long long parsed = strtoll(token, &endp, 10);
             if (endp == token || errno == ERANGE) return false;
+            if (VALUE_TYPE(*value) == TYPE_ENUM) {
+                // SET_INT_VALUE is a no-op on an enum.
+                return builtinSetEnumOrdinal(value, parsed);
+            }
             SET_INT_VALUE(value, parsed);
             return true;
         }
@@ -885,15 +1044,8 @@ static bool readStructuredValue(FILE* stream, Value* rawValue) {
             SET_INT_VALUE(value, AS_CHAR(*value));
             return true;
         }
-        case TYPE_STRING: {
-            if (!readToken(stream, token, sizeof(token))) return false;
-            if (AS_STRING(*value)) {
-                free(AS_STRING(*value));
-                AS_STRING(*value) = NULL;
-            }
-            AS_STRING(*value) = strdup(token);
-            return AS_STRING(*value) != NULL;
-        }
+        case TYPE_STRING:
+            return readStructuredString(stream, value);
         case TYPE_ARRAY: {
             int total = calculateArrayTotalSize(value);
             // See writeStructuredValue's matching comment: arrayUsesPackedBytes
@@ -903,7 +1055,7 @@ static bool readStructuredValue(FILE* stream, Value* rawValue) {
                 return false;
             }
             for (int i = 0; i < total; ++i) {
-                if (!readStructuredValue(stream, &AS_ARRAY(*value)[i])) {
+                if (!readStructuredValueInner(stream, &AS_ARRAY(*value)[i])) {
                     return false;
                 }
             }
@@ -927,7 +1079,7 @@ static bool readStructuredValue(FILE* stream, Value* rawValue) {
                 if (seen_count < (int)(sizeof(seen_storage) / sizeof(seen_storage[0]))) {
                     seen_storage[seen_count++] = fieldValue;
                 }
-                if (!readStructuredValue(stream, fieldValue)) {
+                if (!readStructuredValueInner(stream, fieldValue)) {
                     return false;
                 }
             }
