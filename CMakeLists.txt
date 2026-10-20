@@ -25,6 +25,8 @@ endif()
 
 option(PSCAL_SDL "Enable the SDL graphics/audio backend (sdl/gl/audio + 3D)" OFF)
 option(PSCAL_CURL "Enable libcurl-based networking (apiSend/HTTP session builtins)" OFF)
+option(PSCAL_SQLITE "Enable the SQLite builtins (sqliteopen, ...); links the system libsqlite3" OFF)
+option(PSCAL_OPENAI "Enable the OpenAI chat builtin (openaichatcompletions); needs PSCAL_CURL" OFF)
 option(PSCAL_VALUE_ACCESS_LINT
     "Poison raw Value payload field names outside the representation layer (VM 2.0 Phase 0 accessor-sweep lint)" OFF)
 if(PSCAL_VALUE_ACCESS_LINT)
@@ -199,6 +201,33 @@ endif()
 if(PSCAL_CURL)
     target_link_libraries(pscal_core_static PUBLIC CURL::libcurl)
     message(STATUS "pscal-core: libcurl networking ENABLED")
+endif()
+
+# ---- Optional SQLite and OpenAI builtins ---------------------------------------
+# The ext_builtins/sqlite and ext_builtins/openai sources, which only the PBuild
+# umbrella compiled before: a front end that documents them (Aether's sqlite_*
+# and ai_chat) turns these on. SQLite::SQLite3 is PUBLIC like CURL::libcurl.
+if(PSCAL_SQLITE)
+    find_package(SQLite3 REQUIRED)
+    target_sources(pscal_core_static PRIVATE ${SRC}/ext_builtins/sqlite/sqlite_builtins.c)
+    target_compile_definitions(pscal_core_static PRIVATE ENABLE_EXT_BUILTIN_SQLITE)
+    # CMake 4 renamed the imported target; older CMake (the Linux hosts) has
+    # only the first name.
+    if(TARGET SQLite3::SQLite3)
+        target_link_libraries(pscal_core_static PUBLIC SQLite3::SQLite3)
+    else()
+        target_link_libraries(pscal_core_static PUBLIC SQLite::SQLite3)
+    endif()
+    message(STATUS "pscal-core: SQLite builtins ENABLED")
+endif()
+if(PSCAL_OPENAI)
+    if(NOT PSCAL_CURL)
+        message(FATAL_ERROR "PSCAL_OPENAI needs PSCAL_CURL (the OpenAI builtin calls libcurl)")
+    endif()
+    target_sources(pscal_core_static PRIVATE
+        ${SRC}/ext_builtins/openai/openai_chat.c ${SRC}/ext_builtins/openai/register.c)
+    target_compile_definitions(pscal_core_static PRIVATE ENABLE_EXT_BUILTIN_OPENAI)
+    message(STATUS "pscal-core: OpenAI chat builtin ENABLED")
 endif()
 
 # ---- Install ----------------------------------------------------------------

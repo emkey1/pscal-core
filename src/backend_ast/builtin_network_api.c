@@ -28,6 +28,10 @@
 #include "vm/vm.h"
 #include "vm/string_sentinels.h"
 #include "common/pscal_hosts.h"
+#include "common/frontend_kind.h"
+
+static Value httpAsyncTaskValue(int id, VM* vm);
+static TaskObj* httpAsyncTaskArg(VM* vm, Value v, TaskObj* scratch);
 
 #ifdef _WIN32
 static void ensure_winsock(void) {
@@ -3403,7 +3407,7 @@ Value vmBuiltinHttpRequestAsync(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "httpRequestAsync: failed to spawn task.");
         return makeNil();
     }
-    return makeTask(id, vm);
+    return httpAsyncTaskValue(id, vm);
 }
 
 // HttpRequestAsyncToFile(session, method, url, bodyStrOrMStreamOrNil, outPath): Integer (async id)
@@ -3471,7 +3475,7 @@ Value vmBuiltinHttpRequestAsyncToFile(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "httpRequestAsyncToFile: failed to spawn task.");
         return makeNil();
     }
-    return makeTask(id, vm);
+    return httpAsyncTaskValue(id, vm);
 }
 
 // Shared arg-validation + result-extraction for HttpAwait/HttpTryAwait: both
@@ -3481,6 +3485,27 @@ Value vmBuiltinHttpRequestAsyncToFile(VM* vm, int arg_count, Value* args) {
 // Blocks (vmThreadTakeResult's own wait loop) until the task completes --
 // callers that need a non-blocking check (HttpTryAwait) must call
 // vmTaskIsDone first and only reach this once that's true.
+/* Aether has no type that holds a TASK, so under Aether an async request is
+ * its task id, an Int: http_request_async returns it and the await/poll
+ * builtins take it back (1.0-beta2; before, the documented `let id: Int =
+ * http_request_async(...)` stopped with "Cannot assign TASK to integer").
+ * Other front ends keep the TYPE_TASK value. */
+static Value httpAsyncTaskValue(int id, VM* vm) {
+    return frontendIsAether() ? makeInt(id) : makeTask(id, vm);
+}
+
+static TaskObj* httpAsyncTaskArg(VM* vm, Value v, TaskObj* scratch) {
+    if (VALUE_TYPE(v) == TYPE_TASK) return AS_TASK(v);
+    if (frontendIsAether() && IS_INTLIKE(v)) {
+        memset(scratch, 0, sizeof(*scratch));
+        scratch->header.type = TYPE_TASK;
+        scratch->threadId = (int)AS_INTEGER(v);
+        scratch->owner = vm;
+        return scratch;
+    }
+    return NULL;
+}
+
 static int httpTaskAwaitAndExtract(TaskObj* t, Value* outMstream) {
     Value result = makeNil();
     bool status_flag = false;
@@ -3511,12 +3536,13 @@ static int httpTaskAwaitAndExtract(TaskObj* t, Value* outMstream) {
 
 // HttpAwait(task, out:mstream): Integer (status)
 Value vmBuiltinHttpAwait(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 2 || VALUE_TYPE(args[0]) != TYPE_TASK ||
+    TaskObj scratch;
+    TaskObj* t = arg_count == 2 ? httpAsyncTaskArg(vm, args[0], &scratch) : NULL;
+    if (arg_count != 2 || !t ||
         VALUE_TYPE(args[1]) != TYPE_MEMORYSTREAM || !AS_MSTREAM(args[1])) {
         runtimeError(vm, "httpAwait expects (task, out:mstream).");
         return makeInt(-1);
     }
-    TaskObj* t = AS_TASK(args[0]);
     if (!t || !t->owner) {
         runtimeError(vm, "httpAwait received an invalid task.");
         return makeInt(-1);
@@ -3526,12 +3552,13 @@ Value vmBuiltinHttpAwait(VM* vm, int arg_count, Value* args) {
 
 // HttpTryAwait(task, out:mstream): Integer (-2: pending; otherwise status)
 Value vmBuiltinHttpTryAwait(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 2 || VALUE_TYPE(args[0]) != TYPE_TASK ||
+    TaskObj scratch;
+    TaskObj* t = arg_count == 2 ? httpAsyncTaskArg(vm, args[0], &scratch) : NULL;
+    if (arg_count != 2 || !t ||
         VALUE_TYPE(args[1]) != TYPE_MEMORYSTREAM || !AS_MSTREAM(args[1])) {
         runtimeError(vm, "httpTryAwait expects (task, out:mstream).");
         return makeInt(-1);
     }
-    TaskObj* t = AS_TASK(args[0]);
     if (!t || !t->owner) {
         runtimeError(vm, "httpTryAwait received an invalid task.");
         return makeInt(-1);
@@ -3544,24 +3571,28 @@ Value vmBuiltinHttpTryAwait(VM* vm, int arg_count, Value* args) {
 
 // HttpIsDone(task): Integer (0/1)
 Value vmBuiltinHttpIsDone(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_TASK) {
+    TaskObj scratch;
+    TaskObj* t = arg_count == 1 ? httpAsyncTaskArg(vm, args[0], &scratch) : NULL;
+    if (arg_count != 1 || !t) {
         runtimeError(vm, "httpIsDone expects (task).");
         return makeInt(0);
     }
-    TaskObj* t = AS_TASK(args[0]);
     if (!t || !t->owner) {
         return makeInt(0);
     }
-    return makeInt(vmTaskIsDone(t->owner, t->threadId) ? 1 : 0);
+    bool done = vmTaskIsDone(t->owner, t->threadId);
+    /* Aether documents http_is_done as Bool; other front ends keep 0/1. */
+    return frontendIsAether() ? makeBoolean(done) : makeInt(done ? 1 : 0);
 }
 
 // HttpCancel(task): Integer (1 on success, 0 otherwise)
 Value vmBuiltinHttpCancel(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_TASK) {
+    TaskObj scratch;
+    TaskObj* t = arg_count == 1 ? httpAsyncTaskArg(vm, args[0], &scratch) : NULL;
+    if (arg_count != 1 || !t) {
         runtimeError(vm, "httpCancel expects (task).");
         return makeInt(0);
     }
-    TaskObj* t = AS_TASK(args[0]);
     if (!t || !t->owner) {
         return makeInt(0);
     }
@@ -3570,11 +3601,12 @@ Value vmBuiltinHttpCancel(VM* vm, int arg_count, Value* args) {
 
 // httpGetAsyncProgress(task): Integer (bytes downloaded so far)
 Value vmBuiltinHttpGetAsyncProgress(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_TASK) {
+    TaskObj scratch;
+    TaskObj* t = arg_count == 1 ? httpAsyncTaskArg(vm, args[0], &scratch) : NULL;
+    if (arg_count != 1 || !t) {
         runtimeError(vm, "httpGetAsyncProgress expects (task).");
         return makeInt(0);
     }
-    TaskObj* t = AS_TASK(args[0]);
     if (!t || !t->owner) {
         return makeInt(0);
     }
@@ -3585,11 +3617,12 @@ Value vmBuiltinHttpGetAsyncProgress(VM* vm, int arg_count, Value* args) {
 
 // httpGetAsyncTotal(task): Integer (total bytes expected; 0 if unknown)
 Value vmBuiltinHttpGetAsyncTotal(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_TASK) {
+    TaskObj scratch;
+    TaskObj* t = arg_count == 1 ? httpAsyncTaskArg(vm, args[0], &scratch) : NULL;
+    if (arg_count != 1 || !t) {
         runtimeError(vm, "httpGetAsyncTotal expects (task).");
         return makeInt(0);
     }
-    TaskObj* t = AS_TASK(args[0]);
     if (!t || !t->owner) {
         return makeInt(0);
     }
