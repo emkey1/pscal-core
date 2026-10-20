@@ -4760,6 +4760,10 @@ static int g_vm_sigint_pipe[2] = {-1, -1};
 static pthread_once_t g_vm_sigint_pipe_once = PTHREAD_ONCE_INIT;
 static atomic_bool g_vm_interrupt_broadcast = false;
 static atomic_bool g_vm_suspend_requested = false;
+/* Set when a cursor-position probe (getCursorPosition) gave up before its
+ * ESC[row;colR reply arrived, so the reply may still turn up in the input;
+ * the next canonical read flushes pending input only in that case. */
+static atomic_bool g_vm_dsr_reply_pending = false;
 static void vmDrainSigintFd(int fd, bool is_host);
 
 static void vmEnableRawMode(void); // Forward declaration
@@ -5386,7 +5390,11 @@ bool pscalRuntimeConsumeSigtstp(void) {
 
 void vmInitTerminalState(void) {
     vmSetupTermHandlers();
-    vmPushColorState();
+    // The terminal's colours are no longer queried here: the OSC 10/11 query
+    // waited up to half a second per colour on a terminal that does not
+    // answer, and read away whatever input was already typed ahead -- on
+    // every Pascal start, for programs that never touch the screen. Only the
+    // screen stack needs them; PushScreen saves them on first use.
     vmEnableRawMode();
     if (isatty(STDOUT_FILENO)) {
         setvbuf(stdout, NULL, _IOFBF, 65536);
@@ -5546,7 +5554,14 @@ static void vmPrepareCanonicalInput(void) {
         fprintf(stderr, "[termios] canon get failed errno=%d\n", errno);
     }
     pthread_mutex_unlock(&vm_term_mutex);
-    tcflush(STDIN_FILENO, TCIFLUSH);
+    // Flushing pending input here on every read threw away whatever the user
+    // had typed ahead: pasting three lines into three readln calls kept only
+    // some of them. The flush is only for a late reply to a cursor-position
+    // probe, so it happens only while one may be outstanding; a reply that
+    // still gets through is swallowed by vmReadLineInterruptible's DSR filter.
+    if (atomic_exchange(&g_vm_dsr_reply_pending, false)) {
+        tcflush(STDIN_FILENO, TCIFLUSH);
+    }
     // The cursor escape is for a terminal. Written into a pipe or a file it
     // becomes stray bytes in the program's output (every stdin readln added
     // ESC[?25h ahead of the next line), so it goes out only when stdout is
@@ -6341,6 +6356,7 @@ static int getCursorPosition(int *row, int *col) {
     bool termiosApplied = false;
     int stdin_flags = -1;
     bool restore_blocking = false;
+    bool query_sent = false;
 
     // Default row/col in case of non-critical failure
     *row = 1;
@@ -6391,6 +6407,7 @@ static int getCursorPosition(int *row, int *col) {
         errno = write_errno;
         goto cleanup; // Critical failure
     }
+    query_sent = true;
 
     // --- Read Response ---
     memset(buf, 0, sizeof(buf));
@@ -6528,6 +6545,9 @@ static int getCursorPosition(int *row, int *col) {
     }
 
 cleanup:
+    if (query_sent && !(i > 0 && buf[i - 1] == 'R')) {
+        atomic_store(&g_vm_dsr_reply_pending, true);
+    }
     /* Flush any pending input so delayed DSR replies don't echo later. */
     tcflush(STDIN_FILENO, TCIFLUSH);
     /* Drain any residual DSR bytes so later reads (e.g., ReadKey) are not
@@ -7075,6 +7095,9 @@ Value vmBuiltinPushscreen(VM* vm, int arg_count, Value* args) {
         return makeVoid();
     }
     if (pscalRuntimeStdoutIsInteractive()) {
+        if (vm_color_stack_depth == 0) {
+            vmPushColorState(); // the base colours, restored at exit
+        }
         vmPushColorState();
         if (vm_alt_screen_depth == 0) {
             const char enter_alt[] = "\x1B[?1049h";
