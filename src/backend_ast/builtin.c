@@ -2078,9 +2078,23 @@ static const size_t num_vm_builtins = sizeof(vmBuiltinDispatchTable) / sizeof(vm
 
 static bool threadBuiltinIsAllowlisted(int id);
 
-/* Dynamic registry for user-supplied VM built-ins. */
+/* Dynamic registry for user-supplied VM built-ins. Written under
+ * builtin_registry_mutex.
+ *
+ * CALL_BUILTIN looks a handler up by id on every call, and it used to take
+ * builtin_registry_mutex twice per call (handler and name) -- a recursive
+ * mutex every worker thread contended on. The by-id readers are lock-free
+ * instead: the core table's names never change and its handlers are written
+ * with atomic stores, and the extra table is published as an atomic
+ * pointer plus count. The table is only ever replaced by a larger copy, and
+ * a replaced table is never freed, because a reader may still be using it
+ * (they only double, so the retired tables together are smaller than the
+ * live one). The count is stored after the entry it covers is complete. */
 static VmBuiltinMapping *extra_vm_builtins = NULL;
 static size_t num_extra_vm_builtins = 0;
+static size_t extra_vm_builtins_capacity = 0;
+static _Atomic(VmBuiltinMapping *) g_extra_builtins_published = NULL;
+static atomic_size_t g_extra_builtins_published_count = 0;
 static pthread_mutex_t builtin_registry_mutex;
 static pthread_once_t builtin_registry_once = PTHREAD_ONCE_INIT;
 
@@ -2479,7 +2493,7 @@ void registerVmBuiltin(const char *name, VmBuiltinFn handler,
     size_t existing_id = SIZE_MAX;
     VmBuiltinMapping *mapping = builtinRegistryLookupMappingUnlocked(canonical, &existing_id);
     if (mapping) {
-        mapping->handler = handler;
+        __atomic_store_n(&mapping->handler, handler, __ATOMIC_RELEASE);
         if (existing_id != SIZE_MAX) {
             setEffectOverrideUnlocked(existing_id, effect_mask);
         }
@@ -2487,17 +2501,27 @@ void registerVmBuiltin(const char *name, VmBuiltinFn handler,
         return;
     }
 
-    VmBuiltinMapping *new_table = realloc(extra_vm_builtins,
-        sizeof(VmBuiltinMapping) * (num_extra_vm_builtins + 1));
-    if (!new_table) {
-        pthread_mutex_unlock(&builtin_registry_mutex);
-        return;
+    if (num_extra_vm_builtins == extra_vm_builtins_capacity) {
+        // Grow by copying into a new table, never realloc in place: see the
+        // comment on extra_vm_builtins for why the old one stays allocated.
+        size_t new_capacity = extra_vm_builtins_capacity ? extra_vm_builtins_capacity * 2 : 32;
+        VmBuiltinMapping *new_table = malloc(sizeof(VmBuiltinMapping) * new_capacity);
+        if (!new_table) {
+            pthread_mutex_unlock(&builtin_registry_mutex);
+            return;
+        }
+        if (num_extra_vm_builtins > 0) {
+            memcpy(new_table, extra_vm_builtins, sizeof(VmBuiltinMapping) * num_extra_vm_builtins);
+        }
+        extra_vm_builtins = new_table;
+        extra_vm_builtins_capacity = new_capacity;
+        atomic_store_explicit(&g_extra_builtins_published, new_table, memory_order_release);
     }
-    extra_vm_builtins = new_table;
     extra_vm_builtins[num_extra_vm_builtins].name = strdup(canonical);
     extra_vm_builtins[num_extra_vm_builtins].handler = handler;
     size_t new_index = num_extra_vm_builtins;
     num_extra_vm_builtins++;
+    atomic_store_explicit(&g_extra_builtins_published_count, num_extra_vm_builtins, memory_order_release);
     size_t new_id = num_vm_builtins + new_index;
     builtinRegistryInsertUnlocked(canonical, new_id);
     setEffectOverrideUnlocked(new_id, effect_mask);
@@ -2523,46 +2547,37 @@ VmBuiltinFn getVmBuiltinHandler(const char *name) {
     return handler;
 }
 
+/* The extra-table entry for `extra_index`, or NULL; lock-free (see the
+ * comment on extra_vm_builtins). */
+static const VmBuiltinMapping *publishedExtraBuiltin(size_t extra_index) {
+    size_t count = atomic_load_explicit(&g_extra_builtins_published_count, memory_order_acquire);
+    if (extra_index >= count) {
+        return NULL;
+    }
+    VmBuiltinMapping *table = atomic_load_explicit(&g_extra_builtins_published, memory_order_acquire);
+    return table ? &table[extra_index] : NULL;
+}
+
 VmBuiltinFn getVmBuiltinHandlerById(int id) {
     if (id < 0) return NULL;
-    pthread_once(&builtin_registry_once, initBuiltinRegistryMutex);
-    pthread_mutex_lock(&builtin_registry_mutex);
-    VmBuiltinFn handler = NULL;
     if ((size_t)id < num_vm_builtins) {
-        handler = vmBuiltinDispatchTable[id].handler;
-    } else {
-        size_t extra_index = (size_t)id - num_vm_builtins;
-        if (extra_index < num_extra_vm_builtins) {
-            handler = extra_vm_builtins[extra_index].handler;
-        }
+        return __atomic_load_n(&vmBuiltinDispatchTable[id].handler, __ATOMIC_ACQUIRE);
     }
-    pthread_mutex_unlock(&builtin_registry_mutex);
-    return handler;
+    const VmBuiltinMapping *extra = publishedExtraBuiltin((size_t)id - num_vm_builtins);
+    return extra ? __atomic_load_n(&extra->handler, __ATOMIC_ACQUIRE) : NULL;
 }
 
 const char* getVmBuiltinNameById(int id) {
     if (id < 0) return NULL;
-    pthread_once(&builtin_registry_once, initBuiltinRegistryMutex);
-    pthread_mutex_lock(&builtin_registry_mutex);
-    const char* name = NULL;
     if ((size_t)id < num_vm_builtins) {
-        name = vmBuiltinDispatchTable[id].name;
-    } else {
-        size_t extra_index = (size_t)id - num_vm_builtins;
-        if (extra_index < num_extra_vm_builtins) {
-            name = extra_vm_builtins[extra_index].name;
-        }
+        return vmBuiltinDispatchTable[id].name;
     }
-    pthread_mutex_unlock(&builtin_registry_mutex);
-    return name;
+    const VmBuiltinMapping *extra = publishedExtraBuiltin((size_t)id - num_vm_builtins);
+    return extra ? extra->name : NULL;
 }
 
 size_t getVmBuiltinCount(void) {
-    pthread_once(&builtin_registry_once, initBuiltinRegistryMutex);
-    pthread_mutex_lock(&builtin_registry_mutex);
-    size_t count = num_vm_builtins + num_extra_vm_builtins;
-    pthread_mutex_unlock(&builtin_registry_mutex);
-    return count;
+    return num_vm_builtins + atomic_load_explicit(&g_extra_builtins_published_count, memory_order_acquire);
 }
 
 BuiltinRoutineType getVmBuiltinTypeById(int id) {
@@ -11778,11 +11793,15 @@ int isBuiltin(const char *name) {
 
     int result = 0;
     char canonical[MAX_SYMBOL_LENGTH];
-    if (canonicalizeBuiltinName(name, canonical, sizeof(canonical)) && ensureBuiltinTypeHashUnlocked()) {
+    // While the hash exists it holds every registered name, so a miss there
+    // is final; the linear scan (a strcasecmp per registered builtin, on
+    // every miss) is only for when the hash could not be built.
+    bool hashed = canonicalizeBuiltinName(name, canonical, sizeof(canonical)) && ensureBuiltinTypeHashUnlocked();
+    if (hashed) {
         result = lookupBuiltinTypeEntryUnlocked(canonical) != NULL;
     }
 
-    if (!result) {
+    if (!result && !hashed) {
         for (int i = 0; i < builtin_registry_count; ++i) {
             if (strcasecmp(name, builtin_registry[i].name) == 0) {
                 result = 1;
@@ -11810,14 +11829,16 @@ BuiltinRoutineType getBuiltinType(const char *name) {
 
     BuiltinRoutineType result = BUILTIN_TYPE_NONE;
     char canonical[MAX_SYMBOL_LENGTH];
-    if (canonicalizeBuiltinName(name, canonical, sizeof(canonical)) && ensureBuiltinTypeHashUnlocked()) {
+    // See isBuiltin: the linear scan only stands in for a missing hash.
+    bool hashed = canonicalizeBuiltinName(name, canonical, sizeof(canonical)) && ensureBuiltinTypeHashUnlocked();
+    if (hashed) {
         BuiltinTypeEntry *entry = lookupBuiltinTypeEntryUnlocked(canonical);
         if (entry) {
             result = entry->builtinType;
         }
     }
 
-    if (result == BUILTIN_TYPE_NONE) {
+    if (result == BUILTIN_TYPE_NONE && !hashed) {
         for (int i = 0; i < builtin_registry_count; ++i) {
             if (strcasecmp(name, builtin_registry[i].name) == 0) {
                 result = builtin_registry[i].type;
