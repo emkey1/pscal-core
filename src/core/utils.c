@@ -1559,6 +1559,12 @@ static bool ensureFieldSlotCapacity(FieldValue*** slotOwners, int* capacity, int
     if (!slotOwners || !capacity || requiredSlots <= *capacity) {
         return true;
     }
+    // Field slot operands are at most 16 bits wide. A larger slot index can
+    // only come from a malformed type (one read from a .bc file), and
+    // doubling toward it overflowed the int capacity.
+    if (requiredSlots > 0x10000) {
+        return false;
+    }
 
     int newCapacity = (*capacity > 0) ? *capacity : 4;
     while (newCapacity < requiredSlots) {
