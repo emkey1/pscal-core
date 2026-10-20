@@ -7646,17 +7646,14 @@ Value vmBuiltinNew(VM* vm, int arg_count, Value* args) {
     *(allocated_memory) = makeValueForType(baseVarType, actualBaseTypeDef, NULL);
     // (debug logging removed)
 
-    // Update the pointer variable that was passed by reference
-    SET_VALUE_TYPE(pointerVarValuePtr, TYPE_POINTER);
+    // Update the pointer variable that was passed by reference. It is
+    // already TYPE_POINTER (checked above): keep its PointerObj, and with it
+    // the base_type_node the next new(p) resolves the pointee type from --
+    // retyping it reset .bits and dropped that wrapper, so a second new(p)
+    // on a record pointer allocated an integer. Pascal pointer variables
+    // start out nil-but-wrappered (makeValueForType); the ensure below only
+    // covers one that has no wrapper yet.
     pscalPointerEnsureObj(pointerVarValuePtr);
-    // SET_VALUE_TYPE just reset .bits to a nil-pointer placeholder (VM 2.0
-    // Phase 4i checkpoint 3b) -- but if this pointer variable already held
-    // a real PointerObj (the common case: Pascal pointer vars start out
-    // nil-but-wrappered via makeValueForType, so pscalPointerEnsureObj
-    // above is a no-op here), .bits is now wrongly out of sync with the
-    // wrapper that's actually there. Re-tag unconditionally; safe whether
-    // ensure just allocated fresh or found one already present.
-    pscalValueSetHeapPtrBits(pointerVarValuePtr, PSCAL_VALUE_PTR(*pointerVarValuePtr, PointerObj));
     AS_POINTER(*pointerVarValuePtr) = allocated_memory;
 
     // Safety: if base type metadata is unknown, treat as integer for subsequent dereferences
@@ -8585,11 +8582,23 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
             }
             case TYPE_STRING:
             case TYPE_NIL: {
+                // Install a fresh StringObj instead of rewriting the current
+                // one, which copies of the variable may share by reference
+                // count, then drop this variable's reference to the old one.
+                // A string[N] variable keeps its cap.
+                StringObj *old_s = (VALUE_TYPE(*dst) == TYPE_STRING) ? PSCAL_VALUE_PTR(*dst, StringObj) : NULL;
+                int max_len = old_s ? old_s->max_length : -1;
+                StringObj *fresh_s = pscalStringObjCreate(max_len, TYPE_STRING);
+                if (max_len > 0) {
+                    fresh_s->buffer = (char *)calloc((size_t)max_len + 1, 1);
+                    if (fresh_s->buffer) strncpy(fresh_s->buffer, buffer, (size_t)max_len);
+                } else {
+                    fresh_s->buffer = strdup(buffer);
+                }
+                if (!fresh_s->buffer) { io_error = 1; }
                 SET_VALUE_TYPE(dst, TYPE_STRING);
-                pscalStringEnsureObj(dst); // dst may have arrived as TYPE_NIL with no wrapper
-                if (AS_STRING(*dst)) { free(AS_STRING(*dst)); }
-                AS_STRING(*dst) = strdup(buffer);
-                if (!AS_STRING(*dst)) { io_error = 1; }
+                pscalValueSetHeapPtrBits(dst, fresh_s);
+                if (old_s) pscalObjRelease(&old_s->header);
                 break;
             }
             default:
@@ -8776,12 +8785,28 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
                 // copies pointing at the value they were given, which is what
                 // plain assignment already does (`s = t;` then `t = "x";`
                 // never disturbed `s`). The previous object is header-managed
-                // and is no longer freed here precisely because a sharer may
-                // still hold it.
-                StringObj* fresh_str_obj = pscalStringObjCreate(-1, dst_str_retype);
+                // and only this variable's reference to it is released below
+                // (a sharer still holds its own). A string[N] variable keeps
+                // its cap: the line is truncated to it.
+                StringObj* old_str_obj = PSCAL_VALUE_PTR(*dst, StringObj);
+                int max_len = old_str_obj ? old_str_obj->max_length : -1;
+                if (max_len > 0) {
+                    char* fixed = (char*)calloc((size_t)max_len + 1, 1);
+                    if (!fixed) {
+                        free(tmp);
+                        runtimeError(vm, "Out of memory in Readln.");
+                        io_error = 1;
+                        break;
+                    }
+                    strncpy(fixed, tmp, (size_t)max_len);
+                    free(tmp);
+                    tmp = fixed;
+                }
+                StringObj* fresh_str_obj = pscalStringObjCreate(max_len, dst_str_retype);
                 fresh_str_obj->buffer = tmp;
                 SET_VALUE_TYPE(dst, dst_str_retype);
                 pscalValueSetHeapPtrBits(dst, fresh_str_obj);
+                if (old_str_obj) pscalObjRelease(&old_str_obj->header);
                 i = arg_count; // consume the line; ignore trailing params
                 break;
             }

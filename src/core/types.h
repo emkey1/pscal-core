@@ -829,8 +829,17 @@ static inline long double pscalValueDecodeRealLD(Value v) {
     do { pscalValueSetRealBits((dest), (long double)(val)); } while(0)
 #define SET_CHAR_VALUE(dest, val) \
     do { pscalValueSetCharBits((dest), (val)); } while(0)
+// Retypes `dest` and resets `bits` to the new type's zero placeholder. A
+// no-op when `dest` already has type `t`: resetting then would drop a live
+// heap wrapper (StringObj, PointerObj, ...) without releasing it, leaking it
+// and losing what it carries -- e.g. new(p) on a pointer variable lost the
+// PointerObj's base_type_node, so a second new(p) allocated an integer.
 #define SET_VALUE_TYPE(dest, t) \
-    do { PSCAL_VALUE_FIELD(*(dest), type) = (t); pscalValueResetBitsForType((dest), (t)); } while(0)
+    do { Value *_pscal_svt_dest = (dest); VarType _pscal_svt_t = (t); \
+         if (PSCAL_VALUE_FIELD(*_pscal_svt_dest, type) != _pscal_svt_t) { \
+             PSCAL_VALUE_FIELD(*_pscal_svt_dest, type) = _pscal_svt_t; \
+             pscalValueResetBitsForType(_pscal_svt_dest, _pscal_svt_t); \
+         } } while(0)
 
 /*
  * Value tag and payload accessors (VM 2.0 Phase 0 accessor sweep; see

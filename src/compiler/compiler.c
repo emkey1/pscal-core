@@ -7276,8 +7276,8 @@ static void applyPeepholeOptimizations(BytecodeChunk* chunk) {
                 int total = calculateArrayTotalSize(array_const);
                 if (element_index >= 0 && element_index < total) {
                     Value* elem = &AS_ARRAY(*array_const)[element_index];
-                    SET_INT_VALUE(elem, mapped);
                     SET_VALUE_TYPE(elem, TYPE_INT32);
+                    SET_INT_VALUE(elem, mapped);
                 }
             }
         } else {
