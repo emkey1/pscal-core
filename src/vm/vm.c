@@ -10674,6 +10674,30 @@ comparison_error_label:
                         }
                         SET_INT_VALUE(target_lvalue_ptr, AS_CHAR(*target_lvalue_ptr));
                     }
+                    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_ENUM &&
+                             isIntegerFamilyType(VALUE_TYPE(value_to_set))) {
+                        /* An integer stored into an enum variable: what a
+                         * Pascal cast `e := T(k)` compiles to, since the cast
+                         * itself emits no conversion. Replacing the whole
+                         * cell made `e` an INTEGER that no longer compared
+                         * with T's members ("Operands not comparable");
+                         * keep the enum type and store the ordinal. */
+                        long long ordinal = asI64(value_to_set);
+                        Type* meta = ENUM_META(*target_lvalue_ptr);
+                        const char* enum_name = AS_ENUM(*target_lvalue_ptr).enum_name;
+                        if (meta ? (ordinal < 0 || ordinal >= meta->member_count)
+                                 : (ordinal < INT32_MIN || ordinal > INT32_MAX)) {
+                            runtimeError(vm, "Runtime Error: Enum '%s' out of range (ordinal %lld).",
+                                         enum_name ? enum_name : "<anon>", ordinal);
+                            freeValue(&value_to_set);
+                            freeValue(&pointer_to_lvalue);
+                            return INTERPRET_RUNTIME_ERROR;
+                        }
+                        Value replacement = makeEnum(enum_name, (int)ordinal);
+                        ENUM_META(replacement) = meta;
+                        ENUM_TYPE_DEF(replacement) = ENUM_TYPE_DEF(*target_lvalue_ptr);
+                        replaceValueCell(target_lvalue_ptr, replacement, NULL);
+                    }
                     else {
                         // VM 2.0 Phase 4i: target_lvalue_ptr's type is never
                         // TYPE_POINTER at this point (that case is handled
