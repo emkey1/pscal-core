@@ -16,6 +16,7 @@
 #include "ast/ast.h"
 #include "core/documented_units.h"
 #include "compiler/compiler.h"
+#include "compiler/bytecode.h" // isPointerSentinel
 #include <stdio.h>
 #include "symbol/symbol.h"
 #include "types.h"
@@ -4234,6 +4235,11 @@ void toLowerString(char *str) {
     }
 }
 
+// printValueToStream follows at most this many pointers deep (a linked
+// structure can point back at itself).
+#define PRINT_POINTER_MAX_DEPTH 4
+static PSCAL_THREAD_LOCAL int s_printPointerDepth = 0;
+
 void printValueToStream(Value v, FILE *stream) {
     if (!stream) {
         stream = stdout;
@@ -4319,8 +4325,20 @@ void printValueToStream(Value v, FILE *stream) {
         case TYPE_POINTER: {
             PointerObj *po = PSCAL_VALUE_PTR(v, PointerObj);
             fprintf(stream, "POINTER(@%p -> ", (void*)(po ? AS_POINTER(v) : NULL));
-            if (po && AS_POINTER(v)) { // If it's not a nil pointer, try to print what it points to
-                printValueToStream(*AS_POINTER(v), stream); // Recursive call
+            if (po && AS_POINTER(v) && isPointerSentinel(po->base_type_node) &&
+                po->base_type_node != OWNED_POINTER_SENTINEL) {
+                // A character/byte/opaque address, not a Value.
+                fprintf(stream, "...");
+            } else if (po && AS_POINTER(v)) { // If it's not a nil pointer, try to print what it points to
+                // Pointer targets can form cycles (p^.next := p), so only a
+                // few levels are followed.
+                if (s_printPointerDepth >= PRINT_POINTER_MAX_DEPTH) {
+                    fprintf(stream, "...");
+                } else {
+                    s_printPointerDepth++;
+                    printValueToStream(*AS_POINTER(v), stream); // Recursive call
+                    s_printPointerDepth--;
+                }
             } else {
                 fprintf(stream, "NIL_TARGET");
             }
