@@ -235,6 +235,25 @@ static bool verifyOperands(VCtx* ctx) {
             continue;
         }
 
+        // The field-address opcodes use their constant as the field's name,
+        // straight through AS_STRING, so it has to be a string.
+        if (opcode == GET_FIELD_ADDRESS || opcode == GET_FIELD_ADDRESS16 ||
+            opcode == GET_FIELD_ADDRESS_KEEP || opcode == GET_FIELD_ADDRESS_KEEP16) {
+            bool wide = (opcode == GET_FIELD_ADDRESS16 || opcode == GET_FIELD_ADDRESS_KEEP16);
+            uint32_t name_idx = wide ? verifyReadU16BE(code, pc + 1) : code[pc + 1];
+            if (!checkConstIndex(ctx, name_idx, pc, info->name)) return false;
+            if (VALUE_TYPE(chunk->constants[name_idx]) != TYPE_STRING) {
+                return vfail(ctx, "pc %d: %s field name constant %u is not a string",
+                             pc, info->name, name_idx);
+            }
+            continue;
+        }
+
+        // An element read with no index reads nothing; no compiler emits it.
+        if (opcode == LOAD_ELEMENT_VALUE && code[pc + 1] == 0) {
+            return vfail(ctx, "pc %d: LOAD_ELEMENT_VALUE has no indices", pc);
+        }
+
         int cursor = pc + 1;
         for (const char* p = info->operands; *p; ++p) {
             switch (*p) {

@@ -1091,6 +1091,23 @@ static FieldValue* findRecordFieldByName(Value* record_struct_ptr, const char* f
     return NULL;
 }
 
+// The field name GET_FIELD_ADDRESS[16]/_KEEP[16] read from the constant pool,
+// or NULL after a runtime error when that constant is not a string (the
+// verifier rejects such a chunk; this keeps a chunk that skipped it from
+// reading a non-string's payload as a StringObj).
+static const char* vmFieldNameOperand(VM* vm, uint16_t field_name_idx) {
+    const Value* name_val = (field_name_idx < vm->chunk->constants_count)
+                            ? &vm->chunk->constants[field_name_idx]
+                            : NULL;
+    const char* field_name = (name_val && VALUE_TYPE(*name_val) == TYPE_STRING)
+                              ? AS_STRING(*name_val)
+                              : NULL;
+    if (!field_name) {
+        runtimeError(vm, "VM Error: Field name constant is invalid or NULL.");
+    }
+    return field_name;
+}
+
 static bool pushFieldValueByName(VM* vm, Value* base_val_ptr, const char* field_name) {
     if (!field_name) {
         runtimeError(vm, "VM Error: Field name constant is invalid or NULL.");
@@ -9040,6 +9057,10 @@ comparison_error_label:
                 if (!vmStackHasOperands(vm, GET_FIELD_ADDRESS, 1)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                const char* field_name = vmFieldNameOperand(vm, field_name_idx);
+                if (!field_name) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 Value* base_val_ptr = vm->stackTop - 1;
                 bool invalid_type = false;
                 Value* record_struct_ptr = resolveRecord(base_val_ptr, &invalid_type);
@@ -9063,7 +9084,6 @@ comparison_error_label:
                 // resolving the field's storage address.
                 valueEnsureUnique(record_struct_ptr);
 
-                const char* field_name = AS_STRING(vm->chunk->constants[field_name_idx]);
                 FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
                 if (current) {
                     Value popped_base_val = pop(vm);
@@ -9080,6 +9100,10 @@ comparison_error_label:
                 if (!vmStackHasOperands(vm, GET_FIELD_ADDRESS16, 1)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                const char* field_name = vmFieldNameOperand(vm, field_name_idx);
+                if (!field_name) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 Value* base_val_ptr = vm->stackTop - 1;
                 bool invalid_type = false;
                 Value* record_struct_ptr = resolveRecord(base_val_ptr, &invalid_type);
@@ -9103,7 +9127,6 @@ comparison_error_label:
                 // resolving the field's storage address.
                 valueEnsureUnique(record_struct_ptr);
 
-                const char* field_name = AS_STRING(vm->chunk->constants[field_name_idx]);
                 FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
                 if (current) {
                     Value popped_base_val = pop(vm);
@@ -9120,6 +9143,10 @@ comparison_error_label:
                 if (!vmStackHasOperands(vm, GET_FIELD_ADDRESS_KEEP, 1)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                const char* field_name = vmFieldNameOperand(vm, field_name_idx);
+                if (!field_name) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 Value* base_val_ptr = vm->stackTop - 1;
                 bool invalid_type = false;
                 Value* record_struct_ptr = resolveRecord(base_val_ptr, &invalid_type);
@@ -9143,7 +9170,6 @@ comparison_error_label:
                 // resolving the field's storage address.
                 valueEnsureUnique(record_struct_ptr);
 
-                const char* field_name = AS_STRING(vm->chunk->constants[field_name_idx]);
                 FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
                 if (current) {
                     push(vm, makePointer(fieldValueStorage(current), current->type_def));
@@ -9158,6 +9184,10 @@ comparison_error_label:
                 if (!vmStackHasOperands(vm, GET_FIELD_ADDRESS_KEEP16, 1)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                const char* field_name = vmFieldNameOperand(vm, field_name_idx);
+                if (!field_name) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 Value* base_val_ptr = vm->stackTop - 1;
                 bool invalid_type = false;
                 Value* record_struct_ptr = resolveRecord(base_val_ptr, &invalid_type);
@@ -9181,7 +9211,6 @@ comparison_error_label:
                 // resolving the field's storage address.
                 valueEnsureUnique(record_struct_ptr);
 
-                const char* field_name = AS_STRING(vm->chunk->constants[field_name_idx]);
                 FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
                 if (current) {
                     push(vm, makePointer(fieldValueStorage(current), current->type_def));
@@ -9386,11 +9415,36 @@ comparison_error_label:
                         return INTERPRET_RUNTIME_ERROR;
                     }
                 } else if (VALUE_TYPE(operand) == TYPE_ARRAY) {
-                    array_val_ptr = &operand;
+                    // An array value, not its address: the element address
+                    // handed out would point into storage only this popped
+                    // copy keeps alive, so the copy could never be freed.
+                    // No compiler emits this.
+                    runtimeError(vm, "VM Error: GET_ELEMENT_ADDRESS needs a pointer to the array, not an array value.");
+                    free(indices);
+                    freeValue(&operand);
+                    return INTERPRET_RUNTIME_ERROR;
                 } else {
                     runtimeError(vm, "[AETH-RUNTIME-INDEX-NOT-ARRAY] cannot index this value: it is not an array. hint: indexing a 1-D array two-dimensionally (dp[i][j]) does this -- a `let dp: Int[]` is flat, so use a single index dp[i * width + j], or build an array of arrays.");
                     free(indices);
                     freeValue(&operand);
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+
+                // More indices than the array has dimensions: the extra ones
+                // used to be dropped silently. (A dimensionless array is an
+                // empty dynamic one; the bounds check below reports that.)
+                if (ARRAY_DIMENSIONS(*array_val_ptr) > 0 &&
+                    dimension_count > ARRAY_DIMENSIONS(*array_val_ptr)) {
+                    runtimeError(vm, "VM Error: %u indices for an array of %d dimension(s).",
+                                 dimension_count, ARRAY_DIMENSIONS(*array_val_ptr));
+                    free(indices);
+                    freeValue(&operand);
+                    if (using_wrapper) {
+                        vmFreeArrayIndexWrapper(&temp_wrapper);
+                    }
+                    if (using_snapshot) {
+                        freeValue(&shared_snapshot);
+                    }
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
