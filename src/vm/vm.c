@@ -4454,6 +4454,19 @@ static bool vmCheckArrayIndexBounds(VM* vm, Value* array_val_ptr, int* indices) 
     return true;
 }
 
+// SHL/SHR on 64-bit integers, defined for every count >= 0. A count of 64 or
+// more shifts every bit out: SHL gives 0 and SHR the sign fill (0, or -1 for a
+// negative signed value). The C operators are undefined there (`1 << 64` came
+// back as 1 on arm64) and for a left shift of a negative value, so this shifts
+// the unsigned bits. An unsigned left operand shifts right logically.
+static inline long long vmShiftInt64(long long a, long long count, bool left, bool isUnsigned) {
+    unsigned long long bits = (unsigned long long)a;
+    if (left) return count >= 64 ? 0 : (long long)(bits << count);
+    if (isUnsigned) return count >= 64 ? 0 : (long long)(bits >> count);
+    if (count >= 64) return a < 0 ? -1 : 0;
+    return a >> count;
+}
+
 // runtimeError - Assuming your existing one is fine.
 void runtimeError(VM* vm, const char* format, ...) {
     if (vm) {
@@ -8291,11 +8304,9 @@ dispatch_switch:
                         runtimeError(vm, "Runtime Error: Shift amount cannot be negative.");
                         return INTERPRET_RUNTIME_ERROR;
                     }
-                    if (instruction_val == SHL) {
-                        push(vm, makeInt(ia << ib));
-                    } else {
-                        push(vm, makeInt(ia >> ib));
-                    }
+                    // Widen like the slow path: makeInt() tagged INT32 and
+                    // dropped the high bits (`1 << 32` was 0).
+                    push(vm, pscalIntResultNarrow(vmShiftInt64(ia, ib, instruction_val == SHL, false)));
                 } else if (IS_INTLIKE(a_val) && IS_INTLIKE(b_val)) {
                     long long ia = AS_INTEGER(a_val);
                     long long ib = AS_INTEGER(b_val);
@@ -8304,11 +8315,9 @@ dispatch_switch:
                         freeValue(&a_val); freeValue(&b_val);
                         return INTERPRET_RUNTIME_ERROR;
                     }
-                    if (instruction_val == SHL) {
-                        push(vm, pscalIntResultLike2(a_val, b_val, ia << ib));
-                    } else {
-                        push(vm, pscalIntResultLike2(a_val, b_val, ia >> ib));
-                    }
+                    push(vm, pscalIntResultLike2(a_val, b_val,
+                                                 vmShiftInt64(ia, ib, instruction_val == SHL,
+                                                              VALUE_TYPE(a_val) == TYPE_UINT64)));
                 } else {
                     runtimeError(vm, "Runtime Error: Operands for 'shl' and 'shr' must be integers. Got %s and %s.",
                                  varTypeToString(VALUE_TYPE(a_val)), varTypeToString(VALUE_TYPE(b_val)));
