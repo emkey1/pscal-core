@@ -851,6 +851,44 @@ static inline bool vmEnsureFrameCapacity(VM* vm) {
 static void push(VM* vm, Value value);
 static Value copyValueForStack(const Value* src);
 
+// --- dispose() quarantine (see vmDisposeValueCell in vm.h) ---
+// dispose(p) can only nil the copies of p that vmNullifyAliases finds
+// (globals and stack slots); one stored in a record field, an array element
+// or another heap cell keeps the old address. Keeping the disposed cell as a
+// tombstone makes a later p^ through such a copy a clean runtime error. The
+// quarantine is bounded: once VM_DISPOSE_QUARANTINE newer cells have been
+// disposed, the oldest tombstone is freed for real.
+#define VM_DISPOSED_CELL_BITS 0xD15D05EDD15D05EDull
+#define VM_DISPOSE_QUARANTINE 4096
+static Value* s_disposeQuarantine[VM_DISPOSE_QUARANTINE];
+static size_t s_disposeQuarantineNext = 0;
+static pthread_mutex_t s_disposeQuarantineMutex = PTHREAD_MUTEX_INITIALIZER;
+
+bool vmValueIsDisposed(const Value* cell) {
+    return cell && cell->type == TYPE_VOID && cell->bits == VM_DISPOSED_CELL_BITS;
+}
+
+void vmDisposeValueCell(Value* cell) {
+    if (!cell) {
+        return;
+    }
+    freeValue(cell);
+    cell->type = TYPE_VOID;
+    cell->bits = VM_DISPOSED_CELL_BITS;
+    pthread_mutex_lock(&s_disposeQuarantineMutex);
+    Value* evicted = s_disposeQuarantine[s_disposeQuarantineNext];
+    s_disposeQuarantine[s_disposeQuarantineNext] = cell;
+    s_disposeQuarantineNext = (s_disposeQuarantineNext + 1) % VM_DISPOSE_QUARANTINE;
+    pthread_mutex_unlock(&s_disposeQuarantineMutex);
+    free(evicted);
+}
+
+// Longest pointer-to-pointer chain resolveRecord follows; anything longer is
+// a cycle (q := @q).
+#define VM_MAX_POINTER_CHAIN 64
+
+// Stops at a disposed cell (vmValueIsDisposed) or, for a cyclic chain, at the
+// pointer where the hop limit ran out; callers see a non-record either way.
 static Value* resolveRecord(Value* base, bool* invalid_type) {
     if (invalid_type) *invalid_type = false;
     if (VALUE_TYPE(*base) != TYPE_POINTER && VALUE_TYPE(*base) != TYPE_RECORD) {
@@ -858,10 +896,23 @@ static Value* resolveRecord(Value* base, bool* invalid_type) {
         return NULL;
     }
     Value* current = base;
-    while (current && VALUE_TYPE(*current) == TYPE_POINTER) {
+    int hops = 0;
+    while (current && VALUE_TYPE(*current) == TYPE_POINTER && hops++ < VM_MAX_POINTER_CHAIN) {
         current = AS_POINTER(*current);
     }
     return current;
+}
+
+// The error for a field access whose base resolved (resolveRecord) to
+// something other than a record.
+static void vmReportFieldBaseNotRecord(VM* vm, const Value* resolved) {
+    if (vmValueIsDisposed(resolved)) {
+        runtimeError(vm, "VM Error: Cannot access field through a dangling pointer (its target was disposed).");
+    } else if (VALUE_TYPE(*resolved) == TYPE_POINTER) {
+        runtimeError(vm, "VM Error: Cannot access field: the pointer chain is cyclic.");
+    } else {
+        runtimeError(vm, "VM Error: Internal - expected to resolve to a record for field access.");
+    }
 }
 
 static Value* resolveRecordForField(VM* vm, Value* base_val_ptr) {
@@ -876,7 +927,7 @@ static Value* resolveRecordForField(VM* vm, Value* base_val_ptr) {
         return NULL;
     }
     if (VALUE_TYPE(*record_struct_ptr) != TYPE_RECORD) {
-        runtimeError(vm, "VM Error: Internal - expected to resolve to a record for field access.");
+        vmReportFieldBaseNotRecord(vm, record_struct_ptr);
         return NULL;
     }
     return record_struct_ptr;
@@ -9086,7 +9137,7 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 if (VALUE_TYPE(*record_struct_ptr) != TYPE_RECORD) {
-                    runtimeError(vm, "VM Error: Internal - expected to resolve to a record for field access.");
+                    vmReportFieldBaseNotRecord(vm, record_struct_ptr);
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
@@ -9122,7 +9173,7 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 if (VALUE_TYPE(*record_struct_ptr) != TYPE_RECORD) {
-                    runtimeError(vm, "VM Error: Internal - expected to resolve to a record for field access.");
+                    vmReportFieldBaseNotRecord(vm, record_struct_ptr);
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
@@ -9174,7 +9225,7 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 if (VALUE_TYPE(*record_struct_ptr) != TYPE_RECORD) {
-                    runtimeError(vm, "VM Error: Internal - expected to resolve to a record for field access.");
+                    vmReportFieldBaseNotRecord(vm, record_struct_ptr);
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
@@ -9217,7 +9268,7 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 if (VALUE_TYPE(*record_struct_ptr) != TYPE_RECORD) {
-                    runtimeError(vm, "VM Error: Internal - expected to resolve to a record for field access.");
+                    vmReportFieldBaseNotRecord(vm, record_struct_ptr);
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
@@ -9260,7 +9311,7 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 if (VALUE_TYPE(*record_struct_ptr) != TYPE_RECORD) {
-                    runtimeError(vm, "VM Error: Internal - expected to resolve to a record for field access.");
+                    vmReportFieldBaseNotRecord(vm, record_struct_ptr);
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
@@ -9299,7 +9350,7 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 if (VALUE_TYPE(*record_struct_ptr) != TYPE_RECORD) {
-                    runtimeError(vm, "VM Error: Internal - expected to resolve to a record for field access.");
+                    vmReportFieldBaseNotRecord(vm, record_struct_ptr);
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
@@ -10423,6 +10474,12 @@ comparison_error_label:
                         freeValue(&pointer_to_lvalue);
                         return INTERPRET_RUNTIME_ERROR;
                     }
+                    if (vmValueIsDisposed(target_lvalue_ptr)) {
+                        runtimeError(vm, "VM Error: Assignment through a dangling pointer (its target was disposed).");
+                        freeValue(&value_to_set);
+                        freeValue(&pointer_to_lvalue);
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
 
                     AST* declaredTypeNode = PTR_BASE_TYPE_NODE(pointer_to_lvalue);
                     if (declaredTypeNode == OWNED_POINTER_SENTINEL) {
@@ -10821,6 +10878,11 @@ comparison_error_label:
                     Value* target_lvalue_ptr = (Value*)AS_POINTER(pointer_val);
                     if (target_lvalue_ptr == NULL) {
                         runtimeError(vm, "VM Error: GET_INDIRECT on a nil pointer.");
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    if (vmValueIsDisposed(target_lvalue_ptr)) {
+                        runtimeError(vm, "VM Error: Dereference of a dangling pointer (its target was disposed).");
+                        freeValue(&pointer_val);
                         return INTERPRET_RUNTIME_ERROR;
                     }
                     push(vm, copyValueForStack(target_lvalue_ptr));

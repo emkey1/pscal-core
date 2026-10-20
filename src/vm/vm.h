@@ -407,6 +407,12 @@ void vmResetExecutionState(VM* vm); // Reset stack/frames so a VM can be reused
 // Takes a BytecodeChunk that was successfully compiled.
 InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globals, HashTable* const_globals, HashTable* procedures, uint32_t entry);
 void vmNullifyAliases(VM* vm, uintptr_t disposedAddrValue);
+// dispose()'s second half: frees what the heap cell `cell` holds and turns it
+// into a tombstone (vmValueIsDisposed) instead of freeing it, so a surviving
+// copy of the pointer reports a dangling-pointer error rather than touching
+// freed memory. The most recent cells are quarantined; older ones are freed.
+void vmDisposeValueCell(Value* cell);
+bool vmValueIsDisposed(const Value* cell);
 int vmSpawnCallbackThread(VM* vm, VMThreadCallback callback, void* user_data, VMThreadCleanup cleanup);
 // VM 2.0 Phase 5a checkpoint 5a-i (Docs/pscal_vm2_plan.md Sec 6.1): task
 // primitives backing TaskSpawn/TaskDone (builtin.c). TaskAwait/TaskCancel
