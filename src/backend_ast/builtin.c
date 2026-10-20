@@ -8454,12 +8454,41 @@ Value vmBuiltinEof(VM* vm, int arg_count, Value* args) {
     return makeBoolean(false);
 }
 
+/* The most bytes BlockRead/BlockWrite may move through a raw buffer pointer
+ * (`s[1]`, `buf[0]`): the rest of the string or packed byte array it points
+ * into, rounded down to whole records. The pointer used to carry no bound,
+ * so BlockRead(f, s[1], 4096) on an 8-character string overran the heap and
+ * BlockWrite read past it into the file. A string's extent is its current
+ * length, as in Turbo Pascal (SetLength first to make room); an array
+ * element pointer records its extent when the VM creates it. */
+static size_t blockIoRawPointerLimit(const Value* pointerValue, const unsigned char* rawPointer,
+                                     size_t requestedBytes, int recordSize) {
+    if (!pointerValue || !rawPointer) {
+        return requestedBytes;
+    }
+    size_t limit = SIZE_MAX;
+    AST* base = PTR_BASE_TYPE_NODE(*pointerValue);
+    PointerObj* po = PSCAL_VALUE_PTR(*pointerValue, PointerObj);
+    if (base == BYTE_ARRAY_PTR_SENTINEL) {
+        if (po && po->extent > 0) {
+            limit = po->extent;
+        }
+    } else if (base == STRING_CHAR_PTR_SENTINEL || base == SERIALIZED_CHAR_PTR_SENTINEL) {
+        limit = strlen((const char*)rawPointer);
+    }
+    if (limit != SIZE_MAX && recordSize > 1) {
+        limit -= limit % (size_t)recordSize;
+    }
+    return requestedBytes < limit ? requestedBytes : limit;
+}
+
 Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
     unsigned char* tempBuffer = NULL;
     Value* resultSlot = NULL;
     Value* fileValue = NULL;
     Value* bufferValue = NULL;
     unsigned char* rawPointer = NULL;
+    const Value* rawPointerValue = NULL;
     FILE* stream = NULL;
     bool parameterError = false;
     bool performedIO = false;
@@ -8530,6 +8559,7 @@ Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
         PTR_BASE_TYPE_NODE(args[1]) == BYTE_ARRAY_PTR_SENTINEL) {
         bufferIsRawPointer = true;
         rawPointer = (unsigned char*)AS_POINTER(args[1]);
+        rawPointerValue = &args[1];
     } else {
         bufferValue = (Value*)AS_POINTER(args[1]);
         if (bufferValue && VALUE_TYPE(*bufferValue) == TYPE_POINTER &&
@@ -8538,6 +8568,7 @@ Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
              PTR_BASE_TYPE_NODE(*bufferValue) == BYTE_ARRAY_PTR_SENTINEL)) {
             bufferIsRawPointer = true;
             rawPointer = (unsigned char*)AS_POINTER(*bufferValue);
+            rawPointerValue = bufferValue;
         }
     }
 
@@ -8566,6 +8597,7 @@ Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
             parameterError = true;
             goto cleanup;
         }
+        requestedBytes = blockIoRawPointerLimit(rawPointerValue, rawPointer, requestedBytes, recordSize);
         errno = 0;
         performedIO = true;
         bytesProcessed = (requestedBytes > 0) ? fread(rawPointer, 1, requestedBytes, stream) : 0;
@@ -8680,6 +8712,7 @@ Value vmBuiltinBlockwrite(VM* vm, int arg_count, Value* args) {
     Value* bufferValue = NULL;
     Value* resultSlot = NULL;
     unsigned char* rawPointer = NULL;
+    const Value* rawPointerValue = NULL;
     FILE* stream = NULL;
     bool parameterError = false;
     bool performedIO = false;
@@ -8750,6 +8783,7 @@ Value vmBuiltinBlockwrite(VM* vm, int arg_count, Value* args) {
         PTR_BASE_TYPE_NODE(args[1]) == BYTE_ARRAY_PTR_SENTINEL) {
         bufferIsRawPointer = true;
         rawPointer = (unsigned char*)AS_POINTER(args[1]);
+        rawPointerValue = &args[1];
     } else {
         bufferValue = (Value*)AS_POINTER(args[1]);
         if (bufferValue && VALUE_TYPE(*bufferValue) == TYPE_POINTER &&
@@ -8758,6 +8792,7 @@ Value vmBuiltinBlockwrite(VM* vm, int arg_count, Value* args) {
              PTR_BASE_TYPE_NODE(*bufferValue) == BYTE_ARRAY_PTR_SENTINEL)) {
             bufferIsRawPointer = true;
             rawPointer = (unsigned char*)AS_POINTER(*bufferValue);
+            rawPointerValue = bufferValue;
         }
     }
 
@@ -8786,6 +8821,7 @@ Value vmBuiltinBlockwrite(VM* vm, int arg_count, Value* args) {
             parameterError = true;
             goto cleanup;
         }
+        requestedBytes = blockIoRawPointerLimit(rawPointerValue, rawPointer, requestedBytes, recordSize);
         errno = 0;
         performedIO = true;
         bytesProcessed = (requestedBytes > 0) ? fwrite(rawPointer, 1, requestedBytes, stream) : 0;

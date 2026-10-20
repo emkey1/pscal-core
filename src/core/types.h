@@ -431,6 +431,11 @@ typedef struct PointerObj {
     // carry the real element type AST for chained indexing/field access,
     // so this can't reuse that field the way the sentinels do.
     struct ArrayObj *retained_array;
+    // For a BYTE_ARRAY_PTR_SENTINEL pointer (the address of an element of a
+    // packed byte array, `buf[0]`): the number of bytes from `address` to the
+    // end of that array, so BlockRead/BlockWrite through the pointer cannot
+    // run past it. 0 = not recorded.
+    size_t extent;
 } PointerObj;
 
 // VM 2.0 Phase 4i checkpoint 3a (Docs/pscal_vm2_plan.md sec 5.10.3/

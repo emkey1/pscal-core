@@ -4763,6 +4763,7 @@ Value makeCopyOfValue(const Value *src) {
             // `v = *src` shallow struct copy the way the old top-level
             // field was -- must propagate explicitly.
             po->base_type_node = src_base_type_node;
+            po->extent = src_po ? src_po->extent : 0;
             if (src_address && src_base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
                 const char *text = (const char *)src_address;
                 size_t len = strlen(text);

@@ -9477,13 +9477,18 @@ comparison_error_label:
                     // as the pointer does, even across a concurrent
                     // SetLength() on the live global this snapshot was
                     // taken from.
+                    Value byte_ptr;
                     if (using_snapshot) {
-                        push(vm, makeRetainedArrayElementPointer(&AS_ARRAY_RAW(*array_val_ptr)[offset],
-                                                                  BYTE_ARRAY_PTR_SENTINEL,
-                                                                  PSCAL_VALUE_PTR(shared_snapshot, ArrayObj)));
+                        byte_ptr = makeRetainedArrayElementPointer(&AS_ARRAY_RAW(*array_val_ptr)[offset],
+                                                                   BYTE_ARRAY_PTR_SENTINEL,
+                                                                   PSCAL_VALUE_PTR(shared_snapshot, ArrayObj));
                     } else {
-                        push(vm, makePointer(&AS_ARRAY_RAW(*array_val_ptr)[offset], BYTE_ARRAY_PTR_SENTINEL));
+                        byte_ptr = makePointer(&AS_ARRAY_RAW(*array_val_ptr)[offset], BYTE_ARRAY_PTR_SENTINEL);
                     }
+                    // How many bytes the pointer may reach (BlockRead and
+                    // BlockWrite clamp to it; see PointerObj.extent).
+                    PSCAL_VALUE_PTR(byte_ptr, PointerObj)->extent = (size_t)(total_size - (int)offset);
+                    push(vm, byte_ptr);
                 } else {
                     if (using_snapshot) {
                         push(vm, makeRetainedArrayElementPointer(&AS_ARRAY(*array_val_ptr)[offset],
@@ -9668,13 +9673,18 @@ comparison_error_label:
                         }
                         return INTERPRET_RUNTIME_ERROR;
                     }
+                    Value byte_ptr;
                     if (using_snapshot) {
-                        push(vm, makeRetainedArrayElementPointer(&AS_ARRAY_RAW(*array_val_ptr)[flat_offset],
-                                                                  BYTE_ARRAY_PTR_SENTINEL,
-                                                                  PSCAL_VALUE_PTR(shared_snapshot, ArrayObj)));
+                        byte_ptr = makeRetainedArrayElementPointer(&AS_ARRAY_RAW(*array_val_ptr)[flat_offset],
+                                                                   BYTE_ARRAY_PTR_SENTINEL,
+                                                                   PSCAL_VALUE_PTR(shared_snapshot, ArrayObj));
                     } else {
-                        push(vm, makePointer(&AS_ARRAY_RAW(*array_val_ptr)[flat_offset], BYTE_ARRAY_PTR_SENTINEL));
+                        byte_ptr = makePointer(&AS_ARRAY_RAW(*array_val_ptr)[flat_offset], BYTE_ARRAY_PTR_SENTINEL);
                     }
+                    // How many bytes the pointer may reach (BlockRead and
+                    // BlockWrite clamp to it; see PointerObj.extent).
+                    PSCAL_VALUE_PTR(byte_ptr, PointerObj)->extent = (size_t)(total_size - (int)flat_offset);
+                    push(vm, byte_ptr);
                 } else {
                     if (using_snapshot) {
                         push(vm, makeRetainedArrayElementPointer(&AS_ARRAY(*array_val_ptr)[flat_offset],
