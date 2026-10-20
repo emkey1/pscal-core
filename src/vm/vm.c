@@ -8727,28 +8727,39 @@ dispatch_switch:
                     char b_text[5] = {0};
                     const char *sa = NULL;
                     const char *sb = NULL;
+                    size_t la = 0;
+                    size_t lb = 0;
 
+                    // Explicit lengths: a char is always one character, so
+                    // chr(0) is not the empty string (as a C string it was).
                     if (IS_STRING(a_val)) {
                         sa = AS_STRING(a_val) ? AS_STRING(a_val) : "";
+                        la = strlen(sa);
                     } else if (VALUE_TYPE(a_val) == TYPE_WIDECHAR) {
-                        encodeUtf8Codepoint((uint32_t)AS_CHAR(a_val), a_text);
+                        la = encodeUtf8Codepoint((uint32_t)AS_CHAR(a_val), a_text);
                         sa = a_text;
                     } else {
                         a_text[0] = (char)AS_CHAR(a_val);
+                        la = 1;
                         sa = a_text;
                     }
 
                     if (IS_STRING(b_val)) {
                         sb = AS_STRING(b_val) ? AS_STRING(b_val) : "";
+                        lb = strlen(sb);
                     } else if (VALUE_TYPE(b_val) == TYPE_WIDECHAR) {
-                        encodeUtf8Codepoint((uint32_t)AS_CHAR(b_val), b_text);
+                        lb = encodeUtf8Codepoint((uint32_t)AS_CHAR(b_val), b_text);
                         sb = b_text;
                     } else {
                         b_text[0] = (char)AS_CHAR(b_val);
+                        lb = 1;
                         sb = b_text;
                     }
 
-                    int cmp = strcmp(sa, sb);
+                    int cmp = memcmp(sa, sb, la < lb ? la : lb);
+                    if (cmp == 0) {
+                        cmp = (la > lb) - (la < lb);
+                    }
                     switch (instruction_val) {
                         case EQUAL:         result_val = makeBoolean(cmp == 0); break;
                         case NOT_EQUAL:     result_val = makeBoolean(cmp != 0); break;
