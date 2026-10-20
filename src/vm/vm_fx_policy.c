@@ -24,6 +24,11 @@ static EffectMask g_fx_env_denied_mask = FX_PURE;
 
 static FILE *g_fx_record_file = NULL;
 static FILE *g_fx_replay_file = NULL;
+// One journal record is several separate framed writes (or reads) on the one
+// FILE*, and task workers call impure builtins concurrently: without this
+// lock their records interleaved, corrupting the journal and making replay
+// report mismatches. Held for a whole record, and around opening/closing.
+static pthread_mutex_t g_fx_journal_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 bool pscalFxParseDenyList(const char *csv, EffectMask *out_mask) {
     if (!out_mask) return false;
@@ -81,7 +86,7 @@ EffectMask pscalFxEffectiveDeniedMask(void) {
     return g_fx_cli_denied_mask | g_fx_env_denied_mask;
 }
 
-bool pscalFxBeginRecord(const char *path) {
+static bool pscalFxBeginRecordLocked(const char *path) {
     if (!path || !*path) return false;
     if (g_fx_record_file || g_fx_replay_file) return false;
     FILE *f = fopen(path, "wb");
@@ -98,7 +103,14 @@ bool pscalFxBeginRecord(const char *path) {
     return true;
 }
 
-bool pscalFxBeginReplay(const char *path) {
+bool pscalFxBeginRecord(const char *path) {
+    pthread_mutex_lock(&g_fx_journal_mutex);
+    bool ok = pscalFxBeginRecordLocked(path);
+    pthread_mutex_unlock(&g_fx_journal_mutex);
+    return ok;
+}
+
+static bool pscalFxBeginReplayLocked(const char *path) {
     if (!path || !*path) return false;
     if (g_fx_record_file || g_fx_replay_file) return false;
     FILE *f = fopen(path, "rb");
@@ -117,6 +129,13 @@ bool pscalFxBeginReplay(const char *path) {
     }
     g_fx_replay_file = f;
     return true;
+}
+
+bool pscalFxBeginReplay(const char *path) {
+    pthread_mutex_lock(&g_fx_journal_mutex);
+    bool ok = pscalFxBeginReplayLocked(path);
+    pthread_mutex_unlock(&g_fx_journal_mutex);
+    return ok;
 }
 
 bool pscalFxRecordActive(void) { return g_fx_record_file != NULL; }
@@ -142,8 +161,13 @@ bool pscalFxBuiltinIsJournalExempt(const char *canonical_name) {
 }
 
 void pscalFxEndSession(void) {
+    pthread_mutex_lock(&g_fx_journal_mutex);
     if (g_fx_record_file) { fclose(g_fx_record_file); g_fx_record_file = NULL; }
     if (g_fx_replay_file) { fclose(g_fx_replay_file); g_fx_replay_file = NULL; }
+    pthread_mutex_unlock(&g_fx_journal_mutex);
+    // The --deny mask is per run too: tools run in-process (iOS) would
+    // otherwise inherit one run's --deny in every later run.
+    g_fx_cli_denied_mask = FX_PURE;
 }
 
 /* Raw length-prefixed byte blob, used only for MStream buffer content (see
@@ -248,7 +272,7 @@ static MStream *fxResolveMStreamArg(Value *args, int idx) {
  * Deliberately does NOT record input argument values -- Docs/pscal_vm2_plan.md
  * §6.3 only asks for "return Value + VAR-parameter writebacks", and the
  * program's own deterministic state already supplies the inputs on replay. */
-void pscalFxRecordCall(const char *name, int arg_count, const Value *args, const Value *result) {
+static void pscalFxRecordCallLocked(const char *name, int arg_count, const Value *args, const Value *result) {
     if (!g_fx_record_file || !name) return;
     FILE *f = g_fx_record_file;
 
@@ -327,8 +351,14 @@ void pscalFxRecordCall(const char *name, int arg_count, const Value *args, const
     fflush(f);
 }
 
-PscalFxReplayOutcome pscalFxReplayCall(struct VM_s *vm, const char *name, int arg_count, Value *args,
-                                       Value *out_result, char *mismatch_msg, size_t mismatch_msg_size) {
+void pscalFxRecordCall(const char *name, int arg_count, const Value *args, const Value *result) {
+    pthread_mutex_lock(&g_fx_journal_mutex);
+    pscalFxRecordCallLocked(name, arg_count, args, result);
+    pthread_mutex_unlock(&g_fx_journal_mutex);
+}
+
+static PscalFxReplayOutcome pscalFxReplayCallLocked(struct VM_s *vm, const char *name, int arg_count, Value *args,
+                                                    Value *out_result, char *mismatch_msg, size_t mismatch_msg_size) {
     (void)vm;
     if (!g_fx_replay_file || !name || !out_result) {
         if (mismatch_msg && mismatch_msg_size) {
@@ -482,6 +512,15 @@ PscalFxReplayOutcome pscalFxReplayCall(struct VM_s *vm, const char *name, int ar
 
     *out_result = result;
     return PSCAL_FX_REPLAY_SUBSTITUTED;
+}
+
+PscalFxReplayOutcome pscalFxReplayCall(struct VM_s *vm, const char *name, int arg_count, Value *args,
+                                       Value *out_result, char *mismatch_msg, size_t mismatch_msg_size) {
+    pthread_mutex_lock(&g_fx_journal_mutex);
+    PscalFxReplayOutcome outcome =
+        pscalFxReplayCallLocked(vm, name, arg_count, args, out_result, mismatch_msg, mismatch_msg_size);
+    pthread_mutex_unlock(&g_fx_journal_mutex);
+    return outcome;
 }
 
 bool pscalFxIsCliFlag(const char *arg) {
