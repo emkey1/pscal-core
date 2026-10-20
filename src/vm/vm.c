@@ -6780,6 +6780,19 @@ static InterpretResult returnFromCall(VM* vm, bool* halted) {
     }
 
     CallFrame* currentFrame = &vm->frames[vm->frameCount - 1];
+
+    // Returning resets stackTop to the frame's base. Below the base are the
+    // caller's slots; if the callee has popped into them (possible only past
+    // a CALL_INDIRECT/CALL_METHOD/CALL_HOST, whose stack effect the verifier
+    // cannot follow), the values it moved out are gone, and raising stackTop
+    // back over their stale copies would hand them to the caller to use and
+    // free a second time.
+    if (vm->stackTop < currentFrame->slots) {
+        runtimeError(vm, "VM Error: Stack underflow into the caller's frame on return.");
+        if (halted) *halted = true;
+        return INTERPRET_RUNTIME_ERROR;
+    }
+
     bool has_result = (currentFrame->function_symbol != NULL) &&
                       (currentFrame->function_symbol->type != TYPE_VOID);
 
