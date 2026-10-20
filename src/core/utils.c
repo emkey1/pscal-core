@@ -27,6 +27,7 @@
 #include <unistd.h>    // For STDOUT_FILENO
 #include <sys/stat.h>  // For stat
 #include <limits.h>    // For PATH_MAX
+#include <stdint.h>    // For SIZE_MAX
 #include <pthread.h>
 #ifdef __linux__
 #include <linux/limits.h>
@@ -777,7 +778,9 @@ ChannelObj *createChannelObj(size_t capacity) {
     pthread_mutex_init(&ch->lock, NULL);
     pthread_cond_init(&ch->notEmpty, NULL);
     pthread_cond_init(&ch->notFull, NULL);
-    ch->buf = malloc(sizeof(Value) * capacity);
+    // calloc checks capacity * sizeof(Value) for overflow; a capacity of
+    // 2^60 used to wrap to a tiny malloc that the loop below then overran.
+    ch->buf = (capacity <= SIZE_MAX / sizeof(Value)) ? calloc(capacity, sizeof(Value)) : NULL;
     if (!ch->buf) {
         fprintf(stderr, "Memory allocation error in createChannelObj\n");
         EXIT_FAILURE_HANDLER();
@@ -3020,6 +3023,23 @@ static void releaseStringCharPin(StringObj *s) {
     pscalObjRelease(&s->header);
 }
 
+void pscalPointerDropOwners(PointerObj *po) {
+    if (!po) return;
+    if (po->retained_array) {
+        pthread_mutex_lock(&dynamic_array_refcount_mutex);
+        pscalObjRelease(&po->retained_array->header);
+        pthread_mutex_unlock(&dynamic_array_refcount_mutex);
+        po->retained_array = NULL;
+    }
+    if (po->retained_string) {
+        releaseStringCharPin(po->retained_string);
+        po->retained_string = NULL;
+    }
+    po->string_index = 0;
+    po->string_index_is_codepoint = false;
+    po->extent = 0;
+}
+
 // VM 2.0 Phase 4b (Docs/pscal_vm2_plan.md §5.10.4/§5.10.3): ClosureEnvPayload
 // already carried its own ad hoc refcount; this routes it through the
 // generic ObjHeader mechanism instead. One destructor, registered under
@@ -4799,6 +4819,7 @@ Value makeCopyOfValue(const Value *src) {
             // `v = *src` shallow struct copy the way the old top-level
             // field was -- must propagate explicitly.
             po->base_type_node = src_base_type_node;
+            po->extent = src_po ? src_po->extent : 0;
             if (src_address && src_base_type_node == SERIALIZED_CHAR_PTR_SENTINEL) {
                 const char *text = (const char *)src_address;
                 size_t len = strlen(text);
@@ -5419,7 +5440,9 @@ Value setIntersection(Value setA, Value setB) {
 
 // Helper function to map 0-15 to ANSI FG codes
 int map16FgColorToAnsi(int pscalColorCode, bool isBold) {
-    int basePscalColor = pscalColorCode % 8;
+    // ((x % 8) + 8) % 8: C's % keeps the sign, and a negative index read
+    // outside pscalToAnsiBase.
+    int basePscalColor = ((pscalColorCode % 8) + 8) % 8;
     bool isBright = isBold || (pscalColorCode >= 8);
     int ansiBaseOffset = pscalToAnsiBase[basePscalColor];
     return (isBright ? 90 : 30) + ansiBaseOffset;
@@ -5427,7 +5450,7 @@ int map16FgColorToAnsi(int pscalColorCode, bool isBold) {
 
 // Helper function to map 0-7 to ANSI BG codes
 int map16BgColorToAnsi(int pscalColorCode) {
-    int basePscalColor = pscalColorCode % 8;
+    int basePscalColor = ((pscalColorCode % 8) + 8) % 8;
     return 40 + pscalToAnsiBase[basePscalColor];
 }
 

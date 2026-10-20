@@ -632,6 +632,13 @@ static bool writeBinaryElement(FILE* stream, const Value* rawValue, VarType elem
     if (VALUE_TYPE(*value) == TYPE_POINTER && AS_POINTER(*value)) {
         value = (const Value*)AS_POINTER(*value);
     }
+    // An enum's AS_INTEGER is 0; what goes in the file is its ordinal
+    // (`file of Color` used to come out all zero bytes).
+    Value ordinal_value;
+    if (VALUE_TYPE(*value) == TYPE_ENUM) {
+        ordinal_value = makeInt(AS_ENUM(*value).ordinal);
+        value = &ordinal_value;
+    }
 
     unsigned char buffer[sizeof(long double)] = {0};
     size_t bytes = 0;
@@ -738,6 +745,86 @@ static bool writeBinaryElement(FILE* stream, const Value* rawValue, VarType elem
     return true;
 }
 
+/* The reading half of writeBinaryElement: one element of a typed file
+ * (`file of Integer`, `file of Color`, ...) in the same fixed-size native
+ * layout. Read used to parse these files as text and came back with 0 for
+ * every element. A short read (end of file) reports IOResult 100, as in
+ * Turbo/Free Pascal. */
+static bool builtinSetEnumOrdinal(Value* dst, long long ordinal);
+
+static bool readBinaryElement(FILE* stream, Value* dst, VarType elementType,
+                              size_t elementSize, int* outErrno) {
+    if (outErrno) *outErrno = 0;
+    if (!stream || !dst || elementSize == 0 || elementSize > sizeof(long double)) {
+        if (outErrno) *outErrno = 1;
+        return false;
+    }
+    unsigned char buffer[sizeof(long double)] = {0};
+    errno = 0;
+    size_t got = fread(buffer, 1, elementSize, stream);
+    if (got != elementSize) {
+        if (outErrno) *outErrno = ferror(stream) ? (errno ? errno : 1) : 100;
+        return false;
+    }
+
+    bool is_real = false;
+    long long ival = 0;
+    long double rval = 0.0L;
+    switch (elementType) {
+        case TYPE_INT8:   { int8_t v;   memcpy(&v, buffer, sizeof(v)); ival = v; break; }
+        case TYPE_INT16:  { int16_t v;  memcpy(&v, buffer, sizeof(v)); ival = v; break; }
+        case TYPE_INT32:  { int32_t v;  memcpy(&v, buffer, sizeof(v)); ival = v; break; }
+        case TYPE_INT64:  { int64_t v;  memcpy(&v, buffer, sizeof(v)); ival = v; break; }
+        case TYPE_CHAR:
+        case TYPE_BOOLEAN:
+        case TYPE_BYTE:
+        case TYPE_UINT8:  ival = buffer[0]; break;
+        case TYPE_UINT16:
+        case TYPE_WORD:   { uint16_t v; memcpy(&v, buffer, sizeof(v)); ival = v; break; }
+        case TYPE_UINT32:
+        case TYPE_ENUM:   { uint32_t v; memcpy(&v, buffer, sizeof(v)); ival = v; break; }
+        case TYPE_UINT64: { uint64_t v; memcpy(&v, buffer, sizeof(v)); ival = (long long)v; break; }
+        case TYPE_FLOAT:  { float f;    memcpy(&f, buffer, sizeof(f)); rval = f; is_real = true; break; }
+        case TYPE_DOUBLE: { double d;   memcpy(&d, buffer, sizeof(d)); rval = d; is_real = true; break; }
+        case TYPE_LONG_DOUBLE: { long double ld; memcpy(&ld, buffer, sizeof(ld)); rval = ld; is_real = true; break; }
+        default:
+            if (outErrno) *outErrno = 1;
+            return false;
+    }
+
+    VarType dst_type = VALUE_TYPE(*dst);
+    if (dst_type == TYPE_ENUM) {
+        if (is_real || !builtinSetEnumOrdinal(dst, ival)) {
+            if (outErrno) *outErrno = 1;
+            return false;
+        }
+        return true;
+    }
+    if (isRealType(dst_type)) {
+        SET_REAL_VALUE(dst, is_real ? rval : (long double)ival);
+        return true;
+    }
+    if (is_real) {
+        if (outErrno) *outErrno = 1;
+        return false;
+    }
+    if (dst_type == TYPE_CHAR) {
+        SET_CHAR_VALUE(dst, (unsigned char)ival);
+        SET_INT_VALUE(dst, AS_CHAR(*dst));
+        return true;
+    }
+    if (dst_type == TYPE_BOOLEAN) {
+        SET_INT_VALUE(dst, ival != 0 ? 1 : 0);
+        return true;
+    }
+    if (IS_INTLIKE(*dst)) {
+        SET_INT_VALUE(dst, ival);
+        return true;
+    }
+    if (outErrno) *outErrno = 1;
+    return false;
+}
+
 static bool readToken(FILE* stream, char* buffer, size_t bufferSize) {
     if (!stream || !buffer || bufferSize == 0) {
         return false;
@@ -745,8 +832,150 @@ static bool readToken(FILE* stream, char* buffer, size_t bufferSize) {
     return fscanf(stream, "%1023s", buffer) == 1;
 }
 
-static bool writeStructuredValue(FILE* stream, const Value* value);
-static bool readStructuredValue(FILE* stream, Value* value);
+/* Store freshly read text in a string variable by rebinding it to a new
+ * StringObj, never by rewriting the buffer of the one it holds: string
+ * Values share their StringObj (copy-on-write), so a rewrite in place
+ * changed every other variable holding the same text. This Value's
+ * reference to the previous object is released -- not leaked, and not
+ * freed out from under any other holder. A string[N] target keeps its N:
+ * the text is cut to N bytes and the buffer allocated at N + 1, the size
+ * fixed-length assignment later copies into. Takes `len` bytes of `text`. */
+static bool builtinRebindStringValue(Value* dst, const char* text, size_t len) {
+    if (!dst) {
+        return false;
+    }
+    VarType type = (VALUE_TYPE(*dst) == TYPE_UNICODE_STRING) ? TYPE_UNICODE_STRING : TYPE_STRING;
+    StringObj* old = isPascalStringType(VALUE_TYPE(*dst)) ? PSCAL_VALUE_PTR(*dst, StringObj) : NULL;
+    int max_length = old ? old->max_length : -1;
+    if (max_length > 0 && len > (size_t)max_length) {
+        len = (size_t)max_length;
+    }
+    size_t alloc_len = (max_length > 0) ? (size_t)max_length + 1 : len + 1;
+    char* buffer = (char*)malloc(alloc_len);
+    if (!buffer) {
+        return false;
+    }
+    if (len > 0) {
+        memcpy(buffer, text, len);
+    }
+    buffer[len] = '\0';
+    StringObj* fresh = pscalStringObjCreate(max_length, type);
+    fresh->buffer = buffer;
+    pthread_mutex_lock(&value_cell_mutex);
+    PSCAL_VALUE_FIELD(*dst, type) = type;
+    pscalValueSetHeapPtrBits(dst, fresh);
+    pthread_mutex_unlock(&value_cell_mutex);
+    if (old) {
+        pscalObjRelease(&old->header);
+    }
+    return true;
+}
+
+/* Set an enum variable's ordinal, range-checked against its type. The
+ * variable gets a fresh EnumObj rather than having the shared one edited. */
+static bool builtinSetEnumOrdinal(Value* dst, long long ordinal) {
+    if (!dst || VALUE_TYPE(*dst) != TYPE_ENUM) {
+        return false;
+    }
+    if (ordinal < 0 || ordinal > INT_MAX ||
+        (ENUM_META(*dst) && ordinal >= ENUM_META(*dst)->member_count)) {
+        return false;
+    }
+    if (AS_ENUM(*dst).ordinal == (int)ordinal) {
+        return true;
+    }
+    Value fresh = makeEnum(AS_ENUM(*dst).enum_name, (int)ordinal);
+    ENUM_META(fresh) = ENUM_META(*dst);
+    ENUM_TYPE_DEF(fresh) = ENUM_TYPE_DEF(*dst);
+    Value old = *dst;
+    pthread_mutex_lock(&value_cell_mutex);
+    *dst = fresh;
+    pthread_mutex_unlock(&value_cell_mutex);
+    freeValue(&old);
+    return true;
+}
+
+/* Records and arrays written to (and read back from) a non-binary file go
+ * through the two functions below as a sequence of space-separated tokens.
+ *
+ * Strings are written quoted, Pascal-literal style: 'Ada Lovelace', with an
+ * embedded quote doubled ('it''s') and the empty string as ''. Written raw,
+ * a string with a space came back as its first word and every later field
+ * shifted (an empty string shifted them all). The quoted form reads back
+ * whatever was written, including spaces and line breaks, and still reads
+ * the old unquoted form, so files written before this change load as they
+ * did.
+ *
+ * Pointer fields are refused: the old code followed them, so writing one
+ * node of a cyclic list recursed until the stack overflowed, and a nil
+ * pointer field failed anyway. Only the outermost value (a VAR argument)
+ * is dereferenced. */
+static bool writeStructuredValueInner(FILE* stream, const Value* value);
+static bool readStructuredValueInner(FILE* stream, Value* value);
+
+static bool writeQuotedString(FILE* stream, const char* text) {
+    if (fputc('\'', stream) == EOF) return false;
+    for (const char* c = text; *c; ++c) {
+        if (*c == '\'' && fputc('\'', stream) == EOF) return false;
+        if (fputc((unsigned char)*c, stream) == EOF) return false;
+    }
+    return fputs("' ", stream) != EOF;
+}
+
+static bool readStructuredString(FILE* stream, Value* value) {
+    int ch;
+    do {
+        ch = fgetc(stream);
+    } while (ch != EOF && isspace(ch));
+    if (ch == EOF) {
+        return false;
+    }
+    size_t len = 0, cap = 64;
+    char* buf = (char*)malloc(cap);
+    if (!buf) {
+        return false;
+    }
+    bool quoted = (ch == '\'');
+    if (quoted) {
+        for (;;) {
+            ch = fgetc(stream);
+            if (ch == EOF) {
+                free(buf);
+                return false; // unterminated
+            }
+            if (ch == '\'') {
+                int next = fgetc(stream);
+                if (next != '\'') {
+                    if (next != EOF) ungetc(next, stream);
+                    break;
+                }
+            }
+            if (len + 1 >= cap) {
+                char* grown = (char*)realloc(buf, cap * 2);
+                if (!grown) { free(buf); return false; }
+                buf = grown;
+                cap *= 2;
+            }
+            buf[len++] = (char)ch;
+        }
+    } else {
+        // Legacy unquoted token: up to the next whitespace.
+        while (ch != EOF && !isspace(ch)) {
+            if (len + 1 >= cap) {
+                char* grown = (char*)realloc(buf, cap * 2);
+                if (!grown) { free(buf); return false; }
+                buf = grown;
+                cap *= 2;
+            }
+            buf[len++] = (char)ch;
+            ch = fgetc(stream);
+        }
+        if (ch != EOF) ungetc(ch, stream);
+    }
+    bool ok = builtinRebindStringValue(value, buf, len);
+    free(buf);
+    return ok;
+}
 
 static bool writeStructuredValue(FILE* stream, const Value* rawValue) {
     if (!stream || !rawValue) {
@@ -757,7 +986,10 @@ static bool writeStructuredValue(FILE* stream, const Value* rawValue) {
     if (VALUE_TYPE(*value) == TYPE_POINTER && AS_POINTER(*value)) {
         value = (const Value*)AS_POINTER(*value);
     }
+    return writeStructuredValueInner(stream, value);
+}
 
+static bool writeStructuredValueInner(FILE* stream, const Value* value) {
     switch (VALUE_TYPE(*value)) {
         case TYPE_INT8:
         case TYPE_INT16:
@@ -770,18 +1002,18 @@ static bool writeStructuredValue(FILE* stream, const Value* rawValue) {
         case TYPE_WORD:
         case TYPE_BYTE:
         case TYPE_BOOLEAN:
-        case TYPE_ENUM:
             return fprintf(stream, "%lld ", (long long)AS_INTEGER(*value)) > 0;
+        case TYPE_ENUM:
+            // AS_INTEGER is 0 for an enum; its value is the ordinal.
+            return fprintf(stream, "%d ", AS_ENUM(*value).ordinal) > 0;
         case TYPE_FLOAT:
         case TYPE_DOUBLE:
         case TYPE_LONG_DOUBLE:
             return fprintf(stream, "%.17Lg ", (long double)AS_REAL(*value)) > 0;
         case TYPE_CHAR:
             return fprintf(stream, "%u ", (unsigned int)(unsigned char)AS_CHAR(*value)) > 0;
-        case TYPE_STRING: {
-            const char* text = AS_STRING(*value) ? AS_STRING(*value) : "";
-            return fprintf(stream, "%s ", text) > 0;
-        }
+        case TYPE_STRING:
+            return writeQuotedString(stream, AS_STRING(*value) ? AS_STRING(*value) : "");
         case TYPE_ARRAY: {
             int total = calculateArrayTotalSize(value);
             // arrayUsesPackedBytes must be checked before AS_ARRAY(*value):
@@ -793,7 +1025,7 @@ static bool writeStructuredValue(FILE* stream, const Value* rawValue) {
                 return false;
             }
             for (int i = 0; i < total; ++i) {
-                if (!writeStructuredValue(stream, &AS_ARRAY(*value)[i])) {
+                if (!writeStructuredValueInner(stream, &AS_ARRAY(*value)[i])) {
                     return false;
                 }
             }
@@ -817,7 +1049,7 @@ static bool writeStructuredValue(FILE* stream, const Value* rawValue) {
                 if (seen_count < (int)(sizeof(seen_storage) / sizeof(seen_storage[0]))) {
                     seen_storage[seen_count++] = fieldValue;
                 }
-                if (!writeStructuredValue(stream, fieldValue)) {
+                if (!writeStructuredValueInner(stream, fieldValue)) {
                     return false;
                 }
             }
@@ -837,13 +1069,16 @@ static bool readStructuredValue(FILE* stream, Value* rawValue) {
     if (VALUE_TYPE(*value) == TYPE_POINTER && AS_POINTER(*value)) {
         value = (Value*)AS_POINTER(*value);
     }
+    return readStructuredValueInner(stream, value);
+}
+
+static bool readStructuredValueInner(FILE* stream, Value* value) {
+    char token[1024];
     // Strings, records and static arrays are filled in place (recursively,
     // field by field), so unshare each level before writing into it: copies
     // made by assignment or a by-value parameter share these payloads by
     // reference count and would otherwise change too.
     valueEnsureUnique(value);
-
-    char token[1024];
     switch (VALUE_TYPE(*value)) {
         case TYPE_INT8:
         case TYPE_INT16:
@@ -862,6 +1097,10 @@ static bool readStructuredValue(FILE* stream, Value* rawValue) {
             char* endp = NULL;
             long long parsed = strtoll(token, &endp, 10);
             if (endp == token || errno == ERANGE) return false;
+            if (VALUE_TYPE(*value) == TYPE_ENUM) {
+                // SET_INT_VALUE is a no-op on an enum.
+                return builtinSetEnumOrdinal(value, parsed);
+            }
             SET_INT_VALUE(value, parsed);
             return true;
         }
@@ -890,15 +1129,8 @@ static bool readStructuredValue(FILE* stream, Value* rawValue) {
             SET_INT_VALUE(value, AS_CHAR(*value));
             return true;
         }
-        case TYPE_STRING: {
-            if (!readToken(stream, token, sizeof(token))) return false;
-            if (AS_STRING(*value)) {
-                free(AS_STRING(*value));
-                AS_STRING(*value) = NULL;
-            }
-            AS_STRING(*value) = strdup(token);
-            return AS_STRING(*value) != NULL;
-        }
+        case TYPE_STRING:
+            return readStructuredString(stream, value);
         case TYPE_ARRAY: {
             int total = calculateArrayTotalSize(value);
             // See writeStructuredValue's matching comment: arrayUsesPackedBytes
@@ -908,7 +1140,7 @@ static bool readStructuredValue(FILE* stream, Value* rawValue) {
                 return false;
             }
             for (int i = 0; i < total; ++i) {
-                if (!readStructuredValue(stream, &AS_ARRAY(*value)[i])) {
+                if (!readStructuredValueInner(stream, &AS_ARRAY(*value)[i])) {
                     return false;
                 }
             }
@@ -932,7 +1164,7 @@ static bool readStructuredValue(FILE* stream, Value* rawValue) {
                 if (seen_count < (int)(sizeof(seen_storage) / sizeof(seen_storage[0]))) {
                     seen_storage[seen_count++] = fieldValue;
                 }
-                if (!readStructuredValue(stream, fieldValue)) {
+                if (!readStructuredValueInner(stream, fieldValue)) {
                     return false;
                 }
             }
@@ -1484,7 +1716,9 @@ static int getCursorPosition(int *row, int *col);
 static _Thread_local unsigned char gReadKeyBuf[64];
 static _Thread_local int gReadKeyBufStart = 0;
 static _Thread_local int gReadKeyBufCount = 0;
+#if defined(PSCAL_TARGET_IOS)
 static _Thread_local bool gReadKeyPendingCaretControl = false;
+#endif
 
 static bool readKeyBufHasData(void) {
     return gReadKeyBufCount > 0;
@@ -1507,6 +1741,30 @@ static void readKeyBufPush(unsigned char byte) {
     int tail = (gReadKeyBufStart + gReadKeyBufCount) % (int)sizeof(gReadKeyBuf);
     gReadKeyBuf[tail] = byte;
     gReadKeyBufCount++;
+}
+
+/* Is the escape sequence captured so far complete? CSI (ESC [ ... final
+ * byte 0x40-0x7E, with the Linux console's ESC [ [ x function keys), SS3
+ * (ESC O x) and Alt+key (ESC x) all end at a known byte, so ReadKey can stop
+ * there instead of waiting out its timeout after every arrow key. */
+static bool readKeySeqComplete(const unsigned char *seq, size_t len) {
+    if (len < 2) {
+        return false;
+    }
+    if (seq[1] == '[') {
+        if (len < 3) {
+            return false;
+        }
+        if (len == 3 && seq[2] == '[') {
+            return false;
+        }
+        unsigned char last = seq[len - 1];
+        return last >= 0x40 && last <= 0x7E;
+    }
+    if (seq[1] == 'O') {
+        return len >= 3;
+    }
+    return true;
 }
 
 // Fetch a console byte, skipping any stray DSR responses (ESC [ row ; col R)
@@ -1543,9 +1801,12 @@ static int readKeyFetchConsoleByte(void) {
             }
         }
 
-        const int max_polls = 10;
-        int polls = 0;
-        while (seq_len < sizeof(seq)) {
+        /* Wait at most this long for the rest of a sequence; a lone ESC
+         * key press costs this much. A complete sequence ends the wait at
+         * once (it used to wait 200 ms after every arrow key too). */
+        const int max_wait_ms = 100;
+        int waited_ms = 0;
+        while (seq_len < sizeof(seq) && !readKeySeqComplete(seq, seq_len)) {
             unsigned char b = 0;
 #if defined(PSCAL_TARGET_IOS)
             ssize_t m = vprocReadShim(STDIN_FILENO, &b, 1);
@@ -1554,15 +1815,12 @@ static int readKeyFetchConsoleByte(void) {
 #endif
             if (m == 1) {
                 seq[seq_len++] = b;
-                if (b == 'R') {
-                    break; /* likely end of DSR */
-                }
                 continue;
             }
-            if (m < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && polls < max_polls) {
+            if (m < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && waited_ms < max_wait_ms) {
                 struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN, .revents = 0 };
-                (void)poll(&pfd, 1, 20);
-                polls++;
+                (void)poll(&pfd, 1, 10);
+                waited_ms += 10;
                 continue;
             }
             break;
@@ -1605,21 +1863,23 @@ static int readKeyFetchConsoleByte(void) {
             }
         }
 
+        /* The FIFO is empty here (this function only reads the console once
+         * it is), so the bytes go back in in their arrival order. They used to
+         * be pushed last-first, which made Up-arrow (ESC [ A) read back as
+         * 'A', '[', ESC. */
         if (is_dsr) {
             /* Discard the DSR sequence and continue. Preserve any trailing bytes after R. */
-            if (seq_len > r_pos + 1) {
-                for (ssize_t i = (ssize_t)seq_len - 1; i > (ssize_t)r_pos; --i) {
-                    readKeyBufPush(seq[(size_t)i]);
-                }
+            for (size_t i = r_pos + 1; i < seq_len; ++i) {
+                readKeyBufPush(seq[i]);
             }
             continue;
         }
 
-        /* Not a DSR; push the captured sequence back (in reverse) and return first byte. */
-        for (ssize_t i = (ssize_t)seq_len - 1; i >= 0; --i) {
-            readKeyBufPush(seq[(size_t)i]);
+        /* Not a DSR: hand back the first byte, queue the rest. */
+        for (size_t i = 1; i < seq_len; ++i) {
+            readKeyBufPush(seq[i]);
         }
-        return readKeyBufPop();
+        return seq[0];
     }
 }
 
@@ -1710,6 +1970,12 @@ static Value vmBuiltinToChar(VM* vm, int arg_count, Value* args) {
     unsigned char c = 0;
     if (isRealType(VALUE_TYPE(v))) {
         long double d = AS_REAL(v);
+        // Casting a NaN, an infinity or |x| >= 2^63 to an integer is
+        // undefined behaviour in C; like int(x), that is an error.
+        if (!(d > -9223372036854775809.0L && d < 9223372036854775808.0L)) {
+            runtimeError(vm, "Runtime Error: char(%.16Lg) has no integer value.", d);
+            return makeChar('\0');
+        }
         c = (unsigned char)((long long)d); // truncate then narrow
     } else if (IS_INTLIKE(v)) {
         c = (unsigned char)AS_INTEGER(v);
@@ -1732,6 +1998,11 @@ static Value vmBuiltinToByte(VM* vm, int arg_count, Value* args) {
     unsigned char b = 0;
     if (isRealType(VALUE_TYPE(v))) {
         long double d = AS_REAL(v);
+        // See char(x): an out-of-range cast is undefined behaviour.
+        if (!(d > -9223372036854775809.0L && d < 9223372036854775808.0L)) {
+            runtimeError(vm, "Runtime Error: byte(%.16Lg) has no integer value.", d);
+            return makeByte(0);
+        }
         b = (unsigned char)((long long)d);
     } else if (IS_INTLIKE(v)) {
         b = (unsigned char)AS_INTEGER(v);
@@ -2083,9 +2354,23 @@ static const size_t num_vm_builtins = sizeof(vmBuiltinDispatchTable) / sizeof(vm
 
 static bool threadBuiltinIsAllowlisted(int id);
 
-/* Dynamic registry for user-supplied VM built-ins. */
+/* Dynamic registry for user-supplied VM built-ins. Written under
+ * builtin_registry_mutex.
+ *
+ * CALL_BUILTIN looks a handler up by id on every call, and it used to take
+ * builtin_registry_mutex twice per call (handler and name) -- a recursive
+ * mutex every worker thread contended on. The by-id readers are lock-free
+ * instead: the core table's names never change and its handlers are written
+ * with atomic stores, and the extra table is published as an atomic
+ * pointer plus count. The table is only ever replaced by a larger copy, and
+ * a replaced table is never freed, because a reader may still be using it
+ * (they only double, so the retired tables together are smaller than the
+ * live one). The count is stored after the entry it covers is complete. */
 static VmBuiltinMapping *extra_vm_builtins = NULL;
 static size_t num_extra_vm_builtins = 0;
+static size_t extra_vm_builtins_capacity = 0;
+static _Atomic(VmBuiltinMapping *) g_extra_builtins_published = NULL;
+static atomic_size_t g_extra_builtins_published_count = 0;
 static pthread_mutex_t builtin_registry_mutex;
 static pthread_once_t builtin_registry_once = PTHREAD_ONCE_INIT;
 
@@ -2484,7 +2769,7 @@ void registerVmBuiltin(const char *name, VmBuiltinFn handler,
     size_t existing_id = SIZE_MAX;
     VmBuiltinMapping *mapping = builtinRegistryLookupMappingUnlocked(canonical, &existing_id);
     if (mapping) {
-        mapping->handler = handler;
+        __atomic_store_n(&mapping->handler, handler, __ATOMIC_RELEASE);
         if (existing_id != SIZE_MAX) {
             setEffectOverrideUnlocked(existing_id, effect_mask);
         }
@@ -2492,17 +2777,27 @@ void registerVmBuiltin(const char *name, VmBuiltinFn handler,
         return;
     }
 
-    VmBuiltinMapping *new_table = realloc(extra_vm_builtins,
-        sizeof(VmBuiltinMapping) * (num_extra_vm_builtins + 1));
-    if (!new_table) {
-        pthread_mutex_unlock(&builtin_registry_mutex);
-        return;
+    if (num_extra_vm_builtins == extra_vm_builtins_capacity) {
+        // Grow by copying into a new table, never realloc in place: see the
+        // comment on extra_vm_builtins for why the old one stays allocated.
+        size_t new_capacity = extra_vm_builtins_capacity ? extra_vm_builtins_capacity * 2 : 32;
+        VmBuiltinMapping *new_table = malloc(sizeof(VmBuiltinMapping) * new_capacity);
+        if (!new_table) {
+            pthread_mutex_unlock(&builtin_registry_mutex);
+            return;
+        }
+        if (num_extra_vm_builtins > 0) {
+            memcpy(new_table, extra_vm_builtins, sizeof(VmBuiltinMapping) * num_extra_vm_builtins);
+        }
+        extra_vm_builtins = new_table;
+        extra_vm_builtins_capacity = new_capacity;
+        atomic_store_explicit(&g_extra_builtins_published, new_table, memory_order_release);
     }
-    extra_vm_builtins = new_table;
     extra_vm_builtins[num_extra_vm_builtins].name = strdup(canonical);
     extra_vm_builtins[num_extra_vm_builtins].handler = handler;
     size_t new_index = num_extra_vm_builtins;
     num_extra_vm_builtins++;
+    atomic_store_explicit(&g_extra_builtins_published_count, num_extra_vm_builtins, memory_order_release);
     size_t new_id = num_vm_builtins + new_index;
     builtinRegistryInsertUnlocked(canonical, new_id);
     setEffectOverrideUnlocked(new_id, effect_mask);
@@ -2528,46 +2823,37 @@ VmBuiltinFn getVmBuiltinHandler(const char *name) {
     return handler;
 }
 
+/* The extra-table entry for `extra_index`, or NULL; lock-free (see the
+ * comment on extra_vm_builtins). */
+static const VmBuiltinMapping *publishedExtraBuiltin(size_t extra_index) {
+    size_t count = atomic_load_explicit(&g_extra_builtins_published_count, memory_order_acquire);
+    if (extra_index >= count) {
+        return NULL;
+    }
+    VmBuiltinMapping *table = atomic_load_explicit(&g_extra_builtins_published, memory_order_acquire);
+    return table ? &table[extra_index] : NULL;
+}
+
 VmBuiltinFn getVmBuiltinHandlerById(int id) {
     if (id < 0) return NULL;
-    pthread_once(&builtin_registry_once, initBuiltinRegistryMutex);
-    pthread_mutex_lock(&builtin_registry_mutex);
-    VmBuiltinFn handler = NULL;
     if ((size_t)id < num_vm_builtins) {
-        handler = vmBuiltinDispatchTable[id].handler;
-    } else {
-        size_t extra_index = (size_t)id - num_vm_builtins;
-        if (extra_index < num_extra_vm_builtins) {
-            handler = extra_vm_builtins[extra_index].handler;
-        }
+        return __atomic_load_n(&vmBuiltinDispatchTable[id].handler, __ATOMIC_ACQUIRE);
     }
-    pthread_mutex_unlock(&builtin_registry_mutex);
-    return handler;
+    const VmBuiltinMapping *extra = publishedExtraBuiltin((size_t)id - num_vm_builtins);
+    return extra ? __atomic_load_n(&extra->handler, __ATOMIC_ACQUIRE) : NULL;
 }
 
 const char* getVmBuiltinNameById(int id) {
     if (id < 0) return NULL;
-    pthread_once(&builtin_registry_once, initBuiltinRegistryMutex);
-    pthread_mutex_lock(&builtin_registry_mutex);
-    const char* name = NULL;
     if ((size_t)id < num_vm_builtins) {
-        name = vmBuiltinDispatchTable[id].name;
-    } else {
-        size_t extra_index = (size_t)id - num_vm_builtins;
-        if (extra_index < num_extra_vm_builtins) {
-            name = extra_vm_builtins[extra_index].name;
-        }
+        return vmBuiltinDispatchTable[id].name;
     }
-    pthread_mutex_unlock(&builtin_registry_mutex);
-    return name;
+    const VmBuiltinMapping *extra = publishedExtraBuiltin((size_t)id - num_vm_builtins);
+    return extra ? extra->name : NULL;
 }
 
 size_t getVmBuiltinCount(void) {
-    pthread_once(&builtin_registry_once, initBuiltinRegistryMutex);
-    pthread_mutex_lock(&builtin_registry_mutex);
-    size_t count = num_vm_builtins + num_extra_vm_builtins;
-    pthread_mutex_unlock(&builtin_registry_mutex);
-    return count;
+    return num_vm_builtins + atomic_load_explicit(&g_extra_builtins_published_count, memory_order_acquire);
 }
 
 BuiltinRoutineType getVmBuiltinTypeById(int id) {
@@ -2708,7 +2994,22 @@ Value vmBuiltinSucc(VM* vm, int arg_count, Value* args) {
     }
     Value arg = args[0];
     if (IS_INTLIKE(arg)) {
-        return pscalIntResultLike1(arg, AS_INTEGER(arg) + 1);
+        // The successor of the type's largest value does not exist: it was a
+        // signed overflow (undefined behaviour, wrapping to the minimum).
+        long long cur = AS_INTEGER(arg);
+        if (VALUE_TYPE(arg) == TYPE_UINT64) {
+            if ((unsigned long long)cur == ULLONG_MAX) {
+                runtimeError(vm, "Succ integer overflow.");
+                return makeVoid();
+            }
+            return pscalIntResultLike1(arg, (long long)((unsigned long long)cur + 1ULL));
+        }
+        long long next;
+        if (__builtin_add_overflow(cur, 1LL, &next)) {
+            runtimeError(vm, "Succ integer overflow.");
+            return makeVoid();
+        }
+        return pscalIntResultLike1(arg, next);
     }
     switch(VALUE_TYPE(arg)) {
         case TYPE_CHAR:
@@ -2824,6 +3125,9 @@ Value vmBuiltinPos(VM* vm, int arg_count, Value* args) {
     const long long pos_absent = frontendIsZeroBasedStrings() ? -1 : 0;
 
     if (!needle || !haystack) return makeInt(pos_absent);
+    // An empty substring is not found (Free Pascal: Pos('', s) = 0); strstr
+    // matched it at the start. 0-based frontends keep their match at 0.
+    if (needle[0] == '\0' && !frontendIsZeroBasedStrings()) return makeInt(pos_absent);
 
     const char* found = strstr(haystack, needle);
     if (!found) {
@@ -2834,6 +3138,57 @@ Value vmBuiltinPos(VM* vm, int arg_count, Value* args) {
         return makeInt((long long)utf8CodepointCount(haystack, prefix_len) + pos_base);
     }
     return makeInt((long long)(found - haystack) + pos_base);
+}
+
+/* printf/fprintf/Format conversion helpers.
+ *
+ * Every integer argument these builtins hand to the C library is a long long
+ * (or unsigned long long) and every real a long double, whatever length
+ * modifier the program wrote -- the modifier only says how the program thinks
+ * of the value. So the spec passed to the C library is rebuilt with the
+ * modifier that matches what is actually passed: "ll" for the integer
+ * conversions, "L" for the real ones, none for %c/%s/%p. Passing the
+ * program's own modifier through made "%d" receive a long long and "%Lf" a
+ * double (undefined behaviour; garbage on x86-64 Linux). */
+static const char *builtinPrintfCLength(char spec) {
+    switch (spec) {
+        case 'd': case 'i': case 'u': case 'o': case 'x': case 'X':
+            return "ll";
+        case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A':
+            return "L";
+        default:
+            return "";
+    }
+}
+
+/* Accumulate one decimal digit of a width/precision field, saturating instead
+ * of overflowing int on an absurdly long digit run. */
+static int builtinPrintfAccumDigit(int value, char digit) {
+    if (value > (INT_MAX - 9) / 10) {
+        return value;
+    }
+    return value * 10 + (digit - '0');
+}
+
+/* snprintf into a heap buffer sized for the whole result: no fixed-size
+ * scratch buffer to silently cut a piece short. Returns NULL on failure. */
+static char *builtinAsprintf(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    va_list ap2;
+    va_copy(ap2, ap);
+    int needed = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (needed < 0) {
+        va_end(ap2);
+        return NULL;
+    }
+    char *out = (char *)malloc((size_t)needed + 1);
+    if (out) {
+        vsnprintf(out, (size_t)needed + 1, fmt, ap2);
+    }
+    va_end(ap2);
+    return out;
 }
 
 Value vmBuiltinPrintf(VM* vm, int arg_count, Value* args) {
@@ -2878,7 +3233,7 @@ Value vmBuiltinPrintf(VM* vm, int arg_count, Value* args) {
             int width = 0;
             while (isdigit((unsigned char)fmt[j])) {
                 width_specified = true;
-                width = width * 10 + (fmt[j] - '0');
+                width = builtinPrintfAccumDigit(width, fmt[j]);
                 j++;
             }
             int precision = -1;
@@ -2886,7 +3241,7 @@ Value vmBuiltinPrintf(VM* vm, int arg_count, Value* args) {
                 j++;
                 precision = 0;
                 while (isdigit((unsigned char)fmt[j])) {
-                    precision = precision * 10 + (fmt[j] - '0');
+                    precision = builtinPrintfAccumDigit(precision, fmt[j]);
                     j++;
                 }
             }
@@ -2926,8 +3281,7 @@ Value vmBuiltinPrintf(VM* vm, int arg_count, Value* args) {
                 runtimeError(vm, "printf: incomplete format specifier.");
                 return makeInt(0);
             }
-            char fmtbuf[32];
-            char buf[256];
+            char fmtbuf[48];
             size_t pos = 0;
             fmtbuf[pos++] = '%';
             if (flag_len > 0 && pos + flag_len < sizeof(fmtbuf)) {
@@ -2955,21 +3309,18 @@ Value vmBuiltinPrintf(VM* vm, int arg_count, Value* args) {
                     }
                 }
             }
-            if (length_len > 0 && pos + length_len < sizeof(fmtbuf)) {
-                memcpy(&fmtbuf[pos], length_mod, length_len);
-                pos += length_len;
+            // The program's length modifier is not passed on (see
+            // builtinPrintfCLength): the spec names what is actually passed.
+            const char *c_length = builtinPrintfCLength(spec);
+            size_t c_length_len = strlen(c_length);
+            if (c_length_len > 0 && pos + c_length_len < sizeof(fmtbuf)) {
+                memcpy(&fmtbuf[pos], c_length, c_length_len);
+                pos += c_length_len;
             }
             if (pos < sizeof(fmtbuf)) {
                 fmtbuf[pos++] = spec;
             }
             fmtbuf[pos < sizeof(fmtbuf) ? pos : (sizeof(fmtbuf) - 1)] = '\0';
-            bool has_wide_char_length = false;
-            for (size_t n = 0; n < length_len; ++n) {
-                if (length_mod[n] == 'l' || length_mod[n] == 'L') {
-                    has_wide_char_length = true;
-                    break;
-                }
-            }
             if (arg_index < arg_count) {
                 Value v = args[arg_index++];
                 switch (spec) {
@@ -2977,8 +3328,7 @@ Value vmBuiltinPrintf(VM* vm, int arg_count, Value* args) {
                     case 'i': {
                         long long iv = asI64(v);
                         if (mod_hh) iv = (signed char)iv; else if (mod_h) iv = (short)iv; // wider mods use default
-                        snprintf(buf, sizeof(buf), fmtbuf, iv);
-                        fputs(buf, stdout);
+                        fprintf(stdout, fmtbuf, iv);
                         break; }
                     case 'u':
                     case 'o':
@@ -2986,8 +3336,7 @@ Value vmBuiltinPrintf(VM* vm, int arg_count, Value* args) {
                     case 'X': {
                         unsigned long long uv = (unsigned long long)asI64(v);
                         if (mod_hh) uv = (unsigned char)uv; else if (mod_h) uv = (unsigned short)uv;
-                        snprintf(buf, sizeof(buf), fmtbuf, uv);
-                        fputs(buf, stdout);
+                        fprintf(stdout, fmtbuf, uv);
                         break; }
                     case 'f':
                     case 'F':
@@ -2997,25 +3346,11 @@ Value vmBuiltinPrintf(VM* vm, int arg_count, Value* args) {
                     case 'G':
                     case 'a':
                     case 'A':
-                        snprintf(buf, sizeof(buf), fmtbuf, (double)AS_REAL(v));
-                        fputs(buf, stdout);
+                        fprintf(stdout, fmtbuf, (long double)AS_REAL(v));
                         break;
                     case 'c': {
                         char ch = (VALUE_TYPE(v) == TYPE_CHAR) ? AS_CHAR(v) : (char)asI64(v);
-                        char safe_fmt[sizeof(fmtbuf)];
-                        const char* format = fmtbuf;
-                        if (has_wide_char_length) {
-                            strncpy(safe_fmt, fmtbuf, sizeof(safe_fmt));
-                            safe_fmt[sizeof(safe_fmt) - 1] = '\0';
-                            char* mod_pos = strstr(safe_fmt, length_mod);
-                            if (mod_pos) {
-                                size_t remove_len = strlen(length_mod);
-                                memmove(mod_pos, mod_pos + remove_len, strlen(mod_pos + remove_len) + 1);
-                                format = safe_fmt;
-                            }
-                        }
-                        snprintf(buf, sizeof(buf), format, ch);
-                        fputs(buf, stdout);
+                        fprintf(stdout, fmtbuf, (int)ch);
                         break;
                     }
                     case 's': {
@@ -3030,25 +3365,11 @@ Value vmBuiltinPrintf(VM* vm, int arg_count, Value* args) {
                             encodeUtf8Codepoint((uint32_t)AS_CHAR(v), char_text);
                             sv = char_text;
                         }
-                        char safe_fmt[sizeof(fmtbuf)];
-                        const char* format = fmtbuf;
-                        if (has_wide_char_length) {
-                            strncpy(safe_fmt, fmtbuf, sizeof(safe_fmt));
-                            safe_fmt[sizeof(safe_fmt) - 1] = '\0';
-                            char* mod_pos = strstr(safe_fmt, length_mod);
-                            if (mod_pos) {
-                                size_t remove_len = strlen(length_mod);
-                                memmove(mod_pos, mod_pos + remove_len, strlen(mod_pos + remove_len) + 1);
-                                format = safe_fmt;
-                            }
-                        }
-                        snprintf(buf, sizeof(buf), format, sv);
-                        fputs(buf, stdout);
+                        fprintf(stdout, fmtbuf, sv);
                         break;
                     }
                     case 'p':
-                        snprintf(buf, sizeof(buf), fmtbuf, (void*)(uintptr_t)asI64(v));
-                        fputs(buf, stdout);
+                        fprintf(stdout, fmtbuf, (void*)(uintptr_t)asI64(v));
                         break;
                     default:
                         printValueToStream(v, stdout);
@@ -3122,11 +3443,11 @@ Value vmBuiltinFprintf(VM* vm, int arg_count, Value* args) {
             flags[flag_len] = '\0';
             bool width_specified = false;
             int width = 0;
-            while (isdigit((unsigned char)fmt[j])) { width_specified = true; width = width * 10 + (fmt[j]-'0'); j++; }
+            while (isdigit((unsigned char)fmt[j])) { width_specified = true; width = builtinPrintfAccumDigit(width, fmt[j]); j++; }
             int precision = -1;
             if (fmt[j] == '.') {
                 j++; precision = 0;
-                while (isdigit((unsigned char)fmt[j])) { precision = precision * 10 + (fmt[j]-'0'); j++; }
+                while (isdigit((unsigned char)fmt[j])) { precision = builtinPrintfAccumDigit(precision, fmt[j]); j++; }
             }
             bool mod_h = false, mod_hh = false;
             char length_mod[3] = {0};
@@ -3160,7 +3481,7 @@ Value vmBuiltinFprintf(VM* vm, int arg_count, Value* args) {
             length_mod[length_len < sizeof(length_mod) ? length_len : (sizeof(length_mod) - 1)] = '\0';
             char spec = fmt[j];
             if (!spec) { runtimeError(vm, "fprintf: incomplete format specifier."); return makeInt(0); }
-            char fmtbuf[32]; char buf[256];
+            char fmtbuf[48];
             size_t pos = 0;
             fmtbuf[pos++] = '%';
             if (flag_len > 0 && pos + flag_len < sizeof(fmtbuf)) {
@@ -3188,56 +3509,37 @@ Value vmBuiltinFprintf(VM* vm, int arg_count, Value* args) {
                     }
                 }
             }
-            if (length_len > 0 && pos + length_len < sizeof(fmtbuf)) {
-                memcpy(&fmtbuf[pos], length_mod, length_len);
-                pos += length_len;
+            // The program's length modifier is not passed on (see
+            // builtinPrintfCLength): the spec names what is actually passed.
+            const char *c_length = builtinPrintfCLength(spec);
+            size_t c_length_len = strlen(c_length);
+            if (c_length_len > 0 && pos + c_length_len < sizeof(fmtbuf)) {
+                memcpy(&fmtbuf[pos], c_length, c_length_len);
+                pos += c_length_len;
             }
             if (pos < sizeof(fmtbuf)) {
                 fmtbuf[pos++] = spec;
             }
             fmtbuf[pos < sizeof(fmtbuf) ? pos : (sizeof(fmtbuf) - 1)] = '\0';
-            bool has_wide_char_length = false;
-            for (size_t n = 0; n < length_len; ++n) {
-                if (length_mod[n] == 'l' || length_mod[n] == 'L') {
-                    has_wide_char_length = true;
-                    break;
-                }
-            }
             if (arg_index < arg_count) {
                 Value v = args[arg_index++];
                 switch (spec) {
                     case 'd': case 'i': {
                         long long iv = asI64(v);
                         if (mod_hh) iv = (signed char)iv; else if (mod_h) iv = (short)iv;
-                        snprintf(buf, sizeof(buf), fmtbuf, iv);
-                        fputs(buf, output_stream);
+                        fprintf(output_stream, fmtbuf, iv);
                         break; }
                     case 'u': case 'o': case 'x': case 'X': {
                         unsigned long long uv = (unsigned long long)asI64(v);
                         if (mod_hh) uv = (unsigned char)uv; else if (mod_h) uv = (unsigned short)uv;
-                        snprintf(buf, sizeof(buf), fmtbuf, uv);
-                        fputs(buf, output_stream);
+                        fprintf(output_stream, fmtbuf, uv);
                         break; }
                     case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A': {
-                        snprintf(buf, sizeof(buf), fmtbuf, (double)AS_REAL(v));
-                        fputs(buf, output_stream);
+                        fprintf(output_stream, fmtbuf, (long double)AS_REAL(v));
                         break; }
                     case 'c': {
                         char ch = (VALUE_TYPE(v) == TYPE_CHAR) ? AS_CHAR(v) : (char)asI64(v);
-                        char safe_fmt[sizeof(fmtbuf)];
-                        const char* format = fmtbuf;
-                        if (has_wide_char_length) {
-                            strncpy(safe_fmt, fmtbuf, sizeof(safe_fmt));
-                            safe_fmt[sizeof(safe_fmt) - 1] = '\0';
-                            char* mod_pos = strstr(safe_fmt, length_mod);
-                            if (mod_pos) {
-                                size_t remove_len = strlen(length_mod);
-                                memmove(mod_pos, mod_pos + remove_len, strlen(mod_pos + remove_len) + 1);
-                                format = safe_fmt;
-                            }
-                        }
-                        snprintf(buf, sizeof(buf), format, ch);
-                        fputs(buf, output_stream);
+                        fprintf(output_stream, fmtbuf, (int)ch);
                         break; }
                     case 's': {
                         char char_text[5] = {0};
@@ -3251,24 +3553,10 @@ Value vmBuiltinFprintf(VM* vm, int arg_count, Value* args) {
                             encodeUtf8Codepoint((uint32_t)AS_CHAR(v), char_text);
                             sv = char_text;
                         }
-                        char safe_fmt[sizeof(fmtbuf)];
-                        const char* format = fmtbuf;
-                        if (has_wide_char_length) {
-                            strncpy(safe_fmt, fmtbuf, sizeof(safe_fmt));
-                            safe_fmt[sizeof(safe_fmt) - 1] = '\0';
-                            char* mod_pos = strstr(safe_fmt, length_mod);
-                            if (mod_pos) {
-                                size_t remove_len = strlen(length_mod);
-                                memmove(mod_pos, mod_pos + remove_len, strlen(mod_pos + remove_len) + 1);
-                                format = safe_fmt;
-                            }
-                        }
-                        snprintf(buf, sizeof(buf), format, sv);
-                        fputs(buf, output_stream);
+                        fprintf(output_stream, fmtbuf, sv);
                         break; }
                     case 'p': {
-                        snprintf(buf, sizeof(buf), fmtbuf, (void*)(uintptr_t)asI64(v));
-                        fputs(buf, output_stream);
+                        fprintf(output_stream, fmtbuf, (void*)(uintptr_t)asI64(v));
                         break; }
                     default:
                         printValueToStream(v, output_stream);
@@ -3398,17 +3686,7 @@ Value vmBuiltinCopy(VM* vm, int arg_count, Value* args) {
         len_to_copy = source_len - start_0based;
     }
 
-    char* new_str = malloc(len_to_copy + 1);
-    if (!new_str) {
-        runtimeError(vm, "Malloc failed in copy().");
-        return makeString("");
-    }
-    strncpy(new_str, source + start_0based, len_to_copy);
-    new_str[len_to_copy] = '\0';
-
-    Value result = makeString(new_str);
-    free(new_str);
-    return result;
+    return makeStringLen(source + start_0based, len_to_copy);
 }
 
 Value vmBuiltinTrim(VM* vm, int arg_count, Value* args) {
@@ -3497,10 +3775,22 @@ Value vmBuiltinStringOfChar(VM* vm, int arg_count, Value* args) {
         return unicode_fill ? makeUnicodeString("") : makeString("");
     }
 
+    // A string's length is an int everywhere downstream (Length, indexing),
+    // and len * encoded_fill_len must not wrap: StringOfChar(chr(128512),
+    // 2^62 + 1) used to malloc 5 bytes and then fill 4 * (2^62 + 1).
+    if (count > INT_MAX || (unicode_fill && (size_t)count > (size_t)INT_MAX / encoded_fill_len)) {
+        runtimeError(vm, "StringOfChar: count %lld is too large.", count);
+        return unicode_fill ? makeUnicodeString("") : makeString("");
+    }
     size_t len = (size_t)count;
     size_t total_bytes = unicode_fill ? len * encoded_fill_len : len;
+
+    // Fill the result's own buffer directly rather than building a temporary
+    // and copying it again.
+    Value result = unicode_fill ? makeUnicodeStringLen(NULL, 0) : makeStringLen(NULL, 0);
     char *buffer = (char*)malloc(total_bytes + 1);
     if (!buffer) {
+        freeValue(&result);
         runtimeError(vm, "StringOfChar: memory allocation failed.");
         return makeString("");
     }
@@ -3511,14 +3801,13 @@ Value vmBuiltinStringOfChar(VM* vm, int arg_count, Value* args) {
             memcpy(cursor, encoded_fill, encoded_fill_len);
             cursor += encoded_fill_len;
         }
-        buffer[total_bytes] = '\0';
     } else {
         memset(buffer, fill, len);
-        buffer[len] = '\0';
     }
+    buffer[total_bytes] = '\0';
 
-    Value result = unicode_fill ? makeUnicodeString(buffer) : makeString(buffer);
-    free(buffer);
+    free(AS_STRING(result));
+    AS_STRING(result) = buffer;
     return result;
 }
 
@@ -3590,21 +3879,29 @@ static bool resizeDynamicArrayValue(VM* vm,
         return false;
     }
 
-    if (old->dimensions > 0 && old->dimensions != dimension_count) {
-        runtimeError(vm, "SetLength dimension count (%d) does not match existing array (%d).",
-                     dimension_count,
-                     old->dimensions);
-        pscalObjRelease(&old->header);
-        return false;
-    }
-
     VarType element_type = old->element_type;
     AST* element_type_def = old->element_type_def;
     bool use_packed = isPackedByteElementType(element_type);
     bool is_dynamic = old->is_dynamic;
 
-    int* new_lower = (int*)malloc(sizeof(int) * dimension_count);
-    int* new_upper = (int*)malloc(sizeof(int) * dimension_count);
+    // An array whose elements are arrays (`array of array of T`) is itself
+    // one-dimensional: SetLength(a, n, m) gives `a` n elements and then sizes
+    // each of them to m (the recursion further down). Shaping `a` as an n*m
+    // 2-D array as well allocated n*m inner arrays (SetLength(a, 300, 300)
+    // built 90,000 rows) and rejected re-dimensioning an array first sized
+    // with SetLength(a, n).
+    int own_dims = (element_type == TYPE_ARRAY && dimension_count > 1) ? 1 : dimension_count;
+
+    if (old->dimensions > 0 && old->dimensions != own_dims) {
+        runtimeError(vm, "SetLength dimension count (%d) does not match existing array (%d).",
+                     own_dims,
+                     old->dimensions);
+        pscalObjRelease(&old->header);
+        return false;
+    }
+
+    int* new_lower = (int*)malloc(sizeof(int) * own_dims);
+    int* new_upper = (int*)malloc(sizeof(int) * own_dims);
     if (!new_lower || !new_upper) {
         if (new_lower) free(new_lower);
         if (new_upper) free(new_upper);
@@ -3615,7 +3912,7 @@ static bool resizeDynamicArrayValue(VM* vm,
 
     size_t new_total = 1;
     bool saw_zero = false;
-    for (int i = 0; i < dimension_count; ++i) {
+    for (int i = 0; i < own_dims; ++i) {
         long long len = lengths[i];
         if (len < 0) {
             runtimeError(vm, "SetLength: array length must be non-negative.");
@@ -3809,18 +4106,18 @@ static bool resizeDynamicArrayValue(VM* vm,
         }
 
         if (old_total > 0 && old_lower_bounds && old_upper_bounds &&
-            old->dimensions == dimension_count &&
+            old->dimensions == own_dims &&
             ((use_packed && (old_array_raw || old_array_val)) ||
              (!use_packed && old_array_val))) {
-            copy_lower = (int*)malloc(sizeof(int) * dimension_count);
-            copy_upper = (int*)malloc(sizeof(int) * dimension_count);
+            copy_lower = (int*)malloc(sizeof(int) * own_dims);
+            copy_upper = (int*)malloc(sizeof(int) * own_dims);
             if (!copy_lower || !copy_upper) {
                 runtimeError(vm, "SetLength: memory allocation failed while preserving array contents.");
                 goto setlength_cleanup_failure;
             }
 
             bool has_overlap = true;
-            for (int i = 0; i < dimension_count; ++i) {
+            for (int i = 0; i < own_dims; ++i) {
                 int overlap_low = old_lower_bounds[i] > new_lower[i] ?
                                   old_lower_bounds[i] : new_lower[i];
                 int overlap_high = old_upper_bounds[i] < new_upper[i] ?
@@ -3834,19 +4131,19 @@ static bool resizeDynamicArrayValue(VM* vm,
             }
 
             if (has_overlap) {
-                copy_indices = (int*)malloc(sizeof(int) * dimension_count);
+                copy_indices = (int*)malloc(sizeof(int) * own_dims);
                 if (!copy_indices) {
                     runtimeError(vm, "SetLength: memory allocation failed while preserving array contents.");
                     goto setlength_cleanup_failure;
                 }
 
-                for (int i = 0; i < dimension_count; ++i) {
+                for (int i = 0; i < own_dims; ++i) {
                     copy_indices[i] = copy_lower[i];
                 }
 
                 while (true) {
-                    int old_offset = flatOffsetFromBounds(dimension_count, old_lower_bounds, old_upper_bounds, copy_indices);
-                    int new_offset = flatOffsetFromBounds(dimension_count, new_lower, new_upper, copy_indices);
+                    int old_offset = flatOffsetFromBounds(own_dims, old_lower_bounds, old_upper_bounds, copy_indices);
+                    int new_offset = flatOffsetFromBounds(own_dims, new_lower, new_upper, copy_indices);
                     if (use_packed) {
                         unsigned char byte = 0;
                         if (old_array_is_packed && old_array_raw) {
@@ -3860,7 +4157,7 @@ static bool resizeDynamicArrayValue(VM* vm,
                         new_elements[new_offset] = makeCopyOfValue(&old_array_val[old_offset]);
                     }
 
-                    int dim = dimension_count - 1;
+                    int dim = own_dims - 1;
                     while (dim >= 0) {
                         if (copy_indices[dim] < copy_upper[dim]) {
                             copy_indices[dim]++;
@@ -3911,11 +4208,11 @@ static bool resizeDynamicArrayValue(VM* vm,
     new_obj->element_type_def = element_type_def;
     new_obj->is_packed = use_packed;
     new_obj->is_dynamic = is_dynamic;
-    new_obj->dimensions = dimension_count;
+    new_obj->dimensions = own_dims;
     new_obj->lower_bounds = new_lower;
     new_obj->upper_bounds = new_upper;
-    new_obj->lower_bound = (dimension_count >= 1) ? new_lower[0] : 0;
-    new_obj->upper_bound = (dimension_count >= 1) ? new_upper[0] : -1;
+    new_obj->lower_bound = (own_dims >= 1) ? new_lower[0] : 0;
+    new_obj->upper_bound = (own_dims >= 1) ? new_upper[0] : -1;
     if (new_total > 0) {
         if (use_packed) {
             new_obj->raw = new_raw;
@@ -4137,12 +4434,21 @@ Value vmBuiltinRealtostr(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "RealToStr expects 1 real argument.");
         return makeString("");
     }
-    char buffer[128];
-    if (frontendIsAether())
+    if (frontendIsAether()) {
+        char buffer[128];
         pscalFormatRealRepr((double)AS_REAL(args[0]), buffer, sizeof(buffer)); /* D74 */
-    else
-        snprintf(buffer, sizeof(buffer), "%Lf", AS_REAL(args[0]));
-    return makeString(buffer);
+        return makeString(buffer);
+    }
+    // "%Lf" of a large real runs to hundreds of digits (1e300 is 308 of
+    // them); a fixed 128-byte buffer silently cut it short.
+    char *text = builtinAsprintf("%Lf", AS_REAL(args[0]));
+    if (!text) {
+        runtimeError(vm, "RealToStr failed to format value.");
+        return makeString("");
+    }
+    Value result = makeString(text);
+    free(text);
+    return result;
 }
 
 static bool appendFormatResultChunk(char** buffer, size_t* length, size_t* capacity, const char* text) {
@@ -4225,7 +4531,7 @@ Value vmBuiltinFormat(VM* vm, int arg_count, Value* args) {
         int width = 0;
         while (j < flen && isdigit((unsigned char)fmt[j])) {
             width_specified = true;
-            width = width * 10 + (fmt[j] - '0');
+            width = builtinPrintfAccumDigit(width, fmt[j]);
             ++j;
         }
 
@@ -4234,91 +4540,65 @@ Value vmBuiltinFormat(VM* vm, int arg_count, Value* args) {
             ++j;
             precision = 0;
             while (j < flen && isdigit((unsigned char)fmt[j])) {
-                precision = precision * 10 + (fmt[j] - '0');
+                precision = builtinPrintfAccumDigit(precision, fmt[j]);
                 ++j;
             }
         }
 
+        // Length modifiers are accepted and skipped: the spec handed to the C
+        // library is rebuilt below with the one matching the argument this
+        // code passes (see builtinPrintfCLength).
         const char* length_mods = "hlLjzt";
-        size_t mod_start = j;
         while (j < flen && strchr(length_mods, fmt[j]) != NULL) {
             ++j;
         }
 
-        char lenmod[4] = {0};
-        size_t mod_len = (j > mod_start) ? (j - mod_start) : 0;
-        if (mod_len > sizeof(lenmod) - 1) {
-            mod_len = sizeof(lenmod) - 1;
-        }
-        if (mod_len > 0) {
-            memcpy(lenmod, fmt + mod_start, mod_len);
-            lenmod[mod_len] = '\0';
-        }
-
         char spec = (j < flen) ? fmt[j] : '\0';
         char fmtbuf[64];
-        size_t copy_len = (spec != '\0') ? (j - i + 1) : 0;
-        if (copy_len >= sizeof(fmtbuf)) {
-            copy_len = sizeof(fmtbuf) - 1;
-        }
-        if (copy_len > 0) {
-            memcpy(fmtbuf, fmt + i, copy_len);
-            fmtbuf[copy_len] = '\0';
-        } else {
-            fmtbuf[0] = '%';
-            fmtbuf[1] = '\0';
+        {
+            const char *c_length = builtinPrintfCLength(spec);
+            int n = 0;
+            if (width_specified && precision >= 0) {
+                n = snprintf(fmtbuf, sizeof(fmtbuf), "%%%s%d.%d%s%c", flags, width, precision, c_length, spec);
+            } else if (width_specified) {
+                n = snprintf(fmtbuf, sizeof(fmtbuf), "%%%s%d%s%c", flags, width, c_length, spec);
+            } else if (precision >= 0) {
+                n = snprintf(fmtbuf, sizeof(fmtbuf), "%%%s.%d%s%c", flags, precision, c_length, spec);
+            } else {
+                n = snprintf(fmtbuf, sizeof(fmtbuf), "%%%s%s%c", flags, c_length, spec);
+            }
+            if (n < 0 || (size_t)n >= sizeof(fmtbuf)) {
+                fmtbuf[0] = '\0';
+            }
         }
 
-        char piece[DEFAULT_STRING_CAPACITY];
-        piece[0] = '\0';
+        // Each piece is sized to its own result: a fixed 255-byte buffer cut
+        // Format('%s', [s]) to 255 characters and truncated any wide field.
+        char* piece = NULL;
         Value v = args[arg_index++];
-        bool expects_wide_char = (lenmod[0] != '\0' && strpbrk(lenmod, "lL") != NULL);
 
         switch (spec) {
             case 'd': case 'i': case 'u': case 'o': case 'x': case 'X': {
-                unsigned long long u = 0ULL;
                 long long s = 0LL;
                 if (isIntlikeType(VALUE_TYPE(v)) || VALUE_TYPE(v) == TYPE_BOOLEAN || VALUE_TYPE(v) == TYPE_CHAR || VALUE_TYPE(v) == TYPE_ENUM) {
                     s = AS_INTEGER(v);
-                    u = (unsigned long long)AS_INTEGER(v);
                 }
                 bool is_unsigned = (spec == 'u' || spec == 'o' || spec == 'x' || spec == 'X');
                 if (is_unsigned) {
-                    if (strcmp(lenmod, "ll") == 0) snprintf(piece, sizeof(piece), fmtbuf, (unsigned long long)u);
-                    else if (strcmp(lenmod, "l") == 0) snprintf(piece, sizeof(piece), fmtbuf, (unsigned long)u);
-                    else if (strcmp(lenmod, "j") == 0) snprintf(piece, sizeof(piece), fmtbuf, (uintmax_t)u);
-                    else if (strcmp(lenmod, "z") == 0) snprintf(piece, sizeof(piece), fmtbuf, (size_t)u);
-                    else snprintf(piece, sizeof(piece), fmtbuf, (unsigned int)u);
+                    piece = builtinAsprintf(fmtbuf, (unsigned long long)s);
                 } else {
-                    if (strcmp(lenmod, "ll") == 0) snprintf(piece, sizeof(piece), fmtbuf, (long long)s);
-                    else if (strcmp(lenmod, "l") == 0) snprintf(piece, sizeof(piece), fmtbuf, (long)s);
-                    else if (strcmp(lenmod, "j") == 0) snprintf(piece, sizeof(piece), fmtbuf, (intmax_t)s);
-                    else if (strcmp(lenmod, "t") == 0) snprintf(piece, sizeof(piece), fmtbuf, (ptrdiff_t)s);
-                    else snprintf(piece, sizeof(piece), fmtbuf, (int)s);
+                    piece = builtinAsprintf(fmtbuf, s);
                 }
                 break;
             }
             case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A': {
                 long double rv = isRealType(VALUE_TYPE(v)) ? AS_REAL(v) : (long double)AS_INTEGER(v);
-                if (strcmp(lenmod, "L") == 0) snprintf(piece, sizeof(piece), fmtbuf, (long double)rv);
-                else snprintf(piece, sizeof(piece), fmtbuf, (double)rv);
+                piece = builtinAsprintf(fmtbuf, rv);
                 break;
             }
             case 'c': {
-                char safe_fmt[sizeof(fmtbuf)];
-                const char* active_fmt = fmtbuf;
                 char ch = (VALUE_TYPE(v) == TYPE_CHAR) ? AS_CHAR(v) : (char)AS_INTEGER(v);
-                if (expects_wide_char) {
-                    strncpy(safe_fmt, fmtbuf, sizeof(safe_fmt));
-                    safe_fmt[sizeof(safe_fmt) - 1] = '\0';
-                    char* mod_pos = strstr(safe_fmt, lenmod);
-                    if (mod_pos) {
-                        size_t remove_len = strlen(lenmod);
-                        memmove(mod_pos, mod_pos + remove_len, strlen(mod_pos + remove_len) + 1);
-                        active_fmt = safe_fmt;
-                    }
-                }
-                snprintf(piece, sizeof(piece), active_fmt, (unsigned int)ch);
+                piece = builtinAsprintf(fmtbuf, (unsigned int)(unsigned char)ch);
                 break;
             }
             case 's': {
@@ -4333,34 +4613,29 @@ Value vmBuiltinFormat(VM* vm, int arg_count, Value* args) {
                     encodeUtf8Codepoint((uint32_t)AS_CHAR(v), char_text);
                     sv = char_text;
                 }
-                char safe_fmt[sizeof(fmtbuf)];
-                const char* active_fmt = fmtbuf;
-                if (expects_wide_char) {
-                    strncpy(safe_fmt, fmtbuf, sizeof(safe_fmt));
-                    safe_fmt[sizeof(safe_fmt) - 1] = '\0';
-                    char* mod_pos = strstr(safe_fmt, lenmod);
-                    if (mod_pos) {
-                        size_t remove_len = strlen(lenmod);
-                        memmove(mod_pos, mod_pos + remove_len, strlen(mod_pos + remove_len) + 1);
-                        active_fmt = safe_fmt;
-                    }
-                }
-                snprintf(piece, sizeof(piece), active_fmt, sv);
+                piece = builtinAsprintf(fmtbuf, sv);
                 break;
             }
             default: {
                 if (width_specified && precision >= 0) {
-                    snprintf(piece, sizeof(piece), "%*.*s", width, precision, "");
+                    piece = builtinAsprintf("%*.*s", width, precision, "");
                 } else if (width_specified) {
-                    snprintf(piece, sizeof(piece), "%*s", width, "");
+                    piece = builtinAsprintf("%*s", width, "");
                 } else {
-                    piece[0] = '\0';
+                    piece = builtinAsprintf("%s", "");
                 }
                 break;
             }
         }
 
-        if (!appendFormatResultChunk(&result, &result_len, &result_cap, piece)) {
+        if (!piece) {
+            free(result);
+            runtimeError(vm, "Format: could not format argument %d.", arg_index - 1);
+            return makeString("");
+        }
+        bool appended = appendFormatResultChunk(&result, &result_len, &result_cap, piece);
+        free(piece);
+        if (!appended) {
             free(result);
             runtimeError(vm, "Format: memory allocation failed.");
             return makeString("");
@@ -4399,14 +4674,17 @@ Value vmBuiltinFormatfloat(VM* vm, int arg_count, Value* args) {
     char fmt[16];
     snprintf(fmt, sizeof(fmt), "%%.%dLf", precision);
 
-    char buffer[128];
-    int written = snprintf(buffer, sizeof(buffer), fmt, value);
-    if (written < 0 || written >= (int)sizeof(buffer)) {
+    // Sized to the result: FormatFloat(1e200, 2) is 204 characters, which a
+    // fixed 128-byte buffer turned into a runtime error.
+    char *buffer = builtinAsprintf(fmt, value);
+    if (!buffer) {
         runtimeError(vm, "FormatFloat failed to format value.");
         return makeString("");
     }
 
-    return makeString(buffer);
+    Value result = makeString(buffer);
+    free(buffer);
+    return result;
 }
 
 Value vmBuiltinParamcount(VM* vm, int arg_count, Value* args) {
@@ -4471,6 +4749,22 @@ static pthread_mutex_t vm_term_mutex = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local int vm_raw_mode = 0;
 static _Thread_local int vm_alt_screen_depth = 0; // Track nested alternate screen buffers
 
+/* What the signal handlers put back, captured outside signal context. A
+ * handler may only make async-signal-safe calls (tcsetattr, write, sigaction,
+ * raise, _exit): the old one ran vmAtExitCleanup, which takes vm_term_mutex
+ * (a deadlock if the signal lands while it is held), fcloses the fx journal
+ * and calls getenv/fprintf. Set with vm_term_mutex held. */
+static struct termios g_vm_signal_termios;
+static volatile sig_atomic_t g_vm_signal_termios_valid = 0;
+
+static void vmNoteSignalTermios(void) {
+    if (!g_vm_signal_termios_valid) {
+        g_vm_signal_termios = vm_orig_termios;
+        atomic_signal_fence(memory_order_seq_cst);
+        g_vm_signal_termios_valid = 1;
+    }
+}
+
 typedef struct {
     char fg[32];
     char bg[32];
@@ -4494,6 +4788,10 @@ static int g_vm_sigint_pipe[2] = {-1, -1};
 static pthread_once_t g_vm_sigint_pipe_once = PTHREAD_ONCE_INIT;
 atomic_bool g_vm_interrupt_broadcast = false;
 atomic_bool g_vm_suspend_requested = false;
+/* Set when a cursor-position probe (getCursorPosition) gave up before its
+ * ESC[row;colR reply arrived, so the reply may still turn up in the input;
+ * the next canonical read flushes pending input only in that case. */
+static atomic_bool g_vm_dsr_reply_pending = false;
 static void vmDrainSigintFd(int fd, bool is_host);
 
 static void vmEnableRawMode(void); // Forward declaration
@@ -4509,9 +4807,19 @@ static pthread_key_t vm_thread_cleanup_key;
 static pthread_once_t vm_thread_cleanup_key_once = PTHREAD_ONCE_INIT;
 static pthread_once_t vm_restore_once = PTHREAD_ONCE_INIT;
 
+static void vmRestoreTerminal(void);
+
+/* A thread that set up the terminal handlers is exiting. It undoes raw mode
+ * it set itself (vm_raw_mode is per thread) and nothing else: this used to
+ * run the whole exit cleanup, so any worker thread finishing ended the
+ * process-wide fx record/replay session and took the terminal out of raw
+ * mode under the main thread. The process-level cleanup belongs to
+ * vmExitWithCleanup and the atexit handler. */
 static void vmThreadCleanup(void *unused) {
     (void)unused;
-    vmAtExitCleanup();
+    if (vm_raw_mode) {
+        vmRestoreTerminal();
+    }
 }
 
 static void vmCreateThreadKey(void) {
@@ -4638,6 +4946,7 @@ static void vmRestoreTerminal(void) {
     if (!vm_termios_saved) {
         if (vmTcgetattr(STDIN_FILENO, &vm_orig_termios) == 0) {
             vm_termios_saved = 1;
+            vmNoteSignalTermios();
         }
     }
 
@@ -4816,6 +5125,19 @@ static void vmAtExitCleanup(void) {
     }
 }
 
+/* Put the terminal back the way the program found it, from signal context:
+ * the saved termios and a visible cursor, nothing that is not
+ * async-signal-safe. */
+static void vmSignalRestoreTerminal(void) {
+    if (g_vm_signal_termios_valid) {
+        (void)tcsetattr(STDIN_FILENO, TCSANOW, &g_vm_signal_termios);
+    }
+    if (isatty(STDOUT_FILENO)) {
+        static const char show_cursor[] = "\x1B[?25h";
+        (void)!write(STDOUT_FILENO, show_cursor, sizeof(show_cursor) - 1);
+    }
+}
+
 // Signal handler to ensure terminal state is restored on interrupts.
 static void vmSignalHandler(int signum) {
     if (signum == SIGINT) {
@@ -4826,10 +5148,47 @@ static void vmSignalHandler(int signum) {
         }
         return;
     }
-    if (vm_raw_mode || vm_alt_screen_depth > 0)
-        vmAtExitCleanup();
+    vmSignalRestoreTerminal();
     _exit(128 + signum);
 }
+
+#if !defined(PSCAL_TARGET_IOS)
+/* A crash (SIGSEGV, SIGBUS, SIGABRT) is not turned into a plain exit any
+ * more: that hid it (exit status 139 with no core dump, and no report from
+ * a sanitizer whose handler this one had replaced). The terminal is restored
+ * and the signal goes on to whatever handled it before -- the default action
+ * or a sanitizer -- with its original details: a hardware fault re-faults on
+ * return, a sent signal is raised again. */
+static struct sigaction g_vm_prev_segv_action;
+static struct sigaction g_vm_prev_bus_action;
+static struct sigaction g_vm_prev_abrt_action;
+
+static void vmFatalSignalHandler(int signum, siginfo_t *info, void *context) {
+    (void)context;
+    vmSignalRestoreTerminal();
+    const struct sigaction *prev = (signum == SIGSEGV) ? &g_vm_prev_segv_action
+                                 : (signum == SIGBUS)  ? &g_vm_prev_bus_action
+                                                       : &g_vm_prev_abrt_action;
+    (void)sigaction(signum, prev, NULL);
+#if defined(__APPLE__)
+    /* Darwin fills in a SIGSEGV sent with kill() exactly like a fault
+     * (si_code SEGV_ACCERR, si_pid 0), so the two cannot be told apart.
+     * With the default action behind us, raising is right for both (a real
+     * fault's raised signal is delivered at the faulting instruction as this
+     * handler returns). A handler behind us (a sanitizer) needs the fault's
+     * own details, so a fault is left to re-fault into it; a signal sent
+     * from outside is then absorbed once. */
+    (void)info;
+    bool hardware_fault = (signum == SIGSEGV || signum == SIGBUS) &&
+                          prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN;
+#else
+    bool hardware_fault = (signum == SIGSEGV || signum == SIGBUS) && info && info->si_code > 0;
+#endif
+    if (!hardware_fault) {
+        (void)raise(signum);
+    }
+}
+#endif
 
 static void vmRegisterRestoreHandlers(void) {
     atexit(vmAtExitCleanup);
@@ -4841,8 +5200,17 @@ static void vmRegisterRestoreHandlers(void) {
 #if !defined(PSCAL_TARGET_IOS)
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGQUIT, &sa, NULL);
-    sigaction(SIGABRT, &sa, NULL);
-    sigaction(SIGSEGV, &sa, NULL);
+
+    struct sigaction fatal;
+    memset(&fatal, 0, sizeof(fatal));
+    fatal.sa_sigaction = vmFatalSignalHandler;
+    sigemptyset(&fatal.sa_mask);
+    // SA_ONSTACK: a stack overflow can only be handled on an alternate
+    // signal stack (a sanitizer installs one).
+    fatal.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigaction(SIGSEGV, &fatal, &g_vm_prev_segv_action);
+    sigaction(SIGBUS, &fatal, &g_vm_prev_bus_action);
+    sigaction(SIGABRT, &fatal, &g_vm_prev_abrt_action);
 #endif
 }
 
@@ -4854,6 +5222,7 @@ static void vmSetupTermHandlers(void) {
     if (!vm_termios_saved) {
         if (vmTcgetattr(STDIN_FILENO, &vm_orig_termios) == 0) {
             vm_termios_saved = 1;
+            vmNoteSignalTermios();
         }
     }
     pthread_mutex_unlock(&vm_term_mutex);
@@ -5120,7 +5489,11 @@ bool pscalRuntimeConsumeSigtstp(void) {
 
 void vmInitTerminalState(void) {
     vmSetupTermHandlers();
-    vmPushColorState();
+    // The terminal's colours are no longer queried here: the OSC 10/11 query
+    // waited up to half a second per colour on a terminal that does not
+    // answer, and read away whatever input was already typed ahead -- on
+    // every Pascal start, for programs that never touch the screen. Only the
+    // screen stack needs them; PushScreen saves them on first use.
     vmEnableRawMode();
     if (isatty(STDOUT_FILENO)) {
         setvbuf(stdout, NULL, _IOFBF, 65536);
@@ -5195,6 +5568,7 @@ static void vmEnableRawMode(void) {
             return;
         }
         vm_termios_saved = 1;
+        vmNoteSignalTermios();
     }
     vmLogTermios("raw base", &vm_orig_termios);
 
@@ -5280,7 +5654,14 @@ static void vmPrepareCanonicalInput(void) {
         fprintf(stderr, "[termios] canon get failed errno=%d\n", errno);
     }
     pthread_mutex_unlock(&vm_term_mutex);
-    tcflush(STDIN_FILENO, TCIFLUSH);
+    // Flushing pending input here on every read threw away whatever the user
+    // had typed ahead: pasting three lines into three readln calls kept only
+    // some of them. The flush is only for a late reply to a cursor-position
+    // probe, so it happens only while one may be outstanding; a reply that
+    // still gets through is swallowed by vmReadLineInterruptible's DSR filter.
+    if (atomic_exchange(&g_vm_dsr_reply_pending, false)) {
+        tcflush(STDIN_FILENO, TCIFLUSH);
+    }
     // The cursor escape is for a terminal. Written into a pipe or a file it
     // becomes stray bytes in the program's output (every stdin readln added
     // ESC[?25h ahead of the next line), so it goes out only when stdout is
@@ -5296,6 +5677,12 @@ static void vmPrepareCanonicalInput(void) {
 }
 
 static bool vmBufferIsPureDsr(const char *buf, size_t len);
+
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} VmLineBuf;
 
 #if defined(PSCAL_TARGET_IOS)
 typedef void (*VmSuspendWaitHookFn)(void);
@@ -5423,10 +5810,39 @@ static bool vmHandleCtrlZReadRequest(VM *vm, char *buffer) {
 }
 #endif
 
-static bool vmReadLineInterruptible(VM *vm, FILE *stream, char *buffer, size_t buffer_sz) {
-    if (!stream || !buffer || buffer_sz == 0) {
+/* Make room for at least `need` bytes in `line`. */
+static bool vmLineBufReserve(VmLineBuf *line, size_t need) {
+    if (line->data && line->cap >= need) {
+        return true;
+    }
+    size_t cap = line->cap ? line->cap : 128;
+    while (cap < need) {
+        if (cap > SIZE_MAX / 2) {
+            return false;
+        }
+        cap *= 2;
+    }
+    char *grown = (char *)realloc(line->data, cap);
+    if (!grown) {
         return false;
     }
+    line->data = grown;
+    line->cap = cap;
+    return true;
+}
+
+/* Read one line from `stream` into `line` (grown as needed, NUL-terminated,
+ * line->len set; the caller frees line->data). The line break is not
+ * stored. A line has no length limit: the fixed buffers this used to fill
+ * (1024 bytes for readln, 1 MiB for read_line) returned a longer line as
+ * several lines. */
+static bool vmReadLineInterruptible(VM *vm, FILE *stream, VmLineBuf *line) {
+    if (!stream || !line || !vmLineBufReserve(line, 128)) {
+        return false;
+    }
+    line->len = 0;
+    line->data[0] = '\0';
+    char *buffer = line->data;
     int fd = fileno(stream);
     bool is_stdin_stream = vmStreamTargetsSharedStdin(stream);
 #if defined(PSCAL_TARGET_IOS)
@@ -5526,8 +5942,16 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, char *buffer, size_t b
 #endif
         int sigint_fd = g_vm_sigint_pipe[0];
         bool saw_newline = false;
+#if defined(PSCAL_TARGET_IOS)
         bool pending_caret_control = false;
-        while (len < buffer_sz - 1) {
+#endif
+        for (;;) {
+            /* Room for the most one pass of this loop can store: one byte,
+             * a caret pair, or a pushed-back escape sequence (< 32 bytes). */
+            if (!vmLineBufReserve(line, len + 64)) {
+                break;
+            }
+            buffer = line->data;
 #if defined(PSCAL_TARGET_IOS)
             /* If a frontend thread was hard-stopped while blocked in select/poll,
              * convert that stop into a cooperative pending signal so ReadLn can
@@ -5683,9 +6107,6 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, char *buffer, size_t b
                         return false;
                     }
                     buffer[len++] = '^';
-                    if (len >= buffer_sz - 1) {
-                        break;
-                    }
                 }
                 if (ch == '^') {
                     pending_caret_control = true;
@@ -5838,6 +6259,12 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, char *buffer, size_t b
                 fprintf(stderr, "[readln] byte direct ch=0x%02x len=%zu\n",
                         (unsigned int)(unsigned char)ch, len);
             }
+#if defined(PSCAL_TARGET_IOS)
+            /* Caret notation ("^C", "^Z" as two characters) stands for a
+             * control key only in the iOS app's session input. On a real
+             * terminal Ctrl-C arrives as 0x03 or SIGINT, and a "^c" the user
+             * typed is text: treating it as Ctrl-C aborted `readln` on input
+             * like "^cat". */
             if (pending_caret_control) {
                 pending_caret_control = false;
                 if (ch == 'C' || ch == 'c') {
@@ -5849,31 +6276,19 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, char *buffer, size_t b
                     return false;
                 }
                 if (ch == 'Z' || ch == 'z') {
-#if defined(PSCAL_TARGET_IOS)
                     if (vmHandleCtrlZReadRequest(vm, buffer)) {
                         len = 0;
                         continue;
                     }
-#else
-                    if (vm) {
-                        vm->abort_requested = false;
-                        vm->exit_requested = true;
-                        vm->suspend_unwind_requested = true;
-                    }
-                    shellRuntimeSetLastStatus(128 + SIGTSTP);
-                    buffer[0] = '\0';
-#endif
                     return false;
                 }
                 buffer[len++] = '^';
-                if (len >= buffer_sz - 1) {
-                    break;
-                }
             }
             if (ch == '^') {
                 pending_caret_control = true;
                 continue;
             }
+#endif
             if (ch == 0x03) { // Ctrl-C
                 if (vm) {
                     vm->abort_requested = true;
@@ -5954,7 +6369,7 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, char *buffer, size_t b
                     continue;
                 }
                 // Not a DSR; push everything we pulled back into the user buffer.
-                for (size_t k = 0; k < seq_len && len < buffer_sz - 1; k++) {
+                for (size_t k = 0; k < seq_len; k++) {
                     buffer[len++] = seq[k];
                 }
                 continue;
@@ -5980,6 +6395,7 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, char *buffer, size_t b
             buffer[len++] = ch;
         }
         buffer[len] = '\0';
+        line->len = len;
 #if defined(PSCAL_TARGET_IOS)
         if (tool_dbg && stream == stdin) {
             fprintf(stderr, "[readln] done len=%zu saw_nl=%d eof=%d\n",
@@ -5992,17 +6408,18 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, char *buffer, size_t b
         return false;
     }
 
-    if (fgets(buffer, buffer_sz, stream) == NULL) {
+    ssize_t got = getline(&line->data, &line->cap, stream);
+    if (got < 0) {
+        if (line->data) line->data[0] = '\0';
         return false;
     }
-    buffer[strcspn(buffer, "\r\n")] = '\0';
+    line->len = strcspn(line->data, "\r\n");
+    line->data[line->len] = '\0';
     return true;
 }
 
 static void vmCommitLastIoError(int value) {
-    pthread_mutex_lock(&globals_mutex);
-    last_io_error = value;
-    pthread_mutex_unlock(&globals_mutex);
+    last_io_error = value; // thread-local; no lock needed
 }
 
 static bool vmBufferIsPureDsr(const char *buf, size_t len) {
@@ -6037,6 +6454,7 @@ static int getCursorPosition(int *row, int *col) {
     bool termiosApplied = false;
     int stdin_flags = -1;
     bool restore_blocking = false;
+    bool query_sent = false;
 
     // Default row/col in case of non-critical failure
     *row = 1;
@@ -6087,6 +6505,7 @@ static int getCursorPosition(int *row, int *col) {
         errno = write_errno;
         goto cleanup; // Critical failure
     }
+    query_sent = true;
 
     // --- Read Response ---
     memset(buf, 0, sizeof(buf));
@@ -6224,6 +6643,9 @@ static int getCursorPosition(int *row, int *col) {
     }
 
 cleanup:
+    if (query_sent && !(i > 0 && buf[i - 1] == 'R')) {
+        atomic_store(&g_vm_dsr_reply_pending, true);
+    }
     /* Flush any pending input so delayed DSR replies don't echo later. */
     tcflush(STDIN_FILENO, TCIFLUSH);
     /* Drain any residual DSR bytes so later reads (e.g., ReadKey) are not
@@ -6370,6 +6792,10 @@ Value vmBuiltinReadkey(VM* vm, int arg_count, Value* args) {
             continue;
         }
 
+#if defined(PSCAL_TARGET_IOS)
+        /* Caret notation ("^C" typed as two characters) means a control key
+         * only in the iOS app's session input; on a terminal "^" is a key
+         * like any other, and the "c" after it aborted the program. */
         if (gReadKeyPendingCaretControl) {
             gReadKeyPendingCaretControl = false;
             if (c == 'C' || c == 'c') {
@@ -6382,7 +6808,6 @@ Value vmBuiltinReadkey(VM* vm, int arg_count, Value* args) {
                 c = 0;
                 break;
             }
-#if defined(PSCAL_TARGET_IOS)
             if (c == 'Z' || c == 'z') {
                 char scratch[1] = {'\0'};
                 if (vmHandleCtrlZReadRequest(vm, scratch)) {
@@ -6391,24 +6816,13 @@ Value vmBuiltinReadkey(VM* vm, int arg_count, Value* args) {
                 c = 0;
                 break;
             }
-#else
-            if (c == 'Z' || c == 'z') {
-                if (vm) {
-                    vm->abort_requested = false;
-                    vm->exit_requested = true;
-                    vm->suspend_unwind_requested = true;
-                }
-                shellRuntimeSetLastStatus(128 + SIGTSTP);
-                c = 0;
-                break;
-            }
-#endif
         }
 
         if (c == '^') {
             gReadKeyPendingCaretControl = true;
             break;
         }
+#endif
         if (c == 0x03) { // Ctrl-C
             if (vm) {
                 vm->abort_requested = false;
@@ -6490,7 +6904,9 @@ Value vmBuiltinTextcolor(VM* vm, int arg_count, Value* args) {
         return makeVoid();
     }
     long long colorCode = AS_INTEGER(args[0]);
-    gCurrentTextColor = (int)(colorCode % 16);
+    // Reduced into 0..15 also for a negative code (C's % keeps the sign,
+    // and TextColor(-100) indexed the colour table at -4).
+    gCurrentTextColor = (int)(((colorCode % 16) + 16) % 16);
     gCurrentTextBold = (colorCode >= 8 && colorCode <= 15);
     gCurrentColorIsExt = false;
 
@@ -6505,7 +6921,7 @@ Value vmBuiltinTextbackground(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "TextBackground expects 1 integer argument.");
         return makeVoid();
     }
-    gCurrentTextBackground = (int)(AS_INTEGER(args[0]) % 8);
+    gCurrentTextBackground = (int)(((AS_INTEGER(args[0]) % 8) + 8) % 8);
     gCurrentBgIsExt = false;
 
     markTextAttrDirty();
@@ -6779,6 +7195,9 @@ Value vmBuiltinPushscreen(VM* vm, int arg_count, Value* args) {
         return makeVoid();
     }
     if (pscalRuntimeStdoutIsInteractive()) {
+        if (vm_color_stack_depth == 0) {
+            vmPushColorState(); // the base colours, restored at exit
+        }
         vmPushColorState();
         if (vm_alt_screen_depth == 0) {
             const char enter_alt[] = "\x1B[?1049h";
@@ -7454,6 +7873,45 @@ static ArrayBoundsResult resolveFirstDimBounds(Value* arg) {
     return result;
 }
 
+/* The integer type a Low()/High() type-name argument names: a Pascal name
+ * (longint, cardinal, shortint, smallint, int64, qword, longword, ...) or
+ * the VarType spelling the compiler passes for a variable's type (INT8,
+ * UINT16, INT64, UINT64, ...). TYPE_VOID if it names no integer type. */
+static VarType lowHighIntegerTypeFromName(const char* name) {
+    VarType t = lookupBuiltinPascalTypeName(name);
+    if (isIntlikeType(t)) {
+        return t;
+    }
+    static const VarType kIntTypes[] = {
+        TYPE_INT8, TYPE_UINT8, TYPE_INT16, TYPE_UINT16, TYPE_INT32,
+        TYPE_UINT32, TYPE_INT64, TYPE_UINT64, TYPE_BYTE, TYPE_WORD
+    };
+    for (size_t i = 0; i < sizeof(kIntTypes) / sizeof(kIntTypes[0]); ++i) {
+        if (strcasecmp(name, varTypeToString(kIntTypes[i])) == 0) {
+            return kIntTypes[i];
+        }
+    }
+    if (strcasecmp(name, "longword") == 0 || strcasecmp(name, "dword") == 0) return TYPE_UINT32;
+    if (strcasecmp(name, "int32") == 0) return TYPE_INT32;
+    return TYPE_VOID;
+}
+
+/* Low()/High() of the sized integer types; false for any other type. Only
+ * Integer, Byte and Word were handled, so High(QWord), Low(Int64),
+ * Low(ShortInt) and the like were "not supported". */
+static bool lowHighIntegerBound(VarType t, bool high, Value* out) {
+    switch (t) {
+        case TYPE_INT8:   *out = makeInt(high ? INT8_MAX : INT8_MIN); return true;
+        case TYPE_UINT8:  *out = makeInt(high ? UINT8_MAX : 0); return true;
+        case TYPE_INT16:  *out = makeInt(high ? INT16_MAX : INT16_MIN); return true;
+        case TYPE_UINT16: *out = makeInt(high ? UINT16_MAX : 0); return true;
+        case TYPE_UINT32: *out = high ? makeInt64((long long)UINT32_MAX) : makeInt(0); return true;
+        case TYPE_INT64:  *out = makeInt64(high ? LLONG_MAX : LLONG_MIN); return true;
+        case TYPE_UINT64: *out = makeUInt64(high ? ULLONG_MAX : 0ULL); return true;
+        default:          return false;
+    }
+}
+
 Value vmBuiltinLow(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1) {
         runtimeError(vm, "Low() expects a single array or type identifier argument.");
@@ -7491,6 +7949,7 @@ Value vmBuiltinLow(VM* vm, int arg_count, Value* args) {
         else if (strcasecmp(typeName, "boolean") == 0) t = TYPE_BOOLEAN;
         else if (strcasecmp(typeName, "byte") == 0)    t = TYPE_BYTE;
         else if (strcasecmp(typeName, "word") == 0)    t = TYPE_WORD;
+        else if (lowHighIntegerTypeFromName(typeName) != TYPE_VOID) t = lowHighIntegerTypeFromName(typeName);
         else {
             typeDef = lookupType(typeName);
             if (typeDef) t = typeDef->var_type;
@@ -7511,8 +7970,13 @@ Value vmBuiltinLow(VM* vm, int arg_count, Value* args) {
             }
             break;
         }
-        default:
+        default: {
+            Value bound;
+            if (lowHighIntegerBound(t, false, &bound)) {
+                return bound;
+            }
             break;
+        }
     }
 
     if (typeName)
@@ -7557,6 +8021,7 @@ Value vmBuiltinHigh(VM* vm, int arg_count, Value* args) {
         else if (strcasecmp(typeName, "boolean") == 0) t = TYPE_BOOLEAN;
         else if (strcasecmp(typeName, "byte") == 0)    t = TYPE_BYTE;
         else if (strcasecmp(typeName, "word") == 0)    t = TYPE_WORD;
+        else if (lowHighIntegerTypeFromName(typeName) != TYPE_VOID) t = lowHighIntegerTypeFromName(typeName);
         else {
             typeDef = lookupType(typeName);
             if (typeDef) t = typeDef->var_type;
@@ -7577,8 +8042,13 @@ Value vmBuiltinHigh(VM* vm, int arg_count, Value* args) {
             }
             break;
         }
-        default:
+        default: {
+            Value bound;
+            if (lowHighIntegerBound(t, true, &bound)) {
+                return bound;
+            }
             break;
+        }
     }
 
     if (typeName)
@@ -7586,6 +8056,17 @@ Value vmBuiltinHigh(VM* vm, int arg_count, Value* args) {
     else
         runtimeError(vm, "High() not supported for provided type.");
     return makeInt(0);
+}
+
+static AST* gNewIntegerBaseNode = NULL;
+static pthread_once_t gNewIntegerBaseOnce = PTHREAD_ONCE_INIT;
+
+static void newIntegerBaseInit(void) {
+    Token* baseTok = newToken(TOKEN_IDENTIFIER, "integer", 0, 0);
+    AST* baseNode = newASTNode(AST_VARIABLE, baseTok);
+    setTypeAST(baseNode, TYPE_INT32);
+    freeToken(baseTok);
+    gNewIntegerBaseNode = baseNode;
 }
 
 Value vmBuiltinNew(VM* vm, int arg_count, Value* args) {
@@ -7649,22 +8130,20 @@ Value vmBuiltinNew(VM* vm, int arg_count, Value* args) {
     // (debug logging removed)
 
     // Update the pointer variable that was passed by reference. It is
-    // already TYPE_POINTER (checked above): keep its PointerObj, and with it
-    // the base_type_node the next new(p) resolves the pointee type from --
-    // retyping it reset .bits and dropped that wrapper, so a second new(p)
-    // on a record pointer allocated an integer. Pascal pointer variables
-    // start out nil-but-wrappered (makeValueForType); the ensure below only
-    // covers one that has no wrapper yet.
+    // already TYPE_POINTER (checked above), so it keeps its PointerObj: a
+    // SET_VALUE_TYPE here reset .bits to a nil placeholder, which orphaned
+    // that PointerObj -- and with it the base type -- so every new() leaked
+    // one and then fell into the "no base type" fallback below.
     pscalPointerEnsureObj(pointerVarValuePtr);
+    // It no longer points into an array or string it kept alive.
+    pscalPointerDropOwners(PSCAL_VALUE_PTR(*pointerVarValuePtr, PointerObj));
     AS_POINTER(*pointerVarValuePtr) = allocated_memory;
 
-    // Safety: if base type metadata is unknown, treat as integer for subsequent dereferences
+    // Safety: if base type metadata is unknown, treat as integer for subsequent
+    // dereferences. One shared node, built once: it was a fresh AST per call.
     if (!PTR_BASE_TYPE_NODE(*pointerVarValuePtr)) {
-        Token* baseTok = newToken(TOKEN_IDENTIFIER, "integer", 0, 0);
-        AST* baseNode = newASTNode(AST_VARIABLE, baseTok);
-        setTypeAST(baseNode, TYPE_INT32);
-        freeToken(baseTok);
-        PTR_BASE_TYPE_NODE(*pointerVarValuePtr) = baseNode;
+        pthread_once(&gNewIntegerBaseOnce, newIntegerBaseInit);
+        PTR_BASE_TYPE_NODE(*pointerVarValuePtr) = gNewIntegerBaseNode;
     }
     // (debug logging removed)
 
@@ -8055,12 +8534,41 @@ Value vmBuiltinEof(VM* vm, int arg_count, Value* args) {
     return makeBoolean(false);
 }
 
+/* The most bytes BlockRead/BlockWrite may move through a raw buffer pointer
+ * (`s[1]`, `buf[0]`): the rest of the string or packed byte array it points
+ * into, rounded down to whole records. The pointer used to carry no bound,
+ * so BlockRead(f, s[1], 4096) on an 8-character string overran the heap and
+ * BlockWrite read past it into the file. A string's extent is its current
+ * length, as in Turbo Pascal (SetLength first to make room); an array
+ * element pointer records its extent when the VM creates it. */
+static size_t blockIoRawPointerLimit(const Value* pointerValue, const unsigned char* rawPointer,
+                                     size_t requestedBytes, int recordSize) {
+    if (!pointerValue || !rawPointer) {
+        return requestedBytes;
+    }
+    size_t limit = SIZE_MAX;
+    AST* base = PTR_BASE_TYPE_NODE(*pointerValue);
+    PointerObj* po = PSCAL_VALUE_PTR(*pointerValue, PointerObj);
+    if (base == BYTE_ARRAY_PTR_SENTINEL) {
+        if (po && po->extent > 0) {
+            limit = po->extent;
+        }
+    } else if (base == STRING_CHAR_PTR_SENTINEL || base == SERIALIZED_CHAR_PTR_SENTINEL) {
+        limit = strlen((const char*)rawPointer);
+    }
+    if (limit != SIZE_MAX && recordSize > 1) {
+        limit -= limit % (size_t)recordSize;
+    }
+    return requestedBytes < limit ? requestedBytes : limit;
+}
+
 Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
     unsigned char* tempBuffer = NULL;
     Value* resultSlot = NULL;
     Value* fileValue = NULL;
     Value* bufferValue = NULL;
     unsigned char* rawPointer = NULL;
+    const Value* rawPointerValue = NULL;
     FILE* stream = NULL;
     bool parameterError = false;
     bool performedIO = false;
@@ -8131,6 +8639,7 @@ Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
         PTR_BASE_TYPE_NODE(args[1]) == BYTE_ARRAY_PTR_SENTINEL) {
         bufferIsRawPointer = true;
         rawPointer = (unsigned char*)AS_POINTER(args[1]);
+        rawPointerValue = &args[1];
     } else {
         bufferValue = (Value*)AS_POINTER(args[1]);
         if (bufferValue && VALUE_TYPE(*bufferValue) == TYPE_POINTER &&
@@ -8139,6 +8648,7 @@ Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
              PTR_BASE_TYPE_NODE(*bufferValue) == BYTE_ARRAY_PTR_SENTINEL)) {
             bufferIsRawPointer = true;
             rawPointer = (unsigned char*)AS_POINTER(*bufferValue);
+            rawPointerValue = bufferValue;
         }
     }
 
@@ -8167,6 +8677,7 @@ Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
             parameterError = true;
             goto cleanup;
         }
+        requestedBytes = blockIoRawPointerLimit(rawPointerValue, rawPointer, requestedBytes, recordSize);
         errno = 0;
         performedIO = true;
         bytesProcessed = (requestedBytes > 0) ? fread(rawPointer, 1, requestedBytes, stream) : 0;
@@ -8285,6 +8796,7 @@ Value vmBuiltinBlockwrite(VM* vm, int arg_count, Value* args) {
     Value* bufferValue = NULL;
     Value* resultSlot = NULL;
     unsigned char* rawPointer = NULL;
+    const Value* rawPointerValue = NULL;
     FILE* stream = NULL;
     bool parameterError = false;
     bool performedIO = false;
@@ -8355,6 +8867,7 @@ Value vmBuiltinBlockwrite(VM* vm, int arg_count, Value* args) {
         PTR_BASE_TYPE_NODE(args[1]) == BYTE_ARRAY_PTR_SENTINEL) {
         bufferIsRawPointer = true;
         rawPointer = (unsigned char*)AS_POINTER(args[1]);
+        rawPointerValue = &args[1];
     } else {
         bufferValue = (Value*)AS_POINTER(args[1]);
         if (bufferValue && VALUE_TYPE(*bufferValue) == TYPE_POINTER &&
@@ -8363,6 +8876,7 @@ Value vmBuiltinBlockwrite(VM* vm, int arg_count, Value* args) {
              PTR_BASE_TYPE_NODE(*bufferValue) == BYTE_ARRAY_PTR_SENTINEL)) {
             bufferIsRawPointer = true;
             rawPointer = (unsigned char*)AS_POINTER(*bufferValue);
+            rawPointerValue = bufferValue;
         }
     }
 
@@ -8391,6 +8905,7 @@ Value vmBuiltinBlockwrite(VM* vm, int arg_count, Value* args) {
             parameterError = true;
             goto cleanup;
         }
+        requestedBytes = blockIoRawPointerLimit(rawPointerValue, rawPointer, requestedBytes, recordSize);
         errno = 0;
         performedIO = true;
         bytesProcessed = (requestedBytes > 0) ? fwrite(rawPointer, 1, requestedBytes, stream) : 0;
@@ -8499,10 +9014,97 @@ cleanup:
     return makeVoid();
 }
 
+/* The value range of an integer Read/Readln/Val destination. */
+static void builtinIntTypeRange(VarType type, long long* lo, unsigned long long* hi) {
+    switch (type) {
+        case TYPE_INT8:   *lo = INT8_MIN;  *hi = INT8_MAX;   break;
+        case TYPE_INT16:  *lo = INT16_MIN; *hi = INT16_MAX;  break;
+        case TYPE_INT32:  *lo = INT32_MIN; *hi = INT32_MAX;  break;
+        case TYPE_UINT8:
+        case TYPE_BYTE:   *lo = 0;         *hi = UINT8_MAX;  break;
+        case TYPE_UINT16:
+        case TYPE_WORD:   *lo = 0;         *hi = UINT16_MAX; break;
+        case TYPE_UINT32: *lo = 0;         *hi = UINT32_MAX; break;
+        case TYPE_UINT64: *lo = 0;         *hi = UINT64_MAX; break;
+        default:          *lo = LLONG_MIN; *hi = LLONG_MAX;  break;
+    }
+}
+
+/* Parse the decimal integer at `text` (leading whitespace skipped) for a
+ * destination of type `type`. False when there is no number or it does not
+ * fit the destination; SET_INT_VALUE would otherwise wrap it silently
+ * (99999999999 read into an Integer came back as 1215752191). On success
+ * *endp points past the digits. */
+static bool builtinParseIntForType(VarType type, const char* text, const char** endp, long long* out) {
+    long long lo;
+    unsigned long long hi;
+    builtinIntTypeRange(type, &lo, &hi);
+    const char* p = text;
+    while (isspace((unsigned char)*p)) p++;
+    char* e = NULL;
+    errno = 0;
+    if (lo == 0 && *p != '-') {
+        unsigned long long v = strtoull(p, &e, 10);
+        if (e == p || errno == ERANGE || v > hi) return false;
+        *out = (long long)v;
+    } else {
+        long long v = strtoll(p, &e, 10);
+        if (e == p || errno == ERANGE || v < lo || (v > 0 && (unsigned long long)v > hi)) return false;
+        *out = v;
+    }
+    *endp = e;
+    return true;
+}
+
+/* Turbo/Free Pascal's IOResult for text that is not a number of the
+ * destination's type. */
+#define VM_IO_INVALID_NUMERIC_FORMAT 106
+
+/* The next whitespace-delimited token of `stream`, in a buffer grown to fit
+ * (Read used to cut tokens at 1023 bytes and return the rest as the next
+ * token). The caller frees *out. False at end of input. */
+static bool readTokenAlloc(FILE* stream, char** out, size_t* out_len) {
+    int ch;
+    do {
+        ch = fgetc(stream);
+    } while (ch != EOF && isspace(ch));
+    if (ch == EOF) {
+        return false;
+    }
+    size_t len = 0, cap = 64;
+    char* buf = (char*)malloc(cap);
+    if (!buf) {
+        return false;
+    }
+    while (ch != EOF && !isspace(ch)) {
+        if (len + 1 >= cap) {
+            char* grown = (char*)realloc(buf, cap * 2);
+            if (!grown) {
+                free(buf);
+                return false;
+            }
+            buf = grown;
+            cap *= 2;
+        }
+        buf[len++] = (char)ch;
+        ch = fgetc(stream);
+    }
+    if (ch != EOF) {
+        ungetc(ch, stream);
+    }
+    buf[len] = '\0';
+    *out = buf;
+    *out_len = len;
+    return true;
+}
+
 Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
     FILE* input_stream = stdin;
     int var_start_index = 0;
     int io_error = 0;
+    bool binary_file = false;
+    VarType binary_element_type = TYPE_VOID;
+    size_t binary_element_size = 0;
 
     // Determine input stream: allow FILE or ^FILE
     if (arg_count > 0) {
@@ -8517,6 +9119,18 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
             }
             input_stream = AS_FILE(*a0);
             var_start_index = 1;
+            // A typed file of a scalar type holds its elements in the binary
+            // layout Write gives them (same test as Write's).
+            if (FILE_ELEMENT_TYPE(*a0) != TYPE_VOID && FILE_ELEMENT_TYPE(*a0) != TYPE_UNKNOWN &&
+                (FILE_RECORD_SIZE_EXPLICIT(*a0) || FILE_ELEMENT_TYPE_DEF(*a0) != NULL)) {
+                long long size_bytes = 0;
+                if (builtinSizeForVarType(FILE_ELEMENT_TYPE(*a0), &size_bytes) && size_bytes > 0 &&
+                    (size_t)size_bytes <= sizeof(long double)) {
+                    binary_file = true;
+                    binary_element_type = FILE_ELEMENT_TYPE(*a0);
+                    binary_element_size = (size_t)size_bytes;
+                }
+            }
         }
     }
 
@@ -8532,6 +9146,14 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
         }
         Value* dst = (Value*)AS_POINTER(args[i]);
 
+        if (binary_file) {
+            int read_error = 0;
+            if (!readBinaryElement(input_stream, dst, binary_element_type, binary_element_size, &read_error)) {
+                io_error = read_error ? read_error : 1;
+                break;
+            }
+            continue;
+        }
         if (VALUE_TYPE(*dst) == TYPE_CHAR) {
             int ch = fgetc(input_stream);
             if (ch == EOF) { io_error = feof(input_stream) ? 0 : 1; break; }
@@ -8547,33 +9169,44 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
             continue;
         }
 
-        char buffer[1024];
-        if (fscanf(input_stream, "%1023s", buffer) != 1) {
+        char* buffer = NULL;
+        size_t buffer_len = 0;
+        if (!readTokenAlloc(input_stream, &buffer, &buffer_len)) {
             io_error = feof(input_stream) ? 0 : 1;
             break;
         }
 
+        // A number is the whole token: "12x" is not 12.
         switch (VALUE_TYPE(*dst)) {
-            case TYPE_INTEGER:
+            case TYPE_INT8:
+            case TYPE_INT16:
+            case TYPE_INT32: /* TYPE_INTEGER */
+            case TYPE_INT64:
+            case TYPE_UINT8:
+            case TYPE_BYTE:
+            case TYPE_UINT16:
             case TYPE_WORD:
-            case TYPE_BYTE: {
-                errno = 0;
-                long long v = strtoll(buffer, NULL, 10);
-                if (errno == ERANGE) { io_error = 1; v = 0; }
+            case TYPE_UINT32:
+            case TYPE_UINT64: {
+                const char* endp = NULL;
+                long long v = 0;
+                if (!builtinParseIntForType(VALUE_TYPE(*dst), buffer, &endp, &v) || *endp != '\0') {
+                    io_error = VM_IO_INVALID_NUMERIC_FORMAT;
+                    break;
+                }
                 SET_INT_VALUE(dst, v);
                 break;
             }
-            case TYPE_FLOAT: {
+            case TYPE_FLOAT:
+            case TYPE_DOUBLE: /* TYPE_REAL */
+            case TYPE_LONG_DOUBLE: {
                 errno = 0;
-                float v = strtof(buffer, NULL);
-                if (errno == ERANGE) { io_error = 1; v = 0.0f; }
-                SET_REAL_VALUE(dst, v);
-                break;
-            }
-            case TYPE_REAL: {
-                errno = 0;
-                double v = strtod(buffer, NULL);
-                if (errno == ERANGE) { io_error = 1; v = 0.0; }
+                char* endp = NULL;
+                long double v = strtold(buffer, &endp);
+                if (endp == buffer || *endp != '\0' || errno == ERANGE) {
+                    io_error = VM_IO_INVALID_NUMERIC_FORMAT;
+                    break;
+                }
                 SET_REAL_VALUE(dst, v);
                 break;
             }
@@ -8589,24 +9222,13 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
                 break;
             }
             case TYPE_STRING:
+            case TYPE_UNICODE_STRING:
             case TYPE_NIL: {
-                // Install a fresh StringObj instead of rewriting the current
-                // one, which copies of the variable may share by reference
-                // count, then drop this variable's reference to the old one.
-                // A string[N] variable keeps its cap.
-                StringObj *old_s = (VALUE_TYPE(*dst) == TYPE_STRING) ? PSCAL_VALUE_PTR(*dst, StringObj) : NULL;
-                int max_len = old_s ? old_s->max_length : -1;
-                StringObj *fresh_s = pscalStringObjCreate(max_len, TYPE_STRING);
-                if (max_len > 0) {
-                    fresh_s->buffer = (char *)calloc((size_t)max_len + 1, 1);
-                    if (fresh_s->buffer) strncpy(fresh_s->buffer, buffer, (size_t)max_len);
-                } else {
-                    fresh_s->buffer = strdup(buffer);
+                // A fresh StringObj, the old one released (see
+                // builtinRebindStringValue); it used to be orphaned.
+                if (!builtinRebindStringValue(dst, buffer, buffer_len)) {
+                    io_error = 1;
                 }
-                if (!fresh_s->buffer) { io_error = 1; }
-                SET_VALUE_TYPE(dst, TYPE_STRING);
-                pscalValueSetHeapPtrBits(dst, fresh_s);
-                if (old_s) pscalObjRelease(&old_s->header);
                 break;
             }
             default:
@@ -8615,10 +9237,13 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
                 i = arg_count;
                 break;
         }
+        free(buffer);
+        if (io_error) {
+            break;
+        }
     }
 
     if (!io_error && ferror(input_stream)) io_error = 1;
-    else if (io_error != 1) io_error = 0;
 
     if (input_stream == stdin) {
         vmEnableRawMode();
@@ -8657,8 +9282,9 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
     }
 
     // 2) Read full line
-    char line_buffer[1024];
-    if (!vmReadLineInterruptible(vm, input_stream, line_buffer, sizeof(line_buffer))) {
+    VmLineBuf line = {0};
+    if (!vmReadLineInterruptible(vm, input_stream, &line)) {
+        free(line.data);
         io_error = feof(input_stream) ? 0 : 1;
         if (getenv("PSCALI_TOOL_DEBUG")) {
             fprintf(stderr,
@@ -8672,6 +9298,7 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
         vmCommitLastIoError(io_error);
         return makeVoid();
     }
+    char* line_buffer = line.data;
     line_buffer[strcspn(line_buffer, "\r\n")] = '\0';
 
     // 3) Parse vars from buffer
@@ -8701,27 +9328,25 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
             case TYPE_INT8:
             case TYPE_INT16:
             case TYPE_INT32: /* TYPE_INTEGER */
-            case TYPE_INT64: {
-                errno = 0;
-                char* endp = NULL;
-                long long v = strtoll(p, &endp, 10);
-                if (endp == p || errno == ERANGE) { io_error = 1; v = 0; }
-                SET_INT_VALUE(dst, v);
-                p = endp ? endp : p;
-                break;
-            }
+            case TYPE_INT64:
             case TYPE_UINT8:
             case TYPE_BYTE:
             case TYPE_UINT16:
             case TYPE_WORD:
             case TYPE_UINT32:
             case TYPE_UINT64: {
-                errno = 0;
-                char* endp = NULL;
-                unsigned long long v = strtoull(p, &endp, 10);
-                if (endp == p || errno == ERANGE) { io_error = 1; v = 0; }
+                // The number may be followed directly by the next field
+                // ("42abc" reads 42, then "abc"), but it must fit the
+                // variable: out of range is an error, not a wrapped value.
+                const char* endp = p;
+                long long v = 0;
+                if (!builtinParseIntForType(VALUE_TYPE(*dst), p, &endp, &v)) {
+                    io_error = VM_IO_INVALID_NUMERIC_FORMAT;
+                    v = 0;
+                    endp = p;
+                }
                 SET_INT_VALUE(dst, v);
-                p = endp ? endp : p;
+                p = endp;
                 break;
             }
             case TYPE_FLOAT:
@@ -8730,7 +9355,7 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
                 errno = 0;
                 char* endp = NULL;
                 long double v = strtold(p, &endp);
-                if (endp == p || errno == ERANGE) { io_error = 1; v = 0.0; }
+                if (endp == p || errno == ERANGE) { io_error = VM_IO_INVALID_NUMERIC_FORMAT; v = 0.0; endp = (char*)p; }
                 SET_REAL_VALUE(dst, v);
                 p = endp ? endp : p;
                 break;
@@ -8766,13 +9391,6 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
 
             case TYPE_STRING:
             case TYPE_UNICODE_STRING: {
-                char* tmp = strdup(p);
-                if (!tmp) {
-                    runtimeError(vm, "Out of memory in Readln.");
-                    io_error = 1;
-                    break;
-                }
-                VarType dst_str_retype = (VALUE_TYPE(*dst) == TYPE_UNICODE_STRING) ? TYPE_UNICODE_STRING : TYPE_STRING;
                 // Rebind to a FRESH StringObj rather than overwriting the one
                 // already attached.
                 //
@@ -8792,29 +9410,15 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
                 // line, with no error. Allocating a new object leaves earlier
                 // copies pointing at the value they were given, which is what
                 // plain assignment already does (`s = t;` then `t = "x";`
-                // never disturbed `s`). The previous object is header-managed
-                // and only this variable's reference to it is released below
-                // (a sharer still holds its own). A string[N] variable keeps
-                // its cap: the line is truncated to it.
-                StringObj* old_str_obj = PSCAL_VALUE_PTR(*dst, StringObj);
-                int max_len = old_str_obj ? old_str_obj->max_length : -1;
-                if (max_len > 0) {
-                    char* fixed = (char*)calloc((size_t)max_len + 1, 1);
-                    if (!fixed) {
-                        free(tmp);
-                        runtimeError(vm, "Out of memory in Readln.");
-                        io_error = 1;
-                        break;
-                    }
-                    strncpy(fixed, tmp, (size_t)max_len);
-                    free(tmp);
-                    tmp = fixed;
+                // never disturbed `s`). builtinRebindStringValue releases
+                // this variable's reference to the previous object (it used
+                // to leak, one object per line read) and keeps a string[N]
+                // limit.
+                if (!builtinRebindStringValue(dst, p, strlen(p))) {
+                    runtimeError(vm, "Out of memory in Readln.");
+                    io_error = 1;
+                    break;
                 }
-                StringObj* fresh_str_obj = pscalStringObjCreate(max_len, dst_str_retype);
-                fresh_str_obj->buffer = tmp;
-                SET_VALUE_TYPE(dst, dst_str_retype);
-                pscalValueSetHeapPtrBits(dst, fresh_str_obj);
-                if (old_str_obj) pscalObjRelease(&old_str_obj->header);
                 i = arg_count; // consume the line; ignore trailing params
                 break;
             }
@@ -8827,8 +9431,8 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
         }
     }
 
+    free(line.data);
     if (!io_error && ferror(input_stream)) io_error = 1;
-    else if (io_error != 1) io_error = 0;
 
     if (input_stream == stdin) {
         vmEnableRawMode();
@@ -8898,27 +9502,11 @@ static void vmWriteUnlockStream(void *stream) {
  * at end of input. read_all_stdin() -> Text: the rest of stdin, each line
  * ending in "\n". Aether's replacements for readln (D60); both go through
  * readln's own interruptible line reader, so ^C and the iOS session stdin
- * behave the same. */
-#define VM_STDIN_LINE_MAX ((size_t)1 << 20)
-
-static bool vmReadStdinLineAlloc(VM *vm, char **out_line) {
-    char *buf = (char *)malloc(VM_STDIN_LINE_MAX);
-    *out_line = NULL;
-    if (!buf) {
-        runtimeError(vm, "read_line: out of memory.");
-        return false;
-    }
-    FILE *input_stream = stdin;
-    vmPrepareCanonicalInput();
-    bool ok = vmReadLineInterruptible(vm, input_stream, buf, VM_STDIN_LINE_MAX);
-    vmEnableRawMode();
-    vmCommitLastIoError(ok || feof(input_stream) ? 0 : 1);
-    if (!ok) {
-        free(buf);
-        return false;
-    }
-    *out_line = buf;
-    return true;
+ * behave the same. Lines have no length limit (they were split at 1 MiB). */
+static bool vmReadStdinLine(VM *vm, VmLineBuf *line) {
+    bool ok = vmReadLineInterruptible(vm, stdin, line);
+    vmCommitLastIoError(ok || feof(stdin) ? 0 : 1);
+    return ok;
 }
 
 static Value vmBuiltinReadLine(VM *vm, int arg_count, Value *args) {
@@ -8928,10 +9516,12 @@ static Value vmBuiltinReadLine(VM *vm, int arg_count, Value *args) {
         runtimeError(vm, "read_line expects no arguments.");
         return makeUnicodeString("");
     }
-    char *line = NULL;
-    if (!vmReadStdinLineAlloc(vm, &line)) return makeUnicodeString("");
-    Value v = makeUnicodeString(line);
-    free(line);
+    VmLineBuf line = {0};
+    vmPrepareCanonicalInput();
+    bool ok = vmReadStdinLine(vm, &line);
+    vmEnableRawMode();
+    Value v = ok ? makeUnicodeString(line.data) : makeUnicodeString("");
+    free(line.data);
     return v;
 }
 
@@ -8944,30 +9534,35 @@ static Value vmBuiltinReadAllStdin(VM *vm, int arg_count, Value *args) {
     }
     char *acc = NULL;
     size_t len = 0, cap = 0;
-    char *line = NULL;
-    while (vmReadStdinLineAlloc(vm, &line)) {
-        size_t n = strlen(line);
+    VmLineBuf line = {0};
+    // The terminal is set up once for the whole read, not once per line:
+    // the per-line tcsetattr/tcflush (and a 1 MiB buffer per line) made
+    // reading 500k short lines take 13 s.
+    vmPrepareCanonicalInput();
+    while (vmReadStdinLine(vm, &line)) {
+        size_t n = strlen(line.data);
         if (len + n + 2 > cap) {
             size_t ncap = cap ? cap : 4096;
             while (ncap < len + n + 2) ncap *= 2;
             char *nb = (char *)realloc(acc, ncap);
             if (!nb) {
-                free(line);
+                free(line.data);
                 free(acc);
+                vmEnableRawMode();
                 runtimeError(vm, "read_all_stdin: out of memory.");
                 return makeUnicodeString("");
             }
             acc = nb;
             cap = ncap;
         }
-        memcpy(acc + len, line, n);
+        memcpy(acc + len, line.data, n);
         len += n;
         acc[len++] = '\n';
         acc[len] = '\0';
-        free(line);
-        line = NULL;
         if (vm && (vm->abort_requested || vm->exit_requested)) break;
     }
+    vmEnableRawMode();
+    free(line.data);
     Value v = makeUnicodeStringLen(acc ? acc : "", len);
     free(acc);
     return v;
@@ -9179,6 +9774,41 @@ Value vmBuiltinRandomize(VM* vm, int arg_count, Value* args) {
     return makeVoid();
 }
 
+/* A uniformly distributed integer in [0, n), n >= 1. One rand_r draw covers
+ * RAND_MAX + 1 values; draws from the incomplete block at its top are
+ * rejected, so every result is equally likely (plain `% n` favoured the low
+ * values). For the usual small n that rejection almost never happens, so a
+ * run without Randomize still reproduces the numbers it always did. An n
+ * beyond one draw's range takes 64 bits from several draws (Random(n) could
+ * never return 2^31 or more). */
+static unsigned long long randUniformBelow(unsigned long long n) {
+    const unsigned long long draw_range = (unsigned long long)RAND_MAX + 1ULL;
+    if (n <= draw_range) {
+        unsigned long long limit = draw_range - (draw_range % n);
+        for (;;) {
+            unsigned long long r = (unsigned long long)rand_r(&rand_seed);
+            if (r < limit) {
+                return r % n;
+            }
+        }
+    }
+    int bits_per_draw = 0;
+    for (unsigned long long m = (unsigned long long)RAND_MAX; m; m >>= 1) {
+        bits_per_draw++;
+    }
+    // 2^64 mod n: draws below it belong to the incomplete top block.
+    unsigned long long threshold = (0ULL - n) % n;
+    for (;;) {
+        unsigned long long r = 0;
+        for (int bits = 0; bits < 64; bits += bits_per_draw) {
+            r = (r << bits_per_draw) | (unsigned long long)rand_r(&rand_seed);
+        }
+        if (r >= threshold) {
+            return r % n;
+        }
+    }
+}
+
 Value vmBuiltinRandom(VM* vm, int arg_count, Value* args) {
     if (arg_count == 0) {
         randEnsureSeeded();
@@ -9188,7 +9818,7 @@ Value vmBuiltinRandom(VM* vm, int arg_count, Value* args) {
         long long n = AS_INTEGER(args[0]);
         if (n <= 0) { runtimeError(vm, "Random argument must be > 0."); return makeInt(0); }
         randEnsureSeeded();
-        return makeInt(rand_r(&rand_seed) % n);
+        return pscalIntResultNarrow((long long)randUniformBelow((unsigned long long)n));
     }
     runtimeError(vm, "Random requires 0 arguments, or 1 integer argument.");
     return makeVoid();
@@ -9345,14 +9975,33 @@ Value vmBuiltinVal(VM* vm, int arg_count, Value* args) {
     }
 
     long long status;
-    if (VALUE_TYPE(*dst) == TYPE_REAL || VALUE_TYPE(*dst) == TYPE_FLOAT) {
+    if (isRealType(VALUE_TYPE(*dst))) {
+        // Every real type, Extended included (it used to take the integer
+        // branch, where SET_INT_VALUE on a real stores nothing, and still
+        // report Code 0).
         double r = 0.0;
         status = valScanReal(s, &r);
         if (status == 0) SET_REAL_VALUE(dst, r);
-    } else {
+    } else if (IS_INTLIKE(*dst)) {
         long long n = 0;
         status = valScanInt(s, &n);
-        if (status == 0) SET_INT_VALUE(dst, n);
+        if (status == 0) {
+            // The number must fit the variable: Val('99999999999', i, code)
+            // with an Integer i stored 1215752191 and Code 0. Out of range
+            // is reported one past the end, the variable left unchanged.
+            long long lo;
+            unsigned long long hi;
+            builtinIntTypeRange(VALUE_TYPE(*dst), &lo, &hi);
+            bool fits = (n < 0) ? (lo < 0 && n >= lo) : ((unsigned long long)n <= hi);
+            if (fits) {
+                SET_INT_VALUE(dst, n);
+            } else {
+                status = (long long)strlen(s) + 1;
+            }
+        }
+    } else {
+        runtimeError(vm, "Val expects a numeric variable, got %s.", varTypeToString(VALUE_TYPE(*dst)));
+        return makeVoid();
     }
     *code = makeInt(status);
     return makeVoid();
@@ -9590,6 +10239,21 @@ Value vmBuiltinDosGetfattr(VM* vm, int arg_count, Value* args) {
     return makeInt(attr);
 }
 
+/* Store a date/time component into a VAR argument. An integer variable keeps
+ * its own type: retyping each one to Word first (SET_VALUE_TYPE) dropped an
+ * Int64's heap box without freeing it and changed the variable's type. */
+static void dosStoreTimeField(Value* arg, long long value) {
+    Value* dst = (VALUE_TYPE(*arg) == TYPE_POINTER) ? (Value*)AS_POINTER(*arg) : NULL;
+    if (!dst) {
+        return;
+    }
+    if (!IS_INTLIKE(*dst)) {
+        freeValue(dst);
+        SET_VALUE_TYPE(dst, TYPE_WORD);
+    }
+    SET_INT_VALUE(dst, value);
+}
+
 Value vmBuiltinDosGetdate(VM* vm, int arg_count, Value* args) {
     if (arg_count != 4) {
         runtimeError(vm, "dosGetdate expects 4 var arguments.");
@@ -9605,14 +10269,10 @@ Value vmBuiltinDosGetdate(VM* vm, int arg_count, Value* args) {
         if (tmp) tm_info = *tmp; else memset(&tm_info, 0, sizeof(tm_info));
     }
 #endif
-    Value* year = (Value*)AS_POINTER(args[0]);
-    Value* month = (Value*)AS_POINTER(args[1]);
-    Value* day = (Value*)AS_POINTER(args[2]);
-    Value* dow = (Value*)AS_POINTER(args[3]);
-    if (year) { SET_VALUE_TYPE(year, TYPE_WORD); SET_INT_VALUE(year, tm_info.tm_year + 1900); }
-    if (month) { SET_VALUE_TYPE(month, TYPE_WORD); SET_INT_VALUE(month, tm_info.tm_mon + 1); }
-    if (day) { SET_VALUE_TYPE(day, TYPE_WORD); SET_INT_VALUE(day, tm_info.tm_mday); }
-    if (dow) { SET_VALUE_TYPE(dow, TYPE_WORD); SET_INT_VALUE(dow, tm_info.tm_wday); }
+    dosStoreTimeField(&args[0], tm_info.tm_year + 1900);
+    dosStoreTimeField(&args[1], tm_info.tm_mon + 1);
+    dosStoreTimeField(&args[2], tm_info.tm_mday);
+    dosStoreTimeField(&args[3], tm_info.tm_wday);
     return makeVoid();
 }
 
@@ -9632,14 +10292,10 @@ Value vmBuiltinDosGettime(VM* vm, int arg_count, Value* args) {
         if (tmp) tm_info = *tmp; else memset(&tm_info, 0, sizeof(tm_info));
     }
 #endif
-    Value* hour = (Value*)AS_POINTER(args[0]);
-    Value* min = (Value*)AS_POINTER(args[1]);
-    Value* sec = (Value*)AS_POINTER(args[2]);
-    Value* sec100 = (Value*)AS_POINTER(args[3]);
-    if (hour) { SET_VALUE_TYPE(hour, TYPE_WORD); SET_INT_VALUE(hour, tm_info.tm_hour); }
-    if (min) { SET_VALUE_TYPE(min, TYPE_WORD); SET_INT_VALUE(min, tm_info.tm_min); }
-    if (sec) { SET_VALUE_TYPE(sec, TYPE_WORD); SET_INT_VALUE(sec, tm_info.tm_sec); }
-    if (sec100) { SET_VALUE_TYPE(sec100, TYPE_WORD); SET_INT_VALUE(sec100, (int)(tv.tv_usec / 10000)); }
+    dosStoreTimeField(&args[0], tm_info.tm_hour);
+    dosStoreTimeField(&args[1], tm_info.tm_min);
+    dosStoreTimeField(&args[2], tm_info.tm_sec);
+    dosStoreTimeField(&args[3], (long long)(tv.tv_usec / 10000));
     return makeVoid();
 }
 
@@ -9716,19 +10372,65 @@ Value vmBuiltinMstreamloadfromfile(VM* vm, int arg_count, Value* args) {
         return makeBoolean(0);
     }
 
-    fseek(f, 0, SEEK_END);
-    int size = (int)ftell(f);
-    rewind(f);
-
-    unsigned char* buffer = malloc(size + 1); // +1 for null terminator for safety
+    // Read to end of file rather than trusting ftell for the size: on a pipe
+    // or FIFO (MStreamLoadFromFile(ms, '/dev/stdin')) ftell is -1, which made
+    // this malloc(0) and then fread SIZE_MAX bytes into it. The file size,
+    // when there is one, only sizes the first allocation. MStream sizes are
+    // ints, so a file of 2 GiB or more is refused instead of truncated.
+    size_t capacity = 64 * 1024;
+    if (fseeko(f, 0, SEEK_END) == 0) {
+        off_t end = ftello(f);
+        if (end > 0 && end < (off_t)INT_MAX) {
+            capacity = (size_t)end + 1;
+        }
+        if (fseeko(f, 0, SEEK_SET) != 0) {
+            clearerr(f);
+        }
+    } else {
+        clearerr(f);
+    }
+    unsigned char* buffer = malloc(capacity);
+    size_t size = 0;
+    bool too_large = false;
+    while (buffer) {
+        if (size + 1 >= capacity) {
+            if (capacity >= (size_t)INT_MAX) {
+                too_large = true;
+                break;
+            }
+            size_t new_capacity = capacity * 2;
+            if (new_capacity > (size_t)INT_MAX) new_capacity = (size_t)INT_MAX;
+            unsigned char* grown = realloc(buffer, new_capacity);
+            if (!grown) {
+                free(buffer);
+                buffer = NULL;
+                break;
+            }
+            buffer = grown;
+            capacity = new_capacity;
+        }
+        size_t n = fread(buffer + size, 1, capacity - size - 1, f);
+        size += n;
+        if (n == 0 || feof(f)) {
+            break;
+        }
+        if (size + 1 >= capacity) {
+            // Filled exactly: check for end of file before growing.
+            int c = fgetc(f);
+            if (c == EOF) {
+                break;
+            }
+            ungetc(c, f);
+        }
+    }
     if (!buffer) {
         fclose(f);
         runtimeError(vm, "MStreamLoadFromFile: Memory allocation error for file buffer.");
         return makeBoolean(0);
     }
-    size_t read_bytes = fread(buffer, 1, size, f);
-    if (read_bytes != size) {
-        fprintf(stderr, "MStreamLoadFromFile: short read or read error.\n");
+    if (too_large || ferror(f)) {
+        fprintf(stderr, too_large ? "MStreamLoadFromFile: file is too large (2 GiB or more).\n"
+                                  : "MStreamLoadFromFile: short read or read error.\n");
         free(buffer);
         fclose(f);
         return makeBoolean(0);
@@ -9740,8 +10442,8 @@ Value vmBuiltinMstreamloadfromfile(VM* vm, int arg_count, Value* args) {
     if (ms->buffer) free(ms->buffer);
 
     ms->buffer = buffer;
-    ms->size = size;
-    ms->capacity = size + 1; // Capacity is now exactly what's needed + null
+    ms->size = (int)size;
+    ms->capacity = (int)capacity;
 
     return makeBoolean(1);
 }
@@ -9964,6 +10666,19 @@ Value vmBuiltinStr(VM* vm, int arg_count, Value* args) {
     if (isPascalStringType(VALUE_TYPE(val))) {
         const char* src = AS_STRING(val) ? AS_STRING(val) : "";
         new_buf = strdup(src);
+    } else if (isRealType(VALUE_TYPE(val))) {
+        // The text Write gives the same real with no width (printValueToStream),
+        // sized to fit: a 64-byte buffer cut Str(1e300) to its first 63 digits,
+        // a number a factor 10^246 too small.
+        if (frontendIsAether()) {
+            char repr[64];
+            pscalFormatRealRepr((double)AS_REAL(val), repr, sizeof(repr)); /* D74 */
+            new_buf = strdup(repr);
+        } else if (VALUE_TYPE(val) == TYPE_LONG_DOUBLE) {
+            new_buf = builtinAsprintf("%Lf", AS_REAL(val));
+        } else {
+            new_buf = builtinAsprintf("%f", (double)AS_REAL(val));
+        }
     } else {
         char buffer[64];
         switch (VALUE_TYPE(val)) {
@@ -9982,8 +10697,6 @@ Value vmBuiltinStr(VM* vm, int arg_count, Value* args) {
             default:
                 if (IS_INTLIKE(val)) {
                     snprintf(buffer, sizeof(buffer), "%lld", AS_INTEGER(val));
-                } else if (isRealType(VALUE_TYPE(val))) {
-                    snprintf(buffer, sizeof(buffer), "%Lf", AS_REAL(val));
                 } else {
                     runtimeError(vm, "Str expects a numeric, char, or formatted string argument.");
                     return makeVoid();
@@ -11215,6 +11928,8 @@ Value vmBuiltinTaskCancel(VM* vm, int arg_count, Value* args) {
 // CALLING VM) straight through to vmChannelSend/Receive only so their
 // blocking wait loops can poll cancellation/interrupt state, not to
 // address the channel itself.
+#define VM_CHANNEL_MAX_CAPACITY (1LL << 24)
+
 Value vmBuiltinChannelCreate(VM* vm, int arg_count, Value* args) {
     if (!vm) {
         return makeNil();
@@ -11226,6 +11941,14 @@ Value vmBuiltinChannelCreate(VM* vm, int arg_count, Value* args) {
     long long capacity = asI64(args[0]);
     if (capacity < 1) {
         runtimeError(vm, "ChannelCreate requires capacity >= 1.");
+        return makeNil();
+    }
+    // The buffer is allocated and initialised up front, so an absurd
+    // capacity is refused here rather than exhausting memory (1e9 slots is
+    // 16 GB) or overflowing the size computation.
+    if (capacity > VM_CHANNEL_MAX_CAPACITY) {
+        runtimeError(vm, "ChannelCreate capacity %lld exceeds the maximum of %lld.",
+                     capacity, (long long)VM_CHANNEL_MAX_CAPACITY);
         return makeNil();
     }
     return makeChannel((size_t)capacity);
@@ -11794,11 +12517,15 @@ int isBuiltin(const char *name) {
 
     int result = 0;
     char canonical[MAX_SYMBOL_LENGTH];
-    if (canonicalizeBuiltinName(name, canonical, sizeof(canonical)) && ensureBuiltinTypeHashUnlocked()) {
+    // While the hash exists it holds every registered name, so a miss there
+    // is final; the linear scan (a strcasecmp per registered builtin, on
+    // every miss) is only for when the hash could not be built.
+    bool hashed = canonicalizeBuiltinName(name, canonical, sizeof(canonical)) && ensureBuiltinTypeHashUnlocked();
+    if (hashed) {
         result = lookupBuiltinTypeEntryUnlocked(canonical) != NULL;
     }
 
-    if (!result) {
+    if (!result && !hashed) {
         for (int i = 0; i < builtin_registry_count; ++i) {
             if (strcasecmp(name, builtin_registry[i].name) == 0) {
                 result = 1;
@@ -11826,14 +12553,16 @@ BuiltinRoutineType getBuiltinType(const char *name) {
 
     BuiltinRoutineType result = BUILTIN_TYPE_NONE;
     char canonical[MAX_SYMBOL_LENGTH];
-    if (canonicalizeBuiltinName(name, canonical, sizeof(canonical)) && ensureBuiltinTypeHashUnlocked()) {
+    // See isBuiltin: the linear scan only stands in for a missing hash.
+    bool hashed = canonicalizeBuiltinName(name, canonical, sizeof(canonical)) && ensureBuiltinTypeHashUnlocked();
+    if (hashed) {
         BuiltinTypeEntry *entry = lookupBuiltinTypeEntryUnlocked(canonical);
         if (entry) {
             result = entry->builtinType;
         }
     }
 
-    if (result == BUILTIN_TYPE_NONE) {
+    if (result == BUILTIN_TYPE_NONE && !hashed) {
         for (int i = 0; i < builtin_registry_count; ++i) {
             if (strcasecmp(name, builtin_registry[i].name) == 0) {
                 result = builtin_registry[i].type;

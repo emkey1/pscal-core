@@ -11,7 +11,7 @@
 // These variables are declared as 'extern' in globals.h.
 
 // I/O and type conversion globals
-int last_io_error = 0; // Stores the error code of the last I/O operation.
+PSCAL_THREAD_LOCAL int last_io_error = 0; // Error code of this thread's last I/O operation.
 int typeWarn = 1; // Flag to control type warning messages (e.g., 1 for enabled, 0 for disabled).
 
 #ifdef DEBUG

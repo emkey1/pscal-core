@@ -423,6 +423,10 @@ Value makePointer(void* address, AST* base_type_node); // <<< ADD THIS PROTOTYPE
 // long as this pointer is, even across a concurrent SetLength() on the same
 // array. See PointerObj.retained_array's comment (core/types.h).
 Value makeRetainedArrayElementPointer(void* address, AST* base_type_node, struct ArrayObj* owner);
+// Releases what a pointer keeps alive besides its target address (the array
+// it points into, a pinned string, the recorded extent): for a pointer
+// variable that is about to point somewhere else in place, e.g. new(p).
+void pscalPointerDropOwners(PointerObj *po);
 // A STRING_CHAR_PTR_SENTINEL pointer to character `index` (a byte offset, or
 // a code point index when `index_is_codepoint`) of the string in
 // `*string_val`, at raw `address`. Retains and pins the string's StringObj

@@ -88,7 +88,10 @@ extern char **gParamValues;
 extern bool gParamValuesOwned;
 // extern AST *globalRoot; // Defined in main.c typically
 
-extern int last_io_error;
+// Per thread, like Free Pascal's InOutRes: Write/BlockRead/BlockWrite set
+// it without a lock, so as a process global one thread's I/O clobbered
+// another thread's IOResult.
+extern PSCAL_THREAD_LOCAL int last_io_error;
 extern int typeWarn;
 
 #ifdef DEBUG

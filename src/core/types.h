@@ -450,6 +450,11 @@ typedef struct PointerObj {
     struct StringObj *retained_string;
     size_t string_index;
     bool string_index_is_codepoint;
+    // For a BYTE_ARRAY_PTR_SENTINEL pointer (the address of an element of a
+    // packed byte array, `buf[0]`): the number of bytes from `address` to the
+    // end of that array, so BlockRead/BlockWrite through the pointer cannot
+    // run past it. 0 = not recorded.
+    size_t extent;
 } PointerObj;
 
 // VM 2.0 Phase 4i checkpoint 3a (Docs/pscal_vm2_plan.md sec 5.10.3/
