@@ -1479,7 +1479,9 @@ static int getCursorPosition(int *row, int *col);
 static _Thread_local unsigned char gReadKeyBuf[64];
 static _Thread_local int gReadKeyBufStart = 0;
 static _Thread_local int gReadKeyBufCount = 0;
+#if defined(PSCAL_TARGET_IOS)
 static _Thread_local bool gReadKeyPendingCaretControl = false;
+#endif
 
 static bool readKeyBufHasData(void) {
     return gReadKeyBufCount > 0;
@@ -1502,6 +1504,30 @@ static void readKeyBufPush(unsigned char byte) {
     int tail = (gReadKeyBufStart + gReadKeyBufCount) % (int)sizeof(gReadKeyBuf);
     gReadKeyBuf[tail] = byte;
     gReadKeyBufCount++;
+}
+
+/* Is the escape sequence captured so far complete? CSI (ESC [ ... final
+ * byte 0x40-0x7E, with the Linux console's ESC [ [ x function keys), SS3
+ * (ESC O x) and Alt+key (ESC x) all end at a known byte, so ReadKey can stop
+ * there instead of waiting out its timeout after every arrow key. */
+static bool readKeySeqComplete(const unsigned char *seq, size_t len) {
+    if (len < 2) {
+        return false;
+    }
+    if (seq[1] == '[') {
+        if (len < 3) {
+            return false;
+        }
+        if (len == 3 && seq[2] == '[') {
+            return false;
+        }
+        unsigned char last = seq[len - 1];
+        return last >= 0x40 && last <= 0x7E;
+    }
+    if (seq[1] == 'O') {
+        return len >= 3;
+    }
+    return true;
 }
 
 // Fetch a console byte, skipping any stray DSR responses (ESC [ row ; col R)
@@ -1538,9 +1564,12 @@ static int readKeyFetchConsoleByte(void) {
             }
         }
 
-        const int max_polls = 10;
-        int polls = 0;
-        while (seq_len < sizeof(seq)) {
+        /* Wait at most this long for the rest of a sequence; a lone ESC
+         * key press costs this much. A complete sequence ends the wait at
+         * once (it used to wait 200 ms after every arrow key too). */
+        const int max_wait_ms = 100;
+        int waited_ms = 0;
+        while (seq_len < sizeof(seq) && !readKeySeqComplete(seq, seq_len)) {
             unsigned char b = 0;
 #if defined(PSCAL_TARGET_IOS)
             ssize_t m = vprocReadShim(STDIN_FILENO, &b, 1);
@@ -1549,15 +1578,12 @@ static int readKeyFetchConsoleByte(void) {
 #endif
             if (m == 1) {
                 seq[seq_len++] = b;
-                if (b == 'R') {
-                    break; /* likely end of DSR */
-                }
                 continue;
             }
-            if (m < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && polls < max_polls) {
+            if (m < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && waited_ms < max_wait_ms) {
                 struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN, .revents = 0 };
-                (void)poll(&pfd, 1, 20);
-                polls++;
+                (void)poll(&pfd, 1, 10);
+                waited_ms += 10;
                 continue;
             }
             break;
@@ -1600,21 +1626,23 @@ static int readKeyFetchConsoleByte(void) {
             }
         }
 
+        /* The FIFO is empty here (this function only reads the console once
+         * it is), so the bytes go back in in their arrival order. They used to
+         * be pushed last-first, which made Up-arrow (ESC [ A) read back as
+         * 'A', '[', ESC. */
         if (is_dsr) {
             /* Discard the DSR sequence and continue. Preserve any trailing bytes after R. */
-            if (seq_len > r_pos + 1) {
-                for (ssize_t i = (ssize_t)seq_len - 1; i > (ssize_t)r_pos; --i) {
-                    readKeyBufPush(seq[(size_t)i]);
-                }
+            for (size_t i = r_pos + 1; i < seq_len; ++i) {
+                readKeyBufPush(seq[i]);
             }
             continue;
         }
 
-        /* Not a DSR; push the captured sequence back (in reverse) and return first byte. */
-        for (ssize_t i = (ssize_t)seq_len - 1; i >= 0; --i) {
-            readKeyBufPush(seq[(size_t)i]);
+        /* Not a DSR: hand back the first byte, queue the rest. */
+        for (size_t i = 1; i < seq_len; ++i) {
+            readKeyBufPush(seq[i]);
         }
-        return readKeyBufPop();
+        return seq[0];
     }
 }
 
@@ -5532,7 +5560,9 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, char *buffer, size_t b
 #endif
         int sigint_fd = g_vm_sigint_pipe[0];
         bool saw_newline = false;
+#if defined(PSCAL_TARGET_IOS)
         bool pending_caret_control = false;
+#endif
         while (len < buffer_sz - 1) {
 #if defined(PSCAL_TARGET_IOS)
             /* If a frontend thread was hard-stopped while blocked in select/poll,
@@ -5844,6 +5874,12 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, char *buffer, size_t b
                 fprintf(stderr, "[readln] byte direct ch=0x%02x len=%zu\n",
                         (unsigned int)(unsigned char)ch, len);
             }
+#if defined(PSCAL_TARGET_IOS)
+            /* Caret notation ("^C", "^Z" as two characters) stands for a
+             * control key only in the iOS app's session input. On a real
+             * terminal Ctrl-C arrives as 0x03 or SIGINT, and a "^c" the user
+             * typed is text: treating it as Ctrl-C aborted `readln` on input
+             * like "^cat". */
             if (pending_caret_control) {
                 pending_caret_control = false;
                 if (ch == 'C' || ch == 'c') {
@@ -5855,31 +5891,19 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, char *buffer, size_t b
                     return false;
                 }
                 if (ch == 'Z' || ch == 'z') {
-#if defined(PSCAL_TARGET_IOS)
                     if (vmHandleCtrlZReadRequest(vm, buffer)) {
                         len = 0;
                         continue;
                     }
-#else
-                    if (vm) {
-                        vm->abort_requested = false;
-                        vm->exit_requested = true;
-                        vm->suspend_unwind_requested = true;
-                    }
-                    shellRuntimeSetLastStatus(128 + SIGTSTP);
-                    buffer[0] = '\0';
-#endif
                     return false;
                 }
                 buffer[len++] = '^';
-                if (len >= buffer_sz - 1) {
-                    break;
-                }
             }
             if (ch == '^') {
                 pending_caret_control = true;
                 continue;
             }
+#endif
             if (ch == 0x03) { // Ctrl-C
                 if (vm) {
                     vm->abort_requested = true;
@@ -6376,6 +6400,10 @@ Value vmBuiltinReadkey(VM* vm, int arg_count, Value* args) {
             continue;
         }
 
+#if defined(PSCAL_TARGET_IOS)
+        /* Caret notation ("^C" typed as two characters) means a control key
+         * only in the iOS app's session input; on a terminal "^" is a key
+         * like any other, and the "c" after it aborted the program. */
         if (gReadKeyPendingCaretControl) {
             gReadKeyPendingCaretControl = false;
             if (c == 'C' || c == 'c') {
@@ -6388,7 +6416,6 @@ Value vmBuiltinReadkey(VM* vm, int arg_count, Value* args) {
                 c = 0;
                 break;
             }
-#if defined(PSCAL_TARGET_IOS)
             if (c == 'Z' || c == 'z') {
                 char scratch[1] = {'\0'};
                 if (vmHandleCtrlZReadRequest(vm, scratch)) {
@@ -6397,24 +6424,13 @@ Value vmBuiltinReadkey(VM* vm, int arg_count, Value* args) {
                 c = 0;
                 break;
             }
-#else
-            if (c == 'Z' || c == 'z') {
-                if (vm) {
-                    vm->abort_requested = false;
-                    vm->exit_requested = true;
-                    vm->suspend_unwind_requested = true;
-                }
-                shellRuntimeSetLastStatus(128 + SIGTSTP);
-                c = 0;
-                break;
-            }
-#endif
         }
 
         if (c == '^') {
             gReadKeyPendingCaretControl = true;
             break;
         }
+#endif
         if (c == 0x03) { // Ctrl-C
             if (vm) {
                 vm->abort_requested = false;
