@@ -226,6 +226,12 @@ int addConstantToChunk(BytecodeChunk* chunk, const Value* value); // Add a value
 void disassembleBytecodeChunk(BytecodeChunk* chunk, const char* name, HashTable* procedureTable);
 const char* bytecodeDisplayNameForPath(const char* path);
 int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedureTable);
+// True for the fake base_type_node markers (OWNED_POINTER_SENTINEL and the
+// string_sentinels.h set) that tag a pointer whose target is not a typed
+// Value reached through a real type AST: a character, a byte, a length
+// query, a shell function or an opaque address. Of these only an
+// OWNED_POINTER_SENTINEL address is itself a Value.
+bool isPointerSentinel(const struct AST* base);
 void emitShort(BytecodeChunk* chunk, uint16_t value, int line);
 void emitInt32(BytecodeChunk* chunk, uint32_t value, int line);
 void patchShort(BytecodeChunk* chunk, int offset_in_code, uint16_t value);

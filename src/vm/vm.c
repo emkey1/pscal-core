@@ -1464,6 +1464,13 @@ static VarType vmResolveArrayElementType(AST* arrayType) {
     return elem ? elem->var_type : TYPE_UNKNOWN;
 }
 
+// True when a pointer's target is a character, byte, length query or opaque
+// address rather than a Value that can be indexed or dereferenced as one.
+static bool vmPointerTargetIsNotValue(const Value* pointer) {
+    AST* base = PTR_BASE_TYPE_NODE(*pointer);
+    return isPointerSentinel(base) && base != OWNED_POINTER_SENTINEL;
+}
+
 static Value makeOwnedString(char* data, size_t len) {
     Value v;
     memset(&v, 0, sizeof(Value));
@@ -9407,6 +9414,14 @@ comparison_error_label:
                 // depend on stack offsets.
                 Value operand = pop(vm);
 
+                // A character/byte/opaque address is not a Value: reading
+                // it as one (below) would run off its buffer (`s[2][1]`).
+                if (VALUE_TYPE(operand) == TYPE_POINTER && vmPointerTargetIsNotValue(&operand)) {
+                    runtimeError(vm, "VM Error: Cannot index through a character, byte or opaque address.");
+                    freeValue(&operand);
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+
                 // Special handling for strings when there is exactly one
                 // index.  We avoid referencing stackTop-2 by working with the
                 // popped operand directly and reusing it if it represents a
@@ -9471,7 +9486,14 @@ comparison_error_label:
 
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* candidate = (Value*)AS_POINTER(operand);
-                    if (candidate && VALUE_TYPE(*candidate) == TYPE_ARRAY) {
+                    if (!candidate || vmValueIsDisposed(candidate)) {
+                        runtimeError(vm, candidate ? "VM Error: Array access through a dangling pointer (its target was disposed)."
+                                                   : "VM Error: Array access through a nil pointer.");
+                        free(indices);
+                        freeValue(&operand);
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    if (VALUE_TYPE(*candidate) == TYPE_ARRAY) {
                         // VM 2.0 follow-up to dynamic_array_fresh_publish_race
                         // (pscal-core f65432e): `candidate` here can alias a
                         // shared global's live Value cell. This opcode always
@@ -9730,6 +9752,13 @@ comparison_error_label:
                 uint32_t flat_offset = READ_UINT32(vm);
                 Value operand = pop(vm);
 
+                // See GET_ELEMENT_ADDRESS: such an address is not a Value.
+                if (VALUE_TYPE(operand) == TYPE_POINTER && vmPointerTargetIsNotValue(&operand)) {
+                    runtimeError(vm, "VM Error: Cannot index through a character, byte or opaque address.");
+                    freeValue(&operand);
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* base_val = (Value*)AS_POINTER(operand);
                     if (base_val && isPascalStringType(VALUE_TYPE(*base_val))) {
@@ -9773,7 +9802,13 @@ comparison_error_label:
 
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* candidate = (Value*)AS_POINTER(operand);
-                    if (candidate && VALUE_TYPE(*candidate) == TYPE_ARRAY) {
+                    if (!candidate || vmValueIsDisposed(candidate)) {
+                        runtimeError(vm, candidate ? "VM Error: Array access through a dangling pointer (its target was disposed)."
+                                                   : "VM Error: Array access through a nil pointer.");
+                        freeValue(&operand);
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    if (VALUE_TYPE(*candidate) == TYPE_ARRAY) {
                         // VM 2.0 follow-up to dynamic_array_fresh_publish_race
                         // (pscal-core f65432e): see the matching comment in
                         // GET_ELEMENT_ADDRESS -- same hazard, same fix.
@@ -9934,6 +9969,13 @@ comparison_error_label:
 
                 Value operand = pop(vm);
 
+                // See GET_ELEMENT_ADDRESS: such an address is not a Value.
+                if (VALUE_TYPE(operand) == TYPE_POINTER && vmPointerTargetIsNotValue(&operand)) {
+                    runtimeError(vm, "VM Error: Cannot index through a character, byte or opaque address.");
+                    freeValue(&operand);
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+
                 if (dimension_count == 1 && VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* base_val = (Value*)AS_POINTER(operand);
                     if (base_val && isPascalStringType(VALUE_TYPE(*base_val))) {
@@ -10003,7 +10045,14 @@ comparison_error_label:
 
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* candidate = (Value*)AS_POINTER(operand);
-                    if (candidate && VALUE_TYPE(*candidate) == TYPE_ARRAY) {
+                    if (!candidate || vmValueIsDisposed(candidate)) {
+                        runtimeError(vm, candidate ? "VM Error: Array access through a dangling pointer (its target was disposed)."
+                                                   : "VM Error: Array access through a nil pointer.");
+                        free(indices);
+                        freeValue(&operand);
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    if (VALUE_TYPE(*candidate) == TYPE_ARRAY) {
                         // Checking ARRAY_IS_DYNAMIC(*candidate) here first,
                         // before any lock, would itself race a concurrent
                         // SetLength publish (dynamic_array_fresh_publish_race
@@ -10189,6 +10238,13 @@ comparison_error_label:
 
                 Value operand = pop(vm);
 
+                // See GET_ELEMENT_ADDRESS: such an address is not a Value.
+                if (VALUE_TYPE(operand) == TYPE_POINTER && vmPointerTargetIsNotValue(&operand)) {
+                    runtimeError(vm, "VM Error: Cannot index through a character, byte or opaque address.");
+                    freeValue(&operand);
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* base_val = (Value*)AS_POINTER(operand);
                     if (base_val && isPascalStringType(VALUE_TYPE(*base_val))) {
@@ -10222,7 +10278,13 @@ comparison_error_label:
 
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* candidate = (Value*)AS_POINTER(operand);
-                    if (candidate && VALUE_TYPE(*candidate) == TYPE_ARRAY) {
+                    if (!candidate || vmValueIsDisposed(candidate)) {
+                        runtimeError(vm, candidate ? "VM Error: Array access through a dangling pointer (its target was disposed)."
+                                                   : "VM Error: Array access through a nil pointer.");
+                        freeValue(&operand);
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    if (VALUE_TYPE(*candidate) == TYPE_ARRAY) {
                         // Checking ARRAY_IS_DYNAMIC(*candidate) here first,
                         // before any lock, would itself race a concurrent
                         // SetLength publish (dynamic_array_fresh_publish_race
