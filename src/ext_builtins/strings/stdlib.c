@@ -431,6 +431,26 @@ static Value stdCharClassTest(struct VM_s *vm, int arg_count, Value *args,
     return makeBoolean(1);
 }
 
+/* same(a, b): record identity (D24). `==` on records compares their fields
+ * under Aether; `same` answers whether a and b are the one record. nil is the
+ * same as nil and as nothing else. */
+static Value vmBuiltinStdSame(struct VM_s *vm, int arg_count, Value *args) {
+    if (arg_count != 2) {
+        runtimeError(vm, "same expects 2 arguments.");
+        return makeBoolean(false);
+    }
+    VarType ta = VALUE_TYPE(args[0]), tb = VALUE_TYPE(args[1]);
+    bool aRef = (ta == TYPE_POINTER || ta == TYPE_NIL);
+    bool bRef = (tb == TYPE_POINTER || tb == TYPE_NIL);
+    if (!aRef || !bRef) {
+        runtimeError(vm, "same expects two records.");
+        return makeBoolean(false);
+    }
+    const void *pa = (ta == TYPE_POINTER) ? (const void *)AS_POINTER(args[0]) : NULL;
+    const void *pb = (tb == TYPE_POINTER) ? (const void *)AS_POINTER(args[1]) : NULL;
+    return makeBoolean(pa == pb);
+}
+
 static Value vmBuiltinStdIsDigit(struct VM_s *vm, int arg_count, Value *args) {
     return stdCharClassTest(vm, arg_count, args, "is_digit", STD_CC_DIGIT);
 }
@@ -1477,4 +1497,6 @@ void registerStdlibBuiltins(void) {
     registerVmBuiltin("aether_mstream_append_text", vmBuiltinStdMStreamAppendText, BUILTIN_TYPE_PROCEDURE, NULL, FX_PURE);
     registerVmBuiltin("aether_mstream_length", vmBuiltinStdMStreamLength, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
     registerVmBuiltin("aether_mstream_load", vmBuiltinStdMStreamLoad, BUILTIN_TYPE_FUNCTION, NULL, FX_IO);
+    /* Record identity (D24); appended last so no earlier builtin id moves. */
+    registerVmBuiltin("aether_same", vmBuiltinStdSame, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
 }

@@ -50,7 +50,53 @@
  * an element pair has no defined equality (the caller then reports exactly what
  * it would for those scalars on their own). */
 int calculateArrayTotalSize(const Value* array_val);
-static int pscalValuesDeepEqual(const Value *a, const Value *b);
+static int pscalValuesDeepEqualD(const Value *a, const Value *b, int depth);
+
+/* ---- Aether record equality (D24) -------------------------------------------
+ * Under Aether, `==` / `<>` on two records (and tuples, which are records)
+ * compares them field by field, recursing into nested records and arrays; the
+ * identity comparison is the `same(a, b)` builtin. Records are pointers to a
+ * TYPE_RECORD value, so this replaces the pointer-identity compare for two
+ * non-nil record pointers. The front end rejects `==` on a self-referential
+ * record type (REC-001), so the value graph compared here is acyclic; the depth
+ * cap is a backstop that reports "no defined equality" (-1) rather than
+ * recursing without end. Other front ends keep pointer identity. */
+#define PSCAL_DEEP_EQUAL_MAX_DEPTH 512
+
+static int pscalRecordFieldsDeepEqual(const FieldValue *fa, const FieldValue *fb, int depth) {
+    while (fa && fb) {
+        /* Compiler-owned fields (the hidden __vtable) are not data. */
+        bool hiddenA = fa->name && fa->name[0] == '_' && fa->name[1] == '_';
+        bool hiddenB = fb->name && fb->name[0] == '_' && fb->name[1] == '_';
+        if (hiddenA != hiddenB) return 0;
+        if (!hiddenA) {
+            if (fa->name && fb->name && strcasecmp(fa->name, fb->name) != 0) return 0;
+            const Value *va = fieldValueStorageConst(fa);
+            const Value *vb = fieldValueStorageConst(fb);
+            if (!va || !vb) {
+                if (va != vb) return 0;
+            } else {
+                int r = pscalValuesDeepEqualD(va, vb, depth);
+                if (r != 1) return r;
+            }
+        }
+        fa = fa->next;
+        fb = fb->next;
+    }
+    return (fa == NULL && fb == NULL) ? 1 : 0;
+}
+
+/* Two record pointers under Aether: identical, both nil, or field-wise equal. */
+static int pscalRecordPointersDeepEqual(const Value *a, const Value *b, int depth) {
+    Value *pa = AS_POINTER(*a);
+    Value *pb = AS_POINTER(*b);
+    if (pa == pb) return 1;
+    if (!pa || !pb) return 0;
+    if (depth > PSCAL_DEEP_EQUAL_MAX_DEPTH) return -1;
+    if (VALUE_TYPE(*pa) == TYPE_RECORD && VALUE_TYPE(*pb) == TYPE_RECORD)
+        return pscalRecordFieldsDeepEqual(AS_RECORD(*pa), AS_RECORD(*pb), depth + 1);
+    return 0;
+}
 
 static const char *pscalTextForCompare(const Value *v, char *buf /* >= 5 bytes */) {
     if (IS_STRING(*v)) {
@@ -65,7 +111,7 @@ static const char *pscalTextForCompare(const Value *v, char *buf /* >= 5 bytes *
     return buf;
 }
 
-static int pscalArraysDeepEqual(const Value *a, const Value *b) {
+static int pscalArraysDeepEqualD(const Value *a, const Value *b, int depth) {
     ArrayObj *pa = PSCAL_VALUE_PTR(*a, ArrayObj);
     ArrayObj *pb = PSCAL_VALUE_PTR(*b, ArrayObj);
     if (pa == pb) return 1;
@@ -102,15 +148,20 @@ static int pscalArraysDeepEqual(const Value *a, const Value *b) {
     }
     if (!pa->elements || !pb->elements) return (pa->elements == pb->elements) ? 1 : 0;
     for (int i = 0; i < total; i++) {
-        int r = pscalValuesDeepEqual(&pa->elements[i], &pb->elements[i]);
+        int r = pscalValuesDeepEqualD(&pa->elements[i], &pb->elements[i], depth + 1);
         if (r != 1) return r;
     }
     return 1;
 }
 
-static int pscalValuesDeepEqual(const Value *a, const Value *b) {
+static int pscalArraysDeepEqual(const Value *a, const Value *b) {
+    return pscalArraysDeepEqualD(a, b, 0);
+}
+
+static int pscalValuesDeepEqualD(const Value *a, const Value *b, int depth) {
     VarType ta = VALUE_TYPE(*a), tb = VALUE_TYPE(*b);
-    if (ta == TYPE_ARRAY && tb == TYPE_ARRAY) return pscalArraysDeepEqual(a, b);
+    if (depth > PSCAL_DEEP_EQUAL_MAX_DEPTH) return -1;
+    if (ta == TYPE_ARRAY && tb == TYPE_ARRAY) return pscalArraysDeepEqualD(a, b, depth);
     if (ta == TYPE_NIL && tb == TYPE_NIL) return 1;
     if (ta == TYPE_NIL || tb == TYPE_NIL) {
         const Value *other = (ta == TYPE_NIL) ? b : a;
@@ -126,7 +177,12 @@ static int pscalValuesDeepEqual(const Value *a, const Value *b) {
         char abuf[5] = {0}, bbuf[5] = {0};
         return strcmp(pscalTextForCompare(a, abuf), pscalTextForCompare(b, bbuf)) == 0 ? 1 : 0;
     }
-    if (ta == TYPE_POINTER && tb == TYPE_POINTER) return AS_POINTER(*a) == AS_POINTER(*b) ? 1 : 0;
+    if (ta == TYPE_POINTER && tb == TYPE_POINTER) {
+        if (frontendIsAether()) return pscalRecordPointersDeepEqual(a, b, depth);
+        return AS_POINTER(*a) == AS_POINTER(*b) ? 1 : 0;
+    }
+    if (ta == TYPE_RECORD && tb == TYPE_RECORD && frontendIsAether())
+        return pscalRecordFieldsDeepEqual(AS_RECORD(*a), AS_RECORD(*b), depth + 1);
     if (ta == TYPE_MEMORYSTREAM && tb == TYPE_MEMORYSTREAM) return AS_MSTREAM(*a) == AS_MSTREAM(*b) ? 1 : 0;
     return -1;
 }
@@ -8653,6 +8709,11 @@ dispatch_switch:
                         ptrs_equal = (AS_POINTER(b_val) == NULL);
                     } else if (VALUE_TYPE(a_val) == TYPE_POINTER && VALUE_TYPE(b_val) == TYPE_NIL) {
                         ptrs_equal = (AS_POINTER(a_val) == NULL);
+                    } else if (frontendIsAether()) {
+                        /* D24: records compare field by field under Aether. */
+                        int eq = pscalRecordPointersDeepEqual(&a_val, &b_val, 0);
+                        if (eq < 0) goto comparison_error_label;
+                        ptrs_equal = (eq == 1);
                     } else {
                         ptrs_equal = (AS_POINTER(a_val) == AS_POINTER(b_val));
                     }
