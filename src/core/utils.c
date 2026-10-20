@@ -2408,7 +2408,8 @@ Value makeArrayND(int dimensions, int *lower_bounds, int *upper_bounds, VarType 
     for (int i = 0; i < dimensions; i++) {
         arr->lower_bounds[i] = lower_bounds[i];
         arr->upper_bounds[i] = upper_bounds[i];
-        int size_i = (upper_bounds[i] - lower_bounds[i] + 1);
+        // In 64 bits: bounds like -2^31..2^31-1 overflow an int span.
+        long long size_i = (long long)upper_bounds[i] - (long long)lower_bounds[i] + 1;
         if (size_i <= 0) {
             fprintf(stderr, "Error: Invalid array dimension size (%d..%d) in makeArrayND.\n", lower_bounds[i], upper_bounds[i]);
             EXIT_FAILURE_HANDLER();
