@@ -17,7 +17,10 @@ static Value vmBuiltinFactorial(struct VM_s* vm, int arg_count, Value* args) {
     }
     long long result = 1;
     for (long long i = 2; i <= n; ++i) {
-        result *= i;
+        if (__builtin_mul_overflow(result, i, &result)) { // from 21!
+            runtimeError(vm, "Runtime Error: Integer overflow.");
+            return makeInt(-1);
+        }
     }
     return pscalIntResultLike1(args[0], result);
 }

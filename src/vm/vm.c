@@ -8113,7 +8113,15 @@ dispatch_switch:
             case NEGATE: {
                 Value val_popped = FAST_POP();
                 Value result_val;
-                if (IS_INTEGER(val_popped)) result_val = pscalIntResultLike1(val_popped, -AS_INTEGER(val_popped));
+                if (IS_INTEGER(val_popped)) {
+                    long long iv = AS_INTEGER(val_popped);
+                    if (iv == LLONG_MIN && VALUE_TYPE(val_popped) != TYPE_UINT64) {
+                        runtimeError(vm, "Runtime Error: Integer overflow.");
+                        freeValue(&val_popped);
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    result_val = pscalIntResultLike1(val_popped, (long long)(0ULL - (unsigned long long)iv));
+                }
                 else if (IS_REAL(val_popped)) {
                     if (VALUE_TYPE(val_popped) == TYPE_LONG_DOUBLE) result_val = makeLongDouble(-AS_REAL(val_popped));
                     else result_val = makeReal(-AS_REAL(val_popped));

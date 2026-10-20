@@ -2666,7 +2666,12 @@ Value vmBuiltinSqr(VM* vm, int arg_count, Value* args) {
     Value arg = args[0];
     if (IS_INTLIKE(arg)) {
         long long v = AS_INTEGER(arg);
-        return pscalIntResultLike1(arg, v * v);
+        long long r;
+        if (__builtin_mul_overflow(v, v, &r)) {
+            runtimeError(vm, "Runtime Error: Integer overflow.");
+            return makeInt(0);
+        }
+        return pscalIntResultLike1(arg, r);
     } else if (isRealType(VALUE_TYPE(arg))) {
         long double v = AS_REAL(arg);
         return makeReal(v * v);
@@ -10049,7 +10054,15 @@ Value vmBuiltinSizeof(VM* vm, int arg_count, Value* args) {
 
 Value vmBuiltinAbs(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1) { runtimeError(vm, "abs expects 1 argument."); return makeInt(0); }
-    if (IS_INTLIKE(args[0])) return pscalIntResultLike1(args[0], llabs(AS_INTEGER(args[0])));
+    if (IS_INTLIKE(args[0])) {
+        long long v = AS_INTEGER(args[0]);
+        if (v >= 0 || VALUE_TYPE(args[0]) == TYPE_UINT64) return pscalIntResultLike1(args[0], v);
+        if (v == LLONG_MIN) { // -v does not fit; llabs() is undefined here and wrapped
+            runtimeError(vm, "Runtime Error: Integer overflow.");
+            return makeInt(0);
+        }
+        return pscalIntResultLike1(args[0], -v);
+    }
     if (isRealType(VALUE_TYPE(args[0]))) return makeReal(fabsl(AS_REAL(args[0])));
     runtimeError(vm, "abs expects a numeric argument.");
     return makeInt(0);

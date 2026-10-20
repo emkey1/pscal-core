@@ -677,7 +677,7 @@ static Value vmBuiltinStdSum(struct VM_s *vm, int arg_count, Value *args) {
     if (!stdArrayView(vm, "sum", arr, &elems, &n)) return makeInt64(0);
     ArrayObj *a = PSCAL_VALUE_PTR(*arr, ArrayObj);
     bool real = a && isRealType(a->element_type);
-    unsigned long long isum = 0;
+    long long isum = 0;
     long double rsum = 0.0L;
     for (int i = 0; i < n; i++) {
         StdKind k = stdKind(&elems[i]);
@@ -689,11 +689,15 @@ static Value vmBuiltinStdSum(struct VM_s *vm, int arg_count, Value *args) {
         }
     }
     for (int i = 0; i < n; i++) {
-        if (real) rsum += asLd(elems[i]);
-        else isum += (unsigned long long)asI64(elems[i]);
+        if (real) {
+            rsum += asLd(elems[i]);
+        } else if (__builtin_add_overflow(isum, asI64(elems[i]), &isum)) {
+            runtimeError(vm, "Runtime Error: Integer overflow."); // as `+` reports it
+            return makeInt64(0);
+        }
     }
     if (real) return makeReal((double)rsum);
-    return makeInt64((long long)isum);
+    return makeInt64(isum);
 }
 
 static Value stdExtreme(VM *vm, int arg_count, Value *args, bool wantMax, const char *who) {

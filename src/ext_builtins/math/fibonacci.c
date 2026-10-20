@@ -46,6 +46,13 @@ static Value vmBuiltinFibonacci(struct VM_s* vm, int arg_count, Value* args) {
     if (n == 0) {
         return makeInt(0);
     }
+    // F(92) = 7540113804746346429 is the last one that fits 64 bits. Up to
+    // there no matrix entry (at most F(n)) or partial sum overflows; past it
+    // the products wrapped silently (fibonacci(100) = 3736710778780434371).
+    if (n > 92) {
+        runtimeError(vm, "Runtime Error: Integer overflow.");
+        return makeInt(-1);
+    }
 
     long long F[2][2] = {{1, 1}, {1, 0}};
     power(F, n - 1);
