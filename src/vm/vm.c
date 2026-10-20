@@ -9341,11 +9341,15 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
 #if !defined(PSCAL_TARGET_IOS)
         // Both consumers below are no-ops unless a signal flag or one of
         // these VM flags is set, so test those inline first: this check runs
-        // before every instruction.
+        // before every instruction. A task's cancel/kill arrives as its VM's
+        // abort_requested (vmThreadRequestStop); a pause has no such flag,
+        // so its slot's `paused` is tested here too.
         if (pscalRuntimeSignalAttention() ||
             vm->abort_requested || vm->exit_requested ||
             (vm->threadOwner && (vm->threadOwner->abort_requested ||
-                                 vm->threadOwner->exit_requested)))
+                                 vm->threadOwner->exit_requested)) ||
+            (vm->owningThread &&
+             atomic_load_explicit(&vm->owningThread->paused, memory_order_relaxed)))
 #endif
         {
             if (vmConsumeSuspendRequest(vm)) {
