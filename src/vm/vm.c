@@ -1420,8 +1420,43 @@ static bool adjustLocalByDelta(VM* vm, Value* slot, long long delta, const char*
     return false;
 }
 
+// True for the types whose whole payload lives in Value.bits (no heap data).
+static inline bool vmTypeIsInlineScalar(VarType type) {
+    switch (type) {
+        case TYPE_VOID:
+        case TYPE_INT32:
+        case TYPE_DOUBLE:
+        case TYPE_BOOLEAN:
+        case TYPE_CHAR:
+        case TYPE_BYTE:
+        case TYPE_WORD:
+        case TYPE_INT8:
+        case TYPE_UINT8:
+        case TYPE_INT16:
+        case TYPE_UINT16:
+        case TYPE_UINT32:
+        case TYPE_INT64:
+        case TYPE_UINT64:
+        case TYPE_FLOAT:
+        case TYPE_NIL:
+            return true;
+        default:
+            return false;
+    }
+}
+
 static void replaceValueCell(Value* target, Value replacement, AST* preserved_base_type) {
     if (!target) {
+        return;
+    }
+
+    // Same inline scalar type in and out (an Integer variable taking an
+    // Integer): only `bits` changes, and one aligned 64-bit store cannot be
+    // seen torn, so skip both global locks. Every local store goes through
+    // here, and with worker threads those locks serialised the program.
+    if (VALUE_TYPE(*target) == VALUE_TYPE(replacement) &&
+        vmTypeIsInlineScalar(VALUE_TYPE(replacement))) {
+        __atomic_store_n(&target->bits, replacement.bits, __ATOMIC_RELAXED);
         return;
     }
 
@@ -4665,38 +4700,13 @@ void runtimeError(VM* vm, const char* format, ...) {
     // ... (rest of runtimeError function, calls EXIT_FAILURE_HANDLER()) ...
 }
 
-static Value copyValueForStack(const Value* src) {
+// The body of copyValueForStack without the lock, for sources no other
+// thread can replace while we read them: the chunk's constant pool (never
+// written after load) and this VM's own operand stack (DUP).
+static Value copyValueForStackUnlocked(const Value* src) {
     if (!src) {
         return makeNil();
     }
-
-    // Scalars own no heap data, so they need no lock: read the cell once
-    // and decide on that snapshot. Re-reading *src after the type test could
-    // pair a scalar type with a racing writer's heap pointer, which would
-    // then escape unretained. A torn snapshot whose type is a scalar is at
-    // worst a wrong number in a program that races on the variable.
-    Value snapshot = *src;
-    switch (VALUE_TYPE(snapshot)) {
-        case TYPE_VOID:
-        case TYPE_INT32:
-        case TYPE_DOUBLE:
-        case TYPE_BOOLEAN:
-        case TYPE_CHAR:
-        case TYPE_BYTE:
-        case TYPE_WORD:
-        case TYPE_INT8:
-        case TYPE_UINT8:
-        case TYPE_INT16:
-        case TYPE_UINT16:
-        case TYPE_UINT32:
-        case TYPE_FLOAT:
-        case TYPE_NIL:
-            return snapshot;
-        default:
-            break;
-    }
-
-    pthread_mutex_lock(&value_cell_mutex);
 
     switch (VALUE_TYPE(*src)) {
         case TYPE_VOID:
@@ -4711,26 +4721,17 @@ static Value copyValueForStack(const Value* src) {
         case TYPE_INT16:
         case TYPE_UINT16:
         case TYPE_UINT32:
+        case TYPE_INT64:
+        case TYPE_UINT64:
         case TYPE_FLOAT:
         case TYPE_NIL:
-        {
-            Value copy = *src;
-            pthread_mutex_unlock(&value_cell_mutex);
-            return copy;
-        }
-        // VM 2.0 Phase 4i checkpoint 3c: TYPE_INT64/TYPE_UINT64/
-        // TYPE_LONG_DOUBLE used to belong in the bare-bitwise-copy group
-        // above (fully inline data, no heap ownership) -- WRONG now that
-        // each owns an Int64Box/LongDoubleBox: a bitwise `Value copy =
-        // *src;` aliases the SAME box as `*src` with no retain, and both
-        // eventually being freed independently double-frees it. Exactly
-        // the TYPE_CLOSURE bug shape from checkpoint 3a (see that case's
-        // comment below) -- confirmed by an actual heap-use-after-free
-        // under ASan (`outer=1,inner=2,outer_after=1` scope-shadowing
-        // test: printf's stack-pushed copy of a local int64 variable
-        // destroyed the variable's own live box). Falls through to
-        // makeCopyOfValue's TYPE_INT64/UINT64/LONG_DOUBLE case, which
-        // already allocates a fresh box per copy.
+            return *src;
+        // TYPE_LONG_DOUBLE owns a LongDoubleBox: a bitwise `Value copy =
+        // *src;` would alias the SAME box as `*src` with no retain, and both
+        // eventually being freed independently double-frees it (confirmed by
+        // a real heap-use-after-free under ASan when TYPE_INT64 was boxed the
+        // same way). Falls through to makeCopyOfValue's TYPE_LONG_DOUBLE
+        // case, which allocates a fresh box per copy.
         default:
             break;
     }
@@ -4740,7 +4741,6 @@ static Value copyValueForStack(const Value* src) {
         if (AS_MSTREAM(alias)) {
             retainMStream(AS_MSTREAM(alias));
         }
-        pthread_mutex_unlock(&value_cell_mutex);
         return alias;
     }
 
@@ -4755,7 +4755,6 @@ static Value copyValueForStack(const Value* src) {
         if (AS_TASK(alias)) {
             pscalObjRetain(&AS_TASK(alias)->header);
         }
-        pthread_mutex_unlock(&value_cell_mutex);
         return alias;
     }
 
@@ -4781,35 +4780,30 @@ static Value copyValueForStack(const Value* src) {
             Value alias = *src;
             StringObj *s = PSCAL_VALUE_PTR(alias, StringObj);
             if (s) pscalObjRetain(&s->header);
-            pthread_mutex_unlock(&value_cell_mutex);
             return alias;
         }
         case TYPE_SET: {
             Value alias = *src;
             SetObj *s = PSCAL_VALUE_PTR(alias, SetObj);
             if (s) pscalObjRetain(&s->header);
-            pthread_mutex_unlock(&value_cell_mutex);
             return alias;
         }
         case TYPE_RECORD: {
             Value alias = *src;
             RecordObj *r = PSCAL_VALUE_PTR(alias, RecordObj);
             if (r) pscalObjRetain(&r->header);
-            pthread_mutex_unlock(&value_cell_mutex);
             return alias;
         }
         case TYPE_ENUM: {
             Value alias = *src;
             EnumObj *e = PSCAL_VALUE_PTR(alias, EnumObj);
             if (e) pscalObjRetain(&e->header);
-            pthread_mutex_unlock(&value_cell_mutex);
             return alias;
         }
         case TYPE_ARRAY: {
             Value alias = *src;
             ArrayObj *a = PSCAL_VALUE_PTR(alias, ArrayObj);
             if (a) pscalObjRetain(&a->header);
-            pthread_mutex_unlock(&value_cell_mutex);
             return alias;
         }
         case TYPE_MAP: {
@@ -4818,7 +4812,6 @@ static Value copyValueForStack(const Value* src) {
             Value alias = *src;
             MapObj *m = PSCAL_VALUE_PTR(alias, MapObj);
             if (m) pscalObjRetain(&m->header);
-            pthread_mutex_unlock(&value_cell_mutex);
             return alias;
         }
         default:
@@ -4839,6 +4832,31 @@ static Value copyValueForStack(const Value* src) {
     // fields, and retains only the actually-shared `env`.
 
     Value copy = makeCopyOfValue(src);
+    return copy;
+}
+
+// Copies a cell's value for pushing onto the operand stack: scalars by
+// value, shared payloads by retain (copy-on-write), the rest via
+// makeCopyOfValue. Use this for cells another thread can replace
+// (locals reachable through VAR params and captures, globals, heap cells):
+// it holds value_cell_mutex so the copy never races replaceValueCell.
+static Value copyValueForStack(const Value* src) {
+    if (!src) {
+        return makeNil();
+    }
+
+    // Scalars own no heap data, so they need no lock: read the cell once
+    // and decide on that snapshot. Re-reading *src after the type test could
+    // pair a scalar type with a racing writer's heap pointer, which would
+    // then escape unretained. A torn snapshot whose type is a scalar is at
+    // worst a wrong number in a program that races on the variable.
+    Value snapshot = *src;
+    if (vmTypeIsInlineScalar(VALUE_TYPE(snapshot))) {
+        return snapshot;
+    }
+
+    pthread_mutex_lock(&value_cell_mutex);
+    Value copy = copyValueForStackUnlocked(src);
     pthread_mutex_unlock(&value_cell_mutex);
     return copy;
 }
@@ -6752,9 +6770,10 @@ static InterpretResult returnFromCall(VM* vm, bool* halted) {
             if (halted) *halted = true;
             return INTERPRET_RUNTIME_ERROR;
         }
-        Value returnValue = pop(vm);
-        safeReturnValue = copyValueForStack(&returnValue);
-        freeValue(&returnValue);
+        // pop() hands over the stack's reference, so the result moves to
+        // the caller as is: copying it and freeing the original cost a
+        // locked copy per return and changed nothing.
+        safeReturnValue = pop(vm);
 
         // The declared return type is a coercion sink just like parameter
         // slots (CALL_USER_PROC argument setup) and SET_LOCAL/SET_GLOBAL
@@ -8151,7 +8170,7 @@ dispatch_switch:
             }
             case CONSTANT: {
                 Value constant = READ_CONSTANT();
-                push(vm, copyValueForStack(&constant));
+                push(vm, copyValueForStackUnlocked(&constant));
                 break;
             }
                 
@@ -8161,7 +8180,7 @@ dispatch_switch:
                     runtimeError(vm, "VM Error: Constant index %u out of bounds for CONSTANT16.", idx);
                    return INTERPRET_RUNTIME_ERROR;
                 }
-                push(vm, copyValueForStack(&vm->chunk->constants[idx]));
+                push(vm, copyValueForStackUnlocked(&vm->chunk->constants[idx]));
                 break;
             }
             case CONST_0:
@@ -8332,7 +8351,7 @@ dispatch_switch:
                     runtimeError(vm, "VM Error: Stack underflow (dup from empty stack).");
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                push(vm, copyValueForStack(&vm->stackTop[-1]));
+                push(vm, copyValueForStackUnlocked(&vm->stackTop[-1]));
                 break;
             }
             case AND:
