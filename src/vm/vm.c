@@ -8,6 +8,7 @@
 #include <ctype.h>
 #include <pthread.h>
 #include <limits.h>
+#include <math.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <inttypes.h>
@@ -51,7 +52,8 @@
  * an element pair has no defined equality (the caller then reports exactly what
  * it would for those scalars on their own). */
 int calculateArrayTotalSize(const Value* array_val);
-static int pscalValuesDeepEqualD(const Value *a, const Value *b, int depth);
+typedef struct PscalEqMemo PscalEqMemo;
+static int pscalValuesDeepEqualD(const Value *a, const Value *b, int depth, PscalEqMemo *memo);
 
 /* ---- Aether record equality (D24) -------------------------------------------
  * Under Aether, `==` / `<>` on two records (and tuples, which are records)
@@ -59,12 +61,74 @@ static int pscalValuesDeepEqualD(const Value *a, const Value *b, int depth);
  * identity comparison is the `same(a, b)` builtin. Records are pointers to a
  * TYPE_RECORD value, so this replaces the pointer-identity compare for two
  * non-nil record pointers. The front end rejects `==` on a self-referential
- * record type (REC-001), so the value graph compared here is acyclic; the depth
- * cap is a backstop that reports "no defined equality" (-1) rather than
- * recursing without end. Other front ends keep pointer identity. */
+ * record type (REC-001), but not one that reaches itself through a map, so the
+ * graph compared here can share substructure and even be cyclic. Past a small
+ * depth, every pair of records being compared is remembered and a pair met
+ * again counts as equal: it is either already proven equal or still being
+ * compared further up (a cycle, which is equal if nothing else differs). That
+ * keeps the walk linear in the size of the graph -- without it a DAG whose
+ * nodes are each reached twice took time exponential in its depth -- and lets
+ * cycles compare instead of hitting the depth cap. Results on acyclic data are
+ * unchanged, since any difference ends the whole comparison the moment it is
+ * found. The depth cap remains a backstop that reports "no defined equality"
+ * (-1). Other front ends keep pointer identity. */
 #define PSCAL_DEEP_EQUAL_MAX_DEPTH 512
+#define PSCAL_DEEP_EQUAL_MEMO_DEPTH 8
 
-static int pscalRecordFieldsDeepEqual(const FieldValue *fa, const FieldValue *fb, int depth) {
+typedef struct {
+    const void *a;
+    const void *b;
+} PscalEqPair;
+
+struct PscalEqMemo {
+    PscalEqPair *slots; /* open addressing; a == NULL marks an empty slot */
+    size_t cap;         /* a power of two, or 0 before first use */
+    size_t count;
+};
+
+static size_t pscalEqPairHash(const void *a, const void *b) {
+    uint64_t h = (uint64_t)(uintptr_t)a * 0x9E3779B97F4A7C15ULL;
+    h ^= (uint64_t)(uintptr_t)b * 0xC2B2AE3D27D4EB4FULL;
+    h ^= h >> 29;
+    return (size_t)h;
+}
+
+/* Records the record pair (a, b); true if it was already recorded. If the
+ * table cannot grow the pair simply goes unrecorded (the walk is then only
+ * slower, and a cycle falls back to the depth cap). */
+static bool pscalEqMemoSeen(PscalEqMemo *m, const void *a, const void *b) {
+    if (m->count + 1 > m->cap / 2) {
+        size_t new_cap = m->cap ? m->cap * 2 : 64;
+        PscalEqPair *grown = (PscalEqPair *)calloc(new_cap, sizeof(PscalEqPair));
+        if (!grown) {
+            return false;
+        }
+        for (size_t i = 0; i < m->cap; i++) {
+            if (!m->slots[i].a) continue;
+            size_t j = pscalEqPairHash(m->slots[i].a, m->slots[i].b) & (new_cap - 1);
+            while (grown[j].a) j = (j + 1) & (new_cap - 1);
+            grown[j] = m->slots[i];
+        }
+        free(m->slots);
+        m->slots = grown;
+        m->cap = new_cap;
+    }
+    size_t j = pscalEqPairHash(a, b) & (m->cap - 1);
+    while (m->slots[j].a) {
+        if (m->slots[j].a == a && m->slots[j].b == b) return true;
+        j = (j + 1) & (m->cap - 1);
+    }
+    m->slots[j].a = a;
+    m->slots[j].b = b;
+    m->count++;
+    return false;
+}
+
+static int pscalRecordFieldsDeepEqual(const FieldValue *fa, const FieldValue *fb, int depth,
+                                      PscalEqMemo *memo) {
+    if (depth > PSCAL_DEEP_EQUAL_MEMO_DEPTH && fa && fb && pscalEqMemoSeen(memo, fa, fb)) {
+        return 1;
+    }
     while (fa && fb) {
         /* Compiler-owned fields (the hidden __vtable) are not data. */
         bool hiddenA = fa->name && fa->name[0] == '_' && fa->name[1] == '_';
@@ -77,7 +141,7 @@ static int pscalRecordFieldsDeepEqual(const FieldValue *fa, const FieldValue *fb
             if (!va || !vb) {
                 if (va != vb) return 0;
             } else {
-                int r = pscalValuesDeepEqualD(va, vb, depth);
+                int r = pscalValuesDeepEqualD(va, vb, depth, memo);
                 if (r != 1) return r;
             }
         }
@@ -88,14 +152,14 @@ static int pscalRecordFieldsDeepEqual(const FieldValue *fa, const FieldValue *fb
 }
 
 /* Two record pointers under Aether: identical, both nil, or field-wise equal. */
-static int pscalRecordPointersDeepEqual(const Value *a, const Value *b, int depth) {
+static int pscalRecordPointersDeepEqualD(const Value *a, const Value *b, int depth, PscalEqMemo *memo) {
     Value *pa = AS_POINTER(*a);
     Value *pb = AS_POINTER(*b);
     if (pa == pb) return 1;
     if (!pa || !pb) return 0;
     if (depth > PSCAL_DEEP_EQUAL_MAX_DEPTH) return -1;
     if (VALUE_TYPE(*pa) == TYPE_RECORD && VALUE_TYPE(*pb) == TYPE_RECORD)
-        return pscalRecordFieldsDeepEqual(AS_RECORD(*pa), AS_RECORD(*pb), depth + 1);
+        return pscalRecordFieldsDeepEqual(AS_RECORD(*pa), AS_RECORD(*pb), depth + 1, memo);
     return 0;
 }
 
@@ -112,7 +176,7 @@ static const char *pscalTextForCompare(const Value *v, char *buf /* >= 5 bytes *
     return buf;
 }
 
-static int pscalArraysDeepEqualD(const Value *a, const Value *b, int depth) {
+static int pscalArraysDeepEqualD(const Value *a, const Value *b, int depth, PscalEqMemo *memo) {
     ArrayObj *pa = PSCAL_VALUE_PTR(*a, ArrayObj);
     ArrayObj *pb = PSCAL_VALUE_PTR(*b, ArrayObj);
     if (pa == pb) return 1;
@@ -149,19 +213,22 @@ static int pscalArraysDeepEqualD(const Value *a, const Value *b, int depth) {
     }
     if (!pa->elements || !pb->elements) return (pa->elements == pb->elements) ? 1 : 0;
     for (int i = 0; i < total; i++) {
-        int r = pscalValuesDeepEqualD(&pa->elements[i], &pb->elements[i], depth + 1);
+        int r = pscalValuesDeepEqualD(&pa->elements[i], &pb->elements[i], depth + 1, memo);
         if (r != 1) return r;
     }
     return 1;
 }
 
 static int pscalArraysDeepEqual(const Value *a, const Value *b) {
-    return pscalArraysDeepEqualD(a, b, 0);
+    PscalEqMemo memo = {0};
+    int r = pscalArraysDeepEqualD(a, b, 0, &memo);
+    free(memo.slots);
+    return r;
 }
 
 /* Aether maps (D68, D24): the same key set and equal values, order ignored;
  * values compare by the same structural rules (records field by field). */
-static int pscalMapsDeepEqualD(const Value *a, const Value *b, int depth) {
+static int pscalMapsDeepEqualD(const Value *a, const Value *b, int depth, PscalEqMemo *memo) {
     MapObj *ma = PSCAL_VALUE_PTR(*a, MapObj);
     MapObj *mb = PSCAL_VALUE_PTR(*b, MapObj);
     if (ma == mb) return 1;
@@ -174,21 +241,31 @@ static int pscalMapsDeepEqualD(const Value *a, const Value *b, int depth) {
         if (!e->live) continue;
         Value *other = pscalMapFind(mb, e->key, e->key_len);
         if (!other) return 0;
-        int r = pscalValuesDeepEqualD(e->value, other, depth + 1);
+        int r = pscalValuesDeepEqualD(e->value, other, depth + 1, memo);
         if (r != 1) return r;
     }
     return 1;
 }
 
 static int pscalMapsDeepEqual(const Value *a, const Value *b) {
-    return pscalMapsDeepEqualD(a, b, 0);
+    PscalEqMemo memo = {0};
+    int r = pscalMapsDeepEqualD(a, b, 0, &memo);
+    free(memo.slots);
+    return r;
 }
 
-static int pscalValuesDeepEqualD(const Value *a, const Value *b, int depth) {
+static int pscalRecordPointersDeepEqual(const Value *a, const Value *b) {
+    PscalEqMemo memo = {0};
+    int r = pscalRecordPointersDeepEqualD(a, b, 0, &memo);
+    free(memo.slots);
+    return r;
+}
+
+static int pscalValuesDeepEqualD(const Value *a, const Value *b, int depth, PscalEqMemo *memo) {
     VarType ta = VALUE_TYPE(*a), tb = VALUE_TYPE(*b);
     if (depth > PSCAL_DEEP_EQUAL_MAX_DEPTH) return -1;
-    if (ta == TYPE_ARRAY && tb == TYPE_ARRAY) return pscalArraysDeepEqualD(a, b, depth);
-    if (ta == TYPE_MAP && tb == TYPE_MAP) return pscalMapsDeepEqualD(a, b, depth);
+    if (ta == TYPE_ARRAY && tb == TYPE_ARRAY) return pscalArraysDeepEqualD(a, b, depth, memo);
+    if (ta == TYPE_MAP && tb == TYPE_MAP) return pscalMapsDeepEqualD(a, b, depth, memo);
     if (ta == TYPE_NIL && tb == TYPE_NIL) return 1;
     if (ta == TYPE_NIL || tb == TYPE_NIL) {
         const Value *other = (ta == TYPE_NIL) ? b : a;
@@ -205,11 +282,11 @@ static int pscalValuesDeepEqualD(const Value *a, const Value *b, int depth) {
         return strcmp(pscalTextForCompare(a, abuf), pscalTextForCompare(b, bbuf)) == 0 ? 1 : 0;
     }
     if (ta == TYPE_POINTER && tb == TYPE_POINTER) {
-        if (frontendIsAether()) return pscalRecordPointersDeepEqual(a, b, depth);
+        if (frontendIsAether()) return pscalRecordPointersDeepEqualD(a, b, depth, memo);
         return AS_POINTER(*a) == AS_POINTER(*b) ? 1 : 0;
     }
     if (ta == TYPE_RECORD && tb == TYPE_RECORD && frontendIsAether())
-        return pscalRecordFieldsDeepEqual(AS_RECORD(*a), AS_RECORD(*b), depth + 1);
+        return pscalRecordFieldsDeepEqual(AS_RECORD(*a), AS_RECORD(*b), depth + 1, memo);
     if (ta == TYPE_MEMORYSTREAM && tb == TYPE_MEMORYSTREAM) return AS_MSTREAM(*a) == AS_MSTREAM(*b) ? 1 : 0;
     return -1;
 }
@@ -1047,7 +1124,9 @@ static void hydrateFieldMetadataFromBaseValue(Value* base_val_ptr,
         }
     }
 
-    freeFieldValue(prototype_fields);
+    // The probe's RecordObj owns prototype_fields; freeing only the field
+    // list leaked the RecordObj on every call.
+    freeValue(&prototype_probe);
 }
 
 static bool pushFieldValueByOffset(VM* vm, Value* base_val_ptr, uint16_t field_index) {
@@ -4128,17 +4207,33 @@ static bool destroyMutex(VM* vm, int id) {
 }
 
 // Internal function shared by stack dump helpers
+// Most operand-stack values a dump prints. Runaway recursion leaves hundreds
+// of thousands on the stack (11 MB of stderr, printed twice); the top of the
+// stack is where the error happened.
+#define VM_STACK_DUMP_MAX_SLOTS 32
+
 static void vmDumpStackInternal(VM* vm, bool detailed) {
     if (!vm) return;
 
+    Value* first = vm->stack;
+    ptrdiff_t depth = vm->stackTop - vm->stack;
+    if (depth > VM_STACK_DUMP_MAX_SLOTS) {
+        first = vm->stackTop - VM_STACK_DUMP_MAX_SLOTS;
+        if (detailed) {
+            fprintf(stderr, "  ... %td older value(s) not shown\n", depth - VM_STACK_DUMP_MAX_SLOTS);
+        } else {
+            fprintf(stderr, "[... %td more] ", depth - VM_STACK_DUMP_MAX_SLOTS);
+        }
+    }
+
     if (detailed) {
-        for (Value* slot = vm->stack; slot < vm->stackTop; slot++) {
+        for (Value* slot = first; slot < vm->stackTop; slot++) {
             fprintf(stderr, "  [ ");
             printValueToStream(*slot, stderr);
             fprintf(stderr, " ]\n");
         }
     } else {
-        for (Value* slot = vm->stack; slot < vm->stackTop; slot++) {
+        for (Value* slot = first; slot < vm->stackTop; slot++) {
             fprintf(stderr, "[");
             printValueToStream(*slot, stderr);
             fprintf(stderr, "] ");
@@ -4149,6 +4244,13 @@ static void vmDumpStackInternal(VM* vm, bool detailed) {
 
 static void assignRealToIntChecked(VM* vm, Value* dest, long double real_val) {
     bool range_error = false;
+    // NaN fails no range test below, and converting it to an integer is
+    // undefined: store 0 and report it like any other out-of-range value.
+    bool was_nan = isnan(real_val) && VALUE_TYPE(*dest) != TYPE_BOOLEAN;
+    if (was_nan) {
+        range_error = true;
+        real_val = 0.0L;
+    }
     switch (VALUE_TYPE(*dest)) {
         case TYPE_BOOLEAN: {
             long long tmp = (real_val != 0.0L) ? 1 : 0;
@@ -4261,7 +4363,9 @@ static void assignRealToIntChecked(VM* vm, Value* dest, long double real_val) {
             if (real_val < 0.0L) {
                 range_error = true;
                 tmp = 0ULL;
-            } else if (real_val > (long double)UINT64_MAX) {
+            } else if (real_val >= 18446744073709551616.0L) {
+                // 2^64: (long double)UINT64_MAX rounds up to it where long
+                // double is double, so `>` let 2^64 itself through.
                 range_error = true;
                 tmp = UINT64_MAX;
             } else {
@@ -4282,7 +4386,8 @@ static void assignRealToIntChecked(VM* vm, Value* dest, long double real_val) {
             if (real_val < (long double)LLONG_MIN) {
                 range_error = true;
                 tmp = LLONG_MIN;
-            } else if (real_val > (long double)LLONG_MAX) {
+            } else if (real_val >= 9223372036854775808.0L) {
+                // 2^63, for the same reason as UINT64 above.
                 range_error = true;
                 tmp = LLONG_MAX;
             } else {
@@ -4296,7 +4401,7 @@ static void assignRealToIntChecked(VM* vm, Value* dest, long double real_val) {
             if (real_val < (long double)LLONG_MIN) {
                 range_error = true;
                 tmp = LLONG_MIN;
-            } else if (real_val > (long double)LLONG_MAX) {
+            } else if (real_val >= 9223372036854775808.0L) {
                 range_error = true;
                 tmp = LLONG_MAX;
             } else {
@@ -4306,7 +4411,10 @@ static void assignRealToIntChecked(VM* vm, Value* dest, long double real_val) {
             break;
         }
     }
-    if (range_error) {
+    if (was_nan) {
+        runtimeWarning(vm, "Warning: Range check error assigning REAL NaN to %s.",
+                       varTypeToString(VALUE_TYPE(*dest)));
+    } else if (range_error) {
         runtimeWarning(vm, "Warning: Range check error assigning REAL %Lf to %s.",
                        real_val, varTypeToString(VALUE_TYPE(*dest)));
     }
@@ -4374,32 +4482,11 @@ static bool vmSetContains(const Value* setVal, const Value* itemVal) {
         return false;
     }
 
+    // The same ordinal mapping MAKE_SET_* used to build the set, so every
+    // ordinal type (int64, shortint, cardinal, widechar, ...) tests
+    // membership the way it was added.
     long long item_ord;
-    bool item_is_ordinal = false;
-
-    // Get ordinal value of the item
-    switch (VALUE_TYPE(*itemVal)) {
-        case TYPE_INTEGER:
-        case TYPE_BYTE:
-        case TYPE_WORD:
-        case TYPE_BOOLEAN:
-            item_ord = VAL_INT(*itemVal);
-            item_is_ordinal = true;
-            break;
-        case TYPE_CHAR:
-            item_ord = (long long)AS_CHAR(*itemVal);
-            item_is_ordinal = true;
-            break;
-        case TYPE_ENUM:
-            item_ord = (long long)AS_ENUM(*itemVal).ordinal;
-            item_is_ordinal = true;
-            break;
-        default:
-            item_is_ordinal = false;
-            break;
-    }
-
-    if (!item_is_ordinal) return false; // Item is not of a type that can be in a set
+    if (!tryValueToOrdinal(itemVal, &item_ord)) return false; // Item is not of a type that can be in a set
 
     // Search for the ordinal value in the set's values array
     if (!AS_SET(*setVal).set_values) return false;
@@ -4441,33 +4528,210 @@ static bool vmBuildSetFromOrdinal(Value* outSet, long long ordinal) {
     return vmAddOrdinalToSet(outSet, ordinal);
 }
 
-static bool vmBuildSetFromRange(Value* outSet, long long start_ord, long long end_ord) {
-    if (!outSet) {
+// Largest set a range constructor may build. A set is a flat array of
+// ordinals, so `[0..maxint]` would otherwise try to allocate 16 GiB (and
+// overflow SetObj's int size/capacity on the way).
+#define VM_SET_RANGE_MAX_ELEMENTS (1u << 20)
+
+typedef enum {
+    VM_SET_RANGE_OK,
+    VM_SET_RANGE_TOO_LARGE,
+    VM_SET_RANGE_NO_MEMORY
+} VmSetRangeStatus;
+
+// `[start..end]`: every ordinal from start to end, and the empty set when
+// start > end (ISO Pascal 6.7.1). A fresh range holds distinct ordinals, so
+// it is sized once and filled directly rather than through
+// vmAddOrdinalToSet's per-element duplicate scan. On failure *outSet is nil
+// and owns nothing.
+static VmSetRangeStatus vmBuildSetFromRange(Value* outSet, long long start_ord, long long end_ord) {
+    *outSet = makeValueForType(TYPE_SET, NULL, NULL);
+    if (start_ord > end_ord) {
+        return VM_SET_RANGE_OK;
+    }
+    // end >= start, so the unsigned difference is exact even across the
+    // whole long long range.
+    unsigned long long span = (unsigned long long)end_ord - (unsigned long long)start_ord;
+    if (span >= VM_SET_RANGE_MAX_ELEMENTS) {
+        freeValue(outSet);
+        *outSet = makeNil();
+        return VM_SET_RANGE_TOO_LARGE;
+    }
+    size_t count = (size_t)span + 1;
+    long long* values = (long long*)malloc(sizeof(long long) * count);
+    if (!values) {
+        freeValue(outSet);
+        *outSet = makeNil();
+        return VM_SET_RANGE_NO_MEMORY;
+    }
+    for (size_t i = 0; i < count; i++) {
+        values[i] = start_ord + (long long)i;
+    }
+    free(AS_SET(*outSet).set_values);
+    AS_SET(*outSet).set_values = values;
+    AS_SET(*outSet).set_size = (int)count;
+    SET_CAPACITY(*outSet) = (int)count;
+    return VM_SET_RANGE_OK;
+}
+
+static int vmCompareOrdinals(const void* x, const void* y) {
+    long long a = *(const long long*)x;
+    long long b = *(const long long*)y;
+    return (a > b) - (a < b);
+}
+
+// Is every member of `sub` also a member of `super`? Membership only, so
+// the order the ordinals were added in does not matter. Small sets are
+// compared pairwise; larger ones against a sorted copy of `super`.
+// Returns -1 if that copy cannot be allocated.
+static int vmSetIsSubset(const Value* sub, const Value* super) {
+    const SetObj* s = PSCAL_VALUE_PTR(*sub, SetObj);
+    const SetObj* t = PSCAL_VALUE_PTR(*super, SetObj);
+    int s_size = (s && s->set_values) ? s->set_size : 0;
+    int t_size = (t && t->set_values) ? t->set_size : 0;
+    if (s_size == 0) {
+        return 1;
+    }
+    if (t_size == 0) {
+        return 0;
+    }
+    if ((long long)s_size * (long long)t_size <= 4096) {
+        for (int i = 0; i < s_size; i++) {
+            bool found = false;
+            for (int j = 0; j < t_size; j++) {
+                if (t->set_values[j] == s->set_values[i]) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                return 0;
+            }
+        }
+        return 1;
+    }
+    long long* sorted = (long long*)malloc(sizeof(long long) * (size_t)t_size);
+    if (!sorted) {
+        return -1;
+    }
+    memcpy(sorted, t->set_values, sizeof(long long) * (size_t)t_size);
+    qsort(sorted, (size_t)t_size, sizeof(long long), vmCompareOrdinals);
+    int result = 1;
+    for (int i = 0; i < s_size; i++) {
+        if (!bsearch(&s->set_values[i], sorted, (size_t)t_size, sizeof(long long), vmCompareOrdinals)) {
+            result = 0;
+            break;
+        }
+    }
+    free(sorted);
+    return result;
+}
+
+// --- Integer arithmetic with a UINT64 operand ---
+//
+// asI64() reads a UINT64 as its two's-complement bit pattern, so a qword of
+// 2^63 or more turns negative in signed arithmetic and compares. These
+// helpers carry each operand as sign + magnitude instead: a UINT64 is never
+// negative, and every other integer keeps the sign asI64() gives it.
+typedef struct {
+    bool neg;
+    unsigned long long mag;
+} VmWideInt;
+
+static inline VmWideInt vmWideIntOf(Value v) {
+    VmWideInt w;
+    if (VALUE_TYPE(v) == TYPE_UINT64) {
+        w.neg = false;
+        w.mag = VAL_UINT(v);
+        return w;
+    }
+    long long s = asI64(v);
+    w.neg = s < 0;
+    w.mag = w.neg ? 0ULL - (unsigned long long)s : (unsigned long long)s;
+    return w;
+}
+
+// Three-way compare of two integer-like Values, exact over both the INT64
+// and the UINT64 range.
+static inline int vmCompareIntlike(Value a, Value b) {
+    if (VALUE_TYPE(a) != TYPE_UINT64 && VALUE_TYPE(b) != TYPE_UINT64) {
+        long long ia = asI64(a);
+        long long ib = asI64(b);
+        return (ia > ib) - (ia < ib);
+    }
+    VmWideInt x = vmWideIntOf(a);
+    VmWideInt y = vmWideIntOf(b);
+    if (x.neg != y.neg) {
+        return x.neg ? -1 : 1;
+    }
+    int c = (x.mag > y.mag) - (x.mag < y.mag);
+    return x.neg ? -c : c;
+}
+
+// Packs a result back into the 64-bit word a UINT64 result is stored in.
+// Like every other integer op, the result only has to fit 64 bits read one
+// way or the other, [INT64_MIN, UINT64_MAX]: a negative result wraps (qword
+// 0 - 1 is high(qword)) the way a narrower unsigned type wraps at its store.
+static inline bool vmWideIntToBits(VmWideInt r, unsigned long long* out) {
+    if (r.mag == 0) {
+        r.neg = false;
+    }
+    if (r.neg && r.mag > (1ULL << 63)) {
         return false;
     }
-    *outSet = makeValueForType(TYPE_SET, NULL, NULL);
-    if (start_ord <= end_ord) {
-        for (long long current = start_ord; current <= end_ord; ++current) {
-            if (!vmAddOrdinalToSet(outSet, current)) {
+    *out = r.neg ? 0ULL - r.mag : r.mag;
+    return true;
+}
+
+// a + b, a - b or a * b when either side is UINT64. False on overflow.
+static bool vmUInt64Arith(int op, Value a, Value b, unsigned long long* out) {
+    VmWideInt x = vmWideIntOf(a);
+    VmWideInt y = vmWideIntOf(b);
+    VmWideInt r = { false, 0 };
+    if (op == SUBTRACT) {
+        y.neg = !y.neg && y.mag != 0;
+        op = ADD;
+    }
+    if (op == ADD) {
+        if (x.neg == y.neg) {
+            if (__builtin_add_overflow(x.mag, y.mag, &r.mag)) {
                 return false;
             }
-            if (current == LLONG_MAX) {
-                break;
-            }
+            r.neg = x.neg;
+        } else if (x.mag >= y.mag) {
+            r.mag = x.mag - y.mag;
+            r.neg = x.neg;
+        } else {
+            r.mag = y.mag - x.mag;
+            r.neg = y.neg;
         }
-        return true;
-    }
-    for (long long current = start_ord;; --current) {
-        if (!vmAddOrdinalToSet(outSet, current)) {
+    } else if (op == MULTIPLY) {
+        if (__builtin_mul_overflow(x.mag, y.mag, &r.mag)) {
             return false;
         }
-        if (current == end_ord) {
-            return true;
-        }
-        if (current == LLONG_MIN) {
-            return false;
-        }
+        r.neg = x.neg != y.neg;
+    } else {
+        return false;
     }
+    return vmWideIntToBits(r, out);
+}
+
+// a div b, or a mod b when want_mod, when either side is UINT64 (b != 0).
+// Both truncate, as for the signed types: the quotient's sign combines the
+// operands' signs and the remainder takes the dividend's. False on overflow
+// (high(qword) div -1).
+static bool vmUInt64DivMod(Value a, Value b, bool want_mod, unsigned long long* out) {
+    VmWideInt x = vmWideIntOf(a);
+    VmWideInt y = vmWideIntOf(b);
+    VmWideInt r;
+    if (want_mod) {
+        r.mag = x.mag % y.mag;
+        r.neg = x.neg;
+    } else {
+        r.mag = x.mag / y.mag;
+        r.neg = x.neg != y.neg;
+    }
+    return vmWideIntToBits(r, out);
 }
 
 // Scans all global symbols and the entire VM value stack to find and nullify
@@ -4622,6 +4886,47 @@ static inline long long vmShiftInt64(long long a, long long count, bool left, bo
 }
 
 // runtimeError - Assuming your existing one is fine.
+// Instructions shown before the error point in a verbose runtime error.
+#define VM_ERROR_RECENT_INSTRUCTIONS 5
+
+// Offset of the instruction VM_ERROR_RECENT_INSTRUCTIONS before the one at
+// `error_offset`, found by decoding forward from an instruction boundary
+// (the current routine's entry, else the start of the chunk). Backing up a
+// fixed number of bytes usually landed inside an operand and disassembled
+// garbage. Returns error_offset when no boundary walk reaches it.
+static int vmRecentInstructionStart(VM* vm, int error_offset) {
+    if (!vm->chunk || error_offset <= 0 || error_offset > vm->chunk->count) {
+        return error_offset;
+    }
+    int entries[2] = { 0, 0 };
+    int entry_count = 0;
+    CallFrame* frame = (vm->frameCount > 0) ? &vm->frames[vm->frameCount - 1] : NULL;
+    if (frame && frame->function_symbol && frame->function_symbol->bytecode_address > 0 &&
+        frame->function_symbol->bytecode_address < error_offset) {
+        entries[entry_count++] = frame->function_symbol->bytecode_address;
+    }
+    entries[entry_count++] = 0;
+    for (int e = 0; e < entry_count; e++) {
+        int recent[VM_ERROR_RECENT_INSTRUCTIONS];
+        int seen = 0;
+        int offset = entries[e];
+        while (offset < error_offset) {
+            recent[seen % VM_ERROR_RECENT_INSTRUCTIONS] = offset;
+            seen++;
+            int length = getInstructionLength(vm->chunk, offset);
+            if (length <= 0) {
+                break;
+            }
+            offset += length;
+        }
+        if (offset == error_offset && seen > 0) {
+            return (seen < VM_ERROR_RECENT_INSTRUCTIONS) ? recent[0]
+                                                         : recent[seen % VM_ERROR_RECENT_INSTRUCTIONS];
+        }
+    }
+    return error_offset;
+}
+
 void runtimeError(VM* vm, const char* format, ...) {
     if (vm) {
         vm->abort_requested = true;
@@ -4689,10 +4994,12 @@ void runtimeError(VM* vm, const char* format, ...) {
             fprintf(stderr, "  (IP is out of bytecode bounds: %p)\n", (void*)vm->ip);
         }
 
-        int start_dump_offset = (int)instruction_offset - 10;
-        if (!have_runtime_location || start_dump_offset < 0) start_dump_offset = 0;
+        int start_dump_offset = have_runtime_location
+                                    ? vmRecentInstructionStart(vm, (int)instruction_offset)
+                                    : (int)instruction_offset;
 
-        fprintf(stderr, "\nLast Instructions executed (leading to crash, up to %d bytes before error point):\n", (int)instruction_offset - start_dump_offset);
+        fprintf(stderr, "\nLast Instructions executed (leading to crash, up to %d before error point):\n",
+                VM_ERROR_RECENT_INSTRUCTIONS);
         if (vm->chunk) {
             for (int offset = start_dump_offset; offset < (int)instruction_offset; ) {
                 offset = disassembleInstruction(vm->chunk, offset, vm->procedureTable);
@@ -5388,7 +5695,12 @@ typedef struct RuntimeVTableEntry {
     struct RuntimeVTableEntry* next;
 } RuntimeVTableEntry;
 
+// Interface method tables, one per "<class>|<interface>" pair, shared by
+// every VM in the process (worker threads box interfaces too), so the list
+// is only touched under runtimeVTablesMutex. An entry's table is never
+// changed once built; interface values point straight at it.
 static RuntimeVTableEntry* runtimeVTables = NULL;
+static pthread_mutex_t runtimeVTablesMutex = PTHREAD_MUTEX_INITIALIZER;
 
 static RuntimeVTableEntry* findRuntimeVTableEntry(const char* classNameLower) {
     for (RuntimeVTableEntry* entry = runtimeVTables; entry; entry = entry->next) {
@@ -5416,7 +5728,10 @@ static RuntimeVTableEntry* createRuntimeVTableEntry(const char* classNameLower) 
 }
 
 static void vmFreeRuntimeVTables(void) {
+    pthread_mutex_lock(&runtimeVTablesMutex);
     RuntimeVTableEntry* entry = runtimeVTables;
+    runtimeVTables = NULL;
+    pthread_mutex_unlock(&runtimeVTablesMutex);
     while (entry) {
         RuntimeVTableEntry* next = entry->next;
         free(entry->className);
@@ -5427,7 +5742,6 @@ static void vmFreeRuntimeVTables(void) {
         free(entry);
         entry = next;
     }
-    runtimeVTables = NULL;
 }
 
 static void vmCleanupGlobalCachesIfIdle(void) {
@@ -5544,20 +5858,126 @@ static bool collectRuntimeInterfaceMethods(AST* interfaceType,
     return true;
 }
 
-static bool ensureRuntimeInterfaceVTable(VM* vm,
-                                         const char* className,
-                                         AST* interfaceType,
-                                         Value* tableValue) {
-    if (!vm || !className || !interfaceType || !tableValue) {
+// Builds the method-address table of `className`'s implementation of
+// `interfaceType`, indexed by interface method slot.
+static bool buildRuntimeInterfaceVTable(const char* className,
+                                        const char* class_lower,
+                                        AST* interfaceType,
+                                        Value* out) {
+    int method_capacity = 0;
+    int method_count = 0;
+    int* addrs = NULL;
+
+    AST** methods = NULL;
+    int collected_count = 0;
+    int collected_capacity = 0;
+    if (!collectRuntimeInterfaceMethods(interfaceType,
+                                        &methods,
+                                        &collected_count,
+                                        &collected_capacity,
+                                        0)) {
+        free(methods);
         return false;
     }
 
-    if (VALUE_TYPE(*tableValue) == TYPE_ARRAY && AS_ARRAY(*tableValue)) {
-        return true;
+    for (int i = 0; i < collected_count; i++) {
+        AST* method = methods[i];
+        const char* method_name = (method && method->token) ? method->token->value : NULL;
+        if (!method_name) {
+            free(methods);
+            free(addrs);
+            return false;
+        }
+
+        int slot = method->i_val >= 0 ? method->i_val : i;
+        if (slot >= method_capacity) {
+            int new_capacity = method_capacity < 4 ? 4 : method_capacity * 2;
+            while (new_capacity <= slot) {
+                new_capacity *= 2;
+            }
+            int* resized = (int*)realloc(addrs, (size_t)new_capacity * sizeof(int));
+            if (!resized) {
+                free(methods);
+                free(addrs);
+                return false;
+            }
+            for (int j = method_capacity; j < new_capacity; j++) {
+                resized[j] = -1;
+            }
+            addrs = resized;
+            method_capacity = new_capacity;
+        }
+
+        char method_lower[MAX_SYMBOL_LENGTH];
+        strncpy(method_lower, method_name, sizeof(method_lower) - 1);
+        method_lower[sizeof(method_lower) - 1] = '\0';
+        toLowerString(method_lower);
+
+        char qualified[MAX_SYMBOL_LENGTH * 2 + 2];
+        snprintf(qualified, sizeof(qualified), "%s.%s", class_lower, method_lower);
+        Symbol* sym = lookupProcedure(qualified);
+        if (!sym) {
+            snprintf(qualified, sizeof(qualified), "%s.%s", className, method_name);
+            sym = lookupProcedure(qualified);
+        }
+        if (!sym) {
+            free(methods);
+            free(addrs);
+            return false;
+        }
+
+        Symbol* base = sym->is_alias ? sym->real_symbol : sym;
+        if (!base) {
+            free(methods);
+            free(addrs);
+            return false;
+        }
+
+        addrs[slot] = base->bytecode_address;
+        if (slot + 1 > method_count) {
+            method_count = slot + 1;
+        }
     }
 
-    if (!vm->procedureTable) {
+    free(methods);
+
+    if (method_count == 0) {
+        free(addrs);
         return false;
+    }
+
+    int lower = 0;
+    int upper = method_count - 1;
+    Value arr = makeArrayND(1, &lower, &upper, TYPE_INT32, NULL);
+    if (!AS_ARRAY(arr)) {
+        free(addrs);
+        return false;
+    }
+
+    for (int i = 0; i < method_count; i++) {
+        int addr = (i < method_capacity && addrs) ? addrs[i] : -1;
+        AS_ARRAY(arr)[i] = makeInt(addr >= 0 ? addr : 0);
+    }
+    free(addrs);
+    *out = arr;
+    return true;
+}
+
+// The interface method table for `className` implementing the interface
+// named `interfaceName`, built on first use and cached per (class,
+// interface) pair. The key must name the interface: the interface AST's own
+// token is the `interface` keyword for every Pascal interface, so a key
+// built from it gave all of a class's interfaces the table of whichever
+// was boxed first, and a call through the second dispatched to the wrong
+// method. The table lives in the cache only -- it is never written into
+// the receiver, whose single hidden __vtable field cannot hold one table
+// per interface. NULL if the table cannot be built.
+static Value* ensureRuntimeInterfaceVTable(VM* vm,
+                                           const char* className,
+                                           const char* interfaceName,
+                                           AST* interfaceType) {
+    if (!vm || !className || !interfaceName || !interfaceType || !vm->procedureTable) {
+        return NULL;
     }
 
     char class_lower[MAX_SYMBOL_LENGTH];
@@ -5566,158 +5986,44 @@ static bool ensureRuntimeInterfaceVTable(VM* vm,
     toLowerString(class_lower);
 
     char interface_lower[MAX_SYMBOL_LENGTH];
-    const char* interface_name = (interfaceType->token && interfaceType->token->value)
-                                     ? interfaceType->token->value
-                                     : "<anonymous_interface>";
-    strncpy(interface_lower, interface_name, sizeof(interface_lower) - 1);
+    strncpy(interface_lower, interfaceName, sizeof(interface_lower) - 1);
     interface_lower[sizeof(interface_lower) - 1] = '\0';
     toLowerString(interface_lower);
 
     char cache_key[(MAX_SYMBOL_LENGTH * 2) + 4];
     snprintf(cache_key, sizeof(cache_key), "%s|%s", class_lower, interface_lower);
 
+    pthread_mutex_lock(&runtimeVTablesMutex);
     RuntimeVTableEntry* entry = findRuntimeVTableEntry(cache_key);
-    bool need_build = true;
-    if (entry && entry->table && VALUE_TYPE(*entry->table) == TYPE_ARRAY && AS_ARRAY(*entry->table)) {
-        need_build = false;
-    }
-
-    int method_capacity = 0;
-    int method_count = 0;
-    int* addrs = NULL;
-
-    if (need_build) {
-        AST** methods = NULL;
-        int collected_count = 0;
-        int collected_capacity = 0;
-        if (!collectRuntimeInterfaceMethods(interfaceType,
-                                            &methods,
-                                            &collected_count,
-                                            &collected_capacity,
-                                            0)) {
-            free(methods);
-            return false;
+    if (!entry || !entry->table || VALUE_TYPE(*entry->table) != TYPE_ARRAY || !AS_ARRAY(*entry->table)) {
+        Value arr;
+        if (!buildRuntimeInterfaceVTable(className, class_lower, interfaceType, &arr)) {
+            pthread_mutex_unlock(&runtimeVTablesMutex);
+            return NULL;
         }
-
-        for (int i = 0; i < collected_count; i++) {
-            AST* method = methods[i];
-            const char* method_name = (method && method->token) ? method->token->value : NULL;
-            if (!method_name) {
-                free(methods);
-                free(addrs);
-                return false;
-            }
-
-            int slot = method->i_val >= 0 ? method->i_val : i;
-            if (slot >= method_capacity) {
-                int new_capacity = method_capacity < 4 ? 4 : method_capacity * 2;
-                while (new_capacity <= slot) {
-                    new_capacity *= 2;
-                }
-                int* resized = (int*)realloc(addrs, (size_t)new_capacity * sizeof(int));
-                if (!resized) {
-                    free(methods);
-                    free(addrs);
-                    return false;
-                }
-                for (int j = method_capacity; j < new_capacity; j++) {
-                    resized[j] = -1;
-                }
-                addrs = resized;
-                method_capacity = new_capacity;
-            }
-
-            char method_lower[MAX_SYMBOL_LENGTH];
-            strncpy(method_lower, method_name, sizeof(method_lower) - 1);
-            method_lower[sizeof(method_lower) - 1] = '\0';
-            toLowerString(method_lower);
-
-            char qualified[MAX_SYMBOL_LENGTH * 2 + 2];
-            snprintf(qualified, sizeof(qualified), "%s.%s", class_lower, method_lower);
-            Symbol* sym = lookupProcedure(qualified);
-            if (!sym) {
-                snprintf(qualified, sizeof(qualified), "%s.%s", className, method_name);
-                sym = lookupProcedure(qualified);
-            }
-            if (!sym) {
-                free(methods);
-                free(addrs);
-                return false;
-            }
-
-            Symbol* base = sym->is_alias ? sym->real_symbol : sym;
-            if (!base) {
-                free(methods);
-                free(addrs);
-                return false;
-            }
-
-            addrs[slot] = base->bytecode_address;
-            if (slot + 1 > method_count) {
-                method_count = slot + 1;
-            }
-        }
-
-        free(methods);
-
-        if (method_count == 0) {
-            free(addrs);
-            return false;
-        }
-
-        int lower = 0;
-        int upper = method_count - 1;
-        Value arr = makeArrayND(1, &lower, &upper, TYPE_INT32, NULL);
-        if (!AS_ARRAY(arr)) {
-            free(addrs);
-            return false;
-        }
-
-        for (int i = 0; i < method_count; i++) {
-            int addr = (i < method_capacity && addrs) ? addrs[i] : -1;
-            AS_ARRAY(arr)[i] = makeInt(addr >= 0 ? addr : 0);
-        }
-        free(addrs);
-
         if (!entry) {
             entry = createRuntimeVTableEntry(cache_key);
             if (!entry) {
                 freeValue(&arr);
-                return false;
+                pthread_mutex_unlock(&runtimeVTablesMutex);
+                return NULL;
             }
         }
-
         if (!entry->table) {
             entry->table = (Value*)malloc(sizeof(Value));
             if (!entry->table) {
                 freeValue(&arr);
-                return false;
+                pthread_mutex_unlock(&runtimeVTablesMutex);
+                return NULL;
             }
-            *(entry->table) = makeNil();
         } else {
             freeValue(entry->table);
         }
         *(entry->table) = arr;
     }
-
-    if (!entry) {
-        entry = findRuntimeVTableEntry(class_lower);
-    }
-    if (!entry || !entry->table) {
-        return false;
-    }
-
-    if (tableValue == entry->table) {
-        return true;
-    }
-
-    if (VALUE_TYPE(*tableValue) == TYPE_POINTER && AS_POINTER(*tableValue) == entry->table) {
-        return true;
-    }
-
-    freeValue(tableValue);
-    *tableValue = makePointer(entry->table, NULL);
-    return true;
+    Value* table = entry->table;
+    pthread_mutex_unlock(&runtimeVTablesMutex);
+    return table;
 }
 
 static Value vmHostBoxInterface(VM* vm) {
@@ -5750,37 +6056,13 @@ static Value vmHostBoxInterface(VM* vm) {
 
     AST* interfaceType = lookupType(AS_STRING(typeNameVal));
     if (!interfaceType) {
+        // Report before the frees: freeValue clears the name being printed.
+        runtimeError(vm, "VM Error: Unknown interface type '%s'.", AS_STRING(typeNameVal));
         freeValue(&classNameVal);
         freeValue(&typeNameVal);
         freeValue(&receiverVal);
         freeValue(&tablePtrVal);
-        runtimeError(vm, "VM Error: Unknown interface type '%s'.", AS_STRING(typeNameVal));
         return makeNil();
-    }
-
-    Value* tableSlotPtr = NULL;
-    Value* tableValuePtr = NULL;
-    if (VALUE_TYPE(tablePtrVal) == TYPE_POINTER && AS_POINTER(tablePtrVal)) {
-        tableSlotPtr = (Value*)AS_POINTER(tablePtrVal);
-        tableValuePtr = tableSlotPtr;
-        if (tableValuePtr && VALUE_TYPE(*tableValuePtr) == TYPE_POINTER && AS_POINTER(*tableValuePtr)) {
-            tableValuePtr = (Value*)AS_POINTER(*tableValuePtr);
-        }
-    }
-
-    if (!tableSlotPtr && VALUE_TYPE(receiverVal) == TYPE_POINTER && AS_POINTER(receiverVal)) {
-        bool invalid_type = false;
-        Value* existingRecord = resolveRecord(&receiverVal, &invalid_type);
-        if (!invalid_type && existingRecord && VALUE_TYPE(*existingRecord) == TYPE_RECORD) {
-            FieldValue* hiddenField = AS_RECORD(*existingRecord);
-            if (hiddenField) {
-                tableSlotPtr = fieldValueStorage(hiddenField);
-                tableValuePtr = tableSlotPtr;
-                if (tableValuePtr && VALUE_TYPE(*tableValuePtr) == TYPE_POINTER && AS_POINTER(*tableValuePtr)) {
-                    tableValuePtr = (Value*)AS_POINTER(*tableValuePtr);
-                }
-            }
-        }
     }
 
     if (VALUE_TYPE(receiverVal) != TYPE_POINTER) {
@@ -5794,6 +6076,7 @@ static Value vmHostBoxInterface(VM* vm) {
             return makeNil();
         }
         *clone = makeCopyOfValue(&receiverVal);
+        freeValue(&receiverVal);
         receiverVal = makePointer(clone, NULL);
         PTR_BASE_TYPE_NODE(receiverVal) = OWNED_POINTER_SENTINEL;
 
@@ -5807,26 +6090,11 @@ static Value vmHostBoxInterface(VM* vm) {
             runtimeError(vm, "VM Error: Unable to resolve cloned receiver for interface boxing.");
             return makeNil();
         }
-        FieldValue* hiddenField = AS_RECORD(*clonedRecord);
-        if (!hiddenField) {
-            freeValue(&classNameVal);
-            freeValue(&typeNameVal);
-            freeValue(&receiverVal);
-            freeValue(&tablePtrVal);
-            runtimeError(vm, "VM Error: Cloned receiver lacks vtable storage.");
-            return makeNil();
-        }
-        tableSlotPtr = fieldValueStorage(hiddenField);
-        tableValuePtr = tableSlotPtr;
-        if (tableValuePtr && VALUE_TYPE(*tableValuePtr) == TYPE_POINTER && AS_POINTER(*tableValuePtr)) {
-            tableValuePtr = (Value*)AS_POINTER(*tableValuePtr);
-        }
     }
 
-    const char* class_name_str = (VALUE_TYPE(classNameVal) == TYPE_STRING && AS_STRING(classNameVal))
-                                     ? AS_STRING(classNameVal)
-                                     : NULL;
-    if (!tableValuePtr || !ensureRuntimeInterfaceVTable(vm, class_name_str, interfaceType, tableValuePtr)) {
+    const char* class_name_str = AS_STRING(classNameVal);
+    Value* tableValuePtr = ensureRuntimeInterfaceVTable(vm, class_name_str, AS_STRING(typeNameVal), interfaceType);
+    if (!tableValuePtr) {
         runtimeError(vm, "VM Error: Unable to initialise interface table for class '%s'.",
                      class_name_str ? class_name_str : "<unknown>");
         freeValue(&classNameVal);
@@ -5835,20 +6103,6 @@ static Value vmHostBoxInterface(VM* vm) {
         freeValue(&tablePtrVal);
         return makeNil();
     }
-    Value* resolvedTablePtr = tableSlotPtr;
-    while (resolvedTablePtr && VALUE_TYPE(*resolvedTablePtr) == TYPE_POINTER) {
-        resolvedTablePtr = (Value*)AS_POINTER(*resolvedTablePtr);
-    }
-    if (!resolvedTablePtr || VALUE_TYPE(*resolvedTablePtr) != TYPE_ARRAY || !AS_ARRAY(*resolvedTablePtr)) {
-        runtimeError(vm, "VM Error: Resolved vtable storage for class '%s' is invalid.",
-                     class_name_str ? class_name_str : "<unknown>");
-        freeValue(&classNameVal);
-        freeValue(&typeNameVal);
-        freeValue(&receiverVal);
-        freeValue(&tablePtrVal);
-        return makeNil();
-    }
-    tableValuePtr = resolvedTablePtr;
 
     ClosureEnvPayload* payload = createClosureEnv(3, TYPE_INTERFACE);
     if (!payload) {
@@ -6225,6 +6479,146 @@ static Value vmHostWaitThread(VM* vm) {
     return makeInt(0);
 }
 
+// Base-type nodes for INIT_LOCAL_POINTER's builtin pointee types
+// (`^integer`), which have no registered type to point at. A pointer keeps
+// its base-type node and may outlive the frame, so the node cannot be freed
+// with it; instead one node per type name is built on first use and kept,
+// rather than a new node on every execution (a routine with a `^integer`
+// local leaked one per call).
+typedef struct VmBuiltinPointerBase {
+    char* name;
+    AST* node;
+    struct VmBuiltinPointerBase* next;
+} VmBuiltinPointerBase;
+
+static VmBuiltinPointerBase* gVmBuiltinPointerBases = NULL;
+static pthread_mutex_t gVmBuiltinPointerBasesMutex = PTHREAD_MUTEX_INITIALIZER;
+
+static AST* vmBuiltinPointerBaseNode(const char* tn) {
+    pthread_mutex_lock(&gVmBuiltinPointerBasesMutex);
+    for (VmBuiltinPointerBase* entry = gVmBuiltinPointerBases; entry; entry = entry->next) {
+        if (strcmp(entry->name, tn) == 0) {
+            pthread_mutex_unlock(&gVmBuiltinPointerBasesMutex);
+            return entry->node;
+        }
+    }
+    VmBuiltinPointerBase* entry = (VmBuiltinPointerBase*)calloc(1, sizeof(VmBuiltinPointerBase));
+    char* name = strdup(tn);
+    if (!entry || !name) {
+        free(entry);
+        free(name);
+        pthread_mutex_unlock(&gVmBuiltinPointerBasesMutex);
+        return NULL;
+    }
+    Token* baseTok = newToken(TOKEN_IDENTIFIER, tn, 0, 0);
+    AST* node = newASTNode(AST_VARIABLE, baseTok);
+    if      (strcasecmp(tn, "integer") == 0 || strcasecmp(tn, "int") == 0) setTypeAST(node, TYPE_INT32);
+    else if (strcasecmp(tn, "real")    == 0 || strcasecmp(tn, "double") == 0) setTypeAST(node, TYPE_DOUBLE);
+    else if (strcasecmp(tn, "single")  == 0 || strcasecmp(tn, "float")  == 0) setTypeAST(node, TYPE_FLOAT);
+    else if (strcasecmp(tn, "char")    == 0) setTypeAST(node, TYPE_CHAR);
+    else if (strcasecmp(tn, "widechar")== 0) setTypeAST(node, TYPE_WIDECHAR);
+    else if (strcasecmp(tn, "unicodestring")== 0) setTypeAST(node, TYPE_UNICODE_STRING);
+    else if (strcasecmp(tn, "boolean") == 0 || strcasecmp(tn, "bool") == 0) setTypeAST(node, TYPE_BOOLEAN);
+    else if (strcasecmp(tn, "byte")    == 0) setTypeAST(node, TYPE_BYTE);
+    else if (strcasecmp(tn, "word")    == 0) setTypeAST(node, TYPE_WORD);
+    else if (strcasecmp(tn, "int64")   == 0 || strcasecmp(tn, "longint") == 0) setTypeAST(node, TYPE_INT64);
+    else if (strcasecmp(tn, "cardinal")== 0) setTypeAST(node, TYPE_UINT32);
+    else setTypeAST(node, TYPE_VOID);
+    freeToken(baseTok);
+    entry->name = name;
+    entry->node = node;
+    entry->next = gVmBuiltinPointerBases;
+    gVmBuiltinPointerBases = entry;
+    pthread_mutex_unlock(&gVmBuiltinPointerBasesMutex);
+    return node;
+}
+
+// A call must pass exactly as many arguments as the callee has parameters:
+// otherwise they land in the wrong slots (the frame window keeps that
+// memory-safe, not correct). Reports a runtime error and returns false.
+static bool vmCheckCallArity(VM* vm, const Symbol* callee, int passed) {
+    if (callee->arity != passed) {
+        runtimeError(vm, "VM Error: '%s' takes %d argument(s) but the call passes %d.",
+                     callee->name ? callee->name : "<anonymous>", (int)callee->arity, passed);
+        return false;
+    }
+    return true;
+}
+
+// Checks one dimension of a local or field array before makeArrayND sees
+// it: both bounds must fit an int (a plain cast turned array[1..4294967297]
+// into array[1..1]) and the dimension must hold between 1 and INT_MAX
+// elements (makeArrayND exits the whole process on an empty one). Reports a
+// runtime error and returns false otherwise.
+static bool vmCheckArrayDimension(VM* vm, long long lower, long long upper, int* out_lower, int* out_upper) {
+    if (lower < INT_MIN || lower > INT_MAX || upper < INT_MIN || upper > INT_MAX) {
+        runtimeError(vm, "Runtime Error: Array bounds %lld..%lld are out of range.", lower, upper);
+        return false;
+    }
+    if (upper < lower) {
+        runtimeError(vm, "Runtime Error: Array dimension %lld..%lld has no elements.", lower, upper);
+        return false;
+    }
+    if (upper - lower >= INT_MAX) {
+        runtimeError(vm, "Runtime Error: Array dimension %lld..%lld is too large.", lower, upper);
+        return false;
+    }
+    *out_lower = (int)lower;
+    *out_upper = (int)upper;
+    return true;
+}
+
+// vsnprintf into a fresh heap buffer sized for the whole result (NULL if
+// out of memory). The caller frees it.
+static char* vmFormatAlloc(const char* format, ...) __attribute__((format(printf, 1, 2)));
+static char* vmFormatAlloc(const char* format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    int needed = vsnprintf(NULL, 0, format, ap);
+    va_end(ap);
+    if (needed < 0) {
+        return NULL;
+    }
+    char* out = (char*)malloc((size_t)needed + 1);
+    if (!out) {
+        return NULL;
+    }
+    va_start(ap, format);
+    vsnprintf(out, (size_t)needed + 1, format, ap);
+    va_end(ap);
+    return out;
+}
+
+// Largest field width or precision vmHostPrintf accepts. Anything larger is
+// reported as an error instead of being silently dropped with its argument.
+#define VM_PRINTF_MAX_FIELD 65535
+
+// Reads a run of decimal digits at fmt[*j]; false if the number is above
+// VM_PRINTF_MAX_FIELD (the digits are consumed either way).
+static bool vmPrintfReadField(const char* fmt, size_t flen, size_t* j, int* out) {
+    int value = 0;
+    bool fits = true;
+    while (*j < flen && isdigit((unsigned char)fmt[*j])) {
+        if (fits) {
+            value = value * 10 + (fmt[*j] - '0');
+            if (value > VM_PRINTF_MAX_FIELD) {
+                fits = false;
+            }
+        }
+        (*j)++;
+    }
+    *out = value;
+    return fits;
+}
+
+// printf for the Pascal and Rea front ends. Each conversion is re-issued to
+// the C library from its parsed parts with an argument of exactly the type
+// that conversion expects: an integer is always passed as a 64-bit
+// (unsigned) long long under `ll`, after narrowing it to the width the
+// user's length modifier asks for (hh: 8 bits, h: 16, l/ll/j/z/t/L: 64, none:
+// the operand's own width, 32 or 64); a real is passed as a double, or as a
+// long double under `L`. Output goes straight to stdout, so no conversion
+// is cut short by a fixed buffer.
 static Value vmHostPrintf(VM* vm) {
     Value countVal = pop(vm);
     int arg_count = 0;
@@ -6248,161 +6642,120 @@ static Value vmHostPrintf(VM* vm) {
                 i++;
             } else if (arg_index < arg_count) {
                 size_t j = i + 1;
+                // Flags; a repeated flag means the same as one, so each is
+                // kept once.
                 char flags[8];
                 size_t flag_len = 0;
                 const char* flag_chars = "-+ #0'";
                 while (j < flen && strchr(flag_chars, fmt[j]) != NULL) {
-                    if (flag_len + 1 < sizeof(flags)) {
+                    if (!memchr(flags, fmt[j], flag_len)) {
                         flags[flag_len++] = fmt[j];
                     }
                     j++;
                 }
-                flags[flag_len] = '\0';
-                bool width_specified = false;
-                int width = 0;
-                while (j < flen && isdigit((unsigned char)fmt[j])) {
-                    width_specified = true;
-                    width = width * 10 + (fmt[j]-'0');
-                    j++;
+                bool fields_fit = true;
+                int width = -1;
+                if (j < flen && isdigit((unsigned char)fmt[j])) {
+                    fields_fit = vmPrintfReadField(fmt, flen, &j, &width);
                 }
                 int precision = -1;
                 if (j < flen && fmt[j] == '.') {
                     j++;
-                    precision = 0;
-                    while (j < flen && isdigit((unsigned char)fmt[j])) { precision = precision * 10 + (fmt[j]-'0'); j++; }
+                    if (!vmPrintfReadField(fmt, flen, &j, &precision)) {
+                        fields_fit = false;
+                    }
                 }
                 const char* length_mods = "hlLjzt";
                 size_t mod_start = j;
-                while (j < flen && strchr(length_mods, fmt[j]) != NULL) j++;
-                char lenmod[4] = {0};
-                size_t mod_len = (j > mod_start) ? (j - mod_start) : 0;
-                if (mod_len > 0) {
-                    if (mod_len > sizeof(lenmod) - 1) mod_len = sizeof(lenmod) - 1;
-                    memcpy(lenmod, fmt + mod_start, mod_len);
-                    lenmod[mod_len] = '\0';
+                bool mods_all_h = true;
+                bool mod_long_double = false;
+                while (j < flen && strchr(length_mods, fmt[j]) != NULL) {
+                    if (fmt[j] != 'h') mods_all_h = false;
+                    if (fmt[j] == 'L') mod_long_double = true;
+                    j++;
                 }
+                size_t mod_len = j - mod_start;
                 char spec = (j < flen) ? fmt[j] : '\0';
 
-                char fmtbuf[64];
-                char buf[DEFAULT_STRING_CAPACITY];
                 Value v = args[arg_index++];
-                size_t copy_len = (spec && spec != '\0') ? (j - i + 1) : 0;
-                if (copy_len >= sizeof(fmtbuf)) copy_len = sizeof(fmtbuf) - 1;
-                if (copy_len > 0) {
-                    memcpy(fmtbuf, fmt + i, copy_len);
-                    fmtbuf[copy_len] = '\0';
-                } else {
-                    fmtbuf[0] = '%';
-                    size_t pos = 1;
-                    if (flag_len > 0 && pos + flag_len < sizeof(fmtbuf)) {
-                        memcpy(&fmtbuf[pos], flags, flag_len);
-                        pos += flag_len;
-                    }
-                    if (width_specified) {
-                        int written = snprintf(&fmtbuf[pos], sizeof(fmtbuf) - pos, "%d", width);
-                        if (written > 0) {
-                            if ((size_t)written >= sizeof(fmtbuf) - pos) pos = sizeof(fmtbuf) - 1;
-                            else pos += (size_t)written;
-                        }
-                    }
-                    if (precision >= 0 && pos < sizeof(fmtbuf)) {
-                        fmtbuf[pos++] = '.';
-                        int written = snprintf(&fmtbuf[pos], sizeof(fmtbuf) - pos, "%d", precision);
-                        if (written > 0) {
-                            if ((size_t)written >= sizeof(fmtbuf) - pos) pos = sizeof(fmtbuf) - 1;
-                            else pos += (size_t)written;
-                        }
-                    }
-                    size_t lenmod_len = strlen(lenmod);
-                    if (lenmod_len > 0 && pos + lenmod_len < sizeof(fmtbuf)) {
-                        memcpy(&fmtbuf[pos], lenmod, lenmod_len);
-                        pos += lenmod_len;
-                    }
-                    if (pos < sizeof(fmtbuf)) {
-                        fmtbuf[pos++] = spec ? spec : ' ';
-                    }
-                    fmtbuf[pos < sizeof(fmtbuf) ? pos : (sizeof(fmtbuf) - 1)] = '\0';
+                if (!fields_fit) {
+                    size_t spec_len = (j < flen ? j + 1 : flen) - i;
+                    runtimeError(vm, "Runtime Error: printf field width or precision above %d in '%.*s%s'.",
+                                 VM_PRINTF_MAX_FIELD, (int)(spec_len > 40 ? 40 : spec_len), fmt + i,
+                                 spec_len > 40 ? "..." : "");
+                    freeValue(&v);
+                    break;
                 }
-                bool expects_wide_char = (lenmod[0] != '\0' && strpbrk(lenmod, "lL") != NULL);
+
+                // '%' + flags + width + '.' + precision + "ll" + spec + NUL
+                char conv[40];
+                size_t pos = 0;
+                conv[pos++] = '%';
+                memcpy(conv + pos, flags, flag_len);
+                pos += flag_len;
+                if (width >= 0) {
+                    pos += (size_t)snprintf(conv + pos, sizeof(conv) - pos, "%d", width);
+                }
+                if (precision >= 0 && spec != 'c') {
+                    pos += (size_t)snprintf(conv + pos, sizeof(conv) - pos, ".%d", precision);
+                }
+
                 switch (spec) {
                     case 'd': case 'i': case 'u': case 'o': case 'x': case 'X': {
-                        unsigned long long u = 0ULL; long long s = 0LL;
-                        if (isIntlikeType(VALUE_TYPE(v)) || VALUE_TYPE(v) == TYPE_BOOLEAN || VALUE_TYPE(v) == TYPE_CHAR) {
+                        long long s = 0;
+                        if (isIntlikeType(VALUE_TYPE(v))) {
                             s = AS_INTEGER(v);
-                            u = (unsigned long long)AS_INTEGER(v);
                         }
-                        bool is_unsigned = (spec=='u'||spec=='o'||spec=='x'||spec=='X');
-                        // Cast to the correct type expected by the format length modifier
-                        if (is_unsigned) {
-                            if (strcmp(lenmod, "ll") == 0) {
-                                unsigned long long val = (unsigned long long)u;
-                                snprintf(buf, sizeof(buf), fmtbuf, val);
-                            } else if (strcmp(lenmod, "l") == 0) {
-                                unsigned long val = (unsigned long)u;
-                                snprintf(buf, sizeof(buf), fmtbuf, val);
-                            } else if (strcmp(lenmod, "j") == 0) {
-                                uintmax_t val = (uintmax_t)u;
-                                snprintf(buf, sizeof(buf), fmtbuf, val);
-                            } else if (strcmp(lenmod, "z") == 0) {
-                                size_t val = (size_t)u;
-                                snprintf(buf, sizeof(buf), fmtbuf, val);
-                            } else {
-                                unsigned int val = (unsigned int)u; // includes h, hh, and default
-                                snprintf(buf, sizeof(buf), fmtbuf, val);
-                            }
+                        int bits;
+                        if (mod_len == 0) {
+                            bits = (VALUE_TYPE(v) == TYPE_INT64 || VALUE_TYPE(v) == TYPE_UINT64) ? 64 : 32;
+                        } else if (mods_all_h) {
+                            bits = (mod_len >= 2) ? 8 : 16;
                         } else {
-                            if (strcmp(lenmod, "ll") == 0) {
-                                long long val = (long long)s;
-                                snprintf(buf, sizeof(buf), fmtbuf, val);
-                            } else if (strcmp(lenmod, "l") == 0) {
-                                long val = (long)s;
-                                snprintf(buf, sizeof(buf), fmtbuf, val);
-                            } else if (strcmp(lenmod, "j") == 0) {
-                                intmax_t val = (intmax_t)s;
-                                snprintf(buf, sizeof(buf), fmtbuf, val);
-                            } else if (strcmp(lenmod, "t") == 0) {
-                                ptrdiff_t val = (ptrdiff_t)s;
-                                snprintf(buf, sizeof(buf), fmtbuf, val);
-                            } else {
-                                int val = (int)s; // includes h, hh, and default
-                                snprintf(buf, sizeof(buf), fmtbuf, val);
-                            }
+                            bits = 64;
                         }
-                        fputs(buf, stdout);
+                        conv[pos++] = 'l';
+                        conv[pos++] = 'l';
+                        conv[pos++] = spec;
+                        conv[pos] = '\0';
+                        if (spec == 'd' || spec == 'i') {
+                            if (bits == 8) s = (signed char)s;
+                            else if (bits == 16) s = (short)s;
+                            else if (bits == 32) s = (int32_t)s;
+                            fprintf(stdout, conv, s);
+                        } else {
+                            unsigned long long u = (unsigned long long)s;
+                            if (bits == 8) u &= 0xFFULL;
+                            else if (bits == 16) u &= 0xFFFFULL;
+                            else if (bits == 32) u &= 0xFFFFFFFFULL;
+                            fprintf(stdout, conv, u);
+                        }
                         break;
                     }
                     case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A': {
-                        long double rv = isRealType(VALUE_TYPE(v)) ? AS_REAL(v) : (long double)AS_INTEGER(v);
-                        // If 'L' modifier is present, pass a long double; otherwise pass double
-                        if (strcmp(lenmod, "L") == 0) {
-                            // Print directly with long double argument
-                            // Use a temporary buffer via vsnprintf-like call by delegating to snprintf
-                            // Note: snprintf supports %Lf on platforms where long double is distinct.
-                            // We still format into buf to keep existing behavior (collect into string before fputs)
-                            // Casting to long double explicitly for clarity.
-                            snprintf(buf, sizeof(buf), fmtbuf, (long double)rv);
-                        } else {
-                            snprintf(buf, sizeof(buf), fmtbuf, (double)rv);
+                        long double rv = 0.0L;
+                        if (isRealType(VALUE_TYPE(v))) {
+                            rv = AS_REAL(v);
+                        } else if (isIntlikeType(VALUE_TYPE(v))) {
+                            rv = asLd(v);
                         }
-                        fputs(buf, stdout);
+                        if (mod_long_double) {
+                            conv[pos++] = 'L';
+                            conv[pos++] = spec;
+                            conv[pos] = '\0';
+                            fprintf(stdout, conv, rv);
+                        } else {
+                            conv[pos++] = spec;
+                            conv[pos] = '\0';
+                            fprintf(stdout, conv, (double)rv);
+                        }
                         break;
                     }
                     case 'c': {
-                        char ch = (VALUE_TYPE(v) == TYPE_CHAR) ? AS_CHAR(v) : (char)AS_INTEGER(v);
-                        char safe_fmt[sizeof(fmtbuf)];
-                        const char* format = fmtbuf;
-                        if (expects_wide_char) {
-                            strncpy(safe_fmt, fmtbuf, sizeof(safe_fmt));
-                            safe_fmt[sizeof(safe_fmt) - 1] = '\0';
-                            char* mod_pos = strstr(safe_fmt, lenmod);
-                            if (mod_pos) {
-                                size_t remove_len = strlen(lenmod);
-                                memmove(mod_pos, mod_pos + remove_len, strlen(mod_pos + remove_len) + 1);
-                                format = safe_fmt;
-                            }
-                        }
-                        snprintf(buf, sizeof(buf), format, (unsigned int)ch);
-                        fputs(buf, stdout);
+                        char ch = (VALUE_TYPE(v) == TYPE_CHAR) ? (char)AS_CHAR(v) : (char)AS_INTEGER(v);
+                        conv[pos++] = 'c';
+                        conv[pos] = '\0';
+                        fprintf(stdout, conv, (int)(unsigned char)ch);
                         break;
                     }
                     case 's': {
@@ -6417,20 +6770,9 @@ static Value vmHostPrintf(VM* vm) {
                             encodeUtf8Codepoint((uint32_t)AS_CHAR(v), char_text);
                             sv = char_text;
                         }
-                        char safe_fmt[sizeof(fmtbuf)];
-                        const char* format = fmtbuf;
-                        if (expects_wide_char) {
-                            strncpy(safe_fmt, fmtbuf, sizeof(safe_fmt));
-                            safe_fmt[sizeof(safe_fmt) - 1] = '\0';
-                            char* mod_pos = strstr(safe_fmt, lenmod);
-                            if (mod_pos) {
-                                size_t remove_len = strlen(lenmod);
-                                memmove(mod_pos, mod_pos + remove_len, strlen(mod_pos + remove_len) + 1);
-                                format = safe_fmt;
-                            }
-                        }
-                        snprintf(buf, sizeof(buf), format, sv);
-                        fputs(buf, stdout);
+                        conv[pos++] = 's';
+                        conv[pos] = '\0';
+                        fprintf(stdout, conv, sv);
                         break;
                     }
                     default:
@@ -7337,9 +7679,13 @@ static InterpretResult handleDefineGlobalSlot(VM* vm, uint16_t slot, int define_
         Value typeNameVal = vm->chunk->constants[type_name_idx];
         // (debug logging removed)
         AST* type_def_node = NULL;
+        // True when type_def_node was built here rather than looked up: the
+        // symbol takes it over when created, otherwise it is freed below.
+        bool type_def_built = false;
         if (declaredType == TYPE_STRING && str_len > 0) {
             Token* strTok = newToken(TOKEN_IDENTIFIER, "string", 0, 0);
             type_def_node = newASTNode(AST_VARIABLE, strTok);
+            type_def_built = true;
             setTypeAST(type_def_node, TYPE_STRING);
             freeToken(strTok);
             char buf[32];
@@ -7358,6 +7704,7 @@ static InterpretResult handleDefineGlobalSlot(VM* vm, uint16_t slot, int define_
                 // Fall back to simple base types mapping
                 Token* baseTok = newToken(TOKEN_IDENTIFIER, AS_STRING(typeNameVal), 0, 0);
                 type_def_node = newASTNode(AST_VARIABLE, baseTok);
+                type_def_built = true;
                 const char* tn = AS_STRING(typeNameVal);
                 if      (strcasecmp(tn, "integer") == 0 || strcasecmp(tn, "int") == 0) setTypeAST(type_def_node, TYPE_INT32);
                 else if (strcasecmp(tn, "real")    == 0 || strcasecmp(tn, "double") == 0) setTypeAST(type_def_node, TYPE_DOUBLE);
@@ -7385,6 +7732,7 @@ static InterpretResult handleDefineGlobalSlot(VM* vm, uint16_t slot, int define_
             // Final safety: default pointer base to integer if not provided
             Token* baseTok = newToken(TOKEN_IDENTIFIER, "integer", 0, 0);
             type_def_node = newASTNode(AST_VARIABLE, baseTok);
+            type_def_built = true;
             setTypeAST(type_def_node, TYPE_INT32);
             freeToken(baseTok);
         }
@@ -7397,8 +7745,21 @@ static InterpretResult handleDefineGlobalSlot(VM* vm, uint16_t slot, int define_
                 return INTERPRET_RUNTIME_ERROR;
             }
             hashTableInsert(vm->vmGlobalSymbols, sym);
-        } else if (warn_on_redefine) {
-            runtimeWarning(vm, "VM Warning: Global variable '%.*s' redefined.", sourceNameLen, varName);
+        } else {
+            if (warn_on_redefine) {
+                runtimeWarning(vm, "VM Warning: Global variable '%.*s' redefined.", sourceNameLen, varName);
+            } else if (sym->value) {
+                // This same DEFINE running again (a declaration in a
+                // top-level loop body): start the variable over from its
+                // type's default each iteration, as the array branch above
+                // does and as a function local would, instead of carrying
+                // the previous iteration's value forward.
+                replaceValueCell(sym->value, makeValueForType(declaredType, sym->type_def, sym), NULL);
+            }
+            if (type_def_built) {
+                freeAST(type_def_node);
+                type_def_node = NULL;
+            }
         }
 
         if (declaredType == TYPE_FILE && sym && sym->value) {
@@ -7643,16 +8004,19 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
     // name indices to slot indices. That ordering matters here specifically
     // because pscalProtectChunkCode() below makes `code` read-only -- the
     // link step's in-place rewrite would not be safe to run after this.
-    if (!chunk->prepared_for_execution) {
+    // Double-checked: the unlocked read must acquire, pairing with the
+    // release store below, so a thread that sees `true` also sees the
+    // caches table and the protected code it guards.
+    if (!atomic_load_explicit(&chunk->prepared_for_execution, memory_order_acquire)) {
         pthread_mutex_lock(&globals_mutex);
-        if (!chunk->prepared_for_execution) {
+        if (!atomic_load_explicit(&chunk->prepared_for_execution, memory_order_relaxed)) {
             if (chunk->cache_count > 0 && !chunk->caches) {
                 chunk->caches = (CacheSlot*)calloc((size_t)chunk->cache_count, sizeof(CacheSlot));
             }
             bool caches_ok = (chunk->cache_count == 0) || (chunk->caches != NULL);
             bool protect_ok = caches_ok && pscalProtectChunkCode(chunk);
             if (caches_ok && protect_ok) {
-                chunk->prepared_for_execution = true;
+                atomic_store_explicit(&chunk->prepared_for_execution, true, memory_order_release);
             }
             pthread_mutex_unlock(&globals_mutex);
             if (!caches_ok) {
@@ -7803,8 +8167,15 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
                 while (VALUE_TYPE(*final_b) == TYPE_POINTER && AS_POINTER(*final_b)) { \
                     final_b = (Value*)AS_POINTER(*final_b); \
                 } \
-                if ((IS_STRING(*final_a) || IS_CHAR(*final_a)) && \
-                    (IS_STRING(*final_b) || IS_CHAR(*final_b) || current_instruction_code == ADD)) { \
+                /* A string + anything concatenates (the other side is \
+                 * stringified). A char + a non-text value does so only \
+                 * under Aether, whose `s[i]` is a one-character Text and \
+                 * whose Text + number stringifies (D7); everywhere else a \
+                 * char is an ordinal and char +/- int is arithmetic. */ \
+                bool concat_text_any = frontendIsAether(); \
+                if (IS_STRING(*final_a) || \
+                    (IS_CHAR(*final_a) && \
+                     (IS_STRING(*final_b) || IS_CHAR(*final_b) || concat_text_any))) { \
                     char a_buffer[5] = {0}; \
                     char b_buffer[5] = {0}; \
                     char* coerced_b = NULL; \
@@ -7901,7 +8272,7 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
                     free(coerced_b); \
                     freeValue(&a_val_popped); freeValue(&b_val_popped); \
                     op_is_handled = true; \
-                } else if ((IS_STRING(*final_b) || IS_CHAR(*final_b)) && current_instruction_code == ADD) { \
+                } else if (IS_STRING(*final_b) || (IS_CHAR(*final_b) && concat_text_any)) { \
                     char* coerced_a = vmStringifyValueForConcat(final_a); \
                     char b_buffer[5] = {0}; \
                     const char* s_a = NULL; \
@@ -8066,21 +8437,30 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
                     } \
                     long long iresult = 0; \
                     bool overflow = false; \
+                    /* A UINT64 operand: exact unsigned arithmetic, not the \
+                     * signed reading of its bits (2^63 - 1 was an overflow). */ \
+                    bool uint64_op = (VALUE_TYPE(a_val_popped) == TYPE_UINT64 || \
+                                      VALUE_TYPE(b_val_popped) == TYPE_UINT64); \
+                    unsigned long long uresult = 0; \
                     switch (current_instruction_code) { \
                         case ADD: \
-                            overflow = __builtin_add_overflow(ia, ib, &iresult); \
-                            break; \
                         case SUBTRACT: \
-                            overflow = __builtin_sub_overflow(ia, ib, &iresult); \
-                            break; \
                         case MULTIPLY: \
-                            overflow = __builtin_mul_overflow(ia, ib, &iresult); \
+                            if (uint64_op) { \
+                                overflow = !vmUInt64Arith(current_instruction_code, a_val_popped, b_val_popped, &uresult); \
+                            } else if (current_instruction_code == ADD) { \
+                                overflow = __builtin_add_overflow(ia, ib, &iresult); \
+                            } else if (current_instruction_code == SUBTRACT) { \
+                                overflow = __builtin_sub_overflow(ia, ib, &iresult); \
+                            } else { \
+                                overflow = __builtin_mul_overflow(ia, ib, &iresult); \
+                            } \
                             break; \
                         case DIVIDE: \
-                            result_val = makeReal((long double)ia / (long double)ib); \
+                            result_val = makeReal(asLd(a_val_popped) / asLd(b_val_popped)); \
                             break; \
                         case MOD: \
-                            iresult = ib == 0 ? 0 : ia % ib; \
+                            iresult = (ib == 0 || ib == -1) ? 0 : ia % ib; \
                             break; \
         default: \
                             runtimeError(vm, "Runtime Error: Invalid arithmetic opcode %d for integers.", current_instruction_code); \
@@ -8089,6 +8469,8 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
                     } \
                     if (current_instruction_code == DIVIDE) { \
                         /* result_val already set for division */ \
+                    } else if (uint64_op && !overflow && current_instruction_code != MOD) { \
+                        result_val = makeUInt64(uresult); \
                     } else if (overflow) { \
                         runtimeError(vm, "Runtime Error: Integer overflow."); \
                         freeValue(&a_val_popped); \
@@ -8504,6 +8886,18 @@ dispatch_switch:
                         freeValue(&a_val); freeValue(&b_val);
                         return INTERPRET_RUNTIME_ERROR;
                     }
+                    if (VALUE_TYPE(a_val) == TYPE_UINT64 || VALUE_TYPE(b_val) == TYPE_UINT64) {
+                        unsigned long long uq = 0;
+                        if (!vmUInt64DivMod(a_val, b_val, false, &uq)) {
+                            runtimeError(vm, "Runtime Error: Integer overflow.");
+                            freeValue(&a_val); freeValue(&b_val);
+                            return INTERPRET_RUNTIME_ERROR;
+                        }
+                        push(vm, makeUInt64(uq));
+                        freeValue(&a_val);
+                        freeValue(&b_val);
+                        break;
+                    }
                     if (ia == LLONG_MIN && ib == -1) {
                         runtimeError(vm, "Runtime Error: Integer overflow.");
                         freeValue(&a_val); freeValue(&b_val);
@@ -8544,7 +8938,17 @@ dispatch_switch:
                         freeValue(&a_val); freeValue(&b_val);
                         return INTERPRET_RUNTIME_ERROR;
                     }
-                    push(vm, pscalIntResultLike2(a_val, b_val, ia % ib));
+                    if (VALUE_TYPE(a_val) == TYPE_UINT64 || VALUE_TYPE(b_val) == TYPE_UINT64) {
+                        unsigned long long ur = 0;
+                        vmUInt64DivMod(a_val, b_val, true, &ur); // |a mod b| <= |a|: cannot overflow
+                        push(vm, makeUInt64(ur));
+                        freeValue(&a_val);
+                        freeValue(&b_val);
+                        break;
+                    }
+                    // LLONG_MIN % -1 overflows (it traps on x86-64); any
+                    // x mod -1 is 0.
+                    push(vm, pscalIntResultLike2(a_val, b_val, ib == -1 ? 0 : ia % ib));
                 } else {
                     runtimeError(vm, "Runtime Error: Operands for 'mod' must be integers. Got %s and %s.",
                                  varTypeToString(VALUE_TYPE(a_val)), varTypeToString(VALUE_TYPE(b_val)));
@@ -8649,15 +9053,14 @@ dispatch_switch:
                             default: goto comparison_error_label;
                         }
                     } else {
-                        long long ia = asI64(a_val);
-                        long long ib = asI64(b_val);
+                        int cmp = vmCompareIntlike(a_val, b_val);
                         switch (instruction_val) {
-                            case EQUAL:         result_val = makeBoolean(ia == ib); break;
-                            case NOT_EQUAL:     result_val = makeBoolean(ia != ib); break;
-                            case GREATER:       result_val = makeBoolean(ia >  ib); break;
-                            case GREATER_EQUAL: result_val = makeBoolean(ia >= ib); break;
-                            case LESS:          result_val = makeBoolean(ia <  ib); break;
-                            case LESS_EQUAL:    result_val = makeBoolean(ia <= ib); break;
+                            case EQUAL:         result_val = makeBoolean(cmp == 0); break;
+                            case NOT_EQUAL:     result_val = makeBoolean(cmp != 0); break;
+                            case GREATER:       result_val = makeBoolean(cmp >  0); break;
+                            case GREATER_EQUAL: result_val = makeBoolean(cmp >= 0); break;
+                            case LESS:          result_val = makeBoolean(cmp <  0); break;
+                            case LESS_EQUAL:    result_val = makeBoolean(cmp <= 0); break;
                             default: goto comparison_error_label;
                         }
                     }
@@ -8667,28 +9070,39 @@ dispatch_switch:
                     char b_text[5] = {0};
                     const char *sa = NULL;
                     const char *sb = NULL;
+                    size_t la = 0;
+                    size_t lb = 0;
 
+                    // Explicit lengths: a char is always one character, so
+                    // chr(0) is not the empty string (as a C string it was).
                     if (IS_STRING(a_val)) {
                         sa = AS_STRING(a_val) ? AS_STRING(a_val) : "";
+                        la = strlen(sa);
                     } else if (VALUE_TYPE(a_val) == TYPE_WIDECHAR) {
-                        encodeUtf8Codepoint((uint32_t)AS_CHAR(a_val), a_text);
+                        la = encodeUtf8Codepoint((uint32_t)AS_CHAR(a_val), a_text);
                         sa = a_text;
                     } else {
                         a_text[0] = (char)AS_CHAR(a_val);
+                        la = 1;
                         sa = a_text;
                     }
 
                     if (IS_STRING(b_val)) {
                         sb = AS_STRING(b_val) ? AS_STRING(b_val) : "";
+                        lb = strlen(sb);
                     } else if (VALUE_TYPE(b_val) == TYPE_WIDECHAR) {
-                        encodeUtf8Codepoint((uint32_t)AS_CHAR(b_val), b_text);
+                        lb = encodeUtf8Codepoint((uint32_t)AS_CHAR(b_val), b_text);
                         sb = b_text;
                     } else {
                         b_text[0] = (char)AS_CHAR(b_val);
+                        lb = 1;
                         sb = b_text;
                     }
 
-                    int cmp = strcmp(sa, sb);
+                    int cmp = memcmp(sa, sb, la < lb ? la : lb);
+                    if (cmp == 0) {
+                        cmp = (la > lb) - (la < lb);
+                    }
                     switch (instruction_val) {
                         case EQUAL:         result_val = makeBoolean(cmp == 0); break;
                         case NOT_EQUAL:     result_val = makeBoolean(cmp != 0); break;
@@ -8882,7 +9296,7 @@ dispatch_switch:
                         ptrs_equal = (AS_POINTER(a_val) == NULL);
                     } else if (frontendIsAether()) {
                         /* D24: records compare field by field under Aether. */
-                        int eq = pscalRecordPointersDeepEqual(&a_val, &b_val, 0);
+                        int eq = pscalRecordPointersDeepEqual(&a_val, &b_val);
                         if (eq < 0) goto comparison_error_label;
                         ptrs_equal = (eq == 1);
                     } else {
@@ -8925,6 +9339,38 @@ dispatch_switch:
                         runtimeError(vm, "Runtime Error: maps can only be compared with == and !=.");
                         freeValue(&a_val); freeValue(&b_val); return INTERPRET_RUNTIME_ERROR;
                     }
+                }
+                // Pascal sets: '=' and '<>' compare membership (the order
+                // the members were added in does not matter), '<=' is
+                // "is a subset of" and '>=' "is a superset of". '<' and
+                // '>' are not set operators and stay an error.
+                else if (VALUE_TYPE(a_val) == TYPE_SET && VALUE_TYPE(b_val) == TYPE_SET) {
+                    int sub = 1;
+                    int super = 1;
+                    switch (instruction_val) {
+                        case EQUAL:
+                        case NOT_EQUAL:
+                            sub = vmSetIsSubset(&a_val, &b_val);
+                            if (sub == 1) {
+                                super = vmSetIsSubset(&b_val, &a_val);
+                            }
+                            break;
+                        case LESS_EQUAL:
+                            sub = vmSetIsSubset(&a_val, &b_val);
+                            break;
+                        case GREATER_EQUAL:
+                            super = vmSetIsSubset(&b_val, &a_val);
+                            break;
+                        default:
+                            goto comparison_error_label;
+                    }
+                    if (sub < 0 || super < 0) {
+                        runtimeError(vm, "VM Error: Out of memory comparing sets.");
+                        freeValue(&a_val); freeValue(&b_val); return INTERPRET_RUNTIME_ERROR;
+                    }
+                    bool holds = (sub == 1 && super == 1);
+                    result_val = makeBoolean(instruction_val == NOT_EQUAL ? !holds : holds);
+                    comparison_succeeded = true;
                 }
                 // Any other concrete value compared against NIL: builtins
                 // like ChannelReceive/TaskAwait return TYPE_NIL to signal a
@@ -10589,6 +11035,30 @@ comparison_error_label:
                         }
                         SET_INT_VALUE(target_lvalue_ptr, AS_CHAR(*target_lvalue_ptr));
                     }
+                    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_ENUM &&
+                             isIntegerFamilyType(VALUE_TYPE(value_to_set))) {
+                        /* An integer stored into an enum variable: what a
+                         * Pascal cast `e := T(k)` compiles to, since the cast
+                         * itself emits no conversion. Replacing the whole
+                         * cell made `e` an INTEGER that no longer compared
+                         * with T's members ("Operands not comparable");
+                         * keep the enum type and store the ordinal. */
+                        long long ordinal = asI64(value_to_set);
+                        Type* meta = ENUM_META(*target_lvalue_ptr);
+                        const char* enum_name = AS_ENUM(*target_lvalue_ptr).enum_name;
+                        if (meta ? (ordinal < 0 || ordinal >= meta->member_count)
+                                 : (ordinal < INT32_MIN || ordinal > INT32_MAX)) {
+                            runtimeError(vm, "Runtime Error: Enum '%s' out of range (ordinal %lld).",
+                                         enum_name ? enum_name : "<anon>", ordinal);
+                            freeValue(&value_to_set);
+                            freeValue(&pointer_to_lvalue);
+                            return INTERPRET_RUNTIME_ERROR;
+                        }
+                        Value replacement = makeEnum(enum_name, (int)ordinal);
+                        ENUM_META(replacement) = meta;
+                        ENUM_TYPE_DEF(replacement) = ENUM_TYPE_DEF(*target_lvalue_ptr);
+                        replaceValueCell(target_lvalue_ptr, replacement, NULL);
+                    }
                     else {
                         // VM 2.0 Phase 4i: target_lvalue_ptr's type is never
                         // TYPE_POINTER at this point (that case is handled
@@ -10664,6 +11134,7 @@ comparison_error_label:
                 Value set_value;
                 if (!vmBuildSetFromOrdinal(&set_value, ordinal)) {
                     runtimeError(vm, "VM Error: Failed to allocate set singleton.");
+                    freeValue(&set_value);
                     freeValue(&item_val);
                     return INTERPRET_RUNTIME_ERROR;
                 }
@@ -10685,8 +11156,14 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 Value set_value;
-                if (!vmBuildSetFromRange(&set_value, start_ord, end_ord)) {
-                    runtimeError(vm, "VM Error: Failed to allocate set range.");
+                VmSetRangeStatus range_status = vmBuildSetFromRange(&set_value, start_ord, end_ord);
+                if (range_status != VM_SET_RANGE_OK) {
+                    if (range_status == VM_SET_RANGE_TOO_LARGE) {
+                        runtimeError(vm, "Runtime Error: Set range [%lld..%lld] is too large (at most %u elements).",
+                                     start_ord, end_ord, (unsigned)VM_SET_RANGE_MAX_ELEMENTS);
+                    } else {
+                        runtimeError(vm, "VM Error: Failed to allocate set range.");
+                    }
                     freeValue(&start_val);
                     freeValue(&end_val);
                     return INTERPRET_RUNTIME_ERROR;
@@ -11303,9 +11780,16 @@ comparison_error_label:
                                 free(lower_idx); free(upper_idx);
                                 return INTERPRET_RUNTIME_ERROR;
                             }
-                            lower_bounds[i] = 0;
-                            upper_bounds[i] = (int)VAL_INT(size_val) - 1;
+                            long long size = asI64(size_val);
                             freeValue(&size_val);
+                            if (size < 1 || !vmCheckArrayDimension(vm, 0, size - 1, &lower_bounds[i], &upper_bounds[i])) {
+                                if (size < 1) {
+                                    runtimeError(vm, "Runtime Error: Array size %lld must be at least 1.", size);
+                                }
+                                free(lower_bounds); free(upper_bounds);
+                                free(lower_idx); free(upper_idx);
+                                return INTERPRET_RUNTIME_ERROR;
+                            }
                         } else {
                             if (lower_idx[i] >= vm->chunk->constants_count || upper_idx[i] >= vm->chunk->constants_count) {
                                 runtimeError(vm, "VM Error: Array bound constant index out of range.");
@@ -11321,8 +11805,12 @@ comparison_error_label:
                                 free(lower_idx); free(upper_idx);
                                 return INTERPRET_RUNTIME_ERROR;
                             }
-                            lower_bounds[i] = (int)VAL_INT(lower_val);
-                            upper_bounds[i] = (int)VAL_INT(upper_val);
+                            if (!vmCheckArrayDimension(vm, asI64(lower_val), asI64(upper_val),
+                                                       &lower_bounds[i], &upper_bounds[i])) {
+                                free(lower_bounds); free(upper_bounds);
+                                free(lower_idx); free(upper_idx);
+                                return INTERPRET_RUNTIME_ERROR;
+                            }
                         }
                     }
 
@@ -11407,9 +11895,16 @@ comparison_error_label:
                                 free(lower_idx); free(upper_idx);
                                 return INTERPRET_RUNTIME_ERROR;
                             }
-                            lower_bounds[i] = 0;
-                            upper_bounds[i] = (int)VAL_INT(size_val) - 1;
+                            long long size = asI64(size_val);
                             freeValue(&size_val);
+                            if (size < 1 || !vmCheckArrayDimension(vm, 0, size - 1, &lower_bounds[i], &upper_bounds[i])) {
+                                if (size < 1) {
+                                    runtimeError(vm, "Runtime Error: Array size %lld must be at least 1.", size);
+                                }
+                                free(lower_bounds); free(upper_bounds);
+                                free(lower_idx); free(upper_idx);
+                                return INTERPRET_RUNTIME_ERROR;
+                            }
                         } else {
                             if (lower_idx[i] >= vm->chunk->constants_count || upper_idx[i] >= vm->chunk->constants_count) {
                                 runtimeError(vm, "VM Error: Array bound constant index out of range.");
@@ -11425,8 +11920,12 @@ comparison_error_label:
                                 free(lower_idx); free(upper_idx);
                                 return INTERPRET_RUNTIME_ERROR;
                             }
-                            lower_bounds[i] = (int)VAL_INT(lower_val);
-                            upper_bounds[i] = (int)VAL_INT(upper_val);
+                            if (!vmCheckArrayDimension(vm, asI64(lower_val), asI64(upper_val),
+                                                       &lower_bounds[i], &upper_bounds[i])) {
+                                free(lower_bounds); free(upper_bounds);
+                                free(lower_idx); free(upper_idx);
+                                return INTERPRET_RUNTIME_ERROR;
+                            }
                         }
                     }
 
@@ -11517,23 +12016,8 @@ comparison_error_label:
                     if (looked) {
                         type_def = looked;
                     } else {
-                        // Build a simple base type node from the provided name
-                        Token* baseTok = newToken(TOKEN_IDENTIFIER, AS_STRING(type_name_val), 0, 0);
-                        type_def = newASTNode(AST_VARIABLE, baseTok);
-                        const char* tn = AS_STRING(type_name_val);
-                        if      (strcasecmp(tn, "integer") == 0 || strcasecmp(tn, "int") == 0) setTypeAST(type_def, TYPE_INT32);
-                        else if (strcasecmp(tn, "real")    == 0 || strcasecmp(tn, "double") == 0) setTypeAST(type_def, TYPE_DOUBLE);
-                        else if (strcasecmp(tn, "single")  == 0 || strcasecmp(tn, "float")  == 0) setTypeAST(type_def, TYPE_FLOAT);
-                        else if (strcasecmp(tn, "char")    == 0) setTypeAST(type_def, TYPE_CHAR);
-                        else if (strcasecmp(tn, "widechar")== 0) setTypeAST(type_def, TYPE_WIDECHAR);
-                        else if (strcasecmp(tn, "unicodestring")== 0) setTypeAST(type_def, TYPE_UNICODE_STRING);
-                        else if (strcasecmp(tn, "boolean") == 0 || strcasecmp(tn, "bool") == 0) setTypeAST(type_def, TYPE_BOOLEAN);
-                        else if (strcasecmp(tn, "byte")    == 0) setTypeAST(type_def, TYPE_BYTE);
-                        else if (strcasecmp(tn, "word")    == 0) setTypeAST(type_def, TYPE_WORD);
-                        else if (strcasecmp(tn, "int64")   == 0 || strcasecmp(tn, "longint") == 0) setTypeAST(type_def, TYPE_INT64);
-                        else if (strcasecmp(tn, "cardinal")== 0) setTypeAST(type_def, TYPE_UINT32);
-                        else setTypeAST(type_def, TYPE_VOID);
-                        freeToken(baseTok);
+                        // A builtin base type (`^integer`): one shared node per name.
+                        type_def = vmBuiltinPointerBaseNode(AS_STRING(type_name_val));
                     }
                 }
                 CallFrame* frame = &vm->frames[vm->frameCount - 1];
@@ -12083,6 +12567,10 @@ comparison_error_label:
                     vm->frameCount--;
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                if (!vmCheckCallArity(vm, proc_symbol, declared_arity)) {
+                    vm->frameCount--;
+                    return INTERPRET_RUNTIME_ERROR;
+                }
 
                 if (proc_symbol->type_def && proc_symbol->type_def->child_count >= declared_arity) {
                     for (int i = 0; i < declared_arity; i++) {
@@ -12207,6 +12695,13 @@ comparison_error_label:
                         releaseClosureEnv(captured_env);
                     }
                     runtimeError(vm, "VM Error: No procedure found at address %04u for indirect call.", target_address);
+                    vm->frameCount--;
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+                if (!vmCheckCallArity(vm, proc_symbol, declared_arity)) {
+                    if (captured_env) {
+                        releaseClosureEnv(captured_env);
+                    }
                     vm->frameCount--;
                     return INTERPRET_RUNTIME_ERROR;
                 }
@@ -12382,6 +12877,10 @@ comparison_error_label:
                                  method_index, target_address);
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                // The receiver is the method's first parameter.
+                if (!vmCheckCallArity(vm, method_symbol, declared_arity + 1)) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
 
                 if (!vmEnsureFrameCapacity(vm)) {
                     runtimeError(vm, "VM Error: Call stack overflow.");
@@ -12512,6 +13011,13 @@ comparison_error_label:
                         releaseClosureEnv(captured_env);
                     }
                     runtimeError(vm, "VM Error: No procedure found at address %04u for indirect call.", target_address);
+                    vm->frameCount--;
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+                if (!vmCheckCallArity(vm, proc_symbol, declared_arity)) {
+                    if (captured_env) {
+                        releaseClosureEnv(captured_env);
+                    }
                     vm->frameCount--;
                     return INTERPRET_RUNTIME_ERROR;
                 }
@@ -12755,23 +13261,24 @@ comparison_error_label:
 
                 Value raw_val = pop(vm);
 
-                char buf[DEFAULT_STRING_CAPACITY];
-                buf[0] = '\0';
+                // Sized for the whole field: `1e300:1:2` is over 300
+                // characters, and a string may be any length.
+                char* buf = NULL;
 
                 if (isRealType(VALUE_TYPE(raw_val))) {
                     long double rv = AS_REAL(raw_val);
                     int width_int = width;
                     if (precision >= 0) {
-                        snprintf(buf, sizeof(buf), "%*.*Lf", width_int, precision, rv);
+                        buf = vmFormatAlloc("%*.*Lf", width_int, precision, rv);
                     } else {
-                        snprintf(buf, sizeof(buf), "%*.*LE", width_int,
+                        buf = vmFormatAlloc("%*.*LE", width_int,
                                  (int)PASCAL_DEFAULT_FLOAT_PRECISION, rv);
                     }
                 } else if (VALUE_TYPE(raw_val) == TYPE_CHAR) {
-                    snprintf(buf, sizeof(buf), "%*c", width, AS_CHAR(raw_val));
+                    buf = vmFormatAlloc("%*c", width, AS_CHAR(raw_val));
                 } else if (VALUE_TYPE(raw_val) == TYPE_BOOLEAN) {
                     const char* bool_str = VAL_INT(raw_val) ? "TRUE" : "FALSE";
-                    snprintf(buf, sizeof(buf), "%*s", width, bool_str);
+                    buf = vmFormatAlloc("%*s", width, bool_str);
                 } else if (isIntlikeType(VALUE_TYPE(raw_val))) {
                     if (VALUE_TYPE(raw_val) == TYPE_UINT64 || VALUE_TYPE(raw_val) == TYPE_UINT32 ||
                         VALUE_TYPE(raw_val) == TYPE_UINT16 || VALUE_TYPE(raw_val) == TYPE_UINT8 ||
@@ -12780,25 +13287,29 @@ comparison_error_label:
                         if (VALUE_TYPE(raw_val) == TYPE_BYTE || VALUE_TYPE(raw_val) == TYPE_UINT8)   u &= 0xFFULL;
                         if (VALUE_TYPE(raw_val) == TYPE_WORD || VALUE_TYPE(raw_val) == TYPE_UINT16) u &= 0xFFFFULL;
                         if (VALUE_TYPE(raw_val) == TYPE_UINT32) u &= 0xFFFFFFFFULL;
-                        snprintf(buf, sizeof(buf), "%*llu", width, u);
+                        buf = vmFormatAlloc("%*llu", width, u);
                     } else {
                         long long s = VAL_INT(raw_val);
                         if (VALUE_TYPE(raw_val) == TYPE_INT8)  s = (int8_t)s;
                         if (VALUE_TYPE(raw_val) == TYPE_INT16) s = (int16_t)s;
-                        snprintf(buf, sizeof(buf), "%*lld", width, s);
+                        buf = vmFormatAlloc("%*lld", width, s);
                     }
                 } else if (VALUE_TYPE(raw_val) == TYPE_STRING) {
                     const char* source_str = AS_STRING(raw_val) ? AS_STRING(raw_val) : "";
                     size_t len = strlen(source_str);
                     int prec = (width > 0 && (size_t)width < len) ? width : (int)len;
-                    snprintf(buf, sizeof(buf), "%*.*s", width, prec, source_str);
+                    buf = vmFormatAlloc("%*.*s", width, prec, source_str);
                 } else {
-                    snprintf(buf, sizeof(buf), "%*s", width, "?");
+                    buf = vmFormatAlloc("%*s", width, "?");
                 }
 
                 freeValue(&raw_val);
+                if (!buf) {
+                    runtimeError(vm, "VM Error: Out of memory formatting a value for output.");
+                    return INTERPRET_RUNTIME_ERROR;
+                }
 
-                push(vm, makeString(buf));
+                push(vm, makeOwnedString(buf, strlen(buf)));
                 break;
             }
 
