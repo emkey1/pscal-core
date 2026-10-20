@@ -2456,14 +2456,14 @@ Value makeArrayND(int dimensions, int *lower_bounds, int *upper_bounds, VarType 
         //
         // "Simple" here means a zeroed Value.bits is itself a valid default
         // for that type -- true for the tagged-immediate/NaN-boxed types
-        // (INT8..UINT32, DOUBLE via pscalBoxDouble(0.0) == 0 bits, etc.).
-        // It is NOT true for INT64/UINT64/LONG_DOUBLE: those are heap-boxed
-        // (Int64Box/LongDoubleBox) as of VM 2.0 Phase 4i, and bits=0 with
-        // one of those types set is a documented nil-pointer *placeholder*,
-        // not a usable value (core/types.h's pscalValueSetIntBits/RealBits
-        // comments) -- reading it dereferences a null Int64Box/LongDoubleBox
-        // pointer. Route them through makeValueForType below instead, which
-        // calls SET_INT_VALUE/SET_REAL_VALUE and actually allocates the box.
+        // (INT8..UINT32, DOUBLE via pscalBoxDouble(0.0) == 0 bits, etc.)
+        // and for INT64/UINT64, whose bits are the value itself.
+        // It is NOT true for LONG_DOUBLE: that is heap-boxed
+        // (LongDoubleBox), and bits=0 with that type set is a documented
+        // nil-pointer *placeholder*, not a usable value (core/types.h's
+        // pscalValueSetRealBits comments) -- reading it dereferences a null
+        // LongDoubleBox pointer. Route it through makeValueForType below
+        // instead, which calls SET_REAL_VALUE and actually allocates the box.
         // Previously dormant because every existing caller either filled
         // every slot immediately (compile-time array-literal population) or
         // never constructed a primitive-typed array through the "elements
@@ -2474,6 +2474,7 @@ Value makeArrayND(int dimensions, int *lower_bounds, int *upper_bounds, VarType 
                          element_type == TYPE_BYTE || element_type == TYPE_INT8 ||
                          element_type == TYPE_UINT8 || element_type == TYPE_INT16 ||
                          element_type == TYPE_UINT16 || element_type == TYPE_UINT32 ||
+                         element_type == TYPE_INT64 || element_type == TYPE_UINT64 ||
                          element_type == TYPE_FLOAT);
         if (isSimple && total_size > 0) {
             memset(arr->elements, 0, sizeof(Value) * total_size);
@@ -3241,19 +3242,10 @@ void freeValue(Value *v) {
   //          fflush(stderr);
 //#endif
             break;
-        // VM 2.0 Phase 4i checkpoint 3c: int64_box/long_double_box are the
-        // only heap data these three types own; i_val/u_val/real.r_val
-        // stay valid (they're not heap pointers) but are otherwise inert
-        // once freeValue tears the Value down.
         case TYPE_INT64:
-        case TYPE_UINT64: {
-            Int64Box *box = PSCAL_VALUE_PTR(*v, Int64Box);
-            if (box) {
-                pscalObjRelease(&box->header);
-            }
-            v->bits = pscalTagPointer(NULL);
-            break;
-        }
+        case TYPE_UINT64:
+            break; // stored inline in bits
+        // long_double_box is the only heap data TYPE_LONG_DOUBLE owns.
         case TYPE_LONG_DOUBLE: {
             LongDoubleBox *box = PSCAL_VALUE_PTR(*v, LongDoubleBox);
             if (box) {
@@ -4803,18 +4795,10 @@ Value makeCopyOfValue(const Value *src) {
             // CALL_BUILTIN's skip guarantees is never matched by a
             // release -- a permanent leak, not a fix.
             break;
-        // VM 2.0 Phase 4i checkpoint 3c: `v = *src` above left v's bits
-        // ALIASING src's box -- overwrite with a fresh one,
-        // copy-on-construct, matching the STRING/ENUM/RECORD/SET
-        // precedent above.
-        case TYPE_INT64:
-        case TYPE_UINT64: {
-            Int64Box *src_box = PSCAL_VALUE_PTR(*src, Int64Box);
-            Int64Box *box = pscalInt64BoxCreate(src_box ? src_box->value : VAL_INT(*src));
-            box->header.type = src->type;
-            pscalValueSetHeapPtrBits(&v, box);
-            break;
-        }
+        // `v = *src` above left v's bits ALIASING src's box -- overwrite
+        // with a fresh one, copy-on-construct, matching the
+        // STRING/ENUM/RECORD/SET precedent above. (TYPE_INT64/UINT64 are
+        // inline in bits, so `v = *src` already copied them.)
         case TYPE_LONG_DOUBLE: {
             LongDoubleBox *src_box = PSCAL_VALUE_PTR(*src, LongDoubleBox);
             LongDoubleBox *box = pscalLongDoubleBoxCreate(src_box ? src_box->value : VAL_REAL_LD(*src));

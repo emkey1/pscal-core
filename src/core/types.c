@@ -16,29 +16,24 @@ void setTypeValue(Value *val, VarType type) {
     // first), setTypeValue's own callers (vm.c's real/int
     // parameter-coercion sites) retype an ALREADY-LIVE Value across the
     // real/int family boundary with no freeValue call in between.
-    // Release an old Int64Box/LongDoubleBox here before it becomes
-    // unreachable, or every such coercion leaks one box. Decode straight
-    // from `bits` -- there is no dedicated box field anymore.
-    if (val->type == TYPE_INT64 || val->type == TYPE_UINT64) {
-        Int64Box *box = (Int64Box *)pscalUntagPointer(val->bits);
-        if (box) {
-            pscalObjRelease(&box->header);
-        }
-    } else if (val->type == TYPE_LONG_DOUBLE) {
+    // Release an old LongDoubleBox here before it becomes unreachable, or
+    // every such coercion leaks one box. Decode straight from `bits` --
+    // there is no dedicated box field anymore.
+    if (val->type == TYPE_LONG_DOUBLE) {
         LongDoubleBox *box = (LongDoubleBox *)pscalUntagPointer(val->bits);
         if (box) {
             pscalObjRelease(&box->header);
         }
     }
     val->type = type;
-    // Checkpoint 3d's Int64Box/LongDoubleBox decode path treats `bits` as
-    // either 0 ("no box yet") or a live box pointer from an earlier call
-    // through this same box-owning type. Retyping INTO one of these types
+    // The LongDoubleBox decode path treats `bits` as either 0 ("no box
+    // yet") or a live box pointer from an earlier call. Retyping INTO it
     // from a different family (e.g. TYPE_DOUBLE, whose `bits` is raw
     // NaN-boxed payload, not a pointer) leaves stale non-box bits behind;
-    // the next SET_INT_VALUE/SET_REAL_VALUE call would misread them as a
-    // live box and pass garbage to pscalObjRelease. Zero it so callers see
-    // the documented "no box yet" state.
+    // the next SET_REAL_VALUE call would misread them as a live box and
+    // pass garbage to pscalObjRelease. Zero it so callers see the
+    // documented "no box yet" state. INT64/UINT64 bits are the value
+    // itself, so zero is also their value 0 until the caller sets one.
     if (type == TYPE_INT64 || type == TYPE_UINT64 || type == TYPE_LONG_DOUBLE) {
         val->bits = 0;
     }

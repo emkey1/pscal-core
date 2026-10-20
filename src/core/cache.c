@@ -1959,9 +1959,9 @@ static bool readValue(Cursor* in, Value* out) {
         case TYPE_UINT32:
         case TYPE_UINT64: {
             unsigned long long tmp = curU64LE(in);
-            // SET_INT_VALUE stores the exact 64-bit pattern (Int64Box's
-            // int64_t slot is reinterpreted as unsigned by VAL_UINT), so
-            // no separate raw-field write is needed to preserve range.
+            // SET_INT_VALUE stores the exact 64-bit pattern (VAL_UINT
+            // reads it back as unsigned), so no separate raw-field write
+            // is needed to preserve range.
             SET_INT_VALUE(out, (long long)tmp);
             break;
         }

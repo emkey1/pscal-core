@@ -334,44 +334,15 @@ static inline float pscalUntagFloat(uint64_t word) {
     return f;
 }
 
-// --- Int64Box / LongDoubleBox (plan §5.10.1, sub-phase 4h) ---
+// --- LongDoubleBox (plan §5.10.1, sub-phase 4h) ---
 //
-// The two numeric types that must stay heap-boxed under this tagged-word
-// scheme: TYPE_INT64/TYPE_UINT64 (full 64-bit range doesn't fit the
-// 45-bit immediate payload) and TYPE_LONG_DOUBLE (extended precision a
-// 64-bit word cannot carry inline alongside a type tag). Defined here
-// rather than core/types.h because nothing wires these onto ValueStruct's
-// union until 4i (the flag day) -- keeping them here lets this whole
-// sub-phase build and unit-test standalone against just
-// obj_header.{h,c}, the same isolation 4a established for the NaN-box
-// and canary. Expect these two structs (not their logic) to migrate to
-// core/types.h alongside the other ObjHeader-based shapes once 4i wires
-// them into Value's union, the same way every prior sub-phase's shape
-// has lived there.
-//
-// One physical field serves both TYPE_INT64 and TYPE_UINT64 -- a signed
-// and unsigned 64-bit value share the same bit pattern, exactly like the
-// live VM's Value.i_val already stores unsigned 64-bit values in a
-// signed field today (see utils.h's asI64 family) -- not a new risk this
-// phase introduces, just carried into the boxed shape unchanged. The
-// caller selects which of the two VarTypes a given instance is by
-// setting header.type after pscalInt64BoxCreate returns (default
-// TYPE_INT64); both destructors are pre-registered so either is safe.
-typedef struct Int64Box {
-    ObjHeader header;
-    int64_t value;
-} Int64Box;
-
+// TYPE_LONG_DOUBLE stays heap-boxed: extended precision does not fit a
+// 64-bit word. (TYPE_INT64/TYPE_UINT64 had an Int64Box too; they now keep
+// their bit pattern directly in Value.bits -- see pscalValueSetIntBits.)
 typedef struct LongDoubleBox {
     ObjHeader header; // header.type is always TYPE_LONG_DOUBLE
     long double value;
 } LongDoubleBox;
-
-// Returns a fresh, refcount=1 Int64Box holding `value`, tagged
-// TYPE_INT64 by default -- set `box->header.type = TYPE_UINT64` after
-// the call for an unsigned instance (reinterpret the bit pattern via
-// memcpy at the point of use, not a cast, to avoid signed-overflow UB).
-Int64Box *pscalInt64BoxCreate(int64_t value);
 
 // Returns a fresh, refcount=1 LongDoubleBox holding `value`.
 LongDoubleBox *pscalLongDoubleBoxCreate(long double value);

@@ -501,8 +501,9 @@ typedef struct RealValue { float f32_val; double d_val; long double r_val; } Rea
 // heap-pointer type/array metadata/file metadata/etc, all coexisting with
 // `bits` purely for cross-checking) down to two fields. `bits` is now the
 // SOLE storage for every payload -- immediates decode inline via the
-// pscalUntagX family, heap-pointer types (including the checkpoint-3c
-// Int64Box/LongDoubleBox and the checkpoint-3a ClosureObj/InterfaceObj)
+// pscalUntagX family (TYPE_INT64/UINT64 hold their raw 64-bit pattern),
+// heap-pointer types (including the checkpoint-3c LongDoubleBox and the
+// checkpoint-3a ClosureObj/InterfaceObj)
 // decode via pscalUntagPointer + PSCAL_VALUE_PTR. `pscalValueBitsConsistent`
 // is deleted along with every field it cross-checked -- there is nothing
 // left to compare `bits` against.
@@ -558,39 +559,14 @@ static inline void pscalValueSetIntBits(Value *dest, long long val) {
         case TYPE_INT32:    dest->bits = pscalTagInt32((int32_t)val); break;
         case TYPE_UINT32:   dest->bits = pscalTagUInt32((uint32_t)val); break;
         case TYPE_THREAD:   dest->bits = pscalTagInt32((int32_t)val); break;
-        // VM 2.0 Phase 4i checkpoint 3c: release-then-allocate, not
-        // allocate-only. `dest->type` is ALREADY TYPE_INT64/TYPE_UINT64 by
-        // the time this runs (every caller sets `.type` first, per this
-        // function's own precondition) -- which means any existing
-        // `int64_box` here is guaranteed to be a real, matching box from
-        // an earlier call, never a stale union member from a DIFFERENT
-        // type (that would require retyping via SET_VALUE_TYPE, which
-        // never touches this box -- callers are responsible for freeing
-        // old heap-owned content before retyping, same contract every
-        // other boxed type already has). This makes copy-on-construct
-        // safe for the in-place-mutation call sites checkpoint 3c's audit
-        // found (Inc/Dec, INC_LOCAL/DEC_LOCAL, SET_LOCAL/SET_UPVALUE/
-        // SET_INDIRECT's same-type assignment path) with zero call-site
-        // changes -- exactly the same "extend the shared macro, not every
-        // caller" lesson checkpoint 2 established.
+        // TYPE_INT64/TYPE_UINT64 store their 64-bit pattern directly in
+        // `bits`. They used to be heap-boxed (Int64Box), which cost a
+        // malloc per integer result and per copy, and let an in-place
+        // update free a box a concurrent reader was still copying. `type`
+        // is an explicit field, so nothing needs `bits` itself to say
+        // what kind of word it holds.
         case TYPE_INT64:
-        case TYPE_UINT64: {
-            // VM 2.0 Phase 4i checkpoint 3d: decode the existing box (if
-            // any) straight from `bits` -- there is no dedicated
-            // `int64_box` field anymore. A fresh Value's `bits` is 0,
-            // which decodes to a NULL pointer (correctly "no box yet");
-            // an already-INT64/UINT64 Value's `bits` already holds a
-            // real tagged pointer from an earlier call to this same
-            // function, per the invariant documented above.
-            Int64Box *existing = (Int64Box *)pscalUntagPointer(dest->bits);
-            if (existing) {
-                pscalObjRelease(&existing->header);
-            }
-            Int64Box *box = pscalInt64BoxCreate(val);
-            box->header.type = dest->type;
-            dest->bits = pscalTagPointer(box);
-            break;
-        }
+        case TYPE_UINT64:   dest->bits = (uint64_t)val; break;
         default: break;
     }
 }
@@ -664,6 +640,8 @@ static inline void pscalValueResetBitsForType(Value *dest, VarType t) {
         case TYPE_FLOAT:    dest->bits = pscalTagFloat(0.0f); break;
         case TYPE_DOUBLE:   dest->bits = pscalBoxDouble(0.0); break;
         case TYPE_THREAD:   dest->bits = pscalTagInt32(0); break;
+        case TYPE_INT64:
+        case TYPE_UINT64:   dest->bits = 0; break;
         // VM 2.0 Phase 4i checkpoint 3b: heap-pointer types get a real
         // nil-pointer placeholder (not bare 0) the moment a Value is
         // retyped to one of these, matching the scalar precedent of
@@ -685,18 +663,16 @@ static inline void pscalValueResetBitsForType(Value *dest, VarType t) {
         case TYPE_SET:
         case TYPE_MEMORYSTREAM:
         // VM 2.0 Phase 4i checkpoint 3c: same nil-pointer-placeholder
-        // treatment as the heap-pointer types above -- a retype to one of
-        // these three does NOT itself allocate a box (matching every
+        // treatment as the heap-pointer types above -- a retype to
+        // TYPE_LONG_DOUBLE does NOT itself allocate a box (matching every
         // other boxed type's contract: the caller is responsible for
         // releasing old heap-owned content before retyping away, and the
-        // box gets allocated by pscalValueSetIntBits/RealBits once the
+        // box gets allocated by pscalValueSetRealBits once the
         // numeric value is actually set). Deliberately does NOT touch
-        // int64_box/long_double_box here -- leaving that decision to the
+        // long_double_box here -- leaving that decision to the
         // dedicated setters keeps this function a pure "what should bits
         // look like" query, with zero risk of double-freeing a box a
         // caller already released.
-        case TYPE_INT64:
-        case TYPE_UINT64:
         case TYPE_LONG_DOUBLE:
         // VM 2.0 Phase 4i checkpoint 3d prep: closing the one bits-mirror
         // gap left open since checkpoint 3a boxed these two types
@@ -738,8 +714,7 @@ static inline long long pscalValueDecodeInt(Value v) {
         case TYPE_UINT32:   return (long long)pscalUntagUInt32(v.bits);
         case TYPE_THREAD:   return pscalUntagInt32(v.bits);
         case TYPE_INT64:
-        case TYPE_UINT64:
-            return ((Int64Box *)pscalUntagPointer(v.bits))->value;
+        case TYPE_UINT64:   return (long long)v.bits;
         default: return 0;
     }
 }
@@ -759,8 +734,7 @@ static inline unsigned long long pscalValueDecodeUInt(Value v) {
         case TYPE_UINT32:   return pscalUntagUInt32(v.bits);
         case TYPE_THREAD:   return (unsigned long long)(long long)pscalUntagInt32(v.bits);
         case TYPE_INT64:
-        case TYPE_UINT64:
-            return (unsigned long long)((Int64Box *)pscalUntagPointer(v.bits))->value;
+        case TYPE_UINT64:   return (unsigned long long)v.bits;
         default: return 0;
     }
 }
