@@ -33,6 +33,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h> // For the operand stack's mmap/mprotect-backed growable storage (VM 2.0 Phase 3)
 #include "backend_ast/builtin.h"
+#include "backend_ast/runtime_signal_flags.h"
 #include "vm/vm_fx_policy.h"
 #ifdef SDL
 #include "backend_ast/pscal_sdl_runtime.h"
@@ -4669,6 +4670,32 @@ static Value copyValueForStack(const Value* src) {
         return makeNil();
     }
 
+    // Scalars own no heap data, so they need no lock: read the cell once
+    // and decide on that snapshot. Re-reading *src after the type test could
+    // pair a scalar type with a racing writer's heap pointer, which would
+    // then escape unretained. A torn snapshot whose type is a scalar is at
+    // worst a wrong number in a program that races on the variable.
+    Value snapshot = *src;
+    switch (VALUE_TYPE(snapshot)) {
+        case TYPE_VOID:
+        case TYPE_INT32:
+        case TYPE_DOUBLE:
+        case TYPE_BOOLEAN:
+        case TYPE_CHAR:
+        case TYPE_BYTE:
+        case TYPE_WORD:
+        case TYPE_INT8:
+        case TYPE_UINT8:
+        case TYPE_INT16:
+        case TYPE_UINT16:
+        case TYPE_UINT32:
+        case TYPE_FLOAT:
+        case TYPE_NIL:
+            return snapshot;
+        default:
+            break;
+    }
+
     pthread_mutex_lock(&value_cell_mutex);
 
     switch (VALUE_TYPE(*src)) {
@@ -8011,11 +8038,22 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
             }
         }
 #endif
-        if (vmConsumeSuspendRequest(vm)) {
-            /* Marked as a cooperative stop request; unwind below via exit_requested. */
-        }
-        if (vmConsumeInterruptRequest(vm)) {
-            /* VM abort flag is set; let the normal exit/abort handling run. */
+#if !defined(PSCAL_TARGET_IOS)
+        // Both consumers below are no-ops unless a signal flag or one of
+        // these VM flags is set, so test those inline first: this check runs
+        // before every instruction.
+        if (pscalRuntimeSignalAttention() ||
+            vm->abort_requested || vm->exit_requested ||
+            (vm->threadOwner && (vm->threadOwner->abort_requested ||
+                                 vm->threadOwner->exit_requested)))
+#endif
+        {
+            if (vmConsumeSuspendRequest(vm)) {
+                /* Marked as a cooperative stop request; unwind below via exit_requested. */
+            }
+            if (vmConsumeInterruptRequest(vm)) {
+                /* VM abort flag is set; let the normal exit/abort handling run. */
+            }
         }
         if (pending_exit_flag && *pending_exit_flag) {
             shellRuntimeMaybeRequestPendingExit(vm);

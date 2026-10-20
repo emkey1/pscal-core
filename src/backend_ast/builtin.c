@@ -4477,11 +4477,13 @@ static _Thread_local int vm_color_stack_depth = 0;
 // VMs) -- volatile alone only guarantees signal-safety within one thread,
 // not cross-thread visibility/ordering. atomic_int is still async-signal-
 // safe for a lock-free type (C11 7.17.4) while fixing the cross-thread race.
-static atomic_int g_vm_sigint_seen = 0;
+// Not static: the VM's instruction loop reads these three inline through
+// runtime_signal_flags.h.
+atomic_int g_vm_sigint_seen = 0;
 static int g_vm_sigint_pipe[2] = {-1, -1};
 static pthread_once_t g_vm_sigint_pipe_once = PTHREAD_ONCE_INIT;
-static atomic_bool g_vm_interrupt_broadcast = false;
-static atomic_bool g_vm_suspend_requested = false;
+atomic_bool g_vm_interrupt_broadcast = false;
+atomic_bool g_vm_suspend_requested = false;
 static void vmDrainSigintFd(int fd, bool is_host);
 
 static void vmEnableRawMode(void); // Forward declaration
