@@ -7856,6 +7856,45 @@ static ArrayBoundsResult resolveFirstDimBounds(Value* arg) {
     return result;
 }
 
+/* The integer type a Low()/High() type-name argument names: a Pascal name
+ * (longint, cardinal, shortint, smallint, int64, qword, longword, ...) or
+ * the VarType spelling the compiler passes for a variable's type (INT8,
+ * UINT16, INT64, UINT64, ...). TYPE_VOID if it names no integer type. */
+static VarType lowHighIntegerTypeFromName(const char* name) {
+    VarType t = lookupBuiltinPascalTypeName(name);
+    if (isIntlikeType(t)) {
+        return t;
+    }
+    static const VarType kIntTypes[] = {
+        TYPE_INT8, TYPE_UINT8, TYPE_INT16, TYPE_UINT16, TYPE_INT32,
+        TYPE_UINT32, TYPE_INT64, TYPE_UINT64, TYPE_BYTE, TYPE_WORD
+    };
+    for (size_t i = 0; i < sizeof(kIntTypes) / sizeof(kIntTypes[0]); ++i) {
+        if (strcasecmp(name, varTypeToString(kIntTypes[i])) == 0) {
+            return kIntTypes[i];
+        }
+    }
+    if (strcasecmp(name, "longword") == 0 || strcasecmp(name, "dword") == 0) return TYPE_UINT32;
+    if (strcasecmp(name, "int32") == 0) return TYPE_INT32;
+    return TYPE_VOID;
+}
+
+/* Low()/High() of the sized integer types; false for any other type. Only
+ * Integer, Byte and Word were handled, so High(QWord), Low(Int64),
+ * Low(ShortInt) and the like were "not supported". */
+static bool lowHighIntegerBound(VarType t, bool high, Value* out) {
+    switch (t) {
+        case TYPE_INT8:   *out = makeInt(high ? INT8_MAX : INT8_MIN); return true;
+        case TYPE_UINT8:  *out = makeInt(high ? UINT8_MAX : 0); return true;
+        case TYPE_INT16:  *out = makeInt(high ? INT16_MAX : INT16_MIN); return true;
+        case TYPE_UINT16: *out = makeInt(high ? UINT16_MAX : 0); return true;
+        case TYPE_UINT32: *out = high ? makeInt64((long long)UINT32_MAX) : makeInt(0); return true;
+        case TYPE_INT64:  *out = makeInt64(high ? LLONG_MAX : LLONG_MIN); return true;
+        case TYPE_UINT64: *out = makeUInt64(high ? ULLONG_MAX : 0ULL); return true;
+        default:          return false;
+    }
+}
+
 Value vmBuiltinLow(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1) {
         runtimeError(vm, "Low() expects a single array or type identifier argument.");
@@ -7893,6 +7932,7 @@ Value vmBuiltinLow(VM* vm, int arg_count, Value* args) {
         else if (strcasecmp(typeName, "boolean") == 0) t = TYPE_BOOLEAN;
         else if (strcasecmp(typeName, "byte") == 0)    t = TYPE_BYTE;
         else if (strcasecmp(typeName, "word") == 0)    t = TYPE_WORD;
+        else if (lowHighIntegerTypeFromName(typeName) != TYPE_VOID) t = lowHighIntegerTypeFromName(typeName);
         else {
             typeDef = lookupType(typeName);
             if (typeDef) t = typeDef->var_type;
@@ -7913,8 +7953,13 @@ Value vmBuiltinLow(VM* vm, int arg_count, Value* args) {
             }
             break;
         }
-        default:
+        default: {
+            Value bound;
+            if (lowHighIntegerBound(t, false, &bound)) {
+                return bound;
+            }
             break;
+        }
     }
 
     if (typeName)
@@ -7959,6 +8004,7 @@ Value vmBuiltinHigh(VM* vm, int arg_count, Value* args) {
         else if (strcasecmp(typeName, "boolean") == 0) t = TYPE_BOOLEAN;
         else if (strcasecmp(typeName, "byte") == 0)    t = TYPE_BYTE;
         else if (strcasecmp(typeName, "word") == 0)    t = TYPE_WORD;
+        else if (lowHighIntegerTypeFromName(typeName) != TYPE_VOID) t = lowHighIntegerTypeFromName(typeName);
         else {
             typeDef = lookupType(typeName);
             if (typeDef) t = typeDef->var_type;
@@ -7979,8 +8025,13 @@ Value vmBuiltinHigh(VM* vm, int arg_count, Value* args) {
             }
             break;
         }
-        default:
+        default: {
+            Value bound;
+            if (lowHighIntegerBound(t, true, &bound)) {
+                return bound;
+            }
             break;
+        }
     }
 
     if (typeName)
