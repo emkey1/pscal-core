@@ -3178,7 +3178,16 @@ static bool vmHandleGlobalInterrupt(VM* vm) {
 #endif
     bool pending = allow_runtime_signal && (pscalRuntimeInterruptFlag() || pscalRuntimeSigintPending());
     if (!pending && vm) {
-        pending = vm->abort_requested || vm->exit_requested;
+        // A worker VM whose own job failed keeps abort_requested (with
+        // runtime_error_raised) until its next job resets it. That failure is
+        // reported through the job's thread status; it is not a request to
+        // stop the program. The workers it spawned poll it as their owner,
+        // and escalating it here shut every worker down and set the root's
+        // exit_requested, so the program ended early with exit 0, or a joiner
+        // deadlocked. A shutdown or an exit still sets exit_requested.
+        bool workerJobFailed = vm->threadOwner && vm->threadOwner != vm &&
+                               vm->runtime_error_raised && !vm->exit_requested;
+        pending = !workerJobFailed && (vm->abort_requested || vm->exit_requested);
     }
     if (!pending) {
         return false;
@@ -3282,6 +3291,18 @@ static void vmThreadReleaseForReuse(VM* owner, Thread* thread) {
     pthread_mutex_unlock(&owner->threadRegistryLock);
 }
 
+// A joiner waits holding the joined thread's resultMutex, but an interrupt
+// poll can run vmHandleGlobalInterrupt, which locks every thread's
+// resultMutex to wake its waiters: polling with the lock held deadlocked the
+// joiner on itself (a nested par branch that failed hung the program). Poll
+// with it released; the caller rechecks the job state after re-locking.
+static bool vmJoinPollInterruptUnlocked(VM* vm, Thread* thread) {
+    pthread_mutex_unlock(&thread->resultMutex);
+    bool interrupted = vmConsumeInterruptRequest(vm);
+    pthread_mutex_lock(&thread->resultMutex);
+    return interrupted;
+}
+
 bool vmThreadTakeResult(VM* vm, int threadId, Value* outResult, bool takeValue, bool* outStatus, bool takeStatus) {
     if (!vm) {
         return false;
@@ -3300,10 +3321,13 @@ bool vmThreadTakeResult(VM* vm, int threadId, Value* outResult, bool takeValue, 
             pthread_mutex_unlock(&thread->resultMutex);
             return false;
         }
-        if (vmConsumeInterruptRequest(vm)) {
+        if (vmJoinPollInterruptUnlocked(vm, thread)) {
             pthread_mutex_unlock(&thread->resultMutex);
             vmThreadCancel(vm, threadId);
             return false;
+        }
+        if (vmThreadJobFinishedLocked(thread)) {
+            break;
         }
         struct timespec deadline;
         vmComputeDeadline(&deadline, 100);
@@ -3383,10 +3407,13 @@ static bool joinThreadInternal(VM* vm, int id) {
             pthread_mutex_unlock(&thread->resultMutex);
             return false;
         }
-        if (vmConsumeInterruptRequest(vm)) {
+        if (vmJoinPollInterruptUnlocked(vm, thread)) {
             pthread_mutex_unlock(&thread->resultMutex);
             vmThreadCancel(vm, id);
             return false;
+        }
+        if (vmThreadJobFinishedLocked(thread)) {
+            break;
         }
         struct timespec deadline;
         vmComputeDeadline(&deadline, 100);
