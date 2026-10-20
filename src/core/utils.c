@@ -16,6 +16,7 @@
 #include "ast/ast.h"
 #include "core/documented_units.h"
 #include "compiler/compiler.h"
+#include "compiler/bytecode.h" // isPointerSentinel
 #include <stdio.h>
 #include "symbol/symbol.h"
 #include "types.h"
@@ -1301,6 +1302,7 @@ StringObj *pscalStringObjCreate(int max_length, VarType owner_type) {
     pscalObjHeaderInit(&s->header, owner_type);
     s->max_length = max_length;
     s->buffer = NULL;
+    atomic_init(&s->pins, 0u);
     return s;
 }
 
@@ -2994,6 +2996,29 @@ Value makeRetainedArrayElementPointer(void* address, AST* base_type_node, ArrayO
     return v;
 }
 
+Value makeStringCharPointer(Value* string_val, size_t index, bool index_is_codepoint, char* address) {
+    Value v = makePointer(address, STRING_CHAR_PTR_SENTINEL);
+    StringObj *s = (string_val && isPascalStringType(string_val->type))
+                       ? PSCAL_VALUE_PTR(*string_val, StringObj)
+                       : NULL;
+    if (s) {
+        PointerObj *po = PSCAL_VALUE_PTR(v, PointerObj);
+        pscalObjRetain(&s->header);
+        atomic_fetch_add_explicit(&s->pins, 1u, memory_order_relaxed);
+        po->retained_string = s;
+        po->string_index = index;
+        po->string_index_is_codepoint = index_is_codepoint;
+    }
+    return v;
+}
+
+// Drops a character pointer's pin and reference (see StringObj.pins).
+static void releaseStringCharPin(StringObj *s) {
+    if (!s) return;
+    atomic_fetch_sub_explicit(&s->pins, 1u, memory_order_relaxed);
+    pscalObjRelease(&s->header);
+}
+
 // VM 2.0 Phase 4b (Docs/pscal_vm2_plan.md §5.10.4/§5.10.3): ClosureEnvPayload
 // already carried its own ad hoc refcount; this routes it through the
 // generic ObjHeader mechanism instead. One destructor, registered under
@@ -3297,6 +3322,10 @@ void freeValue(Value *v) {
                     pscalObjRelease(&po->retained_array->header);
                     pthread_mutex_unlock(&dynamic_array_refcount_mutex);
                     po->retained_array = NULL;
+                }
+                if (po->retained_string) {
+                    releaseStringCharPin(po->retained_string);
+                    po->retained_string = NULL;
                 }
                 pscalObjRelease(&po->header);
             }
@@ -4198,6 +4227,11 @@ void toLowerString(char *str) {
     }
 }
 
+// printValueToStream follows at most this many pointers deep (a linked
+// structure can point back at itself).
+#define PRINT_POINTER_MAX_DEPTH 4
+static PSCAL_THREAD_LOCAL int s_printPointerDepth = 0;
+
 void printValueToStream(Value v, FILE *stream) {
     if (!stream) {
         stream = stdout;
@@ -4283,8 +4317,20 @@ void printValueToStream(Value v, FILE *stream) {
         case TYPE_POINTER: {
             PointerObj *po = PSCAL_VALUE_PTR(v, PointerObj);
             fprintf(stream, "POINTER(@%p -> ", (void*)(po ? AS_POINTER(v) : NULL));
-            if (po && AS_POINTER(v)) { // If it's not a nil pointer, try to print what it points to
-                printValueToStream(*AS_POINTER(v), stream); // Recursive call
+            if (po && AS_POINTER(v) && isPointerSentinel(po->base_type_node) &&
+                po->base_type_node != OWNED_POINTER_SENTINEL) {
+                // A character/byte/opaque address, not a Value.
+                fprintf(stream, "...");
+            } else if (po && AS_POINTER(v)) { // If it's not a nil pointer, try to print what it points to
+                // Pointer targets can form cycles (p^.next := p), so only a
+                // few levels are followed.
+                if (s_printPointerDepth >= PRINT_POINTER_MAX_DEPTH) {
+                    fprintf(stream, "...");
+                } else {
+                    s_printPointerDepth++;
+                    printValueToStream(*AS_POINTER(v), stream); // Recursive call
+                    s_printPointerDepth--;
+                }
             } else {
                 fprintf(stream, "NIL_TARGET");
             }
@@ -4778,6 +4824,15 @@ Value makeCopyOfValue(const Value *src) {
                 pthread_mutex_unlock(&dynamic_array_refcount_mutex);
                 po->retained_array = src_retained_array;
             }
+            // Same for a pinned string character pointer
+            // (PointerObj.retained_string): each copy holds its own pin.
+            if (src_po && src_po->retained_string) {
+                pscalObjRetain(&src_po->retained_string->header);
+                atomic_fetch_add_explicit(&src_po->retained_string->pins, 1u, memory_order_relaxed);
+                po->retained_string = src_po->retained_string;
+                po->string_index = src_po->string_index;
+                po->string_index_is_codepoint = src_po->string_index_is_codepoint;
+            }
             break;
         }
         case TYPE_FILE: {
@@ -4820,13 +4875,19 @@ Value makeCopyOfValue(const Value *src) {
 // every one of these structs embeds `ObjHeader header` as its first member
 // (verified: StringObj/SetObj/RecordObj/EnumObj/ArrayObj), so `&x->header`
 // is always a valid ObjHeader*.
-static ObjHeader *valueCowHeader(const Value *target) {
+// The CoW header of `target`'s payload, or NULL when it is not CoW-eligible;
+// `*out_pins` gets the payload's character-pointer pins (strings only).
+static ObjHeader *valueCowHeader(const Value *target, uint32_t *out_pins) {
     ObjHeader *hdr = NULL;
+    uint32_t pins = 0;
     switch (target->type) {
         case TYPE_STRING:
         case TYPE_UNICODE_STRING: {
             StringObj *s = PSCAL_VALUE_PTR(*target, StringObj);
-            if (s) hdr = &s->header;
+            if (s) {
+                hdr = &s->header;
+                pins = atomic_load_explicit(&s->pins, memory_order_acquire);
+            }
             break;
         }
         case TYPE_SET: {
@@ -4878,6 +4939,7 @@ static ObjHeader *valueCowHeader(const Value *target) {
             break;
     }
 
+    *out_pins = pins;
     return hdr;
 }
 
@@ -4885,11 +4947,14 @@ void valueEnsureUnique(Value *target) {
     if (!target) return;
 
     // Nothing to clone when the payload is not CoW-eligible or this cell
-    // holds its only reference -- the common case, so skip the global lock
-    // for it. The lock never covered the caller's mutation that follows
-    // (that happens after unlock), only the decision to clone.
-    ObjHeader *hdr = valueCowHeader(target);
-    if (!hdr || atomic_load_explicit(&hdr->refcount, memory_order_acquire) <= 1) {
+    // holds its only owning reference -- the common case, so skip the
+    // global lock for it. The lock never covered the caller's mutation that
+    // follows (that happens after unlock), only the decision to clone.
+    // Character pointers into a string (`pins`) keep it alive without
+    // owning its text; only another Value sharing it forces the clone.
+    uint32_t pins = 0;
+    ObjHeader *hdr = valueCowHeader(target, &pins);
+    if (!hdr || atomic_load_explicit(&hdr->refcount, memory_order_acquire) <= 1u + pins) {
         return;
     }
 
@@ -4902,14 +4967,153 @@ void valueEnsureUnique(Value *target) {
     // under a multithreaded stress test before this lock was added).
     pthread_mutex_lock(&value_cell_mutex);
 
-    hdr = valueCowHeader(target);
-    if (hdr && atomic_load_explicit(&hdr->refcount, memory_order_acquire) > 1) {
+    hdr = valueCowHeader(target, &pins);
+    if (hdr && atomic_load_explicit(&hdr->refcount, memory_order_acquire) > 1u + pins) {
         Value fresh = makeCopyOfValue(target);
         freeValue(target);
         *target = fresh;
     }
 
     pthread_mutex_unlock(&value_cell_mutex);
+}
+
+// Types whose whole value lives in `bits`: no payload to copy or free.
+static bool valueTypeIsImmediate(VarType t) {
+    switch (t) {
+        case TYPE_INT8: case TYPE_UINT8: case TYPE_INT16: case TYPE_UINT16:
+        case TYPE_INT32: case TYPE_UINT32: case TYPE_BYTE: case TYPE_WORD:
+        case TYPE_INT64: case TYPE_UINT64:
+        case TYPE_BOOLEAN: case TYPE_CHAR: case TYPE_WIDECHAR:
+        case TYPE_FLOAT: case TYPE_DOUBLE: case TYPE_NIL: case TYPE_VOID:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// One leaf of an in-place aggregate assignment: *dst becomes a copy of *src.
+// Same locking as vm.c's replaceValueCell (a reader on another thread may be
+// snapshotting this cell).
+static void assignAggregateLeaf(Value *dst, const Value *src) {
+    if (dst->type == src->type && valueTypeIsImmediate(dst->type)) {
+        dst->bits = src->bits;
+        return;
+    }
+    Value copy = makeCopyOfValue(src);
+    pthread_mutex_lock(&value_cell_mutex);
+    pthread_mutex_lock(&dynamic_array_refcount_mutex);
+    Value old = *dst;
+    *dst = copy;
+    pthread_mutex_unlock(&dynamic_array_refcount_mutex);
+    pthread_mutex_unlock(&value_cell_mutex);
+    freeValue(&old);
+}
+
+static bool recordShapesMatch(const FieldValue *a, const FieldValue *b) {
+    while (a && b) {
+        if (a->owns_storage != b->owns_storage) return false;
+        if ((a->name == NULL) != (b->name == NULL)) return false;
+        if (a->name && strcasecmp(a->name, b->name) != 0) return false;
+        a = a->next;
+        b = b->next;
+    }
+    return a == NULL && b == NULL;
+}
+
+// Element count per dimension and packing agree; returns the total count
+// through *out_total.
+static bool arrayShapesMatch(const ArrayObj *a, const ArrayObj *b, size_t *out_total) {
+    if (a->is_packed != b->is_packed || a->dimensions != b->dimensions || a->dimensions <= 0 ||
+        !a->lower_bounds || !a->upper_bounds || !b->lower_bounds || !b->upper_bounds) {
+        return false;
+    }
+    size_t total = 1;
+    for (int i = 0; i < a->dimensions; i++) {
+        long long extent = (long long)a->upper_bounds[i] - a->lower_bounds[i] + 1;
+        if (extent != (long long)b->upper_bounds[i] - b->lower_bounds[i] + 1) return false;
+        if (extent <= 0) {
+            total = 0;
+            continue;
+        }
+        total *= (size_t)extent;
+    }
+    if (total > 0 && (a->is_packed ? (!a->raw || !b->raw) : (!a->elements || !b->elements))) {
+        return false;
+    }
+    *out_total = total;
+    return true;
+}
+
+static void assignArrayElements(ArrayObj *dst, const ArrayObj *src, size_t total) {
+    if (dst->is_packed) {
+        if (total > 0) memmove(dst->raw, src->raw, total);
+        return;
+    }
+    for (size_t i = 0; i < total; i++) {
+        if (!valueAssignAggregateInPlace(&dst->elements[i], &src->elements[i])) {
+            assignAggregateLeaf(&dst->elements[i], &src->elements[i]);
+        }
+    }
+}
+
+// Retain-shared (copyValueForStack) or otherwise aliased storage must be
+// cloned, not written: the caller's replacement path does exactly that.
+static bool aggregateIsUnshared(const ObjHeader *hdr) {
+    return atomic_load_explicit(&((ObjHeader *)hdr)->refcount, memory_order_acquire) == 1;
+}
+
+bool valueAssignAggregateInPlace(Value *target, const Value *src) {
+    if (!target || !src || target->type != src->type) return false;
+
+    if (target->type == TYPE_RECORD) {
+        RecordObj *dst = PSCAL_VALUE_PTR(*target, RecordObj);
+        RecordObj *from = PSCAL_VALUE_PTR(*src, RecordObj);
+        if (!dst || !from) return false;
+        if (dst == from) return true; // r := r
+        if (!aggregateIsUnshared(&dst->header) || !recordShapesMatch(dst->fields, from->fields)) {
+            return false;
+        }
+        // Aliased (variant/slot-sharing) fields follow their owner's storage.
+        const FieldValue *s = from->fields;
+        for (FieldValue *d = dst->fields; d && s; d = d->next, s = s->next) {
+            if (!d->owns_storage) continue;
+            Value *dv = fieldValueStorage(d);
+            const Value *sv = fieldValueStorageConst(s);
+            if (!dv || !sv) continue;
+            if (!valueAssignAggregateInPlace(dv, sv)) {
+                assignAggregateLeaf(dv, sv);
+            }
+        }
+        return true;
+    }
+
+    if (target->type == TYPE_ARRAY) {
+        ArrayObj *dst = PSCAL_VALUE_PTR(*target, ArrayObj);
+        ArrayObj *from = PSCAL_VALUE_PTR(*src, ArrayObj);
+        // Dynamic arrays are reference types: `a := b` shares b's array.
+        if (!dst || !from || dst->is_dynamic || from->is_dynamic) return false;
+        if (dst == from) return true;
+        size_t total = 0;
+        if (!aggregateIsUnshared(&dst->header) || !arrayShapesMatch(dst, from, &total)) {
+            return false;
+        }
+        assignArrayElements(dst, from, total);
+        return true;
+    }
+
+    return false;
+}
+
+bool valueAssignArrayElementsInPlace(Value *target, const Value *src) {
+    if (!target || !src || target->type != TYPE_ARRAY || src->type != TYPE_ARRAY) return false;
+    ArrayObj *dst = PSCAL_VALUE_PTR(*target, ArrayObj);
+    ArrayObj *from = PSCAL_VALUE_PTR(*src, ArrayObj);
+    if (!dst || !from) return false;
+    if (dst == from) return true;
+    size_t total = 0;
+    if (!arrayShapesMatch(dst, from, &total)) return false;
+    assignArrayElements(dst, from, total);
+    return true;
 }
 
 void pscalValueSwap(Value *a, Value *b) {

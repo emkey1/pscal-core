@@ -781,7 +781,7 @@ static void printSetConstant(const Value* value) {
     fprintf(stderr, "]");
 }
 
-static bool isPointerSentinel(const AST* base) {
+bool isPointerSentinel(const AST* base) {
     return base == OWNED_POINTER_SENTINEL || base == STRING_CHAR_PTR_SENTINEL ||
            base == STRING_LENGTH_SENTINEL || base == BYTE_ARRAY_PTR_SENTINEL ||
            base == SERIALIZED_CHAR_PTR_SENTINEL || base == SHELL_FUNCTION_PTR_SENTINEL ||

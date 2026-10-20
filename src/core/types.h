@@ -189,6 +189,13 @@ typedef struct StringObj {
     ObjHeader header; // header.type is TYPE_STRING or TYPE_UNICODE_STRING
     int max_length;   // -1 = unbounded (dynamic string); >0 = Pascal string[N]
     char *buffer;     // owned, NUL-terminated, or NULL; reassignable in place
+    // How many of header.refcount's references are character pointers
+    // (PointerObj.retained_string) rather than Values holding the string.
+    // A character pointer keeps the StringObj alive but is not a second
+    // owner of its text, so valueEnsureUnique() discounts these: an
+    // aliased s[i] must not make the next write to s clone the string away
+    // from under the pointer (Swap(s[1], s[2]) would lose its writes).
+    _Atomic uint32_t pins;
 } StringObj;
 
 // VM 2.0 Phase 4d (Docs/pscal_vm2_plan.md §5.10.4/§5.10.3): thin wrapper
@@ -430,6 +437,20 @@ typedef struct PointerObj {
     // carry the real element type AST for chained indexing/field access,
     // so this can't reuse that field the way the sentinels do.
     struct ArrayObj *retained_array;
+    // The same idea for a STRING_CHAR_PTR_SENTINEL address made by
+    // GET_ELEMENT_ADDRESS(_CONST)/GET_CHAR_ADDRESS: one retained (and
+    // pinned, see StringObj.pins) reference on the StringObj the character
+    // lives in, plus its position, so SET_INDIRECT/GET_INDIRECT re-index the
+    // string's current buffer (with a bounds check) instead of trusting
+    // `address`, which goes stale once the string is reassigned or resized.
+    // `string_index` is a byte offset, or a code point index when
+    // `string_index_is_codepoint` (a UnicodeString, whose characters are
+    // UTF-8 sequences of varying length). NULL for every other pointer,
+    // including raw char pointers made elsewhere, which keep using
+    // `address`.
+    struct StringObj *retained_string;
+    size_t string_index;
+    bool string_index_is_codepoint;
 } PointerObj;
 
 // VM 2.0 Phase 4i checkpoint 3a (Docs/pscal_vm2_plan.md sec 5.10.3/

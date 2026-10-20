@@ -382,12 +382,27 @@ Value makeNil(void);
 // GET_FIELD_ADDRESS/16/_KEEP/16, and the string-char-address sites.
 // Read-only value loads (LOAD_ELEMENT_VALUE, LOAD_FIELD_VALUE*) never take
 // such an address to begin with, so they never need to call this.
-// If `target`'s underlying object is shared (ObjHeader.refcount > 1),
+// If `target`'s underlying object is shared (ObjHeader.refcount > 1, not
+// counting character pointers pinning a string -- see StringObj.pins),
 // clones it via makeCopyOfValue so the caller-about-to-mutate has a
 // private copy; a no-op otherwise (unique already, or not a CoW-eligible
 // type). TYPE_ARRAY with is_dynamic==true and TYPE_FILE are permanent
 // exemptions -- see Docs/pscal_vm2_plan.md sec 5.10.5.
 void valueEnsureUnique(Value *target);
+// Whole-value assignment of a record or static array into an existing one of
+// the same shape, copying field by field / element by element into the
+// target's own storage (recursively for nested records and static arrays)
+// instead of replacing it. Pascal requires this: a VAR parameter or other
+// address taken into the target must stay valid across `r := r2` / `a := b`.
+// Returns false, leaving *target untouched, when either side is not such an
+// aggregate, the shapes differ, or the target's storage is shared (the caller
+// then replaces the value as before).
+bool valueAssignAggregateInPlace(Value *target, const Value *src);
+// Like valueAssignAggregateInPlace for two arrays, but also writes into a
+// dynamic or shared target: used for a row/slice view (`m[1] := row`), whose
+// storage belongs to the array it was cut from. Returns false when the shapes
+// (element count per dimension, packing) differ.
+bool valueAssignArrayElementsInPlace(Value *target, const Value *src);
 // Exchanges the contents of two Value cells (the `Swap` builtin). A raw
 // three-way struct swap conserves whatever references each cell already
 // held (no clone, no retain/release needed either side), so this is just a
@@ -408,6 +423,12 @@ Value makePointer(void* address, AST* base_type_node); // <<< ADD THIS PROTOTYPE
 // long as this pointer is, even across a concurrent SetLength() on the same
 // array. See PointerObj.retained_array's comment (core/types.h).
 Value makeRetainedArrayElementPointer(void* address, AST* base_type_node, struct ArrayObj* owner);
+// A STRING_CHAR_PTR_SENTINEL pointer to character `index` (a byte offset, or
+// a code point index when `index_is_codepoint`) of the string in
+// `*string_val`, at raw `address`. Retains and pins the string's StringObj
+// (see PointerObj.retained_string) so the character stays addressable for as
+// long as the pointer lives, whatever later happens to `*string_val`.
+Value makeStringCharPointer(Value* string_val, size_t index, bool index_is_codepoint, char* address);
 Value makeString(const char *val);
 Value makeStringLen(const char *val, size_t len);
 Value makeChar(int c);

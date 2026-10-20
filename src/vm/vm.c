@@ -929,6 +929,44 @@ static inline bool vmEnsureFrameCapacity(VM* vm) {
 static void push(VM* vm, Value value);
 static Value copyValueForStack(const Value* src);
 
+// --- dispose() quarantine (see vmDisposeValueCell in vm.h) ---
+// dispose(p) can only nil the copies of p that vmNullifyAliases finds
+// (globals and stack slots); one stored in a record field, an array element
+// or another heap cell keeps the old address. Keeping the disposed cell as a
+// tombstone makes a later p^ through such a copy a clean runtime error. The
+// quarantine is bounded: once VM_DISPOSE_QUARANTINE newer cells have been
+// disposed, the oldest tombstone is freed for real.
+#define VM_DISPOSED_CELL_BITS 0xD15D05EDD15D05EDull
+#define VM_DISPOSE_QUARANTINE 4096
+static Value* s_disposeQuarantine[VM_DISPOSE_QUARANTINE];
+static size_t s_disposeQuarantineNext = 0;
+static pthread_mutex_t s_disposeQuarantineMutex = PTHREAD_MUTEX_INITIALIZER;
+
+bool vmValueIsDisposed(const Value* cell) {
+    return cell && cell->type == TYPE_VOID && cell->bits == VM_DISPOSED_CELL_BITS;
+}
+
+void vmDisposeValueCell(Value* cell) {
+    if (!cell) {
+        return;
+    }
+    freeValue(cell);
+    cell->type = TYPE_VOID;
+    cell->bits = VM_DISPOSED_CELL_BITS;
+    pthread_mutex_lock(&s_disposeQuarantineMutex);
+    Value* evicted = s_disposeQuarantine[s_disposeQuarantineNext];
+    s_disposeQuarantine[s_disposeQuarantineNext] = cell;
+    s_disposeQuarantineNext = (s_disposeQuarantineNext + 1) % VM_DISPOSE_QUARANTINE;
+    pthread_mutex_unlock(&s_disposeQuarantineMutex);
+    free(evicted);
+}
+
+// Longest pointer-to-pointer chain resolveRecord follows; anything longer is
+// a cycle (q := @q).
+#define VM_MAX_POINTER_CHAIN 64
+
+// Stops at a disposed cell (vmValueIsDisposed) or, for a cyclic chain, at the
+// pointer where the hop limit ran out; callers see a non-record either way.
 static Value* resolveRecord(Value* base, bool* invalid_type) {
     if (invalid_type) *invalid_type = false;
     if (VALUE_TYPE(*base) != TYPE_POINTER && VALUE_TYPE(*base) != TYPE_RECORD) {
@@ -936,10 +974,23 @@ static Value* resolveRecord(Value* base, bool* invalid_type) {
         return NULL;
     }
     Value* current = base;
-    while (current && VALUE_TYPE(*current) == TYPE_POINTER) {
+    int hops = 0;
+    while (current && VALUE_TYPE(*current) == TYPE_POINTER && hops++ < VM_MAX_POINTER_CHAIN) {
         current = AS_POINTER(*current);
     }
     return current;
+}
+
+// The error for a field access whose base resolved (resolveRecord) to
+// something other than a record.
+static void vmReportFieldBaseNotRecord(VM* vm, const Value* resolved) {
+    if (vmValueIsDisposed(resolved)) {
+        runtimeError(vm, "VM Error: Cannot access field through a dangling pointer (its target was disposed).");
+    } else if (VALUE_TYPE(*resolved) == TYPE_POINTER) {
+        runtimeError(vm, "VM Error: Cannot access field: the pointer chain is cyclic.");
+    } else {
+        runtimeError(vm, "VM Error: Internal - expected to resolve to a record for field access.");
+    }
 }
 
 static Value* resolveRecordForField(VM* vm, Value* base_val_ptr) {
@@ -954,10 +1005,165 @@ static Value* resolveRecordForField(VM* vm, Value* base_val_ptr) {
         return NULL;
     }
     if (VALUE_TYPE(*record_struct_ptr) != TYPE_RECORD) {
-        runtimeError(vm, "VM Error: Internal - expected to resolve to a record for field access.");
+        vmReportFieldBaseNotRecord(vm, record_struct_ptr);
         return NULL;
     }
     return record_struct_ptr;
+}
+
+static bool vmResolveStringIndex(VM* vm, long long raw_index, size_t len, size_t* out_offset,
+                                 bool allow_length_query, bool* out_length_query);
+
+// The byte a STRING_CHAR_PTR_SENTINEL pointer names. One made by
+// makeStringCharPointer re-indexes its pinned StringObj's current buffer, with
+// a bounds check: the string may have been reassigned (the pin keeps the old
+// one alive) or shortened in place since the address was taken. A raw one
+// made elsewhere uses its address. Reports and returns NULL when there is no
+// such character any more.
+static char* vmStringCharTarget(VM* vm, const Value* pointer, const char* null_message) {
+    PointerObj* po = PSCAL_VALUE_PTR(*pointer, PointerObj);
+    if (!po || !po->retained_string) {
+        char* addr = po ? (char*)po->address : NULL;
+        if (!addr) {
+            runtimeError(vm, "%s", null_message);
+        }
+        return addr;
+    }
+    char* buf = po->retained_string->buffer;
+    // memchr finds a terminator at or before string_index iff the string
+    // is now too short to hold that character.
+    if (!buf || memchr(buf, '\0', po->string_index + 1) != NULL) {
+        runtimeError(vm, "Runtime Error: String index out of range: the string was shortened after the character was addressed.");
+        return NULL;
+    }
+    return buf + po->string_index;
+}
+
+// Byte span of character `index` of a UnicodeString's UTF-8 `buf`. Text that is
+// all ASCII or not valid UTF-8 is indexed by byte, like utf8CodepointCount and
+// GET_CHAR_FROM_STRING do.
+static bool vmUnicodeCharSpan(const char* buf, size_t index, size_t* out_offset, size_t* out_len) {
+    size_t blen = strlen(buf);
+    if (utf8CodepointCount(buf, blen) == blen) {
+        if (index >= blen) return false;
+        *out_offset = index;
+        *out_len = 1;
+        return true;
+    }
+    size_t offset = utf8ByteOffsetForCodepointIndex(buf, blen, index);
+    if (offset >= blen) return false;
+    uint32_t codepoint = 0;
+    size_t advance = 1;
+    if (!decodeUtf8Codepoint(buf + offset, blen - offset, &codepoint, &advance)) {
+        advance = 1;
+    }
+    *out_offset = offset;
+    *out_len = advance;
+    return true;
+}
+
+// Reads the character a code-point-indexed (UnicodeString) char pointer names.
+static bool vmLoadUnicodeChar(VM* vm, const PointerObj* po, Value* out) {
+    const char* buf = po->retained_string->buffer;
+    size_t offset = 0, len = 0;
+    if (!buf || !vmUnicodeCharSpan(buf, po->string_index, &offset, &len)) {
+        runtimeError(vm, "Runtime Error: String index out of range: the string was shortened after the character was addressed.");
+        return false;
+    }
+    uint32_t codepoint = 0;
+    size_t advance = 0;
+    if (!decodeUtf8Codepoint(buf + offset, len, &codepoint, &advance)) {
+        codepoint = (unsigned char)buf[offset];
+    }
+    *out = makeWideChar((int)codepoint);
+    return true;
+}
+
+// Stores `value` as character po->string_index of a UnicodeString: encodes it
+// as UTF-8 and splices it over the old character's bytes (their lengths can
+// differ), so the text stays valid UTF-8.
+static bool vmStoreUnicodeChar(VM* vm, PointerObj* po, const Value* value) {
+    uint32_t codepoint = 0;
+    if (VALUE_TYPE(*value) == TYPE_CHAR) {
+        codepoint = (unsigned char)AS_CHAR(*value);
+    } else if (VALUE_TYPE(*value) == TYPE_WIDECHAR) {
+        long long wide = AS_CHAR(*value);
+        if (wide < 0 || wide > 0x10FFFF) {
+            runtimeError(vm, "VM Error: Invalid character code point %lld.", wide);
+            return false;
+        }
+        codepoint = (uint32_t)wide;
+    } else if (isPascalStringType(VALUE_TYPE(*value)) && AS_STRING(*value)) {
+        const char* text = AS_STRING(*value);
+        size_t text_len = strlen(text);
+        size_t advance = 0;
+        if (text_len == 0 || !decodeUtf8Codepoint(text, text_len, &codepoint, &advance) || advance != text_len) {
+            runtimeError(vm, "VM Error: Cannot assign multi-character or empty string to a single character location.");
+            return false;
+        }
+    } else {
+        runtimeError(vm, "VM Error: Type mismatch for character assignment. Expected CHAR or single-char STRING, got %s.",
+                     varTypeToString(VALUE_TYPE(*value)));
+        return false;
+    }
+
+    StringObj* so = po->retained_string;
+    size_t offset = 0, old_len = 0;
+    if (!so->buffer || !vmUnicodeCharSpan(so->buffer, po->string_index, &offset, &old_len)) {
+        runtimeError(vm, "Runtime Error: String index out of range: the string was shortened after the character was addressed.");
+        return false;
+    }
+    char encoded[5] = {0};
+    size_t encoded_len = encodeUtf8Codepoint(codepoint, encoded);
+    if (encoded_len == old_len) {
+        memcpy(so->buffer + offset, encoded, encoded_len);
+        return true;
+    }
+    size_t old_total = strlen(so->buffer);
+    size_t new_total = old_total - old_len + encoded_len;
+    if (so->max_length > 0 && new_total > (size_t)so->max_length) {
+        runtimeError(vm, "Runtime Error: Character does not fit in string[%d].", so->max_length);
+        return false;
+    }
+    // A string[N] buffer keeps its N+1 capacity; other code writes up to it.
+    size_t capacity = (so->max_length > 0 && (size_t)so->max_length > new_total) ? (size_t)so->max_length : new_total;
+    char* spliced = (char*)calloc(capacity + 1, 1);
+    if (!spliced) {
+        runtimeError(vm, "VM Error: Out of memory writing a string character.");
+        return false;
+    }
+    memcpy(spliced, so->buffer, offset);
+    memcpy(spliced + offset, encoded, encoded_len);
+    memcpy(spliced + offset + encoded_len, so->buffer + offset + old_len, old_total - offset - old_len);
+    free(so->buffer);
+    so->buffer = spliced;
+    return true;
+}
+
+// Character `raw_index` (as the program wrote it) of the string in
+// *string_val, as a pinned char pointer (makeStringCharPointer): bounds-
+// checked by byte, or by code point for a UnicodeString. Pushes it, or a
+// STRING_LENGTH_SENTINEL pointer for Pascal's s[0], and returns false after
+// reporting an out-of-range index. The string must already be unique.
+static bool vmPushStringCharAddress(VM* vm, Value* string_val, long long raw_index, bool allow_length_query) {
+    const char* str = AS_STRING(*string_val) ? AS_STRING(*string_val) : "";
+    size_t byte_len = strlen(str);
+    bool unicode = VALUE_TYPE(*string_val) == TYPE_UNICODE_STRING;
+    size_t len = unicode ? utf8CodepointCount(str, byte_len) : byte_len;
+    size_t char_offset = 0;
+    bool wants_length = false;
+    if (!vmResolveStringIndex(vm, raw_index, len, &char_offset, allow_length_query, &wants_length)) {
+        return false;
+    }
+    if (!frontendIsZeroBasedStrings() && wants_length) {
+        push(vm, makePointer(string_val, STRING_LENGTH_SENTINEL));
+        return true;
+    }
+    size_t byte_offset = (unicode && len != byte_len)
+                             ? utf8ByteOffsetForCodepointIndex(str, byte_len, char_offset)
+                             : char_offset;
+    push(vm, makeStringCharPointer(string_val, char_offset, unicode, &AS_STRING(*string_val)[byte_offset]));
+    return true;
 }
 
 static AST* vmResolveTypeAlias(AST* type_node) {
@@ -1301,6 +1507,19 @@ static bool vmResolveStringIndex(VM* vm,
     return true;
 }
 
+// The dynamic array a derived address must keep alive: the retained owner of
+// the pointer it was derived from (a field or element inside an element of a
+// dynamic array), retained once more for the new pointer. NULL otherwise.
+static ArrayObj* vmRetainPointerOwner(const Value* pointer) {
+    if (!pointer || VALUE_TYPE(*pointer) != TYPE_POINTER) return NULL;
+    PointerObj* po = PSCAL_VALUE_PTR(*pointer, PointerObj);
+    if (!po || !po->retained_array) return NULL;
+    pthread_mutex_lock(&dynamic_array_refcount_mutex);
+    pscalObjRetain(&po->retained_array->header);
+    pthread_mutex_unlock(&dynamic_array_refcount_mutex);
+    return po->retained_array;
+}
+
 static VarType vmResolveArrayElementType(AST* arrayType) {
     if (!arrayType || arrayType->type != AST_ARRAY_TYPE) {
         return TYPE_UNKNOWN;
@@ -1323,6 +1542,13 @@ static VarType vmResolveArrayElementType(AST* arrayType) {
         elem = elem->left;
     }
     return elem ? elem->var_type : TYPE_UNKNOWN;
+}
+
+// True when a pointer's target is a character, byte, length query or opaque
+// address rather than a Value that can be indexed or dereferenced as one.
+static bool vmPointerTargetIsNotValue(const Value* pointer) {
+    AST* base = PTR_BASE_TYPE_NODE(*pointer);
+    return isPointerSentinel(base) && base != OWNED_POINTER_SENTINEL;
 }
 
 static Value makeOwnedString(char* data, size_t len) {
@@ -8685,22 +8911,18 @@ dispatch_switch:
                 freeValue(&index_val);
 
                 Value* string_val = (Value*)AS_POINTER(*string_ptr_val);
-                const char* str = AS_STRING(*string_val) ? AS_STRING(*string_val) : "";
-                size_t len = strlen(str);
-
-                size_t char_offset = 0;
-                if (!vmResolveStringIndex(vm, pscal_index, len, &char_offset, false, NULL)) {
-                    return INTERPRET_RUNTIME_ERROR;
-                }
 
                 // VM 2.0 Phase 4j (Stage B): see the matching comment in
                 // GET_ELEMENT_ADDRESS.
                 valueEnsureUnique(string_val);
 
+                // Pin the character before releasing the base pointer.
                 Value popped_string_ptr = pop(vm);
+                bool pushed = vmPushStringCharAddress(vm, string_val, pscal_index, false);
                 freeValue(&popped_string_ptr);
-
-                push(vm, makePointer(&AS_STRING(*string_val)[char_offset], STRING_CHAR_PTR_SENTINEL));
+                if (!pushed) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 break;
             }
             // GET_GLOBAL_ADDRESS/GET_GLOBAL_ADDRESS16 (0x24/0x27) are
@@ -9503,7 +9725,7 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 if (VALUE_TYPE(*record_struct_ptr) != TYPE_RECORD) {
-                    runtimeError(vm, "VM Error: Internal - expected to resolve to a record for field access.");
+                    vmReportFieldBaseNotRecord(vm, record_struct_ptr);
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
@@ -9526,9 +9748,12 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 hydrateFieldMetadataFromBaseValue(base_val_ptr, current, field_index);
+                // A field of a dynamic array's element: the new address keeps
+                // that array alive as the element pointer did (retained_array).
+                ArrayObj* owner = vmRetainPointerOwner(base_val_ptr);
                 Value popped_base_val = pop(vm);
                 freeValue(&popped_base_val);
-                push(vm, makePointer(fieldValueStorage(current), current->type_def));
+                push(vm, makeRetainedArrayElementPointer(fieldValueStorage(current), current->type_def, owner));
                 break;
             }
             case GET_FIELD_OFFSET16: {
@@ -9548,7 +9773,7 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 if (VALUE_TYPE(*record_struct_ptr) != TYPE_RECORD) {
-                    runtimeError(vm, "VM Error: Internal - expected to resolve to a record for field access.");
+                    vmReportFieldBaseNotRecord(vm, record_struct_ptr);
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
@@ -9564,9 +9789,12 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 hydrateFieldMetadataFromBaseValue(base_val_ptr, current, field_index);
+                // A field of a dynamic array's element: the new address keeps
+                // that array alive as the element pointer did (retained_array).
+                ArrayObj* owner = vmRetainPointerOwner(base_val_ptr);
                 Value popped_base_val = pop(vm);
                 freeValue(&popped_base_val);
-                push(vm, makePointer(fieldValueStorage(current), current->type_def));
+                push(vm, makeRetainedArrayElementPointer(fieldValueStorage(current), current->type_def, owner));
                 break;
             }
             case LOAD_FIELD_VALUE: {
@@ -9602,7 +9830,7 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 if (VALUE_TYPE(*record_struct_ptr) != TYPE_RECORD) {
-                    runtimeError(vm, "VM Error: Internal - expected to resolve to a record for field access.");
+                    vmReportFieldBaseNotRecord(vm, record_struct_ptr);
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
@@ -9616,9 +9844,12 @@ comparison_error_label:
                 const char* field_name = AS_STRING(vm->chunk->constants[field_name_idx]);
                 FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
                 if (current) {
+                    // A field of a dynamic array's element: the new address keeps
+                    // that array alive as the element pointer did (retained_array).
+                    ArrayObj* owner = vmRetainPointerOwner(base_val_ptr);
                     Value popped_base_val = pop(vm);
                     freeValue(&popped_base_val);
-                    push(vm, makePointer(fieldValueStorage(current), current->type_def));
+                    push(vm, makeRetainedArrayElementPointer(fieldValueStorage(current), current->type_def, owner));
                     goto next_instruction;
                 }
 
@@ -9642,7 +9873,7 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 if (VALUE_TYPE(*record_struct_ptr) != TYPE_RECORD) {
-                    runtimeError(vm, "VM Error: Internal - expected to resolve to a record for field access.");
+                    vmReportFieldBaseNotRecord(vm, record_struct_ptr);
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
@@ -9656,9 +9887,12 @@ comparison_error_label:
                 const char* field_name = AS_STRING(vm->chunk->constants[field_name_idx]);
                 FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
                 if (current) {
+                    // A field of a dynamic array's element: the new address keeps
+                    // that array alive as the element pointer did (retained_array).
+                    ArrayObj* owner = vmRetainPointerOwner(base_val_ptr);
                     Value popped_base_val = pop(vm);
                     freeValue(&popped_base_val);
-                    push(vm, makePointer(fieldValueStorage(current), current->type_def));
+                    push(vm, makeRetainedArrayElementPointer(fieldValueStorage(current), current->type_def, owner));
                     goto next_instruction;
                 }
 
@@ -9682,7 +9916,7 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 if (VALUE_TYPE(*record_struct_ptr) != TYPE_RECORD) {
-                    runtimeError(vm, "VM Error: Internal - expected to resolve to a record for field access.");
+                    vmReportFieldBaseNotRecord(vm, record_struct_ptr);
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
@@ -9696,7 +9930,8 @@ comparison_error_label:
                 const char* field_name = AS_STRING(vm->chunk->constants[field_name_idx]);
                 FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
                 if (current) {
-                    push(vm, makePointer(fieldValueStorage(current), current->type_def));
+                    push(vm, makeRetainedArrayElementPointer(fieldValueStorage(current), current->type_def,
+                                                              vmRetainPointerOwner(base_val_ptr)));
                     goto next_instruction;
                 }
 
@@ -9720,7 +9955,7 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 if (VALUE_TYPE(*record_struct_ptr) != TYPE_RECORD) {
-                    runtimeError(vm, "VM Error: Internal - expected to resolve to a record for field access.");
+                    vmReportFieldBaseNotRecord(vm, record_struct_ptr);
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
@@ -9734,7 +9969,8 @@ comparison_error_label:
                 const char* field_name = AS_STRING(vm->chunk->constants[field_name_idx]);
                 FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
                 if (current) {
-                    push(vm, makePointer(fieldValueStorage(current), current->type_def));
+                    push(vm, makeRetainedArrayElementPointer(fieldValueStorage(current), current->type_def,
+                                                              vmRetainPointerOwner(base_val_ptr)));
                     goto next_instruction;
                 }
 
@@ -9776,6 +10012,14 @@ comparison_error_label:
                 // depend on stack offsets.
                 Value operand = pop(vm);
 
+                // A character/byte/opaque address is not a Value: reading
+                // it as one (below) would run off its buffer (`s[2][1]`).
+                if (VALUE_TYPE(operand) == TYPE_POINTER && vmPointerTargetIsNotValue(&operand)) {
+                    runtimeError(vm, "VM Error: Cannot index through a character, byte or opaque address.");
+                    freeValue(&operand);
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+
                 // Special handling for strings when there is exactly one
                 // index.  We avoid referencing stackTop-2 by working with the
                 // popped operand directly and reusing it if it represents a
@@ -9803,27 +10047,13 @@ comparison_error_label:
                         // copyValueForStack retain-share.
                         valueEnsureUnique(base_val);
 
-                        size_t len = AS_STRING(*base_val) ? strlen(AS_STRING(*base_val)) : 0;
-                        size_t char_offset = 0;
-                        bool wants_length = false;
-                        if (!vmResolveStringIndex(vm,
-                                                  pscal_index,
-                                                  len,
-                                                  &char_offset,
-                                                  true,
-                                                  &wants_length)) {
-                            freeValue(&operand);
+                        // A pinned char pointer (makeStringCharPointer),
+                        // indexed by code point for a UnicodeString.
+                        bool pushed = vmPushStringCharAddress(vm, base_val, pscal_index, true);
+                        freeValue(&operand);
+                        if (!pushed) {
                             return INTERPRET_RUNTIME_ERROR;
                         }
-
-                        if (!frontendIsZeroBasedStrings() && wants_length) {
-                            push(vm, makePointer(base_val, STRING_LENGTH_SENTINEL));
-                            freeValue(&operand);
-                            break;
-                        }
-
-                        push(vm, makePointer(&AS_STRING(*base_val)[char_offset], STRING_CHAR_PTR_SENTINEL));
-                        freeValue(&operand);
                         break;
                     }
                 }
@@ -9854,7 +10084,14 @@ comparison_error_label:
 
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* candidate = (Value*)AS_POINTER(operand);
-                    if (candidate && VALUE_TYPE(*candidate) == TYPE_ARRAY) {
+                    if (!candidate || vmValueIsDisposed(candidate)) {
+                        runtimeError(vm, candidate ? "VM Error: Array access through a dangling pointer (its target was disposed)."
+                                                   : "VM Error: Array access through a nil pointer.");
+                        free(indices);
+                        freeValue(&operand);
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    if (VALUE_TYPE(*candidate) == TYPE_ARRAY) {
                         // VM 2.0 follow-up to dynamic_array_fresh_publish_race
                         // (pscal-core f65432e): `candidate` here can alias a
                         // shared global's live Value cell. This opcode always
@@ -10080,7 +10317,11 @@ comparison_error_label:
                                                                   BYTE_ARRAY_PTR_SENTINEL,
                                                                   PSCAL_VALUE_PTR(shared_snapshot, ArrayObj)));
                     } else {
-                        push(vm, makePointer(&AS_ARRAY_RAW(*array_val_ptr)[offset], BYTE_ARRAY_PTR_SENTINEL));
+                        // A static array inside a dynamic array's element
+                        // lives in that array's storage: keep it alive.
+                        push(vm, makeRetainedArrayElementPointer(&AS_ARRAY_RAW(*array_val_ptr)[offset],
+                                                                  BYTE_ARRAY_PTR_SENTINEL,
+                                                                  vmRetainPointerOwner(&operand)));
                     }
                 } else {
                     if (using_snapshot) {
@@ -10088,7 +10329,9 @@ comparison_error_label:
                                                                   element_base_type,
                                                                   PSCAL_VALUE_PTR(shared_snapshot, ArrayObj)));
                     } else {
-                        push(vm, makePointer(&AS_ARRAY(*array_val_ptr)[offset], element_base_type));
+                        push(vm, makeRetainedArrayElementPointer(&AS_ARRAY(*array_val_ptr)[offset],
+                                                                  element_base_type,
+                                                                  vmRetainPointerOwner(&operand)));
                     }
                 }
 
@@ -10107,11 +10350,20 @@ comparison_error_label:
                 uint32_t flat_offset = READ_UINT32(vm);
                 Value operand = pop(vm);
 
+                // See GET_ELEMENT_ADDRESS: such an address is not a Value.
+                if (VALUE_TYPE(operand) == TYPE_POINTER && vmPointerTargetIsNotValue(&operand)) {
+                    runtimeError(vm, "VM Error: Cannot index through a character, byte or opaque address.");
+                    freeValue(&operand);
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* base_val = (Value*)AS_POINTER(operand);
                     if (base_val && isPascalStringType(VALUE_TYPE(*base_val))) {
                         const char* str = AS_STRING(*base_val) ? AS_STRING(*base_val) : "";
-                        size_t len = strlen(str);
+                        size_t byte_len = strlen(str);
+                        bool unicode = VALUE_TYPE(*base_val) == TYPE_UNICODE_STRING;
+                        size_t len = unicode ? utf8CodepointCount(str, byte_len) : byte_len;
 
                         if ((size_t)flat_offset >= len) {
                             unsigned long long display_index = vmDisplayIndexFromOffset(flat_offset);
@@ -10126,7 +10378,11 @@ comparison_error_label:
                         // in GET_ELEMENT_ADDRESS.
                         valueEnsureUnique(base_val);
 
-                        push(vm, makePointer(&AS_STRING(*base_val)[flat_offset], STRING_CHAR_PTR_SENTINEL));
+                        // A pinned char pointer, as in GET_ELEMENT_ADDRESS.
+                        size_t byte_offset = (unicode && len != byte_len)
+                                                 ? utf8ByteOffsetForCodepointIndex(AS_STRING(*base_val), byte_len, flat_offset)
+                                                 : (size_t)flat_offset;
+                        push(vm, makeStringCharPointer(base_val, flat_offset, unicode, &AS_STRING(*base_val)[byte_offset]));
                         freeValue(&operand);
                         break;
                     }
@@ -10144,7 +10400,13 @@ comparison_error_label:
 
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* candidate = (Value*)AS_POINTER(operand);
-                    if (candidate && VALUE_TYPE(*candidate) == TYPE_ARRAY) {
+                    if (!candidate || vmValueIsDisposed(candidate)) {
+                        runtimeError(vm, candidate ? "VM Error: Array access through a dangling pointer (its target was disposed)."
+                                                   : "VM Error: Array access through a nil pointer.");
+                        freeValue(&operand);
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    if (VALUE_TYPE(*candidate) == TYPE_ARRAY) {
                         // VM 2.0 follow-up to dynamic_array_fresh_publish_race
                         // (pscal-core f65432e): see the matching comment in
                         // GET_ELEMENT_ADDRESS -- same hazard, same fix.
@@ -10271,7 +10533,11 @@ comparison_error_label:
                                                                   BYTE_ARRAY_PTR_SENTINEL,
                                                                   PSCAL_VALUE_PTR(shared_snapshot, ArrayObj)));
                     } else {
-                        push(vm, makePointer(&AS_ARRAY_RAW(*array_val_ptr)[flat_offset], BYTE_ARRAY_PTR_SENTINEL));
+                        // See GET_ELEMENT_ADDRESS: keep an enclosing dynamic
+                        // array alive.
+                        push(vm, makeRetainedArrayElementPointer(&AS_ARRAY_RAW(*array_val_ptr)[flat_offset],
+                                                                  BYTE_ARRAY_PTR_SENTINEL,
+                                                                  vmRetainPointerOwner(&operand)));
                     }
                 } else {
                     if (using_snapshot) {
@@ -10279,7 +10545,9 @@ comparison_error_label:
                                                                   element_base_type,
                                                                   PSCAL_VALUE_PTR(shared_snapshot, ArrayObj)));
                     } else {
-                        push(vm, makePointer(&AS_ARRAY(*array_val_ptr)[flat_offset], element_base_type));
+                        push(vm, makeRetainedArrayElementPointer(&AS_ARRAY(*array_val_ptr)[flat_offset],
+                                                                  element_base_type,
+                                                                  vmRetainPointerOwner(&operand)));
                     }
                 }
 
@@ -10298,6 +10566,13 @@ comparison_error_label:
                 uint8_t dimension_count = READ_BYTE();
 
                 Value operand = pop(vm);
+
+                // See GET_ELEMENT_ADDRESS: such an address is not a Value.
+                if (VALUE_TYPE(operand) == TYPE_POINTER && vmPointerTargetIsNotValue(&operand)) {
+                    runtimeError(vm, "VM Error: Cannot index through a character, byte or opaque address.");
+                    freeValue(&operand);
+                    return INTERPRET_RUNTIME_ERROR;
+                }
 
                 if (dimension_count == 1 && VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* base_val = (Value*)AS_POINTER(operand);
@@ -10368,7 +10643,14 @@ comparison_error_label:
 
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* candidate = (Value*)AS_POINTER(operand);
-                    if (candidate && VALUE_TYPE(*candidate) == TYPE_ARRAY) {
+                    if (!candidate || vmValueIsDisposed(candidate)) {
+                        runtimeError(vm, candidate ? "VM Error: Array access through a dangling pointer (its target was disposed)."
+                                                   : "VM Error: Array access through a nil pointer.");
+                        free(indices);
+                        freeValue(&operand);
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    if (VALUE_TYPE(*candidate) == TYPE_ARRAY) {
                         // Checking ARRAY_IS_DYNAMIC(*candidate) here first,
                         // before any lock, would itself race a concurrent
                         // SetLength publish (dynamic_array_fresh_publish_race
@@ -10554,6 +10836,13 @@ comparison_error_label:
 
                 Value operand = pop(vm);
 
+                // See GET_ELEMENT_ADDRESS: such an address is not a Value.
+                if (VALUE_TYPE(operand) == TYPE_POINTER && vmPointerTargetIsNotValue(&operand)) {
+                    runtimeError(vm, "VM Error: Cannot index through a character, byte or opaque address.");
+                    freeValue(&operand);
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* base_val = (Value*)AS_POINTER(operand);
                     if (base_val && isPascalStringType(VALUE_TYPE(*base_val))) {
@@ -10587,7 +10876,13 @@ comparison_error_label:
 
                 if (VALUE_TYPE(operand) == TYPE_POINTER) {
                     Value* candidate = (Value*)AS_POINTER(operand);
-                    if (candidate && VALUE_TYPE(*candidate) == TYPE_ARRAY) {
+                    if (!candidate || vmValueIsDisposed(candidate)) {
+                        runtimeError(vm, candidate ? "VM Error: Array access through a dangling pointer (its target was disposed)."
+                                                   : "VM Error: Array access through a nil pointer.");
+                        freeValue(&operand);
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    if (VALUE_TYPE(*candidate) == TYPE_ARRAY) {
                         // Checking ARRAY_IS_DYNAMIC(*candidate) here first,
                         // before any lock, would itself race a concurrent
                         // SetLength publish (dynamic_array_fresh_publish_race
@@ -10725,9 +11020,21 @@ comparison_error_label:
 
                 if (PTR_BASE_TYPE_NODE(pointer_to_lvalue) == STRING_CHAR_PTR_SENTINEL ||
                     PTR_BASE_TYPE_NODE(pointer_to_lvalue) == SERIALIZED_CHAR_PTR_SENTINEL) {
-                    char* char_target_addr = (char*)AS_POINTER(pointer_to_lvalue);
+                    PointerObj* char_po = PSCAL_VALUE_PTR(pointer_to_lvalue, PointerObj);
+                    if (char_po && char_po->retained_string && char_po->string_index_is_codepoint) {
+                        // A UnicodeString character: re-encoded and spliced
+                        // in, since its UTF-8 length can change.
+                        bool stored = vmStoreUnicodeChar(vm, char_po, &value_to_set);
+                        freeValue(&value_to_set);
+                        freeValue(&pointer_to_lvalue);
+                        if (!stored) {
+                            return INTERPRET_RUNTIME_ERROR;
+                        }
+                        break;
+                    }
+                    char* char_target_addr = vmStringCharTarget(vm, &pointer_to_lvalue,
+                                                                "VM Error: Attempting to assign to a NULL character address.");
                     if (char_target_addr == NULL) {
-                        runtimeError(vm, "VM Error: Attempting to assign to a NULL character address.");
                         freeValue(&value_to_set);
                         freeValue(&pointer_to_lvalue);
                         return INTERPRET_RUNTIME_ERROR;
@@ -10827,8 +11134,37 @@ comparison_error_label:
                         freeValue(&pointer_to_lvalue);
                         return INTERPRET_RUNTIME_ERROR;
                     }
+                    if (vmValueIsDisposed(target_lvalue_ptr)) {
+                        runtimeError(vm, "VM Error: Assignment through a dangling pointer (its target was disposed).");
+                        freeValue(&value_to_set);
+                        freeValue(&pointer_to_lvalue);
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
 
                     AST* declaredTypeNode = PTR_BASE_TYPE_NODE(pointer_to_lvalue);
+                    if (declaredTypeNode == OWNED_POINTER_SENTINEL) {
+                        // GET_ELEMENT_ADDRESS's row of a multi-dimensional
+                        // array (`m[1] := row`): a view whose storage is m's
+                        // (or, for an array of arrays, the row array itself).
+                        // It carries no declared type, and replacing the view
+                        // Value would drop the write, so copy the elements
+                        // through it.
+                        if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_ARRAY) {
+                            bool stored = VALUE_TYPE(value_to_set) == TYPE_ARRAY &&
+                                          valueAssignArrayElementsInPlace(target_lvalue_ptr, &value_to_set);
+                            if (!stored) {
+                                runtimeError(vm, "Runtime Error: Cannot assign %s to an array row of a different shape.",
+                                             VALUE_TYPE(value_to_set) == TYPE_ARRAY ? "an array" : varTypeToString(VALUE_TYPE(value_to_set)));
+                            }
+                            freeValue(&value_to_set);
+                            freeValue(&pointer_to_lvalue);
+                            if (!stored) {
+                                return INTERPRET_RUNTIME_ERROR;
+                            }
+                            break;
+                        }
+                        declaredTypeNode = NULL;
+                    }
                     VarType declaredType = vmDeclaredVarType(declaredTypeNode);
                     AST* resolvedDeclaredType = vmResolveTypeAlias(declaredTypeNode);
                     if (declaredType != TYPE_VOID) {
@@ -11079,7 +11415,12 @@ comparison_error_label:
                             // is freeValue'd a few lines down and would
                             // otherwise abort on a stale non-NULL pointer tag.
                             pscalValueSetHeapPtrBits(&value_to_set, NULL);
-                        } else {
+                        } else if (!valueAssignAggregateInPlace(target_lvalue_ptr, &value_to_set)) {
+                            // (A record or static array assigned over one of
+                            // the same shape was instead copied into the
+                            // target's own storage just now: Pascal keeps a
+                            // variable's storage across `r := r2`, and VAR
+                            // parameters may point into it.)
                             Value replacement = makeCopyOfValue(&value_to_set);
                             replaceValueCell(target_lvalue_ptr, replacement, preserved_base);
                         }
@@ -11184,13 +11525,23 @@ comparison_error_label:
                 if (PTR_BASE_TYPE_NODE(pointer_val) == STRING_CHAR_PTR_SENTINEL ||
                     PTR_BASE_TYPE_NODE(pointer_val) == SERIALIZED_CHAR_PTR_SENTINEL) {
                     // Special case: pointer into a string's character buffer.
-                    char* char_target_addr = (char*)AS_POINTER(pointer_val);
-                    if (char_target_addr == NULL) {
-                        runtimeError(vm, "VM Error: Attempting to dereference a NULL character address.");
-                        freeValue(&pointer_val);
-                        return INTERPRET_RUNTIME_ERROR;
+                    PointerObj* char_po = PSCAL_VALUE_PTR(pointer_val, PointerObj);
+                    if (char_po && char_po->retained_string && char_po->string_index_is_codepoint) {
+                        Value ch;
+                        if (!vmLoadUnicodeChar(vm, char_po, &ch)) {
+                            freeValue(&pointer_val);
+                            return INTERPRET_RUNTIME_ERROR;
+                        }
+                        push(vm, ch);
+                    } else {
+                        char* char_target_addr = vmStringCharTarget(vm, &pointer_val,
+                                                                    "VM Error: Attempting to dereference a NULL character address.");
+                        if (char_target_addr == NULL) {
+                            freeValue(&pointer_val);
+                            return INTERPRET_RUNTIME_ERROR;
+                        }
+                        push(vm, makeChar(*char_target_addr));
                     }
-                    push(vm, makeChar(*char_target_addr));
                 } else if (PTR_BASE_TYPE_NODE(pointer_val) == BYTE_ARRAY_PTR_SENTINEL) {
                     uint8_t* byte_target_addr = (uint8_t*)AS_POINTER(pointer_val);
                     if (byte_target_addr == NULL) {
@@ -11219,6 +11570,11 @@ comparison_error_label:
                     Value* target_lvalue_ptr = (Value*)AS_POINTER(pointer_val);
                     if (target_lvalue_ptr == NULL) {
                         runtimeError(vm, "VM Error: GET_INDIRECT on a nil pointer.");
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    if (vmValueIsDisposed(target_lvalue_ptr)) {
+                        runtimeError(vm, "VM Error: Dereference of a dangling pointer (its target was disposed).");
+                        freeValue(&pointer_val);
                         return INTERPRET_RUNTIME_ERROR;
                     }
                     push(vm, copyValueForStack(target_lvalue_ptr));
@@ -11575,6 +11931,10 @@ comparison_error_label:
                         freeValue(&value_from_stack);
                         return INTERPRET_RUNTIME_ERROR;
                     }
+                } else if (valueAssignAggregateInPlace(target_slot, &value_from_stack)) {
+                    // A whole record or static array, copied into the slot's
+                    // own storage so addresses taken into it stay valid (see
+                    // SET_INDIRECT).
                 } else {
                     // This is the logic for all other types, including dynamic strings,
                     // numbers, records, etc., which requires a deep copy.
@@ -11703,6 +12063,9 @@ comparison_error_label:
                         freeValue(&value_from_stack);
                         return INTERPRET_RUNTIME_ERROR;
                     }
+                } else if (valueAssignAggregateInPlace(target_slot, &value_from_stack)) {
+                    // See SET_LOCAL: a whole record or static array keeps its
+                    // storage.
                 } else {
                     // VM 2.0 Phase 4i: target_slot can genuinely be
                     // TYPE_POINTER here (unlike SET_INDIRECT's fallback

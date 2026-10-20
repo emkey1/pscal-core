@@ -7726,13 +7726,19 @@ Value vmBuiltinDispose(VM* vm, int arg_count, Value* args) {
         // Disposing a nil pointer is a safe no-op.
         return makeVoid();
     }
+    if (vmValueIsDisposed(valueToDispose)) {
+        runtimeError(vm, "dispose(): the pointer's target was already disposed.");
+        return makeVoid();
+    }
     
     // Get the address value BEFORE freeing the memory
     uintptr_t disposedAddrValue = (uintptr_t)valueToDispose;
     
-    // Free the memory and the Value struct itself
-    freeValue(valueToDispose);
-    free(valueToDispose);
+    // Free what the cell holds; the cell itself becomes a quarantined
+    // tombstone so copies of the pointer that vmNullifyAliases cannot reach
+    // (record fields, array elements) fail cleanly instead of using freed
+    // memory.
+    vmDisposeValueCell(valueToDispose);
     
     // Set the original pointer variable to nil
     AS_POINTER(*pointerVarValuePtr) = NULL;

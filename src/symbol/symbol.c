@@ -1103,6 +1103,16 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
         }
     }
 
+    // A whole record or static array is copied into the variable's own
+    // storage when the shapes match: Pascal keeps a variable's storage across
+    // `r := r2`, and a VAR parameter may point into it (replacing it would
+    // leave that parameter dangling).
+    if ((sym->type == TYPE_RECORD || sym->type == TYPE_ARRAY) &&
+        valueAssignAggregateInPlace(sym->value, &val)) {
+        freeValue(&val);
+        return;
+    }
+
     // --- Free Old Value Contents (if necessary) ---
     // **CRITICAL EXCEPTION**: Do NOT free the buffer for a fixed-length string,
     // as we are about to write into it. For all other types, freeing the
