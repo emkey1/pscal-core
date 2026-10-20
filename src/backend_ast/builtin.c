@@ -1705,6 +1705,12 @@ static Value vmBuiltinToChar(VM* vm, int arg_count, Value* args) {
     unsigned char c = 0;
     if (isRealType(VALUE_TYPE(v))) {
         long double d = AS_REAL(v);
+        // Casting a NaN, an infinity or |x| >= 2^63 to an integer is
+        // undefined behaviour in C; like int(x), that is an error.
+        if (!(d > -9223372036854775809.0L && d < 9223372036854775808.0L)) {
+            runtimeError(vm, "Runtime Error: char(%.16Lg) has no integer value.", d);
+            return makeChar('\0');
+        }
         c = (unsigned char)((long long)d); // truncate then narrow
     } else if (IS_INTLIKE(v)) {
         c = (unsigned char)AS_INTEGER(v);
@@ -1727,6 +1733,11 @@ static Value vmBuiltinToByte(VM* vm, int arg_count, Value* args) {
     unsigned char b = 0;
     if (isRealType(VALUE_TYPE(v))) {
         long double d = AS_REAL(v);
+        // See char(x): an out-of-range cast is undefined behaviour.
+        if (!(d > -9223372036854775809.0L && d < 9223372036854775808.0L)) {
+            runtimeError(vm, "Runtime Error: byte(%.16Lg) has no integer value.", d);
+            return makeByte(0);
+        }
         b = (unsigned char)((long long)d);
     } else if (IS_INTLIKE(v)) {
         b = (unsigned char)AS_INTEGER(v);
@@ -2718,7 +2729,22 @@ Value vmBuiltinSucc(VM* vm, int arg_count, Value* args) {
     }
     Value arg = args[0];
     if (IS_INTLIKE(arg)) {
-        return pscalIntResultLike1(arg, AS_INTEGER(arg) + 1);
+        // The successor of the type's largest value does not exist: it was a
+        // signed overflow (undefined behaviour, wrapping to the minimum).
+        long long cur = AS_INTEGER(arg);
+        if (VALUE_TYPE(arg) == TYPE_UINT64) {
+            if ((unsigned long long)cur == ULLONG_MAX) {
+                runtimeError(vm, "Succ integer overflow.");
+                return makeVoid();
+            }
+            return pscalIntResultLike1(arg, (long long)((unsigned long long)cur + 1ULL));
+        }
+        long long next;
+        if (__builtin_add_overflow(cur, 1LL, &next)) {
+            runtimeError(vm, "Succ integer overflow.");
+            return makeVoid();
+        }
+        return pscalIntResultLike1(arg, next);
     }
     switch(VALUE_TYPE(arg)) {
         case TYPE_CHAR:
@@ -2834,6 +2860,9 @@ Value vmBuiltinPos(VM* vm, int arg_count, Value* args) {
     const long long pos_absent = frontendIsZeroBasedStrings() ? -1 : 0;
 
     if (!needle || !haystack) return makeInt(pos_absent);
+    // An empty substring is not found (Free Pascal: Pos('', s) = 0); strstr
+    // matched it at the start. 0-based frontends keep their match at 0.
+    if (needle[0] == '\0' && !frontendIsZeroBasedStrings()) return makeInt(pos_absent);
 
     const char* found = strstr(haystack, needle);
     if (!found) {
