@@ -12,6 +12,7 @@
 #include "core/utils.h"
 #include "core/globals.h"
 
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -804,8 +805,15 @@ static bool verifyStackDepths(VCtx* ctx) {
     // once for a known depth, once for an unknown one (see
     // VISITED_KNOWN/VISITED_UNKNOWN above) -- and each processed pc pushes
     // at most two successors (JUMP_IF_FALSE), so 4*count+8 is a proven upper
-    // bound reusable across every walk (see verifyWalk()).
-    int worklist_cap = chunk->count * 4 + 8;
+    // bound reusable across every walk (see verifyWalk()). The loader caps a
+    // CODE section far below the size where that overflows an int
+    // (cache.c's PSB3_MAX_CODE_BYTES); this refuses anything bigger anyway.
+    size_t worklist_size = (size_t)chunk->count * 4 + 8;
+    if (worklist_size > (size_t)INT_MAX) {
+        ok = vfail(ctx, "code section of %d bytes is too large to verify", chunk->count);
+        goto done;
+    }
+    int worklist_cap = (int)worklist_size;
     worklist = (WorkItem*)calloc((size_t)worklist_cap, sizeof(WorkItem));
     if (!owner || !visited || !depths || !worklist) {
         ok = vfail(ctx, "out of memory building verifier walk state");

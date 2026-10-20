@@ -496,6 +496,8 @@ typedef struct {
     size_t size;
     size_t pos;
     bool error;
+    int depth;     /* readAst/readValue nesting; see curEnterNested */
+    bool too_deep; /* error was CACHE_MAX_NESTING, not a short section */
 } Cursor;
 
 static void curInit(Cursor* c, const uint8_t* data, size_t size) {
@@ -503,6 +505,30 @@ static void curInit(Cursor* c, const uint8_t* data, size_t size) {
     c->size = size;
     c->pos = 0;
     c->error = false;
+    c->depth = 0;
+    c->too_deep = false;
+}
+
+/* readAst and readValue recurse once per level of the AST or Value they
+ * decode (a node's children, an array's elements, a map's values, a nested
+ * shell closure's whole chunk), and they run before the verifier sees
+ * anything. Without a limit, a file nesting deeply enough ran the C stack
+ * out. No compiler writes anything near this deep: type ASTs nest a few
+ * levels per declared type, constants a level per array/map dimension. */
+#define CACHE_MAX_NESTING 1000
+
+static bool curEnterNested(Cursor* c) {
+    if (c->depth >= CACHE_MAX_NESTING) {
+        c->error = true;
+        c->too_deep = true;
+        return false;
+    }
+    c->depth++;
+    return true;
+}
+
+static void curLeaveNested(Cursor* c) {
+    c->depth--;
 }
 
 static bool curEnsure(Cursor* c, size_t n) {
@@ -1074,7 +1100,16 @@ static void writeAst(ByteBuf* out, const AST* node) {
     }
 }
 
+static AST* readAstNested(Cursor* in);
+
 static AST* readAst(Cursor* in) {
+    if (!curEnterNested(in)) return NULL;
+    AST* node = readAstNested(in);
+    curLeaveNested(in);
+    return node;
+}
+
+static AST* readAstNested(Cursor* in) {
     uint8_t has = curU8(in);
     if (in->error || !has) return NULL;
     ASTNodeType t = (ASTNodeType)curU32LE(in);
@@ -1097,7 +1132,13 @@ static AST* readAst(Cursor* in) {
         node->extra = readAst(in); if (node->extra) node->extra->parent = node;
         if (in->error) { freeAST(node); return NULL; }
         int32_t child_count = curI32LE(in);
-        if (in->error || child_count < 0) { freeAST(node); return NULL; }
+        // Each child takes at least its one presence byte, so a count the
+        // rest of the section cannot hold is malformed; refuse it before
+        // allocating for it.
+        if (in->error || child_count < 0 || (size_t)child_count > in->size - in->pos) {
+            freeAST(node);
+            return NULL;
+        }
         if (child_count > 0) {
             node->children = (AST**)malloc(sizeof(AST*) * (size_t)child_count);
             if (!node->children) { freeAST(node); return NULL; }
@@ -1107,6 +1148,7 @@ static AST* readAst(Cursor* in) {
                 node->children[i] = readAst(in);
                 if (node->children[i]) node->children[i]->parent = node;
             }
+            if (in->error) { freeAST(node); return NULL; }
         }
     }
     return node;
@@ -1301,9 +1343,14 @@ static void writeCodeSection(ByteBuf* out, const BytecodeChunk* chunk) {
     }
 }
 
+/* Far above any compiled program, and low enough that the verifier's
+ * per-instruction tables (int-indexed, 4 entries per code byte for the
+ * worklist) stay well inside int range. */
+#define PSB3_MAX_CODE_BYTES (64u * 1024u * 1024u)
+
 static bool readCodeSection(Cursor* in, BytecodeChunk* chunk) {
     uint64_t count = curVarint(in);
-    if (in->error || count > (uint64_t)INT32_MAX) return false;
+    if (in->error || count > (uint64_t)PSB3_MAX_CODE_BYTES) return false;
     uint64_t cache_count = curVarint(in);
     // cache_id operands are u16 (opcodes.def's 'c' spec), so no chunk can
     // legitimately need more than 65536 distinct cache slots.
@@ -1939,8 +1986,20 @@ static void hashValue(uint64_t* hash, const Value* v, ChunkHashContext* ctx) {
     }
 }
 
+static bool readValueNested(Cursor* in, Value* out);
+
 static bool readValue(Cursor* in, Value* out) {
     if (!out) return false;
+    if (!curEnterNested(in)) {
+        memset(out, 0, sizeof(Value));
+        return false;
+    }
+    bool ok = readValueNested(in, out);
+    curLeaveNested(in);
+    return ok;
+}
+
+static bool readValueNested(Cursor* in, Value* out) {
     memset(out, 0, sizeof(Value));
     out->type = (VarType)curU32LE(in);
     if (in->error) return false;
@@ -2074,6 +2133,10 @@ static bool readValue(Cursor* in, Value* out) {
             }
             int total = arrayCodecElementCount(dims, a->lower_bounds, a->upper_bounds);
             if (total < 0) return false;
+            // Every element starts with its 4-byte type, so bounds the rest
+            // of the section cannot hold are malformed; refuse them before
+            // allocating for them.
+            if ((size_t)total > (in->size - in->pos) / 4) return false;
             if (total > 0) {
                 if (a->is_packed) {
                     a->raw = (uint8_t*)calloc((size_t)total, sizeof(uint8_t));
@@ -2802,6 +2865,11 @@ static bool psb3ReadChunk(const Psb3File* pf, BytecodeChunk* chunk) {
     if (!failed) return true;
 
     resetChunk(chunk, read_consts);
+    if (at->too_deep) {
+        return loadFail("%s section%s%s: nested more than %d levels deep at byte %zu of %zu", failed,
+                        g_loadDetail[0] ? ", " : "", g_loadDetail, CACHE_MAX_NESTING,
+                        at->pos, at->size);
+    }
     return loadFail("%s section%s%s: %s at byte %zu of %zu", failed,
                     g_loadDetail[0] ? ", " : "", g_loadDetail,
                     at->error ? "read past the end of the section" : "malformed data",
