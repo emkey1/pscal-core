@@ -10058,13 +10058,17 @@ comparison_error_label:
                     }
                 }
 
-                int* indices = malloc(sizeof(int) * dimension_count);
+                // Up to 8 dimensions index from the stack: this ran a malloc/free
+                // pair on every element access.
+                int indices_inline[8];
+                int* indices = dimension_count <= 8 ? indices_inline
+                                                    : malloc(sizeof(int) * dimension_count);
                 if (!indices) { runtimeError(vm, "VM Error: Malloc failed for array indices."); freeValue(&operand); return INTERPRET_RUNTIME_ERROR; }
 
                 for (int i = 0; i < dimension_count; i++) {
                     Value index_val = pop(vm);
                     if (!vmIndexValueToInt(vm, &index_val, &indices[dimension_count - 1 - i])) {
-                        free(indices);
+                        if (indices != indices_inline) free(indices);
                         freeValue(&index_val);
                         freeValue(&operand);
                         return INTERPRET_RUNTIME_ERROR;
@@ -10087,7 +10091,7 @@ comparison_error_label:
                     if (!candidate || vmValueIsDisposed(candidate)) {
                         runtimeError(vm, candidate ? "VM Error: Array access through a dangling pointer (its target was disposed)."
                                                    : "VM Error: Array access through a nil pointer.");
-                        free(indices);
+                        if (indices != indices_inline) free(indices);
                         freeValue(&operand);
                         return INTERPRET_RUNTIME_ERROR;
                     }
@@ -10148,7 +10152,7 @@ comparison_error_label:
                         if (!ARRAY_LOWER_BOUNDS(temp_wrapper) || !ARRAY_UPPER_BOUNDS(temp_wrapper)) {
                             runtimeError(vm, "VM Error: Malloc failed for temporary array wrapper bounds.");
                             vmFreeArrayIndexWrapper(&temp_wrapper);
-                            free(indices);
+                            if (indices != indices_inline) free(indices);
                             freeValue(&operand);
                             return INTERPRET_RUNTIME_ERROR;
                         }
@@ -10157,7 +10161,7 @@ comparison_error_label:
                             AST* sub = arrayType->children[i];
                             if (sub && !vmResolveArraySubrangeBounds(vm, sub, &lb, &ub)) {
                                 vmFreeArrayIndexWrapper(&temp_wrapper);
-                                free(indices);
+                                if (indices != indices_inline) free(indices);
                                 freeValue(&operand);
                                 return INTERPRET_RUNTIME_ERROR;
                             }
@@ -10168,7 +10172,7 @@ comparison_error_label:
                         using_wrapper = true;
                     } else {
                         runtimeError(vm, "VM Error: Pointer does not point to an array for element access.");
-                        free(indices);
+                        if (indices != indices_inline) free(indices);
                         freeValue(&operand);
                         return INTERPRET_RUNTIME_ERROR;
                     }
@@ -10176,7 +10180,7 @@ comparison_error_label:
                     array_val_ptr = &operand;
                 } else {
                     runtimeError(vm, "[AETH-RUNTIME-INDEX-NOT-ARRAY] cannot index this value: it is not an array. hint: indexing a 1-D array two-dimensionally (dp[i][j]) does this -- a `let dp: Int[]` is flat, so use a single index dp[i * width + j], or build an array of arrays.");
-                    free(indices);
+                    if (indices != indices_inline) free(indices);
                     freeValue(&operand);
                     return INTERPRET_RUNTIME_ERROR;
                 }
@@ -10210,7 +10214,7 @@ comparison_error_label:
                     Value* slice = malloc(sizeof(Value));
                     bool slice_oob = false;
                     bool slice_ok = slice && makeDynamicArraySliceValue(array_val_ptr, dimension_count, indices, slice, &slice_oob);
-                    free(indices);
+                    if (indices != indices_inline) free(indices);
                     if (!slice_ok) {
                         free(slice);
                         runtimeError(vm, "VM Error: Array element index out of bounds.");
@@ -10244,7 +10248,7 @@ comparison_error_label:
                  * print a location-less line and exit. See
                  * vmCheckArrayIndexBounds(). */
                 if (!vmCheckArrayIndexBounds(vm, array_val_ptr, indices)) {
-                    free(indices);
+                    if (indices != indices_inline) free(indices);
                     freeValue(&operand);
                     if (using_wrapper) {
                         vmFreeArrayIndexWrapper(&temp_wrapper);
@@ -10256,7 +10260,7 @@ comparison_error_label:
                 }
 
                 int offset = computeFlatOffset(array_val_ptr, indices);
-                free(indices);
+                if (indices != indices_inline) free(indices);
 
                 int total_size = calculateArrayTotalSize(array_val_ptr);
                 if (offset < 0 || offset >= total_size) {
@@ -10613,7 +10617,11 @@ comparison_error_label:
                     }
                 }
 
-                int* indices = malloc(sizeof(int) * dimension_count);
+                // Up to 8 dimensions index from the stack: this ran a malloc/free
+                // pair on every element access.
+                int indices_inline[8];
+                int* indices = dimension_count <= 8 ? indices_inline
+                                                    : malloc(sizeof(int) * dimension_count);
                 if (!indices) {
                     runtimeError(vm, "VM Error: Malloc failed for array indices.");
                     freeValue(&operand);
@@ -10623,7 +10631,7 @@ comparison_error_label:
                 for (int i = 0; i < dimension_count; i++) {
                     Value index_val = pop(vm);
                     if (!vmIndexValueToInt(vm, &index_val, &indices[dimension_count - 1 - i])) {
-                        free(indices);
+                        if (indices != indices_inline) free(indices);
                         freeValue(&index_val);
                         freeValue(&operand);
                         return INTERPRET_RUNTIME_ERROR;
@@ -10646,7 +10654,7 @@ comparison_error_label:
                     if (!candidate || vmValueIsDisposed(candidate)) {
                         runtimeError(vm, candidate ? "VM Error: Array access through a dangling pointer (its target was disposed)."
                                                    : "VM Error: Array access through a nil pointer.");
-                        free(indices);
+                        if (indices != indices_inline) free(indices);
                         freeValue(&operand);
                         return INTERPRET_RUNTIME_ERROR;
                     }
@@ -10702,7 +10710,7 @@ comparison_error_label:
                         if (!ARRAY_LOWER_BOUNDS(temp_wrapper) || !ARRAY_UPPER_BOUNDS(temp_wrapper)) {
                             runtimeError(vm, "VM Error: Malloc failed for temporary array wrapper bounds.");
                             vmFreeArrayIndexWrapper(&temp_wrapper);
-                            free(indices);
+                            if (indices != indices_inline) free(indices);
                             freeValue(&operand);
                             return INTERPRET_RUNTIME_ERROR;
                         }
@@ -10711,7 +10719,7 @@ comparison_error_label:
                             AST* sub = arrayType->children[i];
                             if (sub && !vmResolveArraySubrangeBounds(vm, sub, &lb, &ub)) {
                                 vmFreeArrayIndexWrapper(&temp_wrapper);
-                                free(indices);
+                                if (indices != indices_inline) free(indices);
                                 freeValue(&operand);
                                 return INTERPRET_RUNTIME_ERROR;
                             }
@@ -10722,7 +10730,7 @@ comparison_error_label:
                         using_wrapper = true;
                     } else {
                         runtimeError(vm, "VM Error: Pointer does not point to an array for element access.");
-                        free(indices);
+                        if (indices != indices_inline) free(indices);
                         freeValue(&operand);
                         return INTERPRET_RUNTIME_ERROR;
                     }
@@ -10730,7 +10738,7 @@ comparison_error_label:
                     array_val_ptr = &operand;
                 } else {
                     runtimeError(vm, "[AETH-RUNTIME-INDEX-NOT-ARRAY] cannot index this value: it is not an array. hint: indexing a 1-D array two-dimensionally (dp[i][j]) does this -- a `let dp: Int[]` is flat, so use a single index dp[i * width + j], or build an array of arrays.");
-                    free(indices);
+                    if (indices != indices_inline) free(indices);
                     freeValue(&operand);
                     return INTERPRET_RUNTIME_ERROR;
                 }
@@ -10750,7 +10758,7 @@ comparison_error_label:
                     Value sliceVal;
                     bool slice_oob = false;
                     bool slice_ok = makeDynamicArraySliceValue(array_val_ptr, dimension_count, indices, &sliceVal, &slice_oob);
-                    free(indices);
+                    if (indices != indices_inline) free(indices);
                     if (!slice_ok) {
                         runtimeError(vm, "VM Error: Array element index out of bounds.");
                         if (VALUE_TYPE(operand) == TYPE_POINTER) freeValue(&operand);
@@ -10777,7 +10785,7 @@ comparison_error_label:
                  * print a location-less line and exit. Note this site's operand
                  * cleanup is conditional, unlike the other call site's. */
                 if (!vmCheckArrayIndexBounds(vm, array_val_ptr, indices)) {
-                    free(indices);
+                    if (indices != indices_inline) free(indices);
                     if (VALUE_TYPE(operand) == TYPE_POINTER) freeValue(&operand);
                     if (using_wrapper) {
                         vmFreeArrayIndexWrapper(&temp_wrapper);
@@ -10789,7 +10797,7 @@ comparison_error_label:
                 }
 
                 int offset = computeFlatOffset(array_val_ptr, indices);
-                free(indices);
+                if (indices != indices_inline) free(indices);
 
                 int total_size = calculateArrayTotalSize(array_val_ptr);
                 if (offset < 0 || offset >= total_size) {
