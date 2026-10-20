@@ -8215,8 +8215,14 @@ dispatch_switch:
                 break;
             }
             case CONSTANT: {
-                Value constant = READ_CONSTANT();
-                push(vm, copyValueForStack(&constant));
+                // The verifier range-checks this operand; checked here too,
+                // as CONSTANT16 is, for code it did not see.
+                uint8_t idx = READ_BYTE();
+                if (idx >= vm->chunk->constants_count) {
+                    runtimeError(vm, "VM Error: Constant index %u out of bounds for CONSTANT.", idx);
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+                push(vm, copyValueForStack(&vm->chunk->constants[idx]));
                 break;
             }
                 
