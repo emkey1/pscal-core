@@ -3392,17 +3392,7 @@ Value vmBuiltinCopy(VM* vm, int arg_count, Value* args) {
         len_to_copy = source_len - start_0based;
     }
 
-    char* new_str = malloc(len_to_copy + 1);
-    if (!new_str) {
-        runtimeError(vm, "Malloc failed in copy().");
-        return makeString("");
-    }
-    strncpy(new_str, source + start_0based, len_to_copy);
-    new_str[len_to_copy] = '\0';
-
-    Value result = makeString(new_str);
-    free(new_str);
-    return result;
+    return makeStringLen(source + start_0based, len_to_copy);
 }
 
 Value vmBuiltinTrim(VM* vm, int arg_count, Value* args) {
@@ -3491,10 +3481,22 @@ Value vmBuiltinStringOfChar(VM* vm, int arg_count, Value* args) {
         return unicode_fill ? makeUnicodeString("") : makeString("");
     }
 
+    // A string's length is an int everywhere downstream (Length, indexing),
+    // and len * encoded_fill_len must not wrap: StringOfChar(chr(128512),
+    // 2^62 + 1) used to malloc 5 bytes and then fill 4 * (2^62 + 1).
+    if (count > INT_MAX || (unicode_fill && (size_t)count > (size_t)INT_MAX / encoded_fill_len)) {
+        runtimeError(vm, "StringOfChar: count %lld is too large.", count);
+        return unicode_fill ? makeUnicodeString("") : makeString("");
+    }
     size_t len = (size_t)count;
     size_t total_bytes = unicode_fill ? len * encoded_fill_len : len;
+
+    // Fill the result's own buffer directly rather than building a temporary
+    // and copying it again.
+    Value result = unicode_fill ? makeUnicodeStringLen(NULL, 0) : makeStringLen(NULL, 0);
     char *buffer = (char*)malloc(total_bytes + 1);
     if (!buffer) {
+        freeValue(&result);
         runtimeError(vm, "StringOfChar: memory allocation failed.");
         return makeString("");
     }
@@ -3505,14 +3507,13 @@ Value vmBuiltinStringOfChar(VM* vm, int arg_count, Value* args) {
             memcpy(cursor, encoded_fill, encoded_fill_len);
             cursor += encoded_fill_len;
         }
-        buffer[total_bytes] = '\0';
     } else {
         memset(buffer, fill, len);
-        buffer[len] = '\0';
     }
+    buffer[total_bytes] = '\0';
 
-    Value result = unicode_fill ? makeUnicodeString(buffer) : makeString(buffer);
-    free(buffer);
+    free(AS_STRING(result));
+    AS_STRING(result) = buffer;
     return result;
 }
 
