@@ -3585,21 +3585,29 @@ static bool resizeDynamicArrayValue(VM* vm,
         return false;
     }
 
-    if (old->dimensions > 0 && old->dimensions != dimension_count) {
-        runtimeError(vm, "SetLength dimension count (%d) does not match existing array (%d).",
-                     dimension_count,
-                     old->dimensions);
-        pscalObjRelease(&old->header);
-        return false;
-    }
-
     VarType element_type = old->element_type;
     AST* element_type_def = old->element_type_def;
     bool use_packed = isPackedByteElementType(element_type);
     bool is_dynamic = old->is_dynamic;
 
-    int* new_lower = (int*)malloc(sizeof(int) * dimension_count);
-    int* new_upper = (int*)malloc(sizeof(int) * dimension_count);
+    // An array whose elements are arrays (`array of array of T`) is itself
+    // one-dimensional: SetLength(a, n, m) gives `a` n elements and then sizes
+    // each of them to m (the recursion further down). Shaping `a` as an n*m
+    // 2-D array as well allocated n*m inner arrays (SetLength(a, 300, 300)
+    // built 90,000 rows) and rejected re-dimensioning an array first sized
+    // with SetLength(a, n).
+    int own_dims = (element_type == TYPE_ARRAY && dimension_count > 1) ? 1 : dimension_count;
+
+    if (old->dimensions > 0 && old->dimensions != own_dims) {
+        runtimeError(vm, "SetLength dimension count (%d) does not match existing array (%d).",
+                     own_dims,
+                     old->dimensions);
+        pscalObjRelease(&old->header);
+        return false;
+    }
+
+    int* new_lower = (int*)malloc(sizeof(int) * own_dims);
+    int* new_upper = (int*)malloc(sizeof(int) * own_dims);
     if (!new_lower || !new_upper) {
         if (new_lower) free(new_lower);
         if (new_upper) free(new_upper);
@@ -3610,7 +3618,7 @@ static bool resizeDynamicArrayValue(VM* vm,
 
     size_t new_total = 1;
     bool saw_zero = false;
-    for (int i = 0; i < dimension_count; ++i) {
+    for (int i = 0; i < own_dims; ++i) {
         long long len = lengths[i];
         if (len < 0) {
             runtimeError(vm, "SetLength: array length must be non-negative.");
@@ -3804,18 +3812,18 @@ static bool resizeDynamicArrayValue(VM* vm,
         }
 
         if (old_total > 0 && old_lower_bounds && old_upper_bounds &&
-            old->dimensions == dimension_count &&
+            old->dimensions == own_dims &&
             ((use_packed && (old_array_raw || old_array_val)) ||
              (!use_packed && old_array_val))) {
-            copy_lower = (int*)malloc(sizeof(int) * dimension_count);
-            copy_upper = (int*)malloc(sizeof(int) * dimension_count);
+            copy_lower = (int*)malloc(sizeof(int) * own_dims);
+            copy_upper = (int*)malloc(sizeof(int) * own_dims);
             if (!copy_lower || !copy_upper) {
                 runtimeError(vm, "SetLength: memory allocation failed while preserving array contents.");
                 goto setlength_cleanup_failure;
             }
 
             bool has_overlap = true;
-            for (int i = 0; i < dimension_count; ++i) {
+            for (int i = 0; i < own_dims; ++i) {
                 int overlap_low = old_lower_bounds[i] > new_lower[i] ?
                                   old_lower_bounds[i] : new_lower[i];
                 int overlap_high = old_upper_bounds[i] < new_upper[i] ?
@@ -3829,19 +3837,19 @@ static bool resizeDynamicArrayValue(VM* vm,
             }
 
             if (has_overlap) {
-                copy_indices = (int*)malloc(sizeof(int) * dimension_count);
+                copy_indices = (int*)malloc(sizeof(int) * own_dims);
                 if (!copy_indices) {
                     runtimeError(vm, "SetLength: memory allocation failed while preserving array contents.");
                     goto setlength_cleanup_failure;
                 }
 
-                for (int i = 0; i < dimension_count; ++i) {
+                for (int i = 0; i < own_dims; ++i) {
                     copy_indices[i] = copy_lower[i];
                 }
 
                 while (true) {
-                    int old_offset = flatOffsetFromBounds(dimension_count, old_lower_bounds, old_upper_bounds, copy_indices);
-                    int new_offset = flatOffsetFromBounds(dimension_count, new_lower, new_upper, copy_indices);
+                    int old_offset = flatOffsetFromBounds(own_dims, old_lower_bounds, old_upper_bounds, copy_indices);
+                    int new_offset = flatOffsetFromBounds(own_dims, new_lower, new_upper, copy_indices);
                     if (use_packed) {
                         unsigned char byte = 0;
                         if (old_array_is_packed && old_array_raw) {
@@ -3855,7 +3863,7 @@ static bool resizeDynamicArrayValue(VM* vm,
                         new_elements[new_offset] = makeCopyOfValue(&old_array_val[old_offset]);
                     }
 
-                    int dim = dimension_count - 1;
+                    int dim = own_dims - 1;
                     while (dim >= 0) {
                         if (copy_indices[dim] < copy_upper[dim]) {
                             copy_indices[dim]++;
@@ -3906,11 +3914,11 @@ static bool resizeDynamicArrayValue(VM* vm,
     new_obj->element_type_def = element_type_def;
     new_obj->is_packed = use_packed;
     new_obj->is_dynamic = is_dynamic;
-    new_obj->dimensions = dimension_count;
+    new_obj->dimensions = own_dims;
     new_obj->lower_bounds = new_lower;
     new_obj->upper_bounds = new_upper;
-    new_obj->lower_bound = (dimension_count >= 1) ? new_lower[0] : 0;
-    new_obj->upper_bound = (dimension_count >= 1) ? new_upper[0] : -1;
+    new_obj->lower_bound = (own_dims >= 1) ? new_lower[0] : 0;
+    new_obj->upper_bound = (own_dims >= 1) ? new_upper[0] : -1;
     if (new_total > 0) {
         if (use_packed) {
             new_obj->raw = new_raw;
