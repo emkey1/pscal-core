@@ -1560,6 +1560,7 @@ typedef struct ThreadJob {
     Symbol* closureSymbol;
     Thread* assignedThread;
     int assignedThreadId;
+    uint32_t assignedGeneration;
     bool assignmentSatisfied;
     bool assignmentConsumed;
     pthread_mutex_t assignmentMutex;
@@ -1589,7 +1590,23 @@ typedef struct {
 
 static bool vmThreadCaptureUpvaluesForJob(VM* vm, ThreadJob* job);
 static void vmThreadJobDestroy(ThreadJob* job);
+static void vmComputeDeadline(struct timespec* out, long millis);
 static void vmReleaseHeldMutexes(VM* vm);
+static bool vmThreadStopJob(VM* pool, int threadId, uint32_t generation, bool kill);
+
+// The VM whose threads[] every spawn uses and every thread id names: the
+// root of `vm`'s family (a worker VM's threadOwner). Worker VMs' own pools
+// stay empty.
+static VM* vmThreadPool(VM* vm) {
+    return (vm && vm->threadOwner) ? vm->threadOwner : vm;
+}
+
+// True once the pool is shutting down (program exit or an interrupt): a
+// spawn refused then is not a limit error to report.
+static bool vmThreadPoolStopping(VM* vm) {
+    VM* pool = vmThreadPool(vm);
+    return pool && atomic_load(&pool->shuttingDownWorkers);
+}
 
 static ThreadJobQueue* vmThreadJobQueueCreate(void) {
     ThreadJobQueue* queue = (ThreadJobQueue*)calloc(1, sizeof(ThreadJobQueue));
@@ -1758,8 +1775,12 @@ static ThreadJob* vmThreadJobQueuePop(ThreadJobQueue* queue,
             pthread_mutex_unlock(&queue->mutex);
             return NULL;
         }
-        if (thread &&
-            (atomic_load(&thread->killRequested) || atomic_load(&thread->cancelRequested))) {
+        // Only a kill retires an idle worker. A cancel names a job, and an
+        // idle worker has none: a cancel that arrived after the job finished
+        // used to retire the worker here although vmThreadReleaseForReuse had
+        // already counted it as available, so the next spawn queued a job no
+        // worker would ever take.
+        if (thread && atomic_load(&thread->killRequested)) {
             pthread_mutex_unlock(&queue->mutex);
             return NULL;
         }
@@ -1788,6 +1809,36 @@ static void vmThreadJobQueueWake(ThreadJobQueue* queue) {
     pthread_mutex_lock(&queue->mutex);
     pthread_cond_broadcast(&queue->cond);
     pthread_mutex_unlock(&queue->mutex);
+}
+
+// Takes `job` back out of the queue if no worker has popped it yet. True when
+// it was still queued: the caller owns the job again and must destroy it.
+static bool vmThreadJobQueueRemove(ThreadJobQueue* queue, ThreadJob* job) {
+    if (!queue || !job) {
+        return false;
+    }
+    bool found = false;
+    pthread_mutex_lock(&queue->mutex);
+    ThreadJob* prev = NULL;
+    for (ThreadJob* cur = queue->head; cur; prev = cur, cur = cur->next) {
+        if (cur != job) {
+            continue;
+        }
+        if (prev) {
+            prev->next = cur->next;
+        } else {
+            queue->head = cur->next;
+        }
+        if (queue->tail == cur) {
+            queue->tail = prev;
+        }
+        queue->pending--;
+        cur->next = NULL;
+        found = true;
+        break;
+    }
+    pthread_mutex_unlock(&queue->mutex);
+    return found;
 }
 
 // VM 2.0 Phase 2a's per-call-site global-access cache helpers
@@ -1897,6 +1948,50 @@ static Symbol* findProcedureByAddress(HashTable* table, uint32_t address);
 static void vmPopulateProcedureAddressCache(VM* vm);
 static Symbol* vmGetProcedureByAddress(VM* vm, uint32_t address);
 
+// A routine's parameters, as the compiler laid them out: its declaration's
+// children are parameter groups (`a, b: Real` is one AST_VAR_DECL naming two
+// parameters), and Symbol.arity is the total. -1 when unknown.
+static int vmProcParamCount(const Symbol* proc) {
+    if (!proc) {
+        return -1;
+    }
+    if (proc->arity > 0) {
+        return proc->arity;
+    }
+    if (!proc->type_def) {
+        return -1;
+    }
+    int count = 0;
+    for (int i = 0; i < proc->type_def->child_count; i++) {
+        AST* group = proc->type_def->children[i];
+        if (group && group->type == AST_VAR_DECL) {
+            count += group->child_count > 0 ? group->child_count : 1;
+        }
+    }
+    return count;
+}
+
+// The declaration group of parameter `index` (its var_type is the
+// parameter's type), or NULL.
+static AST* vmProcParamDecl(const Symbol* proc, int index) {
+    if (!proc || !proc->type_def || index < 0) {
+        return NULL;
+    }
+    int seen = 0;
+    for (int i = 0; i < proc->type_def->child_count; i++) {
+        AST* group = proc->type_def->children[i];
+        if (!group || group->type != AST_VAR_DECL) {
+            continue;
+        }
+        int names = group->child_count > 0 ? group->child_count : 1;
+        if (index < seen + names) {
+            return group;
+        }
+        seen += names;
+    }
+    return NULL;
+}
+
 static bool vmThreadCaptureUpvaluesForJob(VM* vm, ThreadJob* job) {
     if (!vm || !job || job->kind != THREAD_JOB_BYTECODE) {
         return true;
@@ -1988,12 +2083,17 @@ static bool vmThreadPrepareWorkerVm(Thread* thread, VM* owner, ThreadJob* job, i
         return false;
     }
     if (!thread->vm) {
-        thread->vm = (VM*)calloc(1, sizeof(VM));
-        if (!thread->vm) {
+        VM* fresh = (VM*)calloc(1, sizeof(VM));
+        if (!fresh) {
             return false;
         }
-        initVM(thread->vm);
+        initVM(fresh);
+        // Published under stateMutex: vmThreadRequestStop reads thread->vm
+        // from other threads.
+        pthread_mutex_lock(&thread->stateMutex);
+        thread->vm = fresh;
         thread->ownsVm = true;
+        pthread_mutex_unlock(&thread->stateMutex);
     }
 
     vmResetExecutionState(thread->vm);
@@ -2007,7 +2107,9 @@ static bool vmThreadPrepareWorkerVm(Thread* thread, VM* owner, ThreadJob* job, i
         thread->vm->chunk = (job && job->chunk) ? job->chunk : sourceVm->chunk;
         thread->vm->mutexOwner = sourceVm->mutexOwner ? sourceVm->mutexOwner : sourceVm;
         thread->vm->mutexCount = thread->vm->mutexOwner->mutexCount;
-        thread->vm->threadOwner = sourceVm->threadOwner ? sourceVm->threadOwner : sourceVm;
+        // The pool's owner is the root VM (vmThreadPool), whichever VM
+        // spawned the job.
+        thread->vm->threadOwner = owner;
         thread->vm->trace_head_instructions = sourceVm->trace_head_instructions;
     } else {
         thread->vm->chunk = (job && job->chunk) ? job->chunk : owner->chunk;
@@ -2027,13 +2129,14 @@ static bool vmThreadPrepareWorkerVm(Thread* thread, VM* owner, ThreadJob* job, i
     return true;
 }
 
-static void vmThreadJobSignalAssignment(ThreadJob* job, Thread* thread, int threadId) {
+static void vmThreadJobSignalAssignment(ThreadJob* job, Thread* thread, int threadId, uint32_t generation) {
     if (!job || !job->assignmentSyncInitialized) {
         return;
     }
     pthread_mutex_lock(&job->assignmentMutex);
     job->assignedThread = thread;
     job->assignedThreadId = threadId;
+    job->assignedGeneration = generation;
     job->assignmentSatisfied = true;
     pthread_cond_broadcast(&job->assignmentCond);
     pthread_mutex_unlock(&job->assignmentMutex);
@@ -2429,6 +2532,10 @@ static bool vmThreadAwaitRelease(Thread* thread, VM* owner) {
     // read "still running" and a second release could leave a stale
     // readyForReuse behind for the slot's next job.
     atomic_store(&thread->active, false);
+    // A cancel names the job that just finished; it must not outlive it
+    // (vmThreadJobQueuePop no longer retires a worker on cancel, but a stale
+    // flag would still cancel the slot's next job before it started).
+    atomic_store(&thread->cancelRequested, false);
     if (exitLoop) {
         pthread_mutex_lock(&thread->resultMutex);
         thread->awaitingReuse = false;
@@ -2494,13 +2601,24 @@ static void* threadStart(void* arg) {
         thread->queuedAt = job->queuedAt;
         thread->currentJob = job;
         thread->poolWorker = job->submitOnly;
+        uint32_t jobGeneration = thread->jobGeneration + 1;
+        if (jobGeneration == 0) {
+            jobGeneration = 1;
+        }
+        // Read without stateMutex by joiners holding resultMutex.
+        __atomic_store_n(&thread->jobGeneration, jobGeneration, __ATOMIC_RELEASE);
         atomic_store(&thread->active, true);
         atomic_store(&thread->cancelRequested, false);
         atomic_store(&thread->paused, false);
         pthread_mutex_unlock(&thread->stateMutex);
-        vmThreadJobSignalAssignment(job, thread, threadId);
 
-        if (!vmThreadPrepareWorkerVm(thread, owner, job, threadId)) {
+        // Prepare before announcing the assignment: the spawner returns once
+        // it is signalled, and the VM that spawned the job (job->parentVm,
+        // read here) may then move on to another job or exit.
+        bool prepared = vmThreadPrepareWorkerVm(thread, owner, job, threadId);
+        vmThreadJobSignalAssignment(job, thread, threadId, jobGeneration);
+
+        if (!prepared) {
             vmThreadStoreResultDirect(thread, NULL, false);
             vmThreadJobAwaitConsumedAndDestroy(job);
             job = NULL;
@@ -2517,14 +2635,31 @@ static void* threadStart(void* arg) {
         }
 
         VM* workerVm = thread->vm;
-        bool canceled = atomic_load(&thread->cancelRequested);
-        bool killed = atomic_load(&thread->killRequested) || atomic_load(&owner->shuttingDownWorkers);
-
-        if (vmHandleGlobalInterrupt(owner) ||
-            (workerVm && (workerVm->abort_requested || workerVm->exit_requested))) {
+        bool canceled = false;
+        bool killed = false;
+        if (vmHandleGlobalInterrupt(owner)) {
             canceled = true;
             killed = true;
         }
+
+        // Read the stop flags and clear the worker VM's own in the same
+        // stateMutex section vmThreadRequestStop rings them in, so a stop
+        // request either is seen here or reaches the running job.
+        pthread_mutex_lock(&thread->stateMutex);
+        if (atomic_load(&thread->cancelRequested)) {
+            canceled = true;
+        }
+        if (atomic_load(&thread->killRequested) || atomic_load(&owner->shuttingDownWorkers)) {
+            killed = true;
+        }
+        if (!canceled && !killed && workerVm) {
+            workerVm->current_builtin_name = NULL;
+            workerVm->abort_requested = false;
+            workerVm->runtime_error_raised = false;
+            workerVm->exit_requested = false;
+            workerVm->suspend_unwind_requested = false;
+        }
+        pthread_mutex_unlock(&thread->stateMutex);
 
         if (!canceled && !killed) {
             clock_gettime(CLOCK_REALTIME, &thread->startedAt);
@@ -2535,14 +2670,6 @@ static void* threadStart(void* arg) {
 
         if (!workerVm) {
             canceled = true;
-        }
-
-        if (!canceled && !killed && workerVm) {
-            workerVm->current_builtin_name = NULL;
-            workerVm->abort_requested = false;
-            workerVm->runtime_error_raised = false;
-            workerVm->exit_requested = false;
-            workerVm->suspend_unwind_requested = false;
         }
 
         switch (job->kind) {
@@ -2620,11 +2747,14 @@ static void* threadStart(void* arg) {
                         }
                     }
 
-                    int expected = proc_symbol && proc_symbol->type_def ? proc_symbol->type_def->child_count : job->argc;
+                    // Every argument the job carries, up to the declared
+                    // parameter count. Pushing stopped at 8 before, so a
+                    // routine with more parameters ran with its frame short
+                    // and failed with "Local slot index out of range".
+                    int expected = proc_symbol ? vmProcParamCount(proc_symbol) : -1;
+                    if (expected < 0) expected = job->argc;
                     int pushed_args = 0;
-                    int limit = job->argc;
-                    if (limit > 8) limit = 8;
-                    for (int i = 0; i < expected && i < limit; i++) {
+                    for (int i = 0; i < expected && i < job->argc; i++) {
                         // VM 2.0 Phase 4g: must be an independent copy, not a
                         // bare struct alias -- job->args[i] is later freed by
                         // vmThreadJobDestroy, and a bare `Value v = job->args[i]`
@@ -2634,7 +2764,7 @@ static void* threadStart(void* arg) {
                         // freed independently.
                         Value v = job->args ? makeCopyOfValue(&job->args[i]) : makeNil();
                         if (proc_symbol && proc_symbol->type_def) {
-                            AST* param_ast = proc_symbol->type_def->children[i];
+                            AST* param_ast = vmProcParamDecl(proc_symbol, i);
                             if (param_ast) {
                                 if (isRealType(param_ast->var_type) && isIntlikeType(VALUE_TYPE(v))) {
                                     long double tmp = asLd(v);
@@ -2793,6 +2923,15 @@ static void* threadStart(void* arg) {
         }
     }
 
+    // The loop can end before a job handed to this worker was ever taken up
+    // (the pool shut down as the worker started): tell its spawner, which is
+    // waiting for the assignment, that it failed, then free it.
+    if (job) {
+        vmThreadJobSignalAssignment(job, NULL, -1, 0);
+        vmThreadJobAwaitConsumedAndDestroy(job);
+        job = NULL;
+    }
+
     pthread_mutex_lock(&owner->threadRegistryLock);
     if (owner->availableWorkers > 0 && thread->idle) {
         owner->availableWorkers--;
@@ -2804,11 +2943,20 @@ static void* threadStart(void* arg) {
     owner->workerCount--;
     pthread_mutex_unlock(&owner->threadRegistryLock);
 
-    if (thread->ownsVm && thread->vm) {
-        freeVM(thread->vm);
-        free(thread->vm);
-        thread->vm = NULL;
-        thread->ownsVm = false;
+    // Detach the VM under stateMutex before freeing it: vmThreadRequestStop
+    // (cancel, kill, interrupt) writes to thread->vm from other threads, and
+    // used to write into this VM after it was freed.
+    VM* exitedVm = NULL;
+    pthread_mutex_lock(&thread->stateMutex);
+    if (thread->ownsVm) {
+        exitedVm = thread->vm;
+    }
+    thread->vm = NULL;
+    thread->ownsVm = false;
+    pthread_mutex_unlock(&thread->stateMutex);
+    if (exitedVm) {
+        freeVM(exitedVm);
+        free(exitedVm);
     }
     pthread_mutex_lock(&thread->stateMutex);
     vmThreadResetResult(thread);
@@ -2830,6 +2978,30 @@ static void* threadStart(void* arg) {
     return NULL;
 }
 
+// Clears a slot that createThreadJob claimed for a new worker but could not
+// start one on. Caller holds no locks.
+static void vmThreadAbandonClaimedSlot(VM* pool, Thread* assignedThread, int originalGeneration) {
+    pthread_mutex_lock(&pool->threadRegistryLock);
+    pool->workerCount--;
+    atomic_store(&assignedThread->inPool, false);
+    assignedThread->poolGeneration = originalGeneration;
+    atomic_store(&assignedThread->active, false);
+    assignedThread->idle = false;
+    assignedThread->poolWorker = false;
+    assignedThread->awaitingReuse = false;
+    assignedThread->readyForReuse = false;
+    assignedThread->currentJob = NULL;
+    assignedThread->queuedAt = (struct timespec){0, 0};
+    memset(&assignedThread->handle, 0, sizeof(pthread_t));
+    pthread_mutex_unlock(&pool->threadRegistryLock);
+    vmThreadResetResult(assignedThread);
+    atomic_store(&assignedThread->cancelRequested, false);
+    atomic_store(&assignedThread->killRequested, false);
+    atomic_store(&assignedThread->paused, false);
+}
+
+static bool vmConsumeInterruptRequest(VM* vm);
+
 static int createThreadJob(VM* vm,
                            ThreadJobKind kind,
                            BytecodeChunk* chunk,
@@ -2845,10 +3017,22 @@ static int createThreadJob(VM* vm,
                            int builtin_id,
                            const char* builtin_name,
                            bool submitOnly,
-                           const char* threadName) {
+                           const char* threadName,
+                           uint32_t* outGeneration) {
+    if (outGeneration) {
+        *outGeneration = 0;
+    }
     if (!vm) {
         return -1;
     }
+    // The job runs in the root VM's pool whichever VM spawns it (`vm` stays
+    // the job's parent, for its globals and captured variables). A spawn
+    // from inside a worker used to go to that worker VM's own pool, which is
+    // torn down when the worker takes its next job and freed when it exits:
+    // a task handle that outlived the worker's job pointed into freed memory,
+    // and WaitForThread, which joins the root pool, joined an unrelated slot
+    // with the same number -- or its own.
+    VM* pool = vmThreadPool(vm);
 
     ThreadJob* job = vmThreadJobCreate(vm, kind, chunk, entry, closureEnv, closureSymbol, argc, argv, callback, cleanup, user_data,
                                        builtin, builtin_id, builtin_name, submitOnly, threadName);
@@ -2856,13 +3040,17 @@ static int createThreadJob(VM* vm,
         return -1;
     }
 
-    int assignedId = -1;
+claim_worker:;
     Thread* assignedThread = NULL;
+    int assignedId = -1;
     bool spawnNewWorker = false;
 
-    pthread_mutex_lock(&vm->threadRegistryLock);
-    if (!vm->jobQueue) {
-        pthread_mutex_unlock(&vm->threadRegistryLock);
+    pthread_mutex_lock(&pool->threadRegistryLock);
+    // A spawn racing a teardown must not claim a slot freeVM has already
+    // joined: the new thread would never be joined, and would run on
+    // unmapped memory.
+    if (!pool->jobQueue || atomic_load(&pool->shuttingDownWorkers)) {
+        pthread_mutex_unlock(&pool->threadRegistryLock);
         vmThreadJobDestroy(job);
         return -1;
     }
@@ -2880,10 +3068,7 @@ static int createThreadJob(VM* vm,
     // only ever needs one worker at a time (confirmed via
     // thread_worker_reuse.exsh: 18 sequential cycles produced 18 unique
     // thread IDs). When an idle worker exists, fall through to the
-    // job-queue push below instead -- that path already reads
-    // job->assignedThread/assignedThreadId back out once the idle worker's
-    // threadStart loop pops the job and calls vmThreadJobSignalAssignment,
-    // and is exercised (pool-at-ceiling case) and TSan-clean already.
+    // job-queue push below instead.
     //
     // VM 2.0 Phase 5a checkpoint 5a-ii: reuse a free slot within the
     // currently committed range first (identical scan to pre-5a-ii); only
@@ -2891,25 +3076,20 @@ static int createThreadJob(VM* vm,
     // the ceiling still allows more -- keeps the common case (a hole
     // exists) exactly as cheap as before, growth only on genuine pressure.
     size_t threadsCeiling = pscalVmThreadsCeiling();
-    if (vm->availableWorkers == 0 && (size_t)vm->workerCount < threadsCeiling - 1) {
-        for (size_t i = 1; i < vm->threadsCommittedCount; ++i) {
-            Thread* candidate = &vm->threads[i];
+    if (pool->availableWorkers == 0 && (size_t)pool->workerCount < threadsCeiling - 1) {
+        for (size_t i = 1; i < pool->threadsCommittedCount; ++i) {
+            Thread* candidate = &pool->threads[i];
             if (!atomic_load(&candidate->inPool)) {
                 // This slot's previous occupant (if any) has already run to
                 // completion -- inPool only goes false as the very last step
                 // before threadStart returns (see needsJoin's vm.h comment)
                 // -- but nothing has reaped its OS thread yet if it exited
-                // on its own (e.g. an explicit per-task cancel/kill) rather
-                // than through a full VM teardown. Reap it here, before
+                // on its own (e.g. an explicit per-task kill) rather than
+                // through a full VM teardown. Reap it here, before
                 // pthread_create below overwrites candidate->handle with a
                 // new thread's id: otherwise the old, already-finished
-                // pthread's handle is lost forever (nobody left holding it
-                // to join), a genuine, confirmed leak distinct from the
-                // needsJoin/shutdown-race one (reproduced via
-                // Tests/vm_thread_stress/http_async_task_stress.pas and
-                // task_cancel_race.pas, which explicitly cancel mid-flight
-                // tasks and churn this exact slot-reuse path). This join
-                // returns immediately since the thread has already exited.
+                // pthread's handle is lost forever. This join returns
+                // immediately since the thread has already exited.
                 if (atomic_load(&candidate->needsJoin)) {
                     pthread_join(candidate->handle, NULL);
                     atomic_store(&candidate->needsJoin, false);
@@ -2920,10 +3100,10 @@ static int createThreadJob(VM* vm,
                 break;
             }
         }
-        if (!spawnNewWorker && vm->threadsCommittedCount < threadsCeiling) {
-            size_t newSlotIndex = vm->threadsCommittedCount;
-            if (vmGrowThreadStorage(vm, newSlotIndex + 1)) {
-                assignedThread = &vm->threads[newSlotIndex];
+        if (!spawnNewWorker && pool->threadsCommittedCount < threadsCeiling) {
+            size_t newSlotIndex = pool->threadsCommittedCount;
+            if (vmGrowThreadStorage(pool, newSlotIndex + 1)) {
+                assignedThread = &pool->threads[newSlotIndex];
                 assignedId = (int)newSlotIndex;
                 spawnNewWorker = true;
             }
@@ -2936,12 +3116,14 @@ static int createThreadJob(VM* vm,
         atomic_store(&assignedThread->active, true);
         assignedThread->idle = false;
         assignedThread->poolGeneration++;
-        vm->workerCount++;
-        pthread_mutex_unlock(&vm->threadRegistryLock);
+        pool->workerCount++;
+        if (assignedId >= pool->threadCount) {
+            pool->threadCount = assignedId + 1;
+        }
+        pthread_mutex_unlock(&pool->threadRegistryLock);
 
         vmThreadAssignInternalName(assignedThread, assignedId, job->name);
         assignedThread->queuedAt = job->queuedAt;
-        assignedThread->currentJob = job;
         assignedThread->readyForReuse = false;
         assignedThread->awaitingReuse = false;
         atomic_store(&assignedThread->cancelRequested, false);
@@ -2949,51 +3131,19 @@ static int createThreadJob(VM* vm,
 
         ThreadStartArgs* args = (ThreadStartArgs*)calloc(1, sizeof(ThreadStartArgs));
         if (!args) {
-            pthread_mutex_lock(&vm->threadRegistryLock);
-            vm->workerCount--;
-            atomic_store(&assignedThread->inPool, false);
-            assignedThread->poolGeneration = originalGeneration;
-            atomic_store(&assignedThread->active, false);
-            assignedThread->idle = false;
-            assignedThread->poolWorker = false;
-            assignedThread->awaitingReuse = false;
-            assignedThread->readyForReuse = false;
-            assignedThread->currentJob = NULL;
-            assignedThread->queuedAt = (struct timespec){0, 0};
-            memset(&assignedThread->handle, 0, sizeof(pthread_t));
-            pthread_mutex_unlock(&vm->threadRegistryLock);
-            vmThreadResetResult(assignedThread);
-            atomic_store(&assignedThread->cancelRequested, false);
-            atomic_store(&assignedThread->killRequested, false);
-            atomic_store(&assignedThread->paused, false);
+            vmThreadAbandonClaimedSlot(pool, assignedThread, originalGeneration);
             vmThreadJobDestroy(job);
             return -1;
         }
 
         args->thread = assignedThread;
-        args->owner = vm;
+        args->owner = pool;
         args->threadId = assignedId;
         args->initialJob = job;
 
         if (pthread_create(&assignedThread->handle, NULL, threadStart, args) != 0) {
             free(args);
-            pthread_mutex_lock(&vm->threadRegistryLock);
-            vm->workerCount--;
-            atomic_store(&assignedThread->inPool, false);
-            assignedThread->poolGeneration = originalGeneration;
-            atomic_store(&assignedThread->active, false);
-            assignedThread->idle = false;
-            assignedThread->poolWorker = false;
-            assignedThread->awaitingReuse = false;
-            assignedThread->readyForReuse = false;
-            assignedThread->currentJob = NULL;
-            assignedThread->queuedAt = (struct timespec){0, 0};
-            memset(&assignedThread->handle, 0, sizeof(pthread_t));
-            pthread_mutex_unlock(&vm->threadRegistryLock);
-            vmThreadResetResult(assignedThread);
-            atomic_store(&assignedThread->cancelRequested, false);
-            atomic_store(&assignedThread->killRequested, false);
-            atomic_store(&assignedThread->paused, false);
+            vmThreadAbandonClaimedSlot(pool, assignedThread, originalGeneration);
             vmThreadJobDestroy(job);
             return -1;
         }
@@ -3003,46 +3153,97 @@ static int createThreadJob(VM* vm,
         // pthread_join call (see needsJoin's declaration comment in vm.h) --
         // set this before any other thread can observe the handle as valid.
         atomic_store(&assignedThread->needsJoin, true);
-
-        vmThreadJobSignalAssignment(job, assignedThread, assignedId);
-        // We already have assignedThread/assignedId locally (we created this
-        // worker ourselves), so we won't read them back out of job -- mark
-        // consumed immediately so the worker's teardown isn't left waiting
-        // for an ack we'd otherwise never send on this path.
-        if (job->assignmentSyncInitialized) {
-            pthread_mutex_lock(&job->assignmentMutex);
-            job->assignmentConsumed = true;
-            pthread_cond_broadcast(&job->assignmentCond);
-            pthread_mutex_unlock(&job->assignmentMutex);
-        }
-        if (assignedId >= vm->threadCount) {
-            vm->threadCount = assignedId + 1;
-        }
-        return assignedId;
+        // The new worker takes the job up like a queued one and signals
+        // the assignment (with the job's generation) once its VM is
+        // prepared; it always signals, with a NULL thread if it exits
+        // first, so this wait is bounded.
+        goto await_assignment;
     }
 
-    pthread_mutex_unlock(&vm->threadRegistryLock);
+    if (pool->availableWorkers == 0 && !submitOnly) {
+        // Every worker is busy or parked on a result nobody has taken yet,
+        // and the pool is at its ceiling. Queueing used to wait for a
+        // worker to come free with no timeout -- forever when the spawner
+        // itself held the unawaited tasks (spawn N, then await them all,
+        // at the ceiling). Fail the spawn; the caller reports it. Pool
+        // submissions (submitOnly) still queue, and their wait below can
+        // be interrupted.
+        pthread_mutex_unlock(&pool->threadRegistryLock);
+        vmThreadJobDestroy(job);
+        return -1;
+    }
+    pthread_mutex_unlock(&pool->threadRegistryLock);
 
-    if (!vmThreadJobQueuePush(vm->jobQueue, job)) {
+    if (!vmThreadJobQueuePush(pool->jobQueue, job)) {
         vmThreadJobDestroy(job);
         return -1;
     }
 
-    if (job->assignmentSyncInitialized) {
-        pthread_mutex_lock(&job->assignmentMutex);
-        while (!job->assignmentSatisfied) {
-            pthread_cond_wait(&job->assignmentCond, &job->assignmentMutex);
+    // Wait for a worker to take the job, polling for interrupts, the
+    // caller's own cancellation, pool shutdown, and a pool that has lost
+    // its workers. A job still in the queue can be taken back; once a
+    // worker has popped it, it always signals.
+    bool retry = false;
+    bool failed = false;
+    pthread_mutex_lock(&job->assignmentMutex);
+    while (!job->assignmentSatisfied) {
+        struct timespec deadline;
+        vmComputeDeadline(&deadline, 100);
+        int rc = pthread_cond_timedwait(&job->assignmentCond, &job->assignmentMutex, &deadline);
+        if (job->assignmentSatisfied || (rc != ETIMEDOUT && rc != EINTR && rc != 0)) {
+            break;
         }
-        assignedThread = job->assignedThread;
-        assignedId = job->assignedThreadId;
-        // Tell the worker it's safe to free this job now that we've copied
-        // out the fields we need -- see vmThreadJobAwaitConsumedAndDestroy().
-        job->assignmentConsumed = true;
-        pthread_cond_broadcast(&job->assignmentCond);
+        if (rc == 0) {
+            continue;
+        }
         pthread_mutex_unlock(&job->assignmentMutex);
+        bool interrupted = vmConsumeInterruptRequest(vm) || vm->abort_requested;
+        pthread_mutex_lock(&pool->threadRegistryLock);
+        bool noWorkers = pool->workerCount == 0;
+        pthread_mutex_unlock(&pool->threadRegistryLock);
+        bool shuttingDown = atomic_load(&pool->shuttingDownWorkers);
+        if ((interrupted || noWorkers || shuttingDown) &&
+            vmThreadJobQueueRemove(pool->jobQueue, job)) {
+            if (noWorkers && !interrupted && !shuttingDown) {
+                retry = true;
+            } else {
+                failed = true;
+            }
+            pthread_mutex_lock(&job->assignmentMutex);
+            break;
+        }
+        pthread_mutex_lock(&job->assignmentMutex);
+    }
+    pthread_mutex_unlock(&job->assignmentMutex);
+    if (failed) {
+        vmThreadJobDestroy(job);
+        return -1;
+    }
+    if (retry) {
+        goto claim_worker;
     }
 
-    return assignedThread ? assignedId : -1;
+await_assignment:
+    // Copy the assignment out, then tell the worker it may free the job --
+    // see vmThreadJobAwaitConsumedAndDestroy().
+    pthread_mutex_lock(&job->assignmentMutex);
+    while (!job->assignmentSatisfied) {
+        pthread_cond_wait(&job->assignmentCond, &job->assignmentMutex);
+    }
+    assignedThread = job->assignedThread;
+    assignedId = job->assignedThreadId;
+    uint32_t assignedGeneration = job->assignedGeneration;
+    job->assignmentConsumed = true;
+    pthread_cond_broadcast(&job->assignmentCond);
+    pthread_mutex_unlock(&job->assignmentMutex);
+
+    if (!assignedThread) {
+        return -1;
+    }
+    if (outGeneration) {
+        *outGeneration = assignedGeneration;
+    }
+    return assignedId;
 }
 
 static int createThreadWithArgs(VM* vm,
@@ -3050,30 +3251,65 @@ static int createThreadWithArgs(VM* vm,
                                 ClosureEnvPayload* closureEnv,
                                 Symbol* closureSymbol,
                                 int argc,
-                                const Value* argv) {
+                                const Value* argv,
+                                uint32_t* outGeneration) {
     return createThreadJob(vm, THREAD_JOB_BYTECODE, vm ? vm->chunk : NULL, entry, closureEnv, closureSymbol, argc, argv, NULL,
-                           NULL, NULL, NULL, -1, NULL, false, NULL);
+                           NULL, NULL, NULL, -1, NULL, false, NULL, outGeneration);
 }
 
 // Backward-compatible helper: no argument provided, pass NIL
 static int createThread(VM* vm, uint32_t entry) {
-    return createThreadWithArgs(vm, entry, NULL, NULL, 0, NULL);
+    return createThreadWithArgs(vm, entry, NULL, NULL, 0, NULL, NULL);
+}
+
+// The slot `threadId` names in vm's pool, or NULL. With a nonzero
+// generation, also NULL unless that job is still the slot's (or the slot
+// has had no job since). Callers hold no locks; the generation is
+// re-checked under the slot's locks wherever it matters.
+static Thread* vmThreadSlot(VM* pool, int threadId) {
+    if (!pool || threadId <= 0 || (size_t)threadId >= pool->threadsCommittedCount) {
+        return NULL;
+    }
+    return &pool->threads[threadId];
+}
+
+// Whether `generation` (0 = any) still names the job in `thread`. Caller
+// holds thread->stateMutex.
+static bool vmThreadGenerationMatchesLocked(const Thread* thread, uint32_t generation) {
+    return generation == 0 || thread->jobGeneration == generation;
+}
+
+static bool vmThreadGenerationMatches(Thread* thread, uint32_t generation) {
+    if (generation == 0) {
+        return true;
+    }
+    pthread_mutex_lock(&thread->stateMutex);
+    bool matches = thread->jobGeneration == generation;
+    pthread_mutex_unlock(&thread->stateMutex);
+    return matches;
 }
 
 // VM 2.0 Phase 5a checkpoint 5a-i: non-blocking "has this task's job
-// completed" poll for TaskDone -- reads Thread.statusReady under
-// resultMutex (the lock joinThreadInternal/vmThreadTakeResult already treat
-// as authoritative for this field, see vmThreadResetResult's comment) so
-// builtin.c never has to reach into Thread's fields directly, which would
-// reintroduce the exact cross-mutex race class fixed just before this
-// phase started. Does not consume or block -- a later TaskAwait/TaskDone
-// on the same task still sees a consistent state.
-bool vmTaskIsDone(VM* vm, int threadId) {
-    if (!vm || threadId <= 0 || (size_t)threadId >= vm->threadsCommittedCount) {
+// completed" poll for TaskDone -- reads the slot's finished state under
+// resultMutex so builtin.c never has to reach into Thread's fields directly.
+// Does not consume or block. A task whose job is no longer in its slot
+// (awaited, or released by a cancel, and possibly replaced by a later job)
+// reports done: there is nothing left to wait for. Before, a cancelled task
+// that had been released reported "not done" forever.
+bool vmTaskIsDone(VM* vm, int threadId, uint32_t generation) {
+    Thread* thread = vmThreadSlot(vmThreadPool(vm), threadId);
+    if (!thread || !thread->syncInitialized || !thread->stateSyncInitialized) {
         return false;
     }
-    Thread* thread = &vm->threads[threadId];
-    if (!atomic_load(&thread->inPool) || !thread->syncInitialized) {
+    if (generation != 0) {
+        pthread_mutex_lock(&thread->stateMutex);
+        bool current = thread->currentJob != NULL && thread->jobGeneration == generation;
+        pthread_mutex_unlock(&thread->stateMutex);
+        if (!current) {
+            return true;
+        }
+    }
+    if (!atomic_load(&thread->inPool)) {
         return false;
     }
     pthread_mutex_lock(&thread->resultMutex);
@@ -3083,10 +3319,10 @@ bool vmTaskIsDone(VM* vm, int threadId) {
 }
 
 bool vmThreadIsRunning(VM* vm, int threadId) {
-    if (!vm || threadId <= 0 || (size_t)threadId >= vm->threadsCommittedCount) {
+    Thread* thread = vmThreadSlot(vmThreadPool(vm), threadId);
+    if (!thread) {
         return false;
     }
-    Thread* thread = &vm->threads[threadId];
     if (!thread->syncInitialized) {
         return atomic_load(&thread->active);
     }
@@ -3103,7 +3339,8 @@ int vmSpawnCallbackThread(VM* vm, VMThreadCallback callback, void* user_data, VM
         }
         return -1;
     }
-    return createThreadJob(vm, THREAD_JOB_CALLBACK, vm->chunk, 0, NULL, NULL, 0, NULL, callback, cleanup, user_data, NULL, -1, NULL, false, NULL);
+    return createThreadJob(vm, THREAD_JOB_CALLBACK, vm->chunk, 0, NULL, NULL, 0, NULL, callback, cleanup, user_data, NULL, -1,
+                           NULL, false, NULL, NULL);
 }
 
 // VM 2.0 Phase 5a checkpoint 5a-iii (Docs/pscal_vm2_plan.md Sec 6.1): see
@@ -3116,27 +3353,32 @@ int vmSpawnCallbackThread(VM* vm, VMThreadCallback callback, void* user_data, VM
 // before a worker ever picks it up, so "call cleanup" and "destroy the job
 // struct" are different concerns) -- so this wrapper closes that gap for
 // callers who want a simple, uniform contract.
-int vmTaskCreateNative(VM* vm, VMThreadCallback work_fn, void* user_data, VMThreadCleanup cleanup) {
-    int id = vmSpawnCallbackThread(vm, work_fn, user_data, cleanup);
-    if (id < 0) {
-        // vmSpawnCallbackThread already ran cleanup for the !vm||!callback
-        // case; for every other failure inside createThreadJob it did not,
-        // so this call is a no-op there and the only real invocation here
-        // for those cases. Callers must not double-free user_data
-        // themselves after calling this function.
-        if (vm && work_fn && cleanup && user_data) {
+int vmTaskCreateNative(VM* vm, VMThreadCallback work_fn, void* user_data, VMThreadCleanup cleanup,
+                       uint32_t* outGeneration) {
+    if (outGeneration) {
+        *outGeneration = 0;
+    }
+    if (!vm || !work_fn) {
+        if (cleanup && user_data) {
             cleanup(user_data);
         }
         return -1;
     }
-    // Progress counters only -- no cancel hook to set here, see the vm.h
-    // declaration's comment for why (nativeCancelFn was removed after a
-    // confirmed race against this exact slot's first-job-pickup
-    // vmThreadResetResult call on the worker's own thread).
-    VM* owner = vm->threadOwner ? vm->threadOwner : vm;
-    Thread* thread = &owner->threads[id];
-    atomic_store(&thread->nativeProgressNow, 0);
-    atomic_store(&thread->nativeProgressTotal, 0);
+    int id = createThreadJob(vm, THREAD_JOB_CALLBACK, vm->chunk, 0, NULL, NULL, 0, NULL, work_fn, cleanup, user_data, NULL,
+                             -1, NULL, false, NULL, outGeneration);
+    if (id < 0) {
+        // createThreadJob's failure paths destroy the job without running
+        // its cleanup; run it here so callers may assume it always runs
+        // exactly once. Callers must not free user_data themselves.
+        if (cleanup && user_data) {
+            cleanup(user_data);
+        }
+        return -1;
+    }
+    // The progress counters need no reset here: the worker's job pickup
+    // (vmThreadResetResult) zeroes them before the job starts. Writing them
+    // from here raced with the job's own progress reports, and indexed the
+    // wrong pool when the spawn came from inside a worker.
     return id;
 }
 
@@ -3148,17 +3390,22 @@ void vmTaskReportProgress(VM* threadVm, long long now, long long total) {
     atomic_store(&threadVm->owningThread->nativeProgressTotal, total);
 }
 
-bool vmTaskGetProgress(VM* owner, int threadId, long long* outNow, long long* outTotal) {
-    if (!owner || threadId <= 0 || (size_t)threadId >= owner->threadsCommittedCount) {
-        return false;
-    }
-    Thread* thread = &owner->threads[threadId];
-    if (!atomic_load(&thread->inPool)) {
+bool vmTaskGetProgress(VM* vm, int threadId, uint32_t generation, long long* outNow, long long* outTotal) {
+    Thread* thread = vmThreadSlot(vmThreadPool(vm), threadId);
+    if (!thread || !atomic_load(&thread->inPool) || !vmThreadGenerationMatches(thread, generation)) {
         return false;
     }
     if (outNow) *outNow = atomic_load(&thread->nativeProgressNow);
     if (outTotal) *outTotal = atomic_load(&thread->nativeProgressTotal);
     return true;
+}
+
+bool vmThreadStopRequested(const VM* threadVm) {
+    if (!threadVm || !threadVm->owningThread) {
+        return false;
+    }
+    return atomic_load(&threadVm->owningThread->cancelRequested) ||
+           atomic_load(&threadVm->owningThread->killRequested);
 }
 
 int vmSpawnBuiltinThread(VM* vm, int builtinId, const char* builtinName, int argCount,
@@ -3171,7 +3418,112 @@ int vmSpawnBuiltinThread(VM* vm, int builtinId, const char* builtinName, int arg
         return -1;
     }
     return createThreadJob(vm, THREAD_JOB_BUILTIN, vm->chunk, 0, NULL, NULL, argCount, args, NULL, NULL, NULL,
-                           handler, builtinId, builtinName, submitOnly, threadName);
+                           handler, builtinId, builtinName, submitOnly, threadName, NULL);
+}
+
+// --- Stopping a running task (cancel, kill, pool shutdown) ---
+//
+// Contract between the requester, the worker, and the interpreter loop:
+//  * The requester (vmThreadRequestStop) sets the slot's cancelRequested or
+//    killRequested and then, under the slot's stateMutex, sets
+//    abort_requested on the worker VM running the job. abort_requested is
+//    one of the flags the loop's per-instruction check already tests (the
+//    inline fast path calls vmConsumeInterruptRequest only when a signal
+//    flag or the VM's or its owner's abort/exit flag is set), so no extra
+//    test is needed on the hot path; the checks after CALL_BUILTIN and
+//    CALL_HOST end the job directly when the request lands during a call.
+//  * The worker turns the request into a task-local stop in
+//    vmConsumeInterruptRequest (vmTaskStopIfRequested): abort_requested plus
+//    runtime_error_raised, so the loop returns INTERPRET_RUNTIME_ERROR
+//    without printing anything and the job stores a failed status. Nothing
+//    is written to the root VM, so vmHandleGlobalInterrupt never escalates a
+//    cancel into a program-wide shutdown.
+//  * Code that clears abort_requested while a job runs re-arms it from the
+//    slot's flags: the job start in threadStart and interpretBytecode's
+//    entry under stateMutex, and the loop's frame-unwind step checks for a
+//    pending stop before treating abort_requested as "leave one frame".
+//  * Blocking waits (task joins, channel send/receive, mutex lock, the
+//    spawn assignment wait) poll vmConsumeInterruptRequest and so see the
+//    request within their 100ms poll interval. Native jobs poll
+//    vmThreadStopRequested themselves.
+// Previously cancel/kill/shutdown only set the slot flags, which nothing
+// running bytecode ever read: TaskCancel on a busy task did nothing (and a
+// following TaskAwait hung), and program exit hung in freeVM's join on any
+// task still running or blocked in ChannelReceive.
+
+static bool vmThreadStopPending(const Thread* thread) {
+    return thread && (atomic_load(&thread->cancelRequested) || atomic_load(&thread->killRequested));
+}
+
+// Caller holds thread->stateMutex.
+static void vmThreadRequestStopLocked(Thread* thread, bool kill) {
+    if (kill) {
+        atomic_store(&thread->killRequested, true);
+    } else {
+        atomic_store(&thread->cancelRequested, true);
+    }
+    if (thread->vm && thread->currentJob) {
+        __atomic_store_n(&thread->vm->abort_requested, true, __ATOMIC_RELEASE);
+    }
+    pthread_cond_broadcast(&thread->stateCond);
+}
+
+static void vmThreadRequestStop(Thread* thread, bool kill) {
+    if (!thread || !thread->stateSyncInitialized) {
+        return;
+    }
+    pthread_mutex_lock(&thread->stateMutex);
+    vmThreadRequestStopLocked(thread, kill);
+    pthread_mutex_unlock(&thread->stateMutex);
+    if (thread->syncInitialized) {
+        pthread_mutex_lock(&thread->resultMutex);
+        pthread_cond_broadcast(&thread->resultCond);
+        pthread_mutex_unlock(&thread->resultMutex);
+    }
+}
+
+// Worker side: if this VM's job has been asked to stop, make the
+// interpreter return INTERPRET_RUNTIME_ERROR (silently) and say so.
+static bool vmTaskStopIfRequested(VM* vm) {
+    if (!vm || !vm->owningThread || !vmThreadStopPending(vm->owningThread)) {
+        return false;
+    }
+    vm->abort_requested = true;
+    vm->runtime_error_raised = true;
+    return true;
+}
+
+// Re-arms a stop request after code reset abort_requested (interpretBytecode's
+// entry). Under stateMutex, so it cannot miss a request rung concurrently.
+static void vmTaskRearmStopRequest(VM* vm) {
+    if (!vm || !vm->owningThread || !vm->owningThread->stateSyncInitialized) {
+        return;
+    }
+    Thread* thread = vm->owningThread;
+    pthread_mutex_lock(&thread->stateMutex);
+    if (vmThreadStopPending(thread)) {
+        vm->abort_requested = true;
+        vm->runtime_error_raised = true;
+    }
+    pthread_mutex_unlock(&thread->stateMutex);
+}
+
+// ThreadPause on a running job: the worker blocks here until resumed or
+// stopped. Reached from vmConsumeInterruptRequest, i.e. at every slow-path
+// poll of the interpreter loop and in every blocking wait. Called with no
+// locks held.
+static void vmTaskWaitWhilePaused(VM* vm) {
+    Thread* thread = vm ? vm->owningThread : NULL;
+    if (!thread || !thread->stateSyncInitialized || !atomic_load(&thread->paused)) {
+        return;
+    }
+    pthread_mutex_lock(&thread->stateMutex);
+    while (atomic_load(&thread->paused) && !vmThreadStopPending(thread)) {
+        struct timespec deadline;
+        vmComputeDeadline(&deadline, 100);
+        pthread_cond_timedwait(&thread->stateCond, &thread->stateMutex, &deadline);
+    }
+    pthread_mutex_unlock(&thread->stateMutex);
 }
 
 static void vmMarkAbortRequested(VM* vm) {
@@ -3197,6 +3549,19 @@ static bool vmIsRootExecutor(const VM* vm) {
 }
 
 static bool vmConsumeInterruptRequest(VM* vm) {
+    // A worker's own job: stop and pause requests (see the stop contract
+    // above vmThreadRequestStop).
+    if (vm && vm->owningThread) {
+        if (vmTaskStopIfRequested(vm)) {
+            return true;
+        }
+        if (atomic_load(&vm->owningThread->paused)) {
+            vmTaskWaitWhilePaused(vm);
+            if (vmTaskStopIfRequested(vm)) {
+                return true;
+            }
+        }
+    }
     VM* root = vm ? (vm->threadOwner ? vm->threadOwner : vm) : NULL;
     bool poll_runtime_signal = (vm == NULL) || vmIsRootExecutor(vm);
 #if defined(PSCAL_TARGET_IOS)
@@ -3236,7 +3601,15 @@ static bool vmConsumeInterruptRequest(VM* vm) {
         (void)vmHandleGlobalInterrupt(root);
         return true;
     }
-    if (root && (root->abort_requested || root->exit_requested)) {
+    if (root && root == vm && (root->abort_requested || root->exit_requested)) {
+        return true;
+    }
+    // A worker's waits end on a program abort. The root's exit_requested
+    // alone is an Exit leaving one of main's frames, which used to interrupt
+    // any worker that happened to poll in that instant -- and the waits
+    // cancel the task they wait for when interrupted. Stopping the workers
+    // at shutdown or on an interrupt goes through vmThreadRequestStop.
+    if (root && root != vm && root->abort_requested) {
         return true;
     }
     if (vm && vm != root && (vm->abort_requested || vm->exit_requested)) {
@@ -3316,17 +3689,12 @@ static bool vmHandleGlobalInterrupt(VM* vm) {
             if (!atomic_load(&thread->inPool)) {
                 continue;
             }
+            // Native jobs poll cancelRequested; bytecode jobs stop through
+            // vmThreadRequestStop, which also reaches the worker VM under the
+            // slot's stateMutex (it used to be written here unlocked while
+            // an exiting worker could be freeing it).
             atomic_store(&thread->cancelRequested, true);
-            atomic_store(&thread->killRequested, true);
-            if (thread->vm) {
-                thread->vm->abort_requested = true;
-                thread->vm->exit_requested = true;
-                thread->vm->suspend_unwind_requested = false;
-            }
-            vmThreadWakeStateWaiters(thread);
-            pthread_mutex_lock(&thread->resultMutex);
-            pthread_cond_broadcast(&thread->resultCond);
-            pthread_mutex_unlock(&thread->resultMutex);
+            vmThreadRequestStop(thread, true);
         }
         vmThreadJobQueueWake(root->jobQueue);
     }
@@ -3373,19 +3741,20 @@ void vmThreadStoreResult(VM* vm, const Value* result, bool success) {
 // Hand a finished slot back to its worker. Lock order is threadRegistryLock
 // -> stateMutex -> resultMutex, as in threadStart's exit path and
 // vmThreadResetResult. Acts only while the worker is parked for this job
-// (awaitingReuse set, readyForReuse not yet), which vmThreadAwaitRelease
-// makes exact, so a repeated or late release is a no-op. It also counts the
-// worker as available here, before waking it: a spawn issued straight after
-// the release (a spawn/wait/consume loop) used to find availableWorkers == 0
-// until the woken worker got back to vmThreadJobQueuePop, and started a
-// second worker instead (thread_worker_reuse.exsh's "unique:2").
-static void vmThreadReleaseForReuse(VM* owner, Thread* thread) {
+// (awaitingReuse set, readyForReuse not yet) and, with a nonzero generation,
+// only for that job, which vmThreadAwaitRelease makes exact, so a repeated or
+// late release is a no-op. It also counts the worker as available here,
+// before waking it: a spawn issued straight after the release (a
+// spawn/wait/consume loop) used to find availableWorkers == 0 until the woken
+// worker got back to vmThreadJobQueuePop, and started a second worker
+// instead (thread_worker_reuse.exsh's "unique:2").
+static void vmThreadReleaseForReuse(VM* owner, Thread* thread, uint32_t generation) {
     pthread_mutex_lock(&owner->threadRegistryLock);
     pthread_mutex_lock(&thread->stateMutex);
     pthread_mutex_lock(&thread->resultMutex);
     bool parked = thread->awaitingReuse;
     pthread_mutex_unlock(&thread->resultMutex);
-    if (parked && !thread->readyForReuse) {
+    if (parked && !thread->readyForReuse && vmThreadGenerationMatchesLocked(thread, generation)) {
         if (!thread->idle) {
             thread->idle = true;
             owner->availableWorkers++;
@@ -3409,42 +3778,71 @@ static bool vmJoinPollInterruptUnlocked(VM* vm, Thread* thread) {
     return interrupted;
 }
 
-bool vmThreadTakeResult(VM* vm, int threadId, Value* outResult, bool takeValue, bool* outStatus, bool takeStatus) {
-    if (!vm) {
-        return false;
-    }
-    if (threadId <= 0 || (size_t)threadId >= vm->threadsCommittedCount) {
-        return false;
-    }
-    Thread* thread = &vm->threads[threadId];
-    if (!thread->syncInitialized) {
-        return false;
-    }
+typedef enum {
+    VM_JOIN_FINISHED,  // the job has finished (resultMutex still held)
+    VM_JOIN_NOTHING,   // no job to wait for: consumed, released, or a stale generation
+    VM_JOIN_INVALID,   // the id names no pool slot
+    VM_JOIN_FAILED     // a wait on the caller's own slot, or an interrupted wait
+} VmJoinOutcome;
 
-    pthread_mutex_lock(&thread->resultMutex);
-    while (!vmThreadJobFinishedLocked(thread)) {
-        if (!atomic_load(&thread->active) && !thread->awaitingReuse) {
-            pthread_mutex_unlock(&thread->resultMutex);
-            return false;
-        }
-        if (vmJoinPollInterruptUnlocked(vm, thread)) {
-            pthread_mutex_unlock(&thread->resultMutex);
-            vmThreadCancel(vm, threadId);
-            return false;
+static bool vmThreadSlotHoldsGeneration(Thread* thread, uint32_t generation) {
+    return generation == 0 || __atomic_load_n(&thread->jobGeneration, __ATOMIC_ACQUIRE) == generation;
+}
+
+// Waits until the job in `thread` (of `generation`, 0 = whatever job it
+// holds) has finished. Called and returns with thread->resultMutex held.
+// `caller` is the VM doing the waiting: it is polled for interrupts and for
+// its own cancellation, and a wait on its own slot fails with a runtime
+// error instead of deadlocking.
+static VmJoinOutcome vmThreadWaitFinishedLocked(VM* pool, VM* caller, int threadId, Thread* thread,
+                                                uint32_t generation) {
+    for (;;) {
+        if (!vmThreadSlotHoldsGeneration(thread, generation)) {
+            return VM_JOIN_NOTHING;
         }
         if (vmThreadJobFinishedLocked(thread)) {
-            break;
+            return VM_JOIN_FINISHED;
+        }
+        if (!atomic_load(&thread->active) && !thread->awaitingReuse) {
+            return VM_JOIN_NOTHING;
+        }
+        if (caller && caller->owningThread == thread) {
+            pthread_mutex_unlock(&thread->resultMutex);
+            runtimeError(caller, "VM Error: thread %d cannot wait for itself.", threadId);
+            pthread_mutex_lock(&thread->resultMutex);
+            return VM_JOIN_FAILED;
+        }
+        if (vmJoinPollInterruptUnlocked(caller ? caller : pool, thread)) {
+            pthread_mutex_unlock(&thread->resultMutex);
+            if (vmThreadSlotHoldsGeneration(thread, generation)) {
+                vmThreadStopJob(pool, threadId, generation, false);
+            }
+            pthread_mutex_lock(&thread->resultMutex);
+            return VM_JOIN_FAILED;
+        }
+        if (vmThreadJobFinishedLocked(thread) || !vmThreadSlotHoldsGeneration(thread, generation)) {
+            continue;
         }
         struct timespec deadline;
         vmComputeDeadline(&deadline, 100);
         int wait_status = pthread_cond_timedwait(&thread->resultCond, &thread->resultMutex, &deadline);
-        if (wait_status == ETIMEDOUT || wait_status == EINTR) {
-            continue;
+        if (wait_status != 0 && wait_status != ETIMEDOUT && wait_status != EINTR) {
+            return VM_JOIN_FAILED;
         }
-        if (wait_status != 0) {
-            pthread_mutex_unlock(&thread->resultMutex);
-            return false;
-        }
+    }
+}
+
+static bool vmThreadTakeResultInPool(VM* pool, VM* caller, int threadId, uint32_t generation, Value* outResult,
+                                     bool takeValue, bool* outStatus, bool takeStatus) {
+    Thread* thread = vmThreadSlot(pool, threadId);
+    if (!thread || !thread->syncInitialized) {
+        return false;
+    }
+
+    pthread_mutex_lock(&thread->resultMutex);
+    if (vmThreadWaitFinishedLocked(pool, caller, threadId, thread, generation) != VM_JOIN_FINISHED) {
+        pthread_mutex_unlock(&thread->resultMutex);
+        return false;
     }
 
     if (outStatus) {
@@ -3490,50 +3888,28 @@ bool vmThreadTakeResult(VM* vm, int threadId, Value* outResult, bool takeValue, 
     pthread_mutex_unlock(&thread->resultMutex);
 
     if (releaseWorker) {
-        vmThreadReleaseForReuse(vm, thread);
+        vmThreadReleaseForReuse(pool, thread, generation);
     }
     return true;
 }
 
-static bool joinThreadInternal(VM* vm, int id) {
-    if (!vm) {
-        return false;
-    }
-    if (id <= 0 || (size_t)id >= vm->threadsCommittedCount) {
-        return false;
-    }
+bool vmThreadTakeResult(VM* vm, int threadId, Value* outResult, bool takeValue, bool* outStatus, bool takeStatus) {
+    return vmThreadTakeResultInPool(vmThreadPool(vm), vm, threadId, 0, outResult, takeValue, outStatus, takeStatus);
+}
 
-    Thread* thread = &vm->threads[id];
-    if (!atomic_load(&thread->inPool)) {
-        return false;
+bool vmTaskTakeResult(VM* vm, int threadId, uint32_t generation, Value* outResult, bool* outStatus) {
+    return vmThreadTakeResultInPool(vmThreadPool(vm), vm, threadId, generation, outResult, true, outStatus, true);
+}
+
+static VmJoinOutcome joinThreadInternal(VM* pool, VM* caller, int id) {
+    Thread* thread = vmThreadSlot(pool, id);
+    if (!thread || !atomic_load(&thread->inPool) || !thread->syncInitialized) {
+        return VM_JOIN_INVALID;
     }
     pthread_mutex_lock(&thread->resultMutex);
-    while (!vmThreadJobFinishedLocked(thread)) {
-        if (!atomic_load(&thread->active) && !thread->awaitingReuse) {
-            pthread_mutex_unlock(&thread->resultMutex);
-            return false;
-        }
-        if (vmJoinPollInterruptUnlocked(vm, thread)) {
-            pthread_mutex_unlock(&thread->resultMutex);
-            vmThreadCancel(vm, id);
-            return false;
-        }
-        if (vmThreadJobFinishedLocked(thread)) {
-            break;
-        }
-        struct timespec deadline;
-        vmComputeDeadline(&deadline, 100);
-        int wait_status = pthread_cond_timedwait(&thread->resultCond, &thread->resultMutex, &deadline);
-        if (wait_status == ETIMEDOUT || wait_status == EINTR) {
-            continue;
-        }
-        if (wait_status != 0) {
-            pthread_mutex_unlock(&thread->resultMutex);
-            return false;
-        }
-    }
+    VmJoinOutcome outcome = vmThreadWaitFinishedLocked(pool, caller, id, thread, 0);
     pthread_mutex_unlock(&thread->resultMutex);
-    return true;
+    return outcome;
 }
 
 // VM 2.0 Phase 5b checkpoint 5b-i (Docs/pscal_vm2_plan.md Sec 6.2): Channel
@@ -3553,14 +3929,20 @@ static bool joinThreadInternal(VM* vm, int id) {
 // poll-don't-callback pattern 5a-iii's HTTP async cancellation uses (see
 // httpJobCancelRequested's comment in builtin_network_api.c for why a
 // callback-based hook was tried and reverted there).
-static bool vmChannelOperationInterrupted(VM* vm) {
+//
+// vmConsumeInterruptRequest covers the calling task's own cancel, kill and
+// pool shutdown (see vmThreadRequestStop); this used to test cancel alone, so
+// a task blocked here at program exit (kill) never woke and freeVM's join
+// hung. Called with ch->lock released: the poll can block (a paused task)
+// and takes other locks.
+static bool vmChannelOperationInterrupted(VM* vm, ChannelObj* ch) {
     if (!vm) {
         return false;
     }
-    if (vm->owningThread && atomic_load(&vm->owningThread->cancelRequested)) {
-        return true;
-    }
-    return vmConsumeInterruptRequest(vm);
+    pthread_mutex_unlock(&ch->lock);
+    bool interrupted = vmConsumeInterruptRequest(vm);
+    pthread_mutex_lock(&ch->lock);
+    return interrupted;
 }
 
 VmChannelStatus vmChannelSend(VM* vm, ChannelObj* ch, Value value) {
@@ -3570,10 +3952,13 @@ VmChannelStatus vmChannelSend(VM* vm, ChannelObj* ch, Value value) {
     }
     pthread_mutex_lock(&ch->lock);
     while (ch->count >= ch->capacity && !ch->closed) {
-        if (vmChannelOperationInterrupted(vm)) {
+        if (vmChannelOperationInterrupted(vm, ch)) {
             pthread_mutex_unlock(&ch->lock);
             freeValue(&value);
             return VM_CHANNEL_INTERRUPTED;
+        }
+        if (ch->count < ch->capacity || ch->closed) {
+            continue; // changed while the lock was released for the poll
         }
         struct timespec deadline;
         vmComputeDeadline(&deadline, 100);
@@ -3607,10 +3992,13 @@ VmChannelStatus vmChannelReceive(VM* vm, ChannelObj* ch, Value* outValue) {
     }
     pthread_mutex_lock(&ch->lock);
     while (ch->count == 0 && !ch->closed) {
-        if (vmChannelOperationInterrupted(vm)) {
+        if (vmChannelOperationInterrupted(vm, ch)) {
             pthread_mutex_unlock(&ch->lock);
             if (outValue) *outValue = makeNil();
             return VM_CHANNEL_INTERRUPTED;
+        }
+        if (ch->count > 0 || ch->closed) {
+            continue; // changed while the lock was released for the poll
         }
         struct timespec deadline;
         vmComputeDeadline(&deadline, 100);
@@ -3715,58 +4103,61 @@ bool vmChannelIsClosed(ChannelObj* ch) {
     return closed;
 }
 
-static void joinThread(VM* vm, int id) {
-    if (!vm) {
-        return;
-    }
-    joinThreadInternal(vm, id);
-}
-
+// Joins a thread by integer id (WaitForThread): waits for its job, consumes
+// the status, and hands the slot back unless a result value is still waiting
+// for ThreadGetResult. False when the id names no pool slot (this used to
+// report success for any id), when it names the caller's own slot, or when
+// the wait was interrupted. A slot whose job was already consumed counts as
+// joined, as before.
 bool vmJoinThreadById(VM* vm, int id) {
-    joinThread(vm, id);
+    VM* pool = vmThreadPool(vm);
+    VmJoinOutcome outcome = joinThreadInternal(pool, vm, id);
+    if (outcome == VM_JOIN_INVALID || outcome == VM_JOIN_FAILED) {
+        return false;
+    }
 
     /* Ensure any pending status/result is consumed so the worker can be reused. */
-    if (vm && id > 0 && (size_t)id < vm->threadsCommittedCount) {
-        vmThreadTakeResult(vm, id, NULL, false, NULL, true);
-        Thread *thread = &vm->threads[id];
-        if (thread && atomic_load(&thread->inPool) && thread->syncInitialized) {
-            // vmThreadTakeResult already released the slot if nothing is left
-            // to consume; a status still standing means a result value is
-            // pending for ThreadGetResult, which releases it then. With no
-            // status left, release again: it is a no-op unless the worker
-            // is still parked for this job.
-            pthread_mutex_lock(&thread->resultMutex);
-            bool nothing_pending = !thread->statusReady;
-            pthread_mutex_unlock(&thread->resultMutex);
-            if (nothing_pending) {
-                vmThreadReleaseForReuse(vm, thread);
-            }
+    vmThreadTakeResultInPool(pool, vm, id, 0, NULL, false, NULL, true);
+    Thread *thread = vmThreadSlot(pool, id);
+    if (thread && atomic_load(&thread->inPool) && thread->syncInitialized) {
+        // vmThreadTakeResult already released the slot if nothing is left
+        // to consume; a status still standing means a result value is
+        // pending for ThreadGetResult, which releases it then. With no
+        // status left, release again: it is a no-op unless the worker
+        // is still parked for this job.
+        pthread_mutex_lock(&thread->resultMutex);
+        bool nothing_pending = !thread->statusReady;
+        pthread_mutex_unlock(&thread->resultMutex);
+        if (nothing_pending) {
+            vmThreadReleaseForReuse(pool, thread, 0);
         }
     }
     return true;
 }
 
 bool vmThreadAssignName(VM* vm, int threadId, const char* name) {
-    if (!vm || threadId <= 0 || (size_t)threadId >= vm->threadsCommittedCount) {
+    VM* pool = vmThreadPool(vm);
+    Thread* thread = vmThreadSlot(pool, threadId);
+    if (!thread) {
         return false;
     }
-    pthread_mutex_lock(&vm->threadRegistryLock);
-    Thread* thread = &vm->threads[threadId];
+    pthread_mutex_lock(&pool->threadRegistryLock);
     if (!atomic_load(&thread->inPool)) {
-        pthread_mutex_unlock(&vm->threadRegistryLock);
+        pthread_mutex_unlock(&pool->threadRegistryLock);
         return false;
     }
     vmThreadAssignInternalName(thread, threadId, name);
-    pthread_mutex_unlock(&vm->threadRegistryLock);
+    pthread_mutex_unlock(&pool->threadRegistryLock);
     return true;
 }
 
 int vmThreadFindIdByName(VM* vm, const char* name) {
-    if (!vm || !name) {
+    VM* pool = vmThreadPool(vm);
+    if (!pool || !name) {
         return -1;
     }
-    for (size_t i = 1; i < vm->threadsCommittedCount; ++i) {
-        Thread* thread = &vm->threads[i];
+    for (size_t i = 1; i < pool->threadsCommittedCount; ++i) {
+        Thread* thread = &pool->threads[i];
         if (!atomic_load(&thread->inPool)) {
             continue;
         }
@@ -3777,12 +4168,13 @@ int vmThreadFindIdByName(VM* vm, const char* name) {
     return -1;
 }
 
+// Pause is cooperative: the worker blocks at its next interrupt poll
+// (vmConsumeInterruptRequest -> vmTaskWaitWhilePaused) until resumed,
+// cancelled or killed. A job that has not started yet waits in
+// vmThreadAwaitResume instead.
 bool vmThreadPause(VM* vm, int threadId) {
-    if (!vm || threadId <= 0 || (size_t)threadId >= vm->threadsCommittedCount) {
-        return false;
-    }
-    Thread* thread = &vm->threads[threadId];
-    if (!atomic_load(&thread->inPool)) {
+    Thread* thread = vmThreadSlot(vmThreadPool(vm), threadId);
+    if (!thread || !atomic_load(&thread->inPool)) {
         return false;
     }
     atomic_store(&thread->paused, true);
@@ -3791,11 +4183,8 @@ bool vmThreadPause(VM* vm, int threadId) {
 }
 
 bool vmThreadResume(VM* vm, int threadId) {
-    if (!vm || threadId <= 0 || (size_t)threadId >= vm->threadsCommittedCount) {
-        return false;
-    }
-    Thread* thread = &vm->threads[threadId];
-    if (!atomic_load(&thread->inPool)) {
+    Thread* thread = vmThreadSlot(vmThreadPool(vm), threadId);
+    if (!thread || !atomic_load(&thread->inPool)) {
         return false;
     }
     atomic_store(&thread->paused, false);
@@ -3803,52 +4192,59 @@ bool vmThreadResume(VM* vm, int threadId) {
     return true;
 }
 
-bool vmThreadCancel(VM* vm, int threadId) {
-    if (!vm || threadId <= 0 || (size_t)threadId >= vm->threadsCommittedCount) {
+// Cancel (or kill) the job in a slot. A running job is asked to stop (the
+// stop contract above vmThreadRequestStop) and its slot is released once it
+// has finished, as cancel always did. A finished job nobody awaited is
+// released now (its result is dropped). A slot without a job -- idle, or
+// holding a later job than `generation` names -- is left alone: a stale
+// cancel used to kill whatever job had reused the slot, or retire an idle
+// worker that the pool still counted as available.
+//
+// VM 2.0 Phase 5a checkpoint 5a-iii: native (non-bytecode) work has no
+// interpreter safe points; native work_fn implementations poll
+// vmThreadStopRequested at their own safe points (e.g. HTTP async's curl
+// progress callback). An earlier per-slot native-cancel hook raced the
+// worker's own job pickup and was removed.
+static bool vmThreadStopJob(VM* pool, int threadId, uint32_t generation, bool kill) {
+    Thread* thread = vmThreadSlot(pool, threadId);
+    if (!thread || !atomic_load(&thread->inPool) || !thread->stateSyncInitialized) {
         return false;
     }
-    Thread* thread = &vm->threads[threadId];
-    if (!atomic_load(&thread->inPool)) {
-        return false;
-    }
-    atomic_store(&thread->cancelRequested, true);
-    // VM 2.0 Phase 5a checkpoint 5a-iii: native (non-bytecode) work has no
-    // interpreter safe points to cooperatively observe cancelRequested at,
-    // unlike bytecode where the interpreter loop already polls it. There is
-    // deliberately no separate native-cancel-hook mechanism here: an earlier
-    // draft added a per-slot Thread.nativeCancelFn invoked from this
-    // function, but that write raced against this exact worker's own
-    // threadStart job-pickup code resetting the slot on its first loop
-    // iteration (confirmed via a failing cancel-demo run, not just
-    // theorized). Native work_fn implementations must instead poll
-    // Thread.cancelRequested directly at their own natural safe points
-    // (e.g. HTTP async's curl progress callback does) -- that needs no new
-    // plumbing since every native work_fn already has its own Thread*.
-    vmThreadWakeStateWaiters(thread);
     pthread_mutex_lock(&thread->stateMutex);
-    thread->readyForReuse = true;
-    pthread_cond_broadcast(&thread->stateCond);
+    if (!thread->currentJob || !vmThreadGenerationMatchesLocked(thread, generation)) {
+        pthread_mutex_unlock(&thread->stateMutex);
+        return false;
+    }
+    uint32_t target = thread->jobGeneration;
+    pthread_mutex_lock(&thread->resultMutex);
+    bool parked = thread->awaitingReuse;
+    pthread_mutex_unlock(&thread->resultMutex);
+    if (!parked) {
+        vmThreadRequestStopLocked(thread, kill);
+        thread->readyForReuse = true;
+        pthread_cond_broadcast(&thread->stateCond);
+        pthread_mutex_unlock(&thread->stateMutex);
+        vmThreadWakeStateWaiters(thread);
+        return true;
+    }
+    if (kill) {
+        atomic_store(&thread->killRequested, true);
+    }
     pthread_mutex_unlock(&thread->stateMutex);
-    vmThreadJobQueueWake(vm->jobQueue);
+    vmThreadReleaseForReuse(pool, thread, target);
     return true;
 }
 
+bool vmThreadCancel(VM* vm, int threadId) {
+    return vmThreadStopJob(vmThreadPool(vm), threadId, 0, false);
+}
+
+bool vmTaskCancel(VM* vm, int threadId, uint32_t generation) {
+    return vmThreadStopJob(vmThreadPool(vm), threadId, generation, false);
+}
+
 bool vmThreadKill(VM* vm, int threadId) {
-    if (!vm || threadId <= 0 || (size_t)threadId >= vm->threadsCommittedCount) {
-        return false;
-    }
-    Thread* thread = &vm->threads[threadId];
-    if (!atomic_load(&thread->inPool)) {
-        return false;
-    }
-    atomic_store(&thread->killRequested, true);
-    vmThreadWakeStateWaiters(thread);
-    pthread_mutex_lock(&thread->stateMutex);
-    thread->readyForReuse = true;
-    pthread_cond_broadcast(&thread->stateCond);
-    pthread_mutex_unlock(&thread->stateMutex);
-    vmThreadJobQueueWake(vm->jobQueue);
-    return true;
+    return vmThreadStopJob(vmThreadPool(vm), threadId, 0, true);
 }
 
 size_t vmSnapshotWorkerUsage(VM* vm, ThreadMetrics* outMetrics, size_t capacity) {
@@ -5157,178 +5553,192 @@ static Value vmHostQuitRequested(VM* vm) {
     return makeBoolean(atomic_load(&break_requested));
 }
 
+// Resolves what CreateThread/spawn/TaskSpawn was given to an entry point:
+// a closure, a procedure name, or an integer procedure address. On success a
+// closure's environment is retained into *outEnv (release it after the
+// spawn). An integer must be the entry address of a procedure: it used to go
+// straight to `ip = code + entry`, so a stray number ran bytes past the end
+// of the code or crashed the VM.
+static bool vmResolveThreadTarget(VM* vm, Value target, const char* what, uint32_t* outEntry,
+                                  ClosureEnvPayload** outEnv, Symbol** outSymbol) {
+    *outEntry = 0;
+    *outEnv = NULL;
+    *outSymbol = NULL;
+    if (VALUE_TYPE(target) == TYPE_CLOSURE) {
+        *outEntry = (uint32_t)AS_CLOSURE(target).entry_offset;
+        *outEnv = AS_CLOSURE(target).env;
+        *outSymbol = AS_CLOSURE(target).symbol;
+        if (*outEnv) {
+            retainClosureEnv(*outEnv);
+        }
+        return true;
+    }
+    if (isPascalStringType(VALUE_TYPE(target)) && AS_STRING(target)) {
+        char lookup_name[MAX_SYMBOL_LENGTH + 1];
+        strncpy(lookup_name, AS_STRING(target), MAX_SYMBOL_LENGTH);
+        lookup_name[MAX_SYMBOL_LENGTH] = '\0';
+        toLowerString(lookup_name);
+        Symbol* proc_symbol = findProcedureByName(vm->procedureTable, lookup_name, vm);
+        if (proc_symbol && proc_symbol->is_defined && proc_symbol->bytecode_address >= 0) {
+            *outEntry = (uint32_t)proc_symbol->bytecode_address;
+            *outSymbol = proc_symbol;
+            return true;
+        }
+        return false;
+    }
+    if (IS_INTLIKE(target)) {
+        long long raw = asI64(target);
+        Symbol* proc_symbol = NULL;
+        if (raw >= 0 && vm->chunk && raw < (long long)vm->chunk->count) {
+            proc_symbol = vmGetProcedureByAddress(vm, (uint32_t)raw);
+        }
+        if (!proc_symbol) {
+            runtimeError(vm, "VM Error: %s target %lld is not the address of a procedure.", what, raw);
+            return false;
+        }
+        *outEntry = (uint32_t)raw;
+        *outSymbol = proc_symbol;
+        return true;
+    }
+    return false;
+}
+
+// A spawn passes exactly the routine's parameters: there is no other check
+// between the spawn site and the new frame, and a short argument list left
+// the frame's slots misaligned ("Local slot index out of range").
+static bool vmCheckThreadArity(VM* vm, const Symbol* proc, int argc, const char* what) {
+    int expected = vmProcParamCount(proc);
+    if (expected < 0 || expected == argc) {
+        return true;
+    }
+    runtimeError(vm, "VM Error: %s of '%s' passes %d argument(s); it takes %d.", what,
+                 proc && proc->name ? proc->name : "<anonymous>", argc, expected);
+    return false;
+}
+
 static Value vmHostCreateThreadAddr(VM* vm) {
     // New layout: [addr, arg0, arg1, ..., argc] — argc on top.
     Value argcVal = pop(vm);
     if (IS_INTLIKE(argcVal)) {
         int argc = (int)AS_INTEGER(argcVal);
         if (argc < 0) argc = 0;
-        int totalArgs = argc;
-        Value args[8];
-        if (argc > 8) argc = 8;
-        for (int i = totalArgs - 1; i >= 0; i--) {
-            Value v = pop(vm);
-            if (i < 8) {
-                args[i] = v;
-            } else {
-                freeValue(&v);
-            }
+        if (vm->stackTop - vm->stack < argc + 1) {
+            freeValue(&argcVal);
+            runtimeError(vm, "VM Error: Stack underflow in CreateThread.");
+            return makeInt(-1);
+        }
+        // All of them: this used to keep only the first 8 (a fixed array)
+        // and drop the rest.
+        Value* args = argc > 0 ? (Value*)calloc((size_t)argc, sizeof(Value)) : NULL;
+        if (argc > 0 && !args) {
+            runtimeError(vm, "VM Error: Out of memory starting a thread.");
+            return makeInt(-1);
+        }
+        for (int i = argc - 1; i >= 0; i--) {
+            args[i] = pop(vm);
         }
         Value addrVal = pop(vm);
         uint32_t entry = 0;
-        bool validEntry = false;
         ClosureEnvPayload* closureEnv = NULL;
         Symbol* closureSymbol = NULL;
-        if (VALUE_TYPE(addrVal) == TYPE_CLOSURE) {
-            entry = (uint32_t)AS_CLOSURE(addrVal).entry_offset;
-            closureEnv = AS_CLOSURE(addrVal).env;
-            closureSymbol = AS_CLOSURE(addrVal).symbol;
-            if (closureEnv) {
-                retainClosureEnv(closureEnv);
-            }
-            validEntry = true;
-        } else if (VALUE_TYPE(addrVal) == TYPE_STRING && AS_STRING(addrVal)) {
-            char lookup_name[MAX_SYMBOL_LENGTH + 1];
-            strncpy(lookup_name, AS_STRING(addrVal), MAX_SYMBOL_LENGTH);
-            lookup_name[MAX_SYMBOL_LENGTH] = '\0';
-            toLowerString(lookup_name);
-            Symbol* proc_symbol = findProcedureByName(vm->procedureTable, lookup_name, vm);
-            if (proc_symbol && proc_symbol->is_defined && proc_symbol->bytecode_address >= 0) {
-                entry = (uint32_t)proc_symbol->bytecode_address;
-                closureSymbol = proc_symbol;
-                validEntry = true;
-            }
-        } else if (IS_INTLIKE(addrVal)) {
-            entry = (uint32_t)AS_INTEGER(addrVal);
-            validEntry = true;
-        }
+        bool validEntry = vmResolveThreadTarget(vm, addrVal, "CreateThread", &entry, &closureEnv, &closureSymbol);
         freeValue(&addrVal);
 
+        int id = -1;
         if (!validEntry) {
-            for (int i = 0; i < argc && i < 8; ++i) {
-                freeValue(&args[i]);
+            if (!vm->abort_requested) {
+                runtimeError(vm, "VM Error: CreateThread requires a procedure pointer or closure.");
             }
-            if (closureEnv) {
-                releaseClosureEnv(closureEnv);
-            }
-            runtimeError(vm, "VM Error: CreateThread requires a procedure pointer or closure.");
-            freeValue(&argcVal);
-            return makeInt(-1);
+        } else if (argc == 0 && vmProcParamCount(closureSymbol) == 1) {
+            // CreateThread(proc, 0) compiles to [addr, 0] -- the legacy
+            // [addr, arg] layout below -- which is byte for byte a spawn
+            // with no arguments. A target taking one parameter settles it:
+            // it is the legacy call, and the 0 is its argument (it used to
+            // run with that argument missing).
+            id = createThreadWithArgs(vm, entry, closureEnv, closureSymbol, 1, &argcVal, NULL);
+        } else if (vmCheckThreadArity(vm, closureSymbol, argc, "spawn")) {
+            id = createThreadWithArgs(vm, entry, closureEnv, closureSymbol, argc, args, NULL);
         }
-
-        int id = createThreadWithArgs(vm, entry, closureEnv, closureSymbol, argc, args);
         if (closureEnv) {
             releaseClosureEnv(closureEnv);
         }
+        // The job holds its own copies (vmThreadJobCreate); these were leaked.
+        for (int i = 0; i < argc; ++i) {
+            freeValue(&args[i]);
+        }
+        free(args);
+        freeValue(&argcVal);
         return makeInt(id < 0 ? -1 : id);
     } else {
         // Backwards-compatible path: [addr, arg]
         Value argVal = argcVal; // already popped
         Value addrVal = pop(vm);
         uint32_t entry = 0;
-        bool validEntry = false;
         ClosureEnvPayload* closureEnv = NULL;
         Symbol* closureSymbol = NULL;
-        if (VALUE_TYPE(addrVal) == TYPE_CLOSURE) {
-            entry = (uint32_t)AS_CLOSURE(addrVal).entry_offset;
-            closureEnv = AS_CLOSURE(addrVal).env;
-            closureSymbol = AS_CLOSURE(addrVal).symbol;
-            if (closureEnv) {
-                retainClosureEnv(closureEnv);
-            }
-            validEntry = true;
-        } else if (VALUE_TYPE(addrVal) == TYPE_STRING && AS_STRING(addrVal)) {
-            char lookup_name[MAX_SYMBOL_LENGTH + 1];
-            strncpy(lookup_name, AS_STRING(addrVal), MAX_SYMBOL_LENGTH);
-            lookup_name[MAX_SYMBOL_LENGTH] = '\0';
-            toLowerString(lookup_name);
-            Symbol* proc_symbol = findProcedureByName(vm->procedureTable, lookup_name, vm);
-            if (proc_symbol && proc_symbol->is_defined && proc_symbol->bytecode_address >= 0) {
-                entry = (uint32_t)proc_symbol->bytecode_address;
-                closureSymbol = proc_symbol;
-                validEntry = true;
-            }
-        } else if (IS_INTLIKE(addrVal)) {
-            entry = (uint32_t)AS_INTEGER(addrVal);
-            validEntry = true;
-        }
+        bool validEntry = vmResolveThreadTarget(vm, addrVal, "CreateThread", &entry, &closureEnv, &closureSymbol);
         freeValue(&addrVal);
 
+        int id = -1;
         if (!validEntry) {
-            runtimeError(vm, "VM Error: CreateThread requires a procedure pointer or closure.");
-            freeValue(&argVal);
-            if (closureEnv) {
-                releaseClosureEnv(closureEnv);
+            if (!vm->abort_requested) {
+                runtimeError(vm, "VM Error: CreateThread requires a procedure pointer or closure.");
             }
-            return makeInt(-1);
+        } else {
+            id = createThreadWithArgs(vm, entry, closureEnv, closureSymbol, 1, &argVal, NULL);
         }
-
-        int id = createThreadWithArgs(vm, entry, closureEnv, closureSymbol, 1, &argVal);
         if (closureEnv) {
             releaseClosureEnv(closureEnv);
         }
+        freeValue(&argVal); // the job holds its own copy
         return makeInt(id < 0 ? -1 : id);
     }
 }
 
 // VM 2.0 Phase 5a checkpoint 5a-i (Docs/pscal_vm2_plan.md Sec 6.1):
-// TaskSpawn's entry-resolution logic -- the exact same closure/procedure-
-// name/raw-offset dispatch vmHostCreateThreadAddr above uses, over
+// TaskSpawn's entry-resolution logic -- the same closure/procedure-name/
+// procedure-address dispatch vmHostCreateThreadAddr above uses, over
 // createThreadWithArgs (the SAME createThreadJob/ThreadJobQueue path, not a
-// second pool). Unlike vmHostCreateThreadAddr (a CALL_HOST target that pops
-// a variable number of stack args into a fixed [8] local array), this takes
-// `fnVal` and an already-materialized `argv` array directly, matching a
-// VmBuiltinFn's calling convention -- no 8-arg cap, since that cap was an
-// artifact of the stack-popping shape, not of createThreadWithArgs itself.
-// Does not free/consume fnVal or argv -- the caller (a builtin) owns that
-// via its normal argument-cleanup path. Returns the new thread id, or -1
-// with runtimeError already raised.
-int vmHostCreateTaskEntry(VM* vm, Value fnVal, int argc, const Value* argv) {
+// second pool). Takes `fnVal` and an already-materialized `argv` array
+// directly, matching a VmBuiltinFn's calling convention. Does not free/
+// consume fnVal or argv -- the caller (a builtin) owns that via its normal
+// argument-cleanup path. Returns the new thread id (and the job's generation
+// for its TaskObj), or -1 with runtimeError already raised.
+int vmHostCreateTaskEntry(VM* vm, Value fnVal, int argc, const Value* argv, uint32_t* outGeneration) {
+    if (outGeneration) {
+        *outGeneration = 0;
+    }
     if (!vm) {
         return -1;
     }
     uint32_t entry = 0;
-    bool validEntry = false;
     ClosureEnvPayload* closureEnv = NULL;
     Symbol* closureSymbol = NULL;
-    if (VALUE_TYPE(fnVal) == TYPE_CLOSURE) {
-        entry = (uint32_t)AS_CLOSURE(fnVal).entry_offset;
-        closureEnv = AS_CLOSURE(fnVal).env;
-        closureSymbol = AS_CLOSURE(fnVal).symbol;
-        if (closureEnv) {
-            retainClosureEnv(closureEnv);
+    if (!vmResolveThreadTarget(vm, fnVal, "TaskSpawn", &entry, &closureEnv, &closureSymbol)) {
+        if (!vm->abort_requested) {
+            runtimeError(vm, "TaskSpawn requires a procedure pointer or closure.");
         }
-        validEntry = true;
-    } else if (isPascalStringType(VALUE_TYPE(fnVal)) && AS_STRING(fnVal)) {
-        char lookup_name[MAX_SYMBOL_LENGTH + 1];
-        strncpy(lookup_name, AS_STRING(fnVal), MAX_SYMBOL_LENGTH);
-        lookup_name[MAX_SYMBOL_LENGTH] = '\0';
-        toLowerString(lookup_name);
-        Symbol* proc_symbol = findProcedureByName(vm->procedureTable, lookup_name, vm);
-        if (proc_symbol && proc_symbol->is_defined && proc_symbol->bytecode_address >= 0) {
-            entry = (uint32_t)proc_symbol->bytecode_address;
-            closureSymbol = proc_symbol;
-            validEntry = true;
-        }
-    } else if (IS_INTLIKE(fnVal)) {
-        entry = (uint32_t)AS_INTEGER(fnVal);
-        validEntry = true;
+        return -1;
     }
-
-    if (!validEntry) {
+    if (!vmCheckThreadArity(vm, closureSymbol, argc, "TaskSpawn")) {
         if (closureEnv) {
             releaseClosureEnv(closureEnv);
         }
-        runtimeError(vm, "TaskSpawn requires a procedure pointer or closure.");
         return -1;
     }
 
-    int id = createThreadWithArgs(vm, entry, closureEnv, closureSymbol, argc, argv);
+    int id = createThreadWithArgs(vm, entry, closureEnv, closureSymbol, argc, argv, outGeneration);
     if (closureEnv) {
         releaseClosureEnv(closureEnv);
     }
     if (id < 0 && !vm->abort_requested) {
-        runtimeError(vm, "Task limit exceeded.");
+        if (vmThreadPoolStopping(vm)) {
+            // The program is ending; the spawn was refused, not over a limit.
+            vm->abort_requested = true;
+            vm->runtime_error_raised = true;
+        } else {
+            runtimeError(vm, "Task limit exceeded.");
+        }
     }
     return id;
 }
@@ -6228,27 +6638,26 @@ static Value vmHostInterfaceIs(VM* vm) {
 static Value vmHostWaitThread(VM* vm) {
     // Expects top of stack: integer thread id
     Value tidVal = pop(vm);
+    int result = 0;
     if (VALUE_TYPE(tidVal) == TYPE_THREAD || IS_INTLIKE(tidVal)) {
         int id = (int)AS_INTEGER(tidVal);
-        // joinThread() only waits for the job's status; it never consumes the
-        // result or flips readyForReuse, so the worker thread would sit in its
-        // post-job wait loop (vm.c threadStart, awaitingReuse) forever and its
-        // pool slot would never be recyclable. vmJoinThreadById() performs the
-        // same wait plus the release handshake that vmBuiltinWaitForThread
-        // (the indirect-call path) already relies on -- mirror that here so
-        // CALL_HOST/HOST_FN_WAIT_THREAD (the direct WaitForThread(id) call
-        // form) actually returns the worker to the pool.
-        VM* thread_vm = vm;
-        if (vm && vm->threadOwner) {
-            thread_vm = vm->threadOwner;
-        }
-        bool joined = thread_vm ? vmJoinThreadById(thread_vm, id) : false;
-        if (!joined && thread_vm && thread_vm != vm) {
-            vmJoinThreadById(vm, id);
+        // vmJoinThreadById waits for the job, consumes its status and hands
+        // the worker back to the pool (joinThread alone left it parked
+        // forever). It joins the root VM's pool, where every thread lives.
+        // An id that names no thread is an error, as in the WaitForThread
+        // builtin; this returned 0 ("success") for any id.
+        if (!vmJoinThreadById(vm, id)) {
+            result = -1;
+            VM* root = vmThreadPool(vm);
+            bool aborted = vm->abort_requested || vm->exit_requested ||
+                           (root && (root->abort_requested || root->exit_requested));
+            if (!aborted) {
+                runtimeError(vm, "WaitForThread received invalid thread id %d.", id);
+            }
         }
     }
     freeValue(&tidVal);
-    return makeInt(0);
+    return makeInt(result);
 }
 
 static Value vmHostPrintf(VM* vm) {
@@ -6551,6 +6960,27 @@ bool registerHostFunction(VM* vm, HostFunctionID id, HostFn fn) {
     return true;
 }
 
+// Frees a joined slot's worker VM, detaching it under stateMutex first:
+// vmThreadRequestStop on another thread may be about to write into it.
+static void vmThreadFreeOwnedVm(Thread* thread) {
+    VM* owned = NULL;
+    if (thread->stateSyncInitialized) {
+        pthread_mutex_lock(&thread->stateMutex);
+    }
+    if (thread->ownsVm) {
+        owned = thread->vm;
+    }
+    thread->vm = NULL;
+    thread->ownsVm = false;
+    if (thread->stateSyncInitialized) {
+        pthread_mutex_unlock(&thread->stateMutex);
+    }
+    if (owned) {
+        freeVM(owned);
+        free(owned);
+    }
+}
+
 // --- VM Initialization and Cleanup ---
 void vmResetExecutionState(VM* vm) {
     if (!vm) return;
@@ -6588,8 +7018,10 @@ void vmResetExecutionState(VM* vm) {
     for (size_t i = 1; i < vm->threadsCommittedCount; ++i) {
         Thread* thread = &vm->threads[i];
         if (atomic_load(&thread->inPool)) {
-            atomic_store(&thread->killRequested, true);
-            vmThreadWakeStateWaiters(thread);
+            // Reaches a job that is still running, too (see
+            // vmThreadRequestStop): setting killRequested alone left a busy
+            // or channel-blocked task running and this join waiting forever.
+            vmThreadRequestStop(thread, true);
         }
         // Gate on needsJoin, not inPool/active: the global shutdown flags
         // just set above already let any idle worker wake and fully exit
@@ -6601,12 +7033,7 @@ void vmResetExecutionState(VM* vm) {
             atomic_store(&thread->active, false);
             atomic_store(&thread->needsJoin, false);
         }
-        if (thread->ownsVm && thread->vm) {
-            freeVM(thread->vm);
-            free(thread->vm);
-            thread->vm = NULL;
-            thread->ownsVm = false;
-        }
+        vmThreadFreeOwnedVm(thread);
         vmThreadDestroySlot(thread);
         memset(thread, 0, sizeof(*thread));
         vmThreadInitSlot(thread);
@@ -6782,8 +7209,10 @@ void freeVM(VM* vm) {
     for (size_t i = 1; i < vm->threadsCommittedCount; i++) {
         Thread* thread = &vm->threads[i];
         if (atomic_load(&thread->inPool)) {
-            atomic_store(&thread->killRequested, true);
-            vmThreadWakeStateWaiters(thread);
+            // Reaches a job that is still running, too (see
+            // vmThreadRequestStop): setting killRequested alone left a busy
+            // or channel-blocked task running and this join waiting forever.
+            vmThreadRequestStop(thread, true);
         }
         // Gate on needsJoin, not inPool/active: the global shutdown flags
         // just set above already let any idle worker wake and fully exit
@@ -6795,12 +7224,7 @@ void freeVM(VM* vm) {
             atomic_store(&thread->active, false);
             atomic_store(&thread->needsJoin, false);
         }
-        if (thread->ownsVm && thread->vm) {
-            freeVM(thread->vm);
-            free(thread->vm);
-            thread->vm = NULL;
-            thread->ownsVm = false;
-        }
+        vmThreadFreeOwnedVm(thread);
         atomic_store(&thread->inPool, false);
     }
     if (vm->jobQueue) {
@@ -7686,6 +8110,9 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
     vm->abort_requested = false;
     vm->runtime_error_raised = false;
     vm->suspend_unwind_requested = false;
+    // A worker whose job was asked to stop keeps stopping in a nested call
+    // too: the reset above must not swallow the request.
+    vmTaskRearmStopRequest(vm);
     vm->zeroBasedIndexing = frontendIsZeroBasedStrings();
 
     vm->vmGlobalSymbols = globals;    // Store globals table (ensure this is the intended one)
@@ -8172,6 +8599,12 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
             vm->runtime_error_raised = false;
         }
         if (vm->exit_requested || vm->abort_requested) {
+            // A stop request for this worker's job (which may land after the
+            // check above) ends the job; it is not an Exit that leaves one
+            // frame. See vmThreadRequestStop.
+            if (vmTaskStopIfRequested(vm)) {
+                return INTERPRET_RUNTIME_ERROR;
+            }
             if (shellRuntimeShouldDeferExit(vm)) {
                 continue;
             }
@@ -12621,7 +13054,7 @@ comparison_error_label:
                 uint32_t entry = READ_UINT32(vm);
                 int id = createThread(vm, entry);
                 if (id < 0) {
-                    if (!vm->abort_requested) {
+                    if (!vm->abort_requested && !vmThreadPoolStopping(vm)) {
                         runtimeError(vm, "Thread limit exceeded.");
                     }
                     return INTERPRET_RUNTIME_ERROR;
@@ -12648,8 +13081,8 @@ comparison_error_label:
                 }
                 bool joined_ok = true;
                 bool have_status = vmThreadTakeResult(vm, tid, NULL, true, &joined_ok, true);
-                if (!have_status) {
-                    joinThreadInternal(vm, tid);
+                if (!have_status && !vm->abort_requested) {
+                    (void)joinThreadInternal(vmThreadPool(vm), vm, tid);
                 }
                 Value popped_tid = pop(vm);
                 freeValue(&popped_tid);

@@ -417,8 +417,8 @@ Value makeMStream(MStream *ms);
 // VM 2.0 Phase 5a checkpoint 5a-i: `owner` is the VM whose threads[] pool
 // slot `threadId` names -- see TaskObj's comment in core/types.h.
 struct VM_s;
-TaskObj *createTaskObj(int threadId, struct VM_s *owner);
-Value makeTask(int threadId, struct VM_s *owner);
+TaskObj *createTaskObj(int threadId, struct VM_s *owner, uint32_t generation);
+Value makeTask(int threadId, struct VM_s *owner, uint32_t generation);
 // VM 2.0 Phase 5b checkpoint 5b-i: capacity is fixed at creation, never
 // resized -- see ChannelObj's comment in core/types.h.
 ChannelObj *createChannelObj(size_t capacity);

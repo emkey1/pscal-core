@@ -2724,8 +2724,10 @@ static size_t headerAccumJob(char *buffer, size_t size, size_t nitems, void *use
 // directly needs no new plumbing since every native work_fn already has its
 // own Thread* via VM.owningThread.
 static int httpJobCancelRequested(HttpAsyncJob* j) {
-    if (!j || !j->threadVm || !j->threadVm->owningThread) return 0;
-    return atomic_load(&j->threadVm->owningThread->cancelRequested) ? 1 : 0;
+    if (!j || !j->threadVm) return 0;
+    // Cancel, kill and pool shutdown alike: a transfer still running at
+    // program exit would otherwise hold up the exit until it finished.
+    return vmThreadStopRequested(j->threadVm) ? 1 : 0;
 }
 
 #if LIBCURL_VERSION_NUM >= 0x072000
@@ -3398,12 +3400,13 @@ Value vmBuiltinHttpRequestAsync(VM* vm, int arg_count, Value* args) {
     // (vmTaskCreateNative) instead of a raw pthread_create -- job cleanup on
     // failure is httpAsyncJobFree's job now (vmTaskCreateNative guarantees
     // it runs exactly once, success or failure), not this call site's.
-    int id = vmTaskCreateNative(vm, httpAsyncWork, job, httpAsyncJobFree);
+    uint32_t generation = 0;
+    int id = vmTaskCreateNative(vm, httpAsyncWork, job, httpAsyncJobFree, &generation);
     if (id < 0) {
         runtimeError(vm, "httpRequestAsync: failed to spawn task.");
         return makeNil();
     }
-    return makeTask(id, vm);
+    return makeTask(id, vm->threadOwner ? vm->threadOwner : vm, generation);
 }
 
 // HttpRequestAsyncToFile(session, method, url, bodyStrOrMStreamOrNil, outPath): Integer (async id)
@@ -3466,12 +3469,13 @@ Value vmBuiltinHttpRequestAsyncToFile(VM* vm, int arg_count, Value* args) {
     }
     // VM 2.0 Phase 5a checkpoint 5a-iii: see vmBuiltinHttpRequestAsync's
     // matching comment.
-    int id = vmTaskCreateNative(vm, httpAsyncWork, job, httpAsyncJobFree);
+    uint32_t generation = 0;
+    int id = vmTaskCreateNative(vm, httpAsyncWork, job, httpAsyncJobFree, &generation);
     if (id < 0) {
         runtimeError(vm, "httpRequestAsyncToFile: failed to spawn task.");
         return makeNil();
     }
-    return makeTask(id, vm);
+    return makeTask(id, vm->threadOwner ? vm->threadOwner : vm, generation);
 }
 
 // Shared arg-validation + result-extraction for HttpAwait/HttpTryAwait: both
@@ -3481,10 +3485,10 @@ Value vmBuiltinHttpRequestAsyncToFile(VM* vm, int arg_count, Value* args) {
 // Blocks (vmThreadTakeResult's own wait loop) until the task completes --
 // callers that need a non-blocking check (HttpTryAwait) must call
 // vmTaskIsDone first and only reach this once that's true.
-static int httpTaskAwaitAndExtract(TaskObj* t, Value* outMstream) {
+static int httpTaskAwaitAndExtract(VM* vm, TaskObj* t, Value* outMstream) {
     Value result = makeNil();
     bool status_flag = false;
-    if (!vmThreadTakeResult(t->owner, t->threadId, &result, true, &status_flag, true)) {
+    if (!vmTaskTakeResult(vm, t->threadId, t->generation, &result, &status_flag)) {
         return -1;
     }
     int status = -1;
@@ -3521,7 +3525,7 @@ Value vmBuiltinHttpAwait(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "httpAwait received an invalid task.");
         return makeInt(-1);
     }
-    return makeInt(httpTaskAwaitAndExtract(t, &args[1]));
+    return makeInt(httpTaskAwaitAndExtract(vm, t, &args[1]));
 }
 
 // HttpTryAwait(task, out:mstream): Integer (-2: pending; otherwise status)
@@ -3536,10 +3540,10 @@ Value vmBuiltinHttpTryAwait(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "httpTryAwait received an invalid task.");
         return makeInt(-1);
     }
-    if (!vmTaskIsDone(t->owner, t->threadId)) {
+    if (!vmTaskIsDone(vm, t->threadId, t->generation)) {
         return makeInt(-2);
     }
-    return makeInt(httpTaskAwaitAndExtract(t, &args[1]));
+    return makeInt(httpTaskAwaitAndExtract(vm, t, &args[1]));
 }
 
 // HttpIsDone(task): Integer (0/1)
@@ -3552,7 +3556,7 @@ Value vmBuiltinHttpIsDone(VM* vm, int arg_count, Value* args) {
     if (!t || !t->owner) {
         return makeInt(0);
     }
-    return makeInt(vmTaskIsDone(t->owner, t->threadId) ? 1 : 0);
+    return makeInt(vmTaskIsDone(vm, t->threadId, t->generation) ? 1 : 0);
 }
 
 // HttpCancel(task): Integer (1 on success, 0 otherwise)
@@ -3565,7 +3569,7 @@ Value vmBuiltinHttpCancel(VM* vm, int arg_count, Value* args) {
     if (!t || !t->owner) {
         return makeInt(0);
     }
-    return makeInt(vmThreadCancel(t->owner, t->threadId) ? 1 : 0);
+    return makeInt(vmTaskCancel(vm, t->threadId, t->generation) ? 1 : 0);
 }
 
 // httpGetAsyncProgress(task): Integer (bytes downloaded so far)
@@ -3579,7 +3583,7 @@ Value vmBuiltinHttpGetAsyncProgress(VM* vm, int arg_count, Value* args) {
         return makeInt(0);
     }
     long long now = 0, total = 0;
-    vmTaskGetProgress(t->owner, t->threadId, &now, &total);
+    vmTaskGetProgress(vm, t->threadId, t->generation, &now, &total);
     return makeInt((int)now);
 }
 
@@ -3594,7 +3598,7 @@ Value vmBuiltinHttpGetAsyncTotal(VM* vm, int arg_count, Value* args) {
         return makeInt(0);
     }
     long long now = 0, total = 0;
-    vmTaskGetProgress(t->owner, t->threadId, &now, &total);
+    vmTaskGetProgress(vm, t->threadId, t->generation, &now, &total);
     return makeInt((int)total);
 }
 

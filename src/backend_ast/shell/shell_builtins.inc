@@ -11501,13 +11501,9 @@ Value vmBuiltinShellWaitForThread(VM *vm, int arg_count, Value *args) {
         thread_vm = vm->threadOwner;
     }
 
-    bool joined = thread_vm ? vmJoinThreadById(thread_vm, (int)thread_id) : false;
-    if (!joined && thread_vm && thread_vm != vm) {
-        joined = vmJoinThreadById(vm, (int)thread_id);
-        if (joined) {
-            thread_vm = vm;
-        }
-    }
+    // Every thread lives in the root VM's pool (thread_vm), whichever VM
+    // spawned it; vmJoinThreadById waits as `vm`.
+    bool joined = vmJoinThreadById(vm, (int)thread_id);
     if (!joined) {
         runtimeError(vm, "WaitForThread: %lld: invalid thread id", thread_id);
         if (converted_valid) {

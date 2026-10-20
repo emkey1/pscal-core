@@ -258,6 +258,11 @@ typedef struct {
     bool shouldExit;                // Signals worker loop shutdown
     bool ownsVm;                    // Tracks whether vm pointer should be destroyed
     int poolGeneration;             // Bumps when recycled so handles stay unique
+    uint32_t jobGeneration;         // Bumped under stateMutex each time the slot takes a
+                                    // job (never 0 once a job ran). Task handles carry the
+                                    // value they were spawned with, so a stale handle
+                                    // (awaited or released, its slot since reused) is
+                                    // refused instead of reaching the slot's later job.
     bool poolWorker;                // True when thread should be reported as part of the shared pool
     ThreadJob* currentJob;          // Currently executing job (if any)
     bool awaitingReuse;             // True once job finished but not yet released
@@ -436,11 +441,24 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
 void vmNullifyAliases(VM* vm, uintptr_t disposedAddrValue);
 int vmSpawnCallbackThread(VM* vm, VMThreadCallback callback, void* user_data, VMThreadCleanup cleanup);
 // VM 2.0 Phase 5a checkpoint 5a-i (Docs/pscal_vm2_plan.md Sec 6.1): task
-// primitives backing TaskSpawn/TaskDone (builtin.c). TaskAwait/TaskCancel
-// reuse the existing vmJoinThreadById/vmThreadTakeResult/vmThreadCancel
-// above directly -- no new entry point needed for those.
-int vmHostCreateTaskEntry(VM* vm, Value fnVal, int argc, const Value* argv);
-bool vmTaskIsDone(VM* vm, int threadId);
+// primitives backing TaskSpawn/TaskAwait/TaskDone/TaskCancel (builtin.c).
+//
+// Every spawn lands in the root VM's pool (vm->threadOwner), whichever VM
+// issues it, and every thread id names a slot there; the task functions take
+// the CALLING VM, use its root's pool, and use the caller itself only to poll
+// interrupts and its own cancellation while they wait. `generation` (from
+// the out-parameter at spawn, stored in TaskObj) identifies the job; 0 means
+// "whatever job the slot holds", the historical integer-handle behaviour.
+int vmHostCreateTaskEntry(VM* vm, Value fnVal, int argc, const Value* argv, uint32_t* outGeneration);
+bool vmTaskIsDone(VM* vm, int threadId, uint32_t generation);
+// TaskAwait: wait for the job, take its result and status, release the slot.
+// False when the handle no longer names a job (awaited, or released by a
+// cancel), when it names the caller's own slot, or when the wait was
+// interrupted (the awaited task is then cancelled).
+bool vmTaskTakeResult(VM* vm, int threadId, uint32_t generation, Value* outResult, bool* outStatus);
+// TaskCancel: stop a running job (see the stop contract in vm.c) or release a
+// finished one that was never awaited. False when the handle is stale.
+bool vmTaskCancel(VM* vm, int threadId, uint32_t generation);
 // True while threadId's job is still running (active and not yet parked
 // awaiting release), read under the slot's resultMutex. Never true after a
 // join of that job has returned. ThreadGetResult/ThreadGetStatus use it to
@@ -453,24 +471,29 @@ bool vmThreadIsRunning(VM* vm, int threadId);
 // vmSpawnCallbackThread (same underlying growable pool, same job-queue
 // machinery). The interpreter's own cooperative-cancel safe points don't
 // exist inside native C code, so work_fn is responsible for polling
-// Thread.cancelRequested itself (via threadVm->owningThread) at its own
-// natural safe points (e.g. a curl progress callback) -- deliberately NOT
-// a separate cancel_fn hook set post-spawn: an earlier draft tried that and
-// found it races against this exact worker's own first-job-pickup
-// vmThreadResetResult call on a different thread (confirmed by an actual
-// failing cancel test, not assumed). Returns the new thread id (wrap in
-// makeTask(id, vm) to hand a Value back to script code), or -1 with
+// vmThreadStopRequested(threadVm) itself at its own natural safe points
+// (e.g. a curl progress callback) -- deliberately NOT a separate cancel_fn
+// hook set post-spawn: an earlier draft tried that and found it races
+// against this exact worker's own first-job-pickup vmThreadResetResult call
+// on a different thread (confirmed by an actual failing cancel test, not
+// assumed). Returns the new thread id (wrap in makeTask(id, root VM,
+// *outGeneration) to hand a Value back to script code), or -1 with
 // *cleanup* already invoked on failure -- unlike vmSpawnCallbackThread,
 // whose failure contract leaves that to the caller only for the narrow
 // (!vm || !callback) case; callers of THIS function may assume cleanup
 // always runs exactly once, success or failure.
-int vmTaskCreateNative(VM* vm, VMThreadCallback work_fn, void* user_data, VMThreadCleanup cleanup);
+int vmTaskCreateNative(VM* vm, VMThreadCallback work_fn, void* user_data, VMThreadCleanup cleanup,
+                       uint32_t* outGeneration);
 // Called by a native work_fn (e.g. HTTP async's curl progress callback) to
 // publish progress; called by anything holding a task Value (e.g.
 // HttpGetAsyncProgress/Total) to read it back. total==0 conventionally
 // means "unknown," matching HTTP's pre-existing dl_total contract.
 void vmTaskReportProgress(VM* threadVm, long long now, long long total);
-bool vmTaskGetProgress(VM* owner, int threadId, long long* outNow, long long* outTotal);
+bool vmTaskGetProgress(VM* vm, int threadId, uint32_t generation, long long* outNow, long long* outTotal);
+// True once the worker running threadVm's job has been asked to stop
+// (cancel, kill or pool shutdown). Native work_fns poll this at their own
+// safe points; false for a VM that is not running a pool job.
+bool vmThreadStopRequested(const struct VM_s* threadVm);
 
 // VM 2.0 Phase 5b checkpoint 5b-i (Docs/pscal_vm2_plan.md Sec 6.2): Channel
 // blocking/non-blocking Send/Receive, plus Close/IsClosed. Unlike the Task

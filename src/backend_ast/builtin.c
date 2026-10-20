@@ -10746,13 +10746,9 @@ Value vmBuiltinWaitForThread(VM* vm, int arg_count, Value* args) {
         thread_vm = vm->threadOwner;
     }
 
-    bool joined = thread_vm ? vmJoinThreadById(thread_vm, id) : false;
-    if (!joined && thread_vm && thread_vm != vm) {
-        joined = vmJoinThreadById(vm, id);
-        if (joined) {
-            thread_vm = vm;
-        }
-    }
+    // Every thread lives in the root VM's pool (thread_vm), whichever VM
+    // spawned it; vmJoinThreadById waits as `vm`.
+    bool joined = vmJoinThreadById(vm, id);
     if (!joined) {
         bool aborted = (thread_vm && (thread_vm->abort_requested || thread_vm->exit_requested)) ||
                        (vm && (vm->abort_requested || vm->exit_requested));
@@ -11056,21 +11052,11 @@ Value vmBuiltinThreadCancel(VM* vm, int arg_count, Value* args) {
 }
 
 // VM 2.0 Phase 5a checkpoint 5a-i (Docs/pscal_vm2_plan.md Sec 6.1): TYPE_TASK
-// builtins. Unlike the historical thread-id builtins above, a TaskObj
-// carries its owning VM explicitly (captured at TaskSpawn time as whichever
-// VM was actually executing it -- a worker's own per-thread VM has its own
-// independent pool, exactly like a nested THREAD_CREATE call would), so
-// there is no vm->threadOwner-vs-vm fallback guesswork needed here.
-//
-// Known limitation, not fixed in this checkpoint: a Task whose pool slot
-// has already been fully consumed (TaskAwait'd) and reused for an unrelated
-// later TaskSpawn will, like a stale raw thread-id today, silently observe
-// the NEW job's state rather than erroring -- Thread.poolGeneration exists
-// and could detect this, but doing so correctly needs its own locking
-// audit (poolGeneration is currently written under threadRegistryLock but
-// only ever read unlocked, diagnostic-only); left for a dedicated follow-up
-// rather than expanding this checkpoint's scope. Not a regression --
-// today's raw int-handle world has the identical ambiguity.
+// builtins. Every task lives in the root VM's pool (TaskObj.owner), and a
+// TaskObj also carries its job's generation: once the task has been awaited
+// or released and its slot reused, TaskAwait/TaskDone/TaskCancel on it no
+// longer reach the slot's later job (a stale TaskCancel used to throw away
+// the next task's result).
 Value vmBuiltinTaskSpawn(VM* vm, int arg_count, Value* args) {
     if (!vm) {
         return makeNil();
@@ -11079,11 +11065,12 @@ Value vmBuiltinTaskSpawn(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "TaskSpawn requires at least one argument (a procedure or closure).");
         return makeNil();
     }
-    int id = vmHostCreateTaskEntry(vm, args[0], arg_count - 1, args + 1);
+    uint32_t generation = 0;
+    int id = vmHostCreateTaskEntry(vm, args[0], arg_count - 1, args + 1, &generation);
     if (id < 0) {
         return makeNil();
     }
-    return makeTask(id, vm);
+    return makeTask(id, vm->threadOwner ? vm->threadOwner : vm, generation);
 }
 
 Value vmBuiltinTaskAwait(VM* vm, int arg_count, Value* args) {
@@ -11099,7 +11086,6 @@ Value vmBuiltinTaskAwait(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "TaskAwait received an invalid task.");
         return makeNil();
     }
-    VM* owner = t->owner;
     int id = t->threadId;
 
     // vmThreadTakeResult(..., takeValue=true, takeStatus=true) alone is the
@@ -11116,7 +11102,7 @@ Value vmBuiltinTaskAwait(VM* vm, int arg_count, Value* args) {
     // this checkpoint's own smoke test.
     bool status = false;
     Value result = makeNil();
-    if (vmThreadTakeResult(owner, id, &result, true, &status, true)) {
+    if (vmTaskTakeResult(vm, id, t->generation, &result, &status)) {
         if (!status) {
             // statusFlag is false for every "didn't succeed" outcome --
             // canceled, killed, or (since the ordinal-vs-nil comparison fix)
@@ -11129,13 +11115,8 @@ Value vmBuiltinTaskAwait(VM* vm, int arg_count, Value* args) {
         }
         return result;
     }
-    if (owner != vm && vmThreadTakeResult(vm, id, &result, true, &status, true)) {
-        if (!status) {
-            runtimeWarning(vm, "Task %d did not complete successfully (canceled, killed, or aborted -- see any earlier error above).", id);
-        }
-        return result;
-    }
 
+    VM* owner = t->owner;
     if ((vm->abort_requested || vm->exit_requested) ||
         (owner->abort_requested || owner->exit_requested)) {
         return makeNil();
@@ -11164,7 +11145,7 @@ Value vmBuiltinTaskDone(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "TaskDone received an invalid task.");
         return makeBoolean(false);
     }
-    return makeBoolean(vmTaskIsDone(t->owner, t->threadId));
+    return makeBoolean(vmTaskIsDone(vm, t->threadId, t->generation));
 }
 
 // Cooperative, like vmThreadCancel itself: sets an atomic flag the worker's
@@ -11190,7 +11171,7 @@ Value vmBuiltinTaskCancel(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "TaskCancel received an invalid task.");
         return makeBoolean(false);
     }
-    return makeBoolean(vmThreadCancel(t->owner, t->threadId));
+    return makeBoolean(vmTaskCancel(vm, t->threadId, t->generation));
 }
 
 // VM 2.0 Phase 5b checkpoint 5b-i (Docs/pscal_vm2_plan.md Sec 6.2):
