@@ -28,6 +28,10 @@ typedef struct AST {
     bool is_exported;        // Flag for exported module declarations
     struct AST *type_def;    // For TYPE_REFERENCE etc.
     bool freed;              // Internal flag to guard against double free
+    // AST_RECORD_TYPE only: the field layout createEmptyRecord last computed
+    // for this type (core/utils.c, RecordTypeLayout), reused while the symbol
+    // and type tables are unchanged. Owned by this node; not copied.
+    struct RecordTypeLayout *record_layout;
 } AST;
 
 AST *newASTNode(ASTNodeType type, Token *token);

@@ -22,12 +22,7 @@ static bool appendField(FieldValue** head, FieldValue** tail, const char* name, 
         freeValue(&value);
         return false;
     }
-    node->name = strdup(name);
-    if (!node->name) {
-        free(node);
-        freeValue(&value);
-        return false;
-    }
+    node->name = pscalInternName(name);
     node->value = value;
     node->storage = &node->value;
     node->type_def = NULL;

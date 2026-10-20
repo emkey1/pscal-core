@@ -267,6 +267,7 @@ void hashTableInsert(HashTable *table, Symbol *symbol) {
     // Insert the symbol at the head of the linked list in the bucket
     symbol->next = table->buckets[index]; // New symbol points to the current head
     table->buckets[index] = symbol;        // Bucket head now points to the new symbol
+    pscalNoteTypeTablesChanged();          // cached record layouts may depend on it
 
     DEBUG_PRINT("[DEBUG SYMBOL] Inserted Symbol '%s' at %p into bucket %d of HashTable %p.\n",
                 symbol->name, (void*)symbol, index, (void*)table);
@@ -411,10 +412,7 @@ void insertGlobalSymbol(const char *name, VarType type, AST *type_def) {
             def = def->right;
         }
         if (def && def->type == AST_ENUM_TYPE && def->token && def->token->value) {
-            if (AS_ENUM(*new_symbol->value).enum_name) {
-                free(AS_ENUM(*new_symbol->value).enum_name);
-            }
-            AS_ENUM(*new_symbol->value).enum_name = strdup(def->token->value);
+            AS_ENUM(*new_symbol->value).enum_name = pscalInternName(def->token->value);
             AS_ENUM(*new_symbol->value).ordinal = 0;
             ENUM_TYPE_DEF(*new_symbol->value) = def;
         }
@@ -1364,8 +1362,7 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
 
         case TYPE_ENUM:
             if (VALUE_TYPE(val) == TYPE_ENUM) {
-                if(AS_ENUM(*sym->value).enum_name) free(AS_ENUM(*sym->value).enum_name);
-                AS_ENUM(*sym->value).enum_name = AS_ENUM(val).enum_name ? strdup(AS_ENUM(val).enum_name) : NULL;
+                AS_ENUM(*sym->value).enum_name = AS_ENUM(val).enum_name; // interned
                 AS_ENUM(*sym->value).ordinal = AS_ENUM(val).ordinal;
             } else if (isIntlikeType(VALUE_TYPE(val))) {
                 AST* typeDef = sym->type_def;

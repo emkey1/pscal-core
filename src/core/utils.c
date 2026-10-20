@@ -28,6 +28,8 @@
 #include <sys/stat.h>  // For stat
 #include <limits.h>    // For PATH_MAX
 #include <stdint.h>    // For SIZE_MAX
+#include <stddef.h>    // For offsetof
+#include <stdatomic.h>
 #include <pthread.h>
 #ifdef __linux__
 #include <linux/limits.h>
@@ -669,13 +671,25 @@ static void mstreamDestroy(ObjHeader *header) {
     free(ms);
 }
 
+// Each boxed type registers its ObjHeader destructor on its first
+// allocation. Calling pthread_once on every allocation showed up in VM
+// profiles; once the registration has run, its flag makes this one load.
+#define PSCAL_ENSURE_DESTRUCTOR(registered, once, fn) \
+    do { \
+        if (!atomic_load_explicit(&(registered), memory_order_acquire)) { \
+            pthread_once(&(once), (fn)); \
+        } \
+    } while (0)
+
 static pthread_once_t g_mstream_destructor_once = PTHREAD_ONCE_INIT;
+static _Atomic bool g_mstream_destructor_registered = false;
 static void registerMStreamDestructor(void) {
     pscalObjRegisterDestructor(TYPE_MEMORYSTREAM, mstreamDestroy);
+    atomic_store_explicit(&g_mstream_destructor_registered, true, memory_order_release);
 }
 
 MStream *createMStream(void) {
-    pthread_once(&g_mstream_destructor_once, registerMStreamDestructor);
+    PSCAL_ENSURE_DESTRUCTOR(g_mstream_destructor_registered, g_mstream_destructor_once, registerMStreamDestructor);
     MStream *ms = malloc(sizeof(MStream));
     if (!ms) {
         fprintf(stderr, "Memory allocation error in create_memory_stream\n");
@@ -711,12 +725,14 @@ static void taskObjDestroy(ObjHeader *header) {
 }
 
 static pthread_once_t g_task_destructor_once = PTHREAD_ONCE_INIT;
+static _Atomic bool g_task_destructor_registered = false;
 static void registerTaskObjDestructor(void) {
     pscalObjRegisterDestructor(TYPE_TASK, taskObjDestroy);
+    atomic_store_explicit(&g_task_destructor_registered, true, memory_order_release);
 }
 
 TaskObj *createTaskObj(int threadId, struct VM_s *owner, uint32_t generation) {
-    pthread_once(&g_task_destructor_once, registerTaskObjDestructor);
+    PSCAL_ENSURE_DESTRUCTOR(g_task_destructor_registered, g_task_destructor_once, registerTaskObjDestructor);
     TaskObj *t = malloc(sizeof(TaskObj));
     if (!t) {
         fprintf(stderr, "Memory allocation error in createTaskObj\n");
@@ -757,8 +773,10 @@ static void channelObjDestroy(ObjHeader *header) {
 }
 
 static pthread_once_t g_channel_destructor_once = PTHREAD_ONCE_INIT;
+static _Atomic bool g_channel_destructor_registered = false;
 static void registerChannelObjDestructor(void) {
     pscalObjRegisterDestructor(TYPE_CHANNEL, channelObjDestroy);
+    atomic_store_explicit(&g_channel_destructor_registered, true, memory_order_release);
 }
 
 // Precondition: capacity >= 1, enforced by the ChannelCreate builtin (the
@@ -768,7 +786,7 @@ static void registerChannelObjDestructor(void) {
 // ring buffer would be a guaranteed modulo-by-zero/deadlock hazard, not
 // something to silently clamp away from a lower layer.
 ChannelObj *createChannelObj(size_t capacity) {
-    pthread_once(&g_channel_destructor_once, registerChannelObjDestructor);
+    PSCAL_ENSURE_DESTRUCTOR(g_channel_destructor_registered, g_channel_destructor_once, registerChannelObjDestructor);
     ChannelObj *ch = malloc(sizeof(ChannelObj));
     if (!ch) {
         fprintf(stderr, "Memory allocation error in createChannelObj\n");
@@ -831,12 +849,14 @@ static void mapObjDestroy(ObjHeader *header) {
 }
 
 static pthread_once_t g_map_destructor_once = PTHREAD_ONCE_INIT;
+static _Atomic bool g_map_destructor_registered = false;
 static void registerMapObjDestructor(void) {
     pscalObjRegisterDestructor(TYPE_MAP, mapObjDestroy);
+    atomic_store_explicit(&g_map_destructor_registered, true, memory_order_release);
 }
 
 MapObj *pscalMapObjCreate(VarType value_type) {
-    pthread_once(&g_map_destructor_once, registerMapObjDestructor);
+    PSCAL_ENSURE_DESTRUCTOR(g_map_destructor_registered, g_map_destructor_once, registerMapObjDestructor);
     MapObj *m = (MapObj *)calloc(1, sizeof(MapObj));
     if (!m) {
         fprintf(stderr, "Memory allocation error in pscalMapObjCreate\n");
@@ -1260,12 +1280,14 @@ static void setObjDestroy(ObjHeader *header) {
 }
 
 static pthread_once_t g_set_obj_destructor_once = PTHREAD_ONCE_INIT;
+static _Atomic bool g_set_obj_destructor_registered = false;
 static void registerSetObjDestructor(void) {
     pscalObjRegisterDestructor(TYPE_SET, setObjDestroy);
+    atomic_store_explicit(&g_set_obj_destructor_registered, true, memory_order_release);
 }
 
 SetObj *pscalSetObjCreate(void) {
-    pthread_once(&g_set_obj_destructor_once, registerSetObjDestructor);
+    PSCAL_ENSURE_DESTRUCTOR(g_set_obj_destructor_registered, g_set_obj_destructor_once, registerSetObjDestructor);
     SetObj *s = malloc(sizeof(SetObj));
     if (!s) {
         fprintf(stderr, "FATAL: Memory allocation failed in pscalSetObjCreate\n");
@@ -1291,13 +1313,15 @@ static void stringObjDestroy(ObjHeader *header) {
 }
 
 static pthread_once_t g_string_obj_destructor_once = PTHREAD_ONCE_INIT;
+static _Atomic bool g_string_obj_destructor_registered = false;
 static void registerStringObjDestructor(void) {
     pscalObjRegisterDestructor(TYPE_STRING, stringObjDestroy);
     pscalObjRegisterDestructor(TYPE_UNICODE_STRING, stringObjDestroy);
+    atomic_store_explicit(&g_string_obj_destructor_registered, true, memory_order_release);
 }
 
 StringObj *pscalStringObjCreate(int max_length, VarType owner_type) {
-    pthread_once(&g_string_obj_destructor_once, registerStringObjDestructor);
+    PSCAL_ENSURE_DESTRUCTOR(g_string_obj_destructor_registered, g_string_obj_destructor_once, registerStringObjDestructor);
     StringObj *s = malloc(sizeof(StringObj));
     if (!s) {
         fprintf(stderr, "FATAL: Memory allocation failed in pscalStringObjCreate\n");
@@ -1319,33 +1343,237 @@ void pscalStringEnsureObj(Value *v) {
     pscalValueSetHeapPtrBits(v, s);
 }
 
-// VM 2.0 Phase 4d: RecordObj is a thin wrapper only -- FieldValue's own
-// linked-list body, ownership rules, and the owns_storage/aliased-storage
-// trick are entirely unchanged (see core/types.h's RecordObj comment).
-// Unlike StringObj, the wrapper must tolerate `fields == NULL` (a
-// record Value with no type info available, e.g. makeValueForType's
-// "no node_to_inspect" branch) rather than ever leaving `record_val`
-// itself NULL -- AS_RECORD(v) unconditionally dereferences the wrapper.
+// Field and enum type names are interned: one process-lifetime copy per
+// distinct spelling, shared by every record and enum value that carries it,
+// so copying a value shares the pointer instead of strdup'ing the name, and
+// freeing a value never frees it. The table only grows. A slot is written
+// once (under g_intern_lock) and never changes, and a grown table replaces
+// the old one without freeing it (each keeps its predecessor reachable), so
+// a reader may probe whichever table it loaded without a lock: a miss there
+// just falls through to the locked path.
+typedef struct InternTable {
+    size_t mask;   // capacity - 1; capacity is a power of two
+    size_t count;  // written under g_intern_lock only
+    _Atomic(const char *) *slots;
+    struct InternTable *previous;
+} InternTable;
+
+static _Atomic(InternTable *) g_intern_table = NULL;
+static pthread_mutex_t g_intern_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint64_t internHash(const char *s) {
+    uint64_t h = 1469598103934665603ULL;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        h ^= *p;
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+static const char *internProbe(InternTable *t, const char *name, uint64_t h) {
+    for (size_t i = (size_t)h & t->mask;; i = (i + 1) & t->mask) {
+        const char *entry = atomic_load_explicit(&t->slots[i], memory_order_acquire);
+        if (!entry) return NULL;
+        if (strcmp(entry, name) == 0) return entry;
+    }
+}
+
+static void internPlace(InternTable *t, const char *entry, uint64_t h) {
+    size_t i = (size_t)h & t->mask;
+    while (atomic_load_explicit(&t->slots[i], memory_order_relaxed)) {
+        i = (i + 1) & t->mask;
+    }
+    atomic_store_explicit(&t->slots[i], entry, memory_order_release);
+    t->count++;
+}
+
+const char *pscalInternName(const char *name) {
+    if (!name) return NULL;
+    uint64_t h = internHash(name);
+    InternTable *t = atomic_load_explicit(&g_intern_table, memory_order_acquire);
+    if (t) {
+        const char *found = internProbe(t, name, h);
+        if (found) return found;
+    }
+
+    pthread_mutex_lock(&g_intern_lock);
+    t = atomic_load_explicit(&g_intern_table, memory_order_acquire);
+    const char *found = t ? internProbe(t, name, h) : NULL;
+    if (!found) {
+        // Keep the load factor at or below one half, so probes stay short and
+        // a probe always reaches an empty slot.
+        if (!t || (t->count + 1) * 2 > t->mask + 1) {
+            size_t capacity = t ? (t->mask + 1) * 2 : 256;
+            InternTable *grown = calloc(1, sizeof(InternTable));
+            _Atomic(const char *) *slots = calloc(capacity, sizeof(*slots));
+            if (!grown || !slots) {
+                fprintf(stderr, "FATAL: Memory allocation failed in pscalInternName\n");
+                EXIT_FAILURE_HANDLER();
+            }
+            grown->mask = capacity - 1;
+            grown->slots = slots;
+            grown->previous = t;
+            if (t) {
+                for (size_t i = 0; i <= t->mask; i++) {
+                    const char *entry = atomic_load_explicit(&t->slots[i], memory_order_relaxed);
+                    if (entry) internPlace(grown, entry, internHash(entry));
+                }
+            }
+            atomic_store_explicit(&g_intern_table, grown, memory_order_release);
+            t = grown;
+        }
+        char *copy = strdup(name);
+        if (!copy) {
+            fprintf(stderr, "FATAL: Memory allocation failed in pscalInternName\n");
+            EXIT_FAILURE_HANDLER();
+        }
+        internPlace(t, copy, h);
+        found = copy;
+    }
+    pthread_mutex_unlock(&g_intern_lock);
+    return found;
+}
+
+// See pscalNoteTypeTablesChanged (utils.h). Starts at 1 so a zeroed layout
+// never matches.
+static _Atomic uint64_t g_type_tables_generation = 1;
+
+void pscalNoteTypeTablesChanged(void) {
+    atomic_fetch_add_explicit(&g_type_tables_generation, 1u, memory_order_relaxed);
+}
+
 static void recordObjDestroy(ObjHeader *header) {
     RecordObj *r = (RecordObj *)header;
-    freeFieldValue(r->fields);
+    for (uint32_t i = 0; i < r->field_count; i++) {
+        FieldValue *f = &r->field_block[i];
+        if (f->owns_storage) {
+            freeValue(fieldValueStorage(f));
+        }
+    }
     free(r);
 }
 
 static pthread_once_t g_record_obj_destructor_once = PTHREAD_ONCE_INIT;
+static _Atomic bool g_record_obj_destructor_registered = false;
 static void registerRecordObjDestructor(void) {
     pscalObjRegisterDestructor(TYPE_RECORD, recordObjDestroy);
+    atomic_store_explicit(&g_record_obj_destructor_registered, true, memory_order_release);
 }
 
-RecordObj *pscalRecordObjCreate(FieldValue *fields) {
-    pthread_once(&g_record_obj_destructor_once, registerRecordObjDestructor);
-    RecordObj *r = malloc(sizeof(RecordObj));
+// A record with `count` zeroed fields, each next-linked to the one after it.
+static RecordObj *recordObjAllocate(uint32_t count) {
+    PSCAL_ENSURE_DESTRUCTOR(g_record_obj_destructor_registered, g_record_obj_destructor_once, registerRecordObjDestructor);
+    if ((size_t)count > (SIZE_MAX - sizeof(RecordObj)) / sizeof(FieldValue)) {
+        fprintf(stderr, "FATAL: Record of %u fields is too large\n", (unsigned)count);
+        EXIT_FAILURE_HANDLER();
+    }
+    RecordObj *r = calloc(1, sizeof(RecordObj) + (size_t)count * sizeof(FieldValue));
     if (!r) {
         fprintf(stderr, "FATAL: Memory allocation failed in pscalRecordObjCreate\n");
         EXIT_FAILURE_HANDLER();
     }
     pscalObjHeaderInit(&r->header, TYPE_RECORD);
-    r->fields = fields;
+    r->field_count = count;
+    r->fields = count ? r->field_block : NULL;
+    for (uint32_t i = 0; i + 1 < count; i++) {
+        r->field_block[i].next = &r->field_block[i + 1];
+    }
+    return r;
+}
+
+RecordObj *pscalRecordObjCreate(FieldValue *fields) {
+    uint32_t count = 0;
+    for (FieldValue *f = fields; f; f = f->next) count++;
+    RecordObj *r = recordObjAllocate(count);
+
+    FieldValue *src = fields;
+    for (uint32_t i = 0; i < count; i++, src = src->next) {
+        FieldValue *dst = &r->field_block[i];
+        dst->name = src->name;
+        dst->type_def = src->type_def;
+        dst->declared_type = src->declared_type;
+        dst->slot_index = src->slot_index;
+
+        Value *storage = fieldValueStorage(src);
+        if (storage == &src->value) {
+            dst->value = src->value;
+            dst->storage = &dst->value;
+            dst->owns_storage = src->owns_storage;
+            continue;
+        }
+        // Storage shared with an earlier field of the list.
+        uint32_t j = 0;
+        FieldValue *owner = fields;
+        while (owner != src && &owner->value != storage) {
+            owner = owner->next;
+            j++;
+        }
+        if (owner != src) {
+            dst->value = src->value;
+            dst->storage = &r->field_block[j].value;
+            dst->owns_storage = false;
+        } else {
+            // Storage outside the list: the record gets its own copy.
+            dst->value = makeCopyOfValue(storage);
+            dst->storage = &dst->value;
+            dst->owns_storage = true;
+        }
+    }
+
+    // The values moved into the block; only the nodes are left to free.
+    while (fields) {
+        FieldValue *next = fields->next;
+        free(fields);
+        fields = next;
+    }
+    return r;
+}
+
+RecordObj *pscalRecordObjCreateAnonymous(uint32_t field_count) {
+    RecordObj *r = recordObjAllocate(field_count);
+    for (uint32_t i = 0; i < field_count; i++) {
+        FieldValue *f = &r->field_block[i];
+        f->value = makeNil();
+        f->storage = &f->value;
+        f->slot_index = (int)i;
+        f->owns_storage = true;
+        f->declared_type = TYPE_VOID;
+    }
+    return r;
+}
+
+RecordObj *pscalRecordObjCopy(const RecordObj *src) {
+    uint32_t count = src ? src->field_count : 0;
+    RecordObj *r = recordObjAllocate(count);
+    for (uint32_t i = 0; i < count; i++) {
+        const FieldValue *s = &src->field_block[i];
+        FieldValue *d = &r->field_block[i];
+        d->name = s->name;
+        d->type_def = s->type_def;
+        d->declared_type = s->declared_type;
+        d->slot_index = s->slot_index;
+
+        // A field sharing an earlier field's storage (a variant or a
+        // redeclared slot) shares the copy of it.
+        const Value *storage = fieldValueStorageConst(s);
+        if (!s->owns_storage && storage) {
+            uintptr_t base = (uintptr_t)src->field_block;
+            uintptr_t at = (uintptr_t)storage;
+            if (at >= base && at < (uintptr_t)&src->field_block[i] &&
+                (at - base) % sizeof(FieldValue) == offsetof(FieldValue, value)) {
+                size_t j = (at - base) / sizeof(FieldValue);
+                if (r->field_block[j].owns_storage) {
+                    d->value.type = TYPE_VOID;
+                    d->storage = &r->field_block[j].value;
+                    d->owns_storage = false;
+                    continue;
+                }
+            }
+        }
+        d->value = makeCopyOfValue(storage);
+        d->storage = &d->value;
+        d->owns_storage = true;
+    }
     return r;
 }
 
@@ -1399,12 +1627,14 @@ static void arrayObjDestroy(ObjHeader *header) {
 }
 
 static pthread_once_t g_array_obj_destructor_once = PTHREAD_ONCE_INIT;
+static _Atomic bool g_array_obj_destructor_registered = false;
 static void registerArrayObjDestructor(void) {
     pscalObjRegisterDestructor(TYPE_ARRAY, arrayObjDestroy);
+    atomic_store_explicit(&g_array_obj_destructor_registered, true, memory_order_release);
 }
 
 ArrayObj *pscalArrayObjCreate(void) {
-    pthread_once(&g_array_obj_destructor_once, registerArrayObjDestructor);
+    PSCAL_ENSURE_DESTRUCTOR(g_array_obj_destructor_registered, g_array_obj_destructor_once, registerArrayObjDestructor);
     ArrayObj *a = calloc(1, sizeof(ArrayObj));
     if (!a) {
         fprintf(stderr, "FATAL: Memory allocation failed in pscalArrayObjCreate\n");
@@ -1422,22 +1652,22 @@ void pscalArrayEnsureObj(Value *v) {
     pscalValueSetHeapPtrBits(v, a);
 }
 
-// VM 2.0 Phase 4g: EnumObj destructor only owns enum_name (strdup'd);
-// enum_meta is a non-owned, shared/interned pointer (see core/types.h's
-// EnumObj comment) and must never be freed here.
+// VM 2.0 Phase 4g: EnumObj owns nothing but itself: enum_name is interned
+// and enum_meta is a non-owned, shared/interned pointer (see core/types.h's
+// EnumObj comment); neither may be freed here.
 static void enumObjDestroy(ObjHeader *header) {
-    EnumObj *e = (EnumObj *)header;
-    free(e->enum_name);
-    free(e);
+    free(header);
 }
 
 static pthread_once_t g_enum_obj_destructor_once = PTHREAD_ONCE_INIT;
+static _Atomic bool g_enum_obj_destructor_registered = false;
 static void registerEnumObjDestructor(void) {
     pscalObjRegisterDestructor(TYPE_ENUM, enumObjDestroy);
+    atomic_store_explicit(&g_enum_obj_destructor_registered, true, memory_order_release);
 }
 
 EnumObj *pscalEnumObjCreate(void) {
-    pthread_once(&g_enum_obj_destructor_once, registerEnumObjDestructor);
+    PSCAL_ENSURE_DESTRUCTOR(g_enum_obj_destructor_registered, g_enum_obj_destructor_once, registerEnumObjDestructor);
     EnumObj *e = calloc(1, sizeof(EnumObj));
     if (!e) {
         fprintf(stderr, "FATAL: Memory allocation failed in pscalEnumObjCreate\n");
@@ -1474,12 +1704,14 @@ static void fileObjDestroy(ObjHeader *header) {
 }
 
 static pthread_once_t g_file_obj_destructor_once = PTHREAD_ONCE_INIT;
+static _Atomic bool g_file_obj_destructor_registered = false;
 static void registerFileObjDestructor(void) {
     pscalObjRegisterDestructor(TYPE_FILE, fileObjDestroy);
+    atomic_store_explicit(&g_file_obj_destructor_registered, true, memory_order_release);
 }
 
 FileObj *pscalFileObjCreate(void) {
-    pthread_once(&g_file_obj_destructor_once, registerFileObjDestructor);
+    PSCAL_ENSURE_DESTRUCTOR(g_file_obj_destructor_registered, g_file_obj_destructor_once, registerFileObjDestructor);
     FileObj *fo = calloc(1, sizeof(FileObj));
     if (!fo) {
         fprintf(stderr, "FATAL: Memory allocation failed in pscalFileObjCreate\n");
@@ -1508,18 +1740,111 @@ void pscalFileEnsureObj(Value *v) {
 // TYPE_POINTER case does that check itself, exactly as it always has,
 // before ever calling pscalObjRelease. This destructor only ever tears
 // down the wrapper struct itself.
+//
+// Element and field addresses (GET_ELEMENT_ADDRESS, GET_FIELD_ADDRESS, ...)
+// are PointerObjs that mostly live for an instruction or two, so each thread
+// keeps up to POINTER_OBJ_CACHE_MAX released ones to hand out again instead
+// of going through malloc and free. Not under AddressSanitizer or
+// ThreadSanitizer, where reusing one would hide a use-after-free.
+#if defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__)
+#define PSCAL_POINTER_OBJ_CACHE 0
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#define PSCAL_POINTER_OBJ_CACHE 0
+#endif
+#endif
+#ifndef PSCAL_POINTER_OBJ_CACHE
+#define PSCAL_POINTER_OBJ_CACHE 1
+#endif
+
+#if PSCAL_POINTER_OBJ_CACHE
+// A thread's cache lives behind a pthread key, whose destructor frees it at
+// thread exit. (Not a _Thread_local: those are torn down by their own key
+// destructor, in no particular order relative to this one.) POSIX clears the
+// key before calling the destructor, so a PointerObj released later during
+// that thread's teardown just starts a new cache, which the next destructor
+// pass frees.
+#define POINTER_OBJ_CACHE_MAX 64u
+
+typedef struct PointerObjCache {
+    PointerObj *head; // linked through each entry's `address`
+    unsigned count;
+} PointerObjCache;
+
+static pthread_key_t g_pointer_obj_cache_key;
+static pthread_once_t g_pointer_obj_cache_key_once = PTHREAD_ONCE_INIT;
+static _Atomic bool g_pointer_obj_cache_ready = false;
+
+static void pointerObjCacheThreadExit(void *arg) {
+    PointerObjCache *cache = (PointerObjCache *)arg;
+    while (cache->head) {
+        PointerObj *po = cache->head;
+        cache->head = (PointerObj *)po->address;
+        free(po);
+    }
+    free(cache);
+}
+
+static void pointerObjCacheKeyInit(void) {
+    if (pthread_key_create(&g_pointer_obj_cache_key, pointerObjCacheThreadExit) == 0) {
+        atomic_store_explicit(&g_pointer_obj_cache_ready, true, memory_order_release);
+    }
+}
+
+// This thread's cache, or NULL when it cannot have one.
+static PointerObjCache *pointerObjCacheForThread(void) {
+    if (!atomic_load_explicit(&g_pointer_obj_cache_ready, memory_order_acquire)) {
+        pthread_once(&g_pointer_obj_cache_key_once, pointerObjCacheKeyInit);
+        if (!atomic_load_explicit(&g_pointer_obj_cache_ready, memory_order_acquire)) {
+            return NULL;
+        }
+    }
+    PointerObjCache *cache = (PointerObjCache *)pthread_getspecific(g_pointer_obj_cache_key);
+    if (!cache) {
+        cache = calloc(1, sizeof(PointerObjCache));
+        if (cache && pthread_setspecific(g_pointer_obj_cache_key, cache) != 0) {
+            free(cache);
+            cache = NULL;
+        }
+    }
+    return cache;
+}
+#endif
+
 static void pointerObjDestroy(ObjHeader *header) {
     PointerObj *po = (PointerObj *)header;
+#if PSCAL_POINTER_OBJ_CACHE
+    PointerObjCache *cache = pointerObjCacheForThread();
+    if (cache && cache->count < POINTER_OBJ_CACHE_MAX) {
+        po->address = (Value *)cache->head;
+        cache->head = po;
+        cache->count++;
+        return;
+    }
+#endif
     free(po);
 }
 
 static pthread_once_t g_pointer_obj_destructor_once = PTHREAD_ONCE_INIT;
+static _Atomic bool g_pointer_obj_destructor_registered = false;
 static void registerPointerObjDestructor(void) {
     pscalObjRegisterDestructor(TYPE_POINTER, pointerObjDestroy);
+    atomic_store_explicit(&g_pointer_obj_destructor_registered, true, memory_order_release);
 }
 
 PointerObj *pscalPointerObjCreate(void) {
-    pthread_once(&g_pointer_obj_destructor_once, registerPointerObjDestructor);
+    PSCAL_ENSURE_DESTRUCTOR(g_pointer_obj_destructor_registered, g_pointer_obj_destructor_once, registerPointerObjDestructor);
+#if PSCAL_POINTER_OBJ_CACHE
+    PointerObjCache *cache = pointerObjCacheForThread();
+    if (cache && cache->head) {
+        PointerObj *reused = cache->head;
+        cache->head = (PointerObj *)reused->address;
+        cache->count--;
+        memset(reused, 0, sizeof(PointerObj));
+        pscalObjHeaderInit(&reused->header, TYPE_POINTER);
+        return reused;
+    }
+#endif
     PointerObj *po = calloc(1, sizeof(PointerObj));
     if (!po) {
         fprintf(stderr, "FATAL: Memory allocation failed in pscalPointerObjCreate\n");
@@ -1559,127 +1884,6 @@ InterfaceObj *pscalInterfaceObjCreate(void) {
         EXIT_FAILURE_HANDLER();
     }
     return io;
-}
-
-static bool ensureFieldSlotCapacity(FieldValue*** slotOwners, int* capacity, int requiredSlots) {
-    if (!slotOwners || !capacity || requiredSlots <= *capacity) {
-        return true;
-    }
-    // Field slot operands are at most 16 bits wide. A larger slot index can
-    // only come from a malformed type (one read from a .bc file), and
-    // doubling toward it overflowed the int capacity.
-    if (requiredSlots > 0x10000) {
-        return false;
-    }
-
-    int newCapacity = (*capacity > 0) ? *capacity : 4;
-    while (newCapacity < requiredSlots) {
-        newCapacity *= 2;
-    }
-
-    FieldValue** resized = realloc(*slotOwners, sizeof(FieldValue*) * newCapacity);
-    if (!resized) {
-        return false;
-    }
-    memset(resized + *capacity, 0, sizeof(FieldValue*) * (newCapacity - *capacity));
-    *slotOwners = resized;
-    *capacity = newCapacity;
-    return true;
-}
-
-FieldValue *copyRecord(FieldValue *orig) {
-    if (!orig) return NULL;
-
-    FieldValue *new_head = NULL;
-    FieldValue **tail_next = &new_head;
-    const Value **oldStorages = NULL;
-    Value **newStorages = NULL;
-    int storageCount = 0;
-    int storageCapacity = 0;
-
-    for (FieldValue *curr = orig; curr != NULL; curr = curr->next) {
-        FieldValue *new_field = (FieldValue*)calloc(1, sizeof(FieldValue));
-        if (!new_field) {
-            fprintf(stderr, "Memory allocation error in copyRecord for new_field\n");
-            free(oldStorages);
-            free(newStorages);
-            freeFieldValue(new_head);
-            EXIT_FAILURE_HANDLER();
-            return NULL;
-        }
-
-        if (curr->name) {
-            new_field->name = strdup(curr->name);
-            if (!new_field->name) {
-                fprintf(stderr, "Memory allocation error in copyRecord for new_field->name\n");
-                free(new_field);
-                free(oldStorages);
-                free(newStorages);
-                freeFieldValue(new_head);
-                EXIT_FAILURE_HANDLER();
-                return NULL;
-            }
-        }
-
-        new_field->slot_index = curr->slot_index;
-        new_field->type_def = curr->type_def;
-        new_field->declared_type = curr->declared_type;
-        new_field->owns_storage = curr->owns_storage;
-        new_field->next = NULL;
-
-        const Value *oldStorage = fieldValueStorageConst(curr);
-        Value *mappedStorage = NULL;
-        for (int i = 0; i < storageCount; i++) {
-            if (oldStorages[i] == oldStorage) {
-                mappedStorage = newStorages[i];
-                break;
-            }
-        }
-
-        if (curr->owns_storage || !mappedStorage) {
-            new_field->value = makeCopyOfValue(oldStorage);
-            new_field->storage = &new_field->value;
-
-            if (storageCount == storageCapacity) {
-                int newCapacity = (storageCapacity > 0) ? storageCapacity * 2 : 4;
-                const Value **resizedOld = realloc(oldStorages, sizeof(Value*) * newCapacity);
-                if (!resizedOld) {
-                    free(oldStorages);
-                    freeFieldValue(new_head);
-                    freeFieldValue(new_field);
-                    EXIT_FAILURE_HANDLER();
-                    return NULL;
-                }
-                Value **resizedNew = realloc(newStorages, sizeof(Value*) * newCapacity);
-                if (!resizedNew) {
-                    free(resizedOld);
-                    free(newStorages);
-                    freeFieldValue(new_head);
-                    freeFieldValue(new_field);
-                    EXIT_FAILURE_HANDLER();
-                    return NULL;
-                }
-                oldStorages = resizedOld;
-                newStorages = resizedNew;
-                storageCapacity = newCapacity;
-            }
-            oldStorages[storageCount] = oldStorage;
-            newStorages[storageCount] = new_field->storage;
-            storageCount++;
-        } else {
-            memset(&new_field->value, 0, sizeof(new_field->value));
-            new_field->value.type = TYPE_VOID;
-            new_field->storage = mappedStorage;
-            new_field->owns_storage = false;
-        }
-
-        *tail_next = new_field;
-        tail_next = &new_field->next;
-    }
-
-    free(oldStorages);
-    free(newStorages);
-    return new_head;
 }
 
 static AST* resolveTypeAliasForRecord(AST* typeNode) {
@@ -1947,14 +2151,101 @@ static bool pascalVarTypeSize(VarType type, long long *out_bytes) {
  * diagnosable error instead of a stack-overflow segfault. */
 #define PSCAL_MAX_RECORD_EMBED_DEPTH 256
 
-FieldValue *createEmptyRecord(AST *recordType) {
+// What createEmptyRecord works out from a record type's AST (and the
+// procedure/type tables, for inherited and virtual-method slots): each
+// field's name, declared type and slot, and which field's storage it uses.
+// Computing it scans the whole procedure table (recordTypeNeedsVTableSlot),
+// which every `new`, SetLength of a record array and record-field access on
+// an ALLOC_OBJECT object used to repeat. It is cached on the type's node and
+// reused while the generation and the procedure and type tables in effect
+// (per thread on iOS, PSCAL_THREAD_LOCAL) match what it was built from:
+// tables only change while code is being compiled, and every insert (and
+// each compile's start and end) moves the generation on. A thread with no
+// type table never caches, building fresh as before, so its records keep the
+// shape they always had there.
+typedef struct RecordLayoutField {
+    const char *name;   // interned
+    AST *type_def;
+    VarType declared_type;
+    int slot_index;
+    int owner;          // field whose storage this one uses (itself when it owns it)
+    bool is_vtable;     // the hidden __vtable field, which starts as nil
+} RecordLayoutField;
+
+typedef struct RecordTypeLayout {
+    _Atomic uint32_t refcount;
+    bool cacheable;     // built without printing a diagnostic
+    uint64_t generation;
+    const void *procedure_table;
+    const void *type_table;
+    int field_count;
+    RecordLayoutField fields[];
+} RecordTypeLayout;
+
+typedef struct RecordLayoutBuilder {
+    RecordLayoutField *fields;
+    int count;
+    int capacity;
+    bool diagnosed;
+} RecordLayoutBuilder;
+
+static pthread_mutex_t g_record_layout_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Thread_local int t_record_embed_depth = 0; // per thread on every target, unlike PSCAL_THREAD_LOCAL
+
+static void recordLayoutBuilderPush(RecordLayoutBuilder *b, RecordLayoutField field) {
+    if (b->count == b->capacity) {
+        int capacity = b->capacity ? b->capacity * 2 : 8;
+        RecordLayoutField *grown = realloc(b->fields, sizeof(RecordLayoutField) * (size_t)capacity);
+        if (!grown) {
+            fprintf(stderr, "FATAL: Memory allocation failed in createEmptyRecord.\n");
+            EXIT_FAILURE_HANDLER();
+        }
+        b->fields = grown;
+        b->capacity = capacity;
+    }
+    b->fields[b->count++] = field;
+}
+
+static bool ensureFieldSlotCapacity(int **slotOwners, int *capacity, int requiredSlots) {
+    if (requiredSlots <= *capacity) {
+        return true;
+    }
+    // Field slot operands are at most 16 bits wide. A larger slot index can
+    // only come from a malformed type (one read from a .bc file), and
+    // doubling toward it overflowed the int capacity.
+    if (requiredSlots > 0x10000) {
+        return false;
+    }
+
+    int newCapacity = (*capacity > 0) ? *capacity : 4;
+    while (newCapacity < requiredSlots) {
+        newCapacity *= 2;
+    }
+
+    int *resized = realloc(*slotOwners, sizeof(int) * (size_t)newCapacity);
+    if (!resized) {
+        return false;
+    }
+    for (int i = *capacity; i < newCapacity; i++) {
+        resized[i] = -1;
+    }
+    *slotOwners = resized;
+    *capacity = newCapacity;
+    return true;
+}
+
+// Appends recordType's fields (its hidden __vtable, its parent's fields,
+// then its own) to `b`. Returns false, adding nothing, when recordType is
+// not a record type.
+static bool buildRecordLayoutFields(RecordLayoutBuilder *b, AST *recordType, int depth) {
     recordType = resolveTypeAliasForRecord(recordType);
 
     // Check if we have a valid RECORD_TYPE node
     if (!recordType || recordType->type != AST_RECORD_TYPE) {
         fprintf(stderr, "Error in createEmptyRecord: Invalid or NULL recordType node provided (Type: %s).\n",
                 recordType ? astTypeToString(recordType->type) : "NULL");
-        return NULL; // Return NULL explicitly on error
+        b->diagnosed = true;
+        return false;
     }
 
     /* Recursion guard (defense in depth): a record type whose embedded fields
@@ -1962,79 +2253,59 @@ FieldValue *createEmptyRecord(AST *recordType) {
      * die as a bare segfault. Frontends are expected to make class-typed
      * fields references (rea) or reject incomplete embedded types (pascal),
      * so tripping this means a frontend let a cycle through -- fail loudly. */
-    static _Thread_local int embedDepth = 0;
-    if (embedDepth >= PSCAL_MAX_RECORD_EMBED_DEPTH) {
+    if (depth >= PSCAL_MAX_RECORD_EMBED_DEPTH) {
         const char *typeName = (recordType->token && recordType->token->value)
                                    ? recordType->token->value : "<anonymous>";
         fprintf(stderr, "Error in createEmptyRecord: record type nesting exceeded %d levels "
                         "while building '%s'; embedded record definitions likely form a cycle.\n",
                 PSCAL_MAX_RECORD_EMBED_DEPTH, typeName);
-        return NULL;
+        b->diagnosed = true;
+        return false;
     }
-    embedDepth++;
-
-    FieldValue *head = NULL, **ptr = &head; // Use pointer-to-pointer for easy list building
 
     AST* parentRecord = resolveTypeAliasForRecord(recordType->extra);
-    bool parentNeedsVTableSlot = parentRecord && parentRecord != recordType &&
-                                 recordTypeNeedsVTableSlot(parentRecord);
+    bool hasParent = parentRecord && parentRecord != recordType;
+    bool parentNeedsVTableSlot = hasParent && recordTypeNeedsVTableSlot(parentRecord);
     bool needsVTableSlot = recordTypeNeedsVTableSlot(recordType) && !parentNeedsVTableSlot;
     int slotBias = needsVTableSlot ? 1 : 0;
-    int inheritedSlotCount = (parentRecord && parentRecord != recordType)
-                                 ? getRecordSlotCount(parentRecord)
-                                 : 0;
+    int inheritedSlotCount = hasParent ? getRecordSlotCount(parentRecord) : 0;
     int totalSlotCount = getRecordSlotCount(recordType);
-    int slotOwnerCapacity = totalSlotCount + slotBias;
-    FieldValue **slotOwners = NULL;
-    if (slotOwnerCapacity > 0) {
-        slotOwners = calloc((size_t)slotOwnerCapacity, sizeof(FieldValue*));
-        if (!slotOwners) {
-            fprintf(stderr, "FATAL: calloc failed for record slot owner table in createEmptyRecord.\n");
-            EXIT_FAILURE_HANDLER();
-        }
+    // The field owning each slot's storage, or -1.
+    int slotOwnerCapacity = 0;
+    int *slotOwners = NULL;
+    if (!ensureFieldSlotCapacity(&slotOwners, &slotOwnerCapacity, totalSlotCount + slotBias)) {
+        fprintf(stderr, "FATAL: calloc failed for record slot owner table in createEmptyRecord.\n");
+        EXIT_FAILURE_HANDLER();
     }
     int sequentialSlot = slotBias + inheritedSlotCount;
 
     if (needsVTableSlot) {
-        FieldValue *vtableField = calloc(1, sizeof(FieldValue));
-        if (!vtableField) {
-             free(slotOwners);
-             fprintf(stderr, "FATAL: malloc failed for hidden vtable field in createEmptyRecord.\n");
-             EXIT_FAILURE_HANDLER();
-        }
-        vtableField->name = strdup("__vtable");
-        if (!vtableField->name) {
-             fprintf(stderr, "FATAL: strdup failed for hidden vtable field name in createEmptyRecord.\n");
-             free(vtableField);
-             free(slotOwners);
-             EXIT_FAILURE_HANDLER();
-        }
-        vtableField->value = makeNil();
-        vtableField->storage = &vtableField->value;
-        vtableField->type_def = NULL;
-        vtableField->declared_type = TYPE_POINTER;
-        vtableField->slot_index = 0;
-        vtableField->owns_storage = true;
-        vtableField->next = NULL;
-        *ptr = vtableField;
-        ptr = &vtableField->next;
+        RecordLayoutField vtableField = {
+            .name = pscalInternName("__vtable"),
+            .type_def = NULL,
+            .declared_type = TYPE_POINTER,
+            .slot_index = 0,
+            .owner = b->count,
+            .is_vtable = true,
+        };
+        recordLayoutBuilderPush(b, vtableField);
     }
 
-    if (parentRecord && parentRecord != recordType) {
-        FieldValue *baseFields = createEmptyRecord(parentRecord);
-        *ptr = baseFields;
-        while (*ptr) {
-            FieldValue *field = *ptr;
+    if (hasParent) {
+        int first = b->count;
+        buildRecordLayoutFields(b, parentRecord, depth + 1);
+        for (int k = first; k < b->count; k++) {
+            RecordLayoutField *field = &b->fields[k];
             if (field->slot_index >= 0) {
                 if (!ensureFieldSlotCapacity(&slotOwners, &slotOwnerCapacity, field->slot_index + 1)) {
                     fprintf(stderr, "FATAL: realloc failed for inherited record slot owner table in createEmptyRecord.\n");
                     free(slotOwners);
-                    freeFieldValue(head);
                     EXIT_FAILURE_HANDLER();
                 }
-                slotOwners[field->slot_index] = field->owns_storage ? field : slotOwners[field->slot_index];
+                if (field->owner == k) {
+                    slotOwners[field->slot_index] = k;
+                }
             }
-            ptr = &field->next;
         }
     }
 
@@ -2045,6 +2316,7 @@ FieldValue *createEmptyRecord(AST *recordType) {
         // --- Robustness Check: Ensure fieldDecl is a valid VAR_DECL node ---
         if (!fieldDecl) {
              fprintf(stderr, "Warning: NULL field declaration node at index %d in createEmptyRecord.\n", i);
+             b->diagnosed = true;
              continue; // Skip this invalid entry
         }
         if (fieldDecl->type != AST_VAR_DECL) {
@@ -2052,6 +2324,7 @@ FieldValue *createEmptyRecord(AST *recordType) {
                 fprintf(stderr,
                         "Warning: Expected VAR_DECL for field group at index %d in createEmptyRecord, found %s.\n",
                         i, astTypeToString(fieldDecl->type));
+                b->diagnosed = true;
             }
             continue; // Skip invalid entry
         }
@@ -2067,86 +2340,203 @@ FieldValue *createEmptyRecord(AST *recordType) {
             // --- Robustness Check: Ensure varNode and its token are valid ---
             if (!varNode || varNode->type != AST_VARIABLE || !varNode->token || !varNode->token->value) {
                  fprintf(stderr, "Warning: Invalid field variable node or token at index %d,%d in createEmptyRecord.\n", i, j);
+                 b->diagnosed = true;
                  continue; // Skip this invalid field name
             }
             // ---
-
-            // Allocate memory for the FieldValue struct (holds name + value)
-            FieldValue *fv = calloc(1, sizeof(FieldValue));
-            if (!fv) {
-                 fprintf(stderr, "FATAL: malloc failed for FieldValue in createEmptyRecord for field '%s'\n", varNode->token->value);
-                 free(slotOwners);
-                 freeFieldValue(head); // Free any partially built list
-                 EXIT_FAILURE_HANDLER();
-            }
-
-            // Duplicate the field name
-            fv->name = strdup(varNode->token->value);
-            if (!fv->name) {
-                 fprintf(stderr, "FATAL: strdup failed for FieldValue name in createEmptyRecord for field '%s'\n", varNode->token->value);
-                 free(fv); // Free the FieldValue struct itself
-                 free(slotOwners);
-                 freeFieldValue(head);
-                 EXIT_FAILURE_HANDLER();
-            }
 
             bool usesExplicitSlots = (recordType->i_val > 0);
             int slotIndex = usesExplicitSlots
                                 ? (slotBias + inheritedSlotCount + varNode->i_val)
                                 : sequentialSlot++;
-            fv->slot_index = slotIndex;
-            fv->type_def = fieldTypeDef;
-            fv->declared_type = fieldType;
-            fv->next = NULL; // Initialize next pointer
-
-            if (slotIndex >= 0) {
-                if (!ensureFieldSlotCapacity(&slotOwners, &slotOwnerCapacity, slotIndex + 1)) {
-                    fprintf(stderr, "FATAL: realloc failed for record slot owner table in createEmptyRecord.\n");
-                    free(slotOwners);
-                    freeFieldValue(head);
-                    freeFieldValue(fv);
-                    EXIT_FAILURE_HANDLER();
-                }
+            if (slotIndex >= 0 &&
+                !ensureFieldSlotCapacity(&slotOwners, &slotOwnerCapacity, slotIndex + 1)) {
+                fprintf(stderr, "FATAL: realloc failed for record slot owner table in createEmptyRecord.\n");
+                free(slotOwners);
+                EXIT_FAILURE_HANDLER();
             }
 
-            if (slotIndex >= 0 && slotOwners && slotOwners[slotIndex]) {
-                fv->storage = fieldValueStorage(slotOwners[slotIndex]);
-                fv->owns_storage = false;
-                memset(&fv->value, 0, sizeof(fv->value));
-                fv->value.type = TYPE_VOID;
-            } else {
-                // Recursively create the default value for this field's type
-                fv->value = makeValueForType(fieldType, fieldTypeDef, NULL); // Relies on makeValueForType checks
-                fv->storage = &fv->value;
-                fv->owns_storage = true;
-                if (slotIndex >= 0 && slotOwners) {
-                    slotOwners[slotIndex] = fv;
-                }
+            RecordLayoutField field = {
+                .name = pscalInternName(varNode->token->value),
+                .type_def = fieldTypeDef,
+                .declared_type = fieldType,
+                .slot_index = slotIndex,
+                .owner = b->count,
+                .is_vtable = false,
+            };
+            if (slotIndex >= 0 && slotOwners[slotIndex] >= 0) {
+                // A variant or redeclared slot: share the storage of the
+                // field that claimed it first.
+                field.owner = slotOwners[slotIndex];
+            } else if (slotIndex >= 0) {
+                slotOwners[slotIndex] = b->count;
             }
-
-            // Link this new FieldValue struct into the list
-            *ptr = fv;
-            ptr = &fv->next; // Advance the tail pointer
+            recordLayoutBuilderPush(b, field);
         }
     }
     free(slotOwners);
-    embedDepth--;
-    return head; // Return the head of the linked list of fields
+    return true;
 }
 
+static void recordTypeLayoutRelease(RecordTypeLayout *layout) {
+    if (layout && atomic_fetch_sub_explicit(&layout->refcount, 1u, memory_order_acq_rel) == 1u) {
+        free(layout);
+    }
+}
+
+static RecordTypeLayout *recordTypeLayoutBuild(AST *recordType) {
+    RecordLayoutBuilder b = {0};
+    if (!buildRecordLayoutFields(&b, recordType, t_record_embed_depth)) {
+        free(b.fields);
+        return NULL;
+    }
+    RecordTypeLayout *layout = malloc(sizeof(RecordTypeLayout) + sizeof(RecordLayoutField) * (size_t)b.count);
+    if (!layout) {
+        fprintf(stderr, "FATAL: Memory allocation failed in createEmptyRecord.\n");
+        EXIT_FAILURE_HANDLER();
+    }
+    atomic_init(&layout->refcount, 1u);
+    layout->cacheable = !b.diagnosed;
+    layout->generation = 0;
+    layout->procedure_table = NULL;
+    layout->type_table = NULL;
+    layout->field_count = b.count;
+    if (b.count > 0) {
+        memcpy(layout->fields, b.fields, sizeof(RecordLayoutField) * (size_t)b.count);
+    }
+    free(b.fields);
+    return layout;
+}
+
+// recordType's layout, retained (recordTypeLayoutRelease it), or NULL after
+// a diagnostic when recordType is not a record type.
+static RecordTypeLayout *recordTypeLayoutAcquire(AST *recordType) {
+    AST *resolved = resolveTypeAliasForRecord(recordType);
+    if (!resolved || resolved->type != AST_RECORD_TYPE) {
+        return recordTypeLayoutBuild(recordType); // reports the error, returns NULL
+    }
+
+    uint64_t generation = atomic_load_explicit(&g_type_tables_generation, memory_order_acquire);
+    const void *procedures = procedure_table;
+    const void *types = type_table;
+    bool cacheable = types != NULL;
+    if (cacheable) {
+        pthread_mutex_lock(&g_record_layout_lock);
+        RecordTypeLayout *cached = resolved->record_layout;
+        if (cached && cached->generation == generation &&
+            cached->procedure_table == procedures && cached->type_table == types) {
+            atomic_fetch_add_explicit(&cached->refcount, 1u, memory_order_relaxed);
+            pthread_mutex_unlock(&g_record_layout_lock);
+            return cached;
+        }
+        pthread_mutex_unlock(&g_record_layout_lock);
+    }
+
+    RecordTypeLayout *built = recordTypeLayoutBuild(resolved);
+    if (built && cacheable && built->cacheable) {
+        built->generation = generation;
+        built->procedure_table = procedures;
+        built->type_table = types;
+        atomic_fetch_add_explicit(&built->refcount, 1u, memory_order_relaxed); // the cache's reference
+        pthread_mutex_lock(&g_record_layout_lock);
+        RecordTypeLayout *old = resolved->record_layout;
+        resolved->record_layout = built;
+        pthread_mutex_unlock(&g_record_layout_lock);
+        recordTypeLayoutRelease(old);
+    }
+    return built;
+}
+
+void pscalRecordTypeLayoutDiscard(AST *recordType) {
+    if (!recordType || !recordType->record_layout) {
+        return;
+    }
+    pthread_mutex_lock(&g_record_layout_lock);
+    RecordTypeLayout *old = recordType->record_layout;
+    recordType->record_layout = NULL;
+    pthread_mutex_unlock(&g_record_layout_lock);
+    recordTypeLayoutRelease(old);
+}
+
+RecordObj *pscalRecordObjCreateForType(AST *recordType) {
+    RecordTypeLayout *layout = recordTypeLayoutAcquire(recordType);
+    if (!layout) {
+        return NULL;
+    }
+    if (t_record_embed_depth >= PSCAL_MAX_RECORD_EMBED_DEPTH) {
+        AST *resolved = resolveTypeAliasForRecord(recordType);
+        const char *typeName = (resolved && resolved->token && resolved->token->value)
+                                   ? resolved->token->value : "<anonymous>";
+        fprintf(stderr, "Error in createEmptyRecord: record type nesting exceeded %d levels "
+                        "while building '%s'; embedded record definitions likely form a cycle.\n",
+                PSCAL_MAX_RECORD_EMBED_DEPTH, typeName);
+        recordTypeLayoutRelease(layout);
+        return NULL;
+    }
+
+    t_record_embed_depth++;
+    RecordObj *r = recordObjAllocate((uint32_t)layout->field_count);
+    for (int i = 0; i < layout->field_count; i++) {
+        const RecordLayoutField *lf = &layout->fields[i];
+        FieldValue *f = &r->field_block[i];
+        f->name = lf->name;
+        f->type_def = lf->type_def;
+        f->declared_type = lf->declared_type;
+        f->slot_index = lf->slot_index;
+        if (lf->owner == i) {
+            // Recursively create the default value for this field's type
+            f->value = lf->is_vtable ? makeNil() : makeValueForType(lf->declared_type, lf->type_def, NULL);
+            f->storage = &f->value;
+            f->owns_storage = true;
+        } else {
+            f->value.type = TYPE_VOID;
+            f->storage = &r->field_block[lf->owner].value;
+            f->owns_storage = false;
+        }
+    }
+    t_record_embed_depth--;
+    recordTypeLayoutRelease(layout);
+    return r;
+}
+
+bool pscalRecordTypeFieldInfo(AST *recordType, uint16_t field_index,
+                              const char **out_name, AST **out_type_def,
+                              VarType *out_declared_type) {
+    RecordTypeLayout *layout = recordTypeLayoutAcquire(recordType);
+    if (!layout) {
+        return false;
+    }
+    // GET_FIELD_OFFSET's lookup (vm.c findRecordFieldBySlot): the first field
+    // with that slot, or by position while no field has an explicit slot.
+    const RecordLayoutField *found = NULL;
+    bool sawExplicitSlots = false;
+    for (int i = 0; i < layout->field_count && !found; i++) {
+        const RecordLayoutField *lf = &layout->fields[i];
+        if (lf->slot_index >= 0) {
+            sawExplicitSlots = true;
+            if ((uint16_t)lf->slot_index == field_index) found = lf;
+        } else if (!sawExplicitSlots && (uint16_t)i == field_index) {
+            found = lf;
+        }
+    }
+    if (found) {
+        if (out_name) *out_name = found->name;
+        if (out_type_def) *out_type_def = found->type_def;
+        if (out_declared_type) *out_declared_type = found->declared_type;
+    }
+    recordTypeLayoutRelease(layout);
+    return found != NULL;
+}
 
 void freeFieldValue(FieldValue *fv) {
     FieldValue *current = fv;
     while (current) {
         FieldValue *next = current->next; // Store next pointer before freeing current node's contents
-        if (current->name) {
-            free(current->name); // Free the duplicated field name
-        }
         if (current->owns_storage) {
             // Recursively free the value stored in the field.
             freeValue(fieldValueStorage(current));
         }
-        // Free the FieldValue struct itself
+        // Free the FieldValue struct itself (its name is interned)
         free(current);
         current = next; // Move to the next node
     }
@@ -2763,7 +3153,10 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
             // The wrapper itself is never NULL (AS_RECORD dereferences it
             // unconditionally); only .fields can be NULL, matching the old
             // "no node_to_inspect" behavior exactly.
-            RecordObj *r = pscalRecordObjCreate(node_to_inspect ? createEmptyRecord(node_to_inspect) : NULL);
+            RecordObj *r = node_to_inspect ? pscalRecordObjCreateForType(node_to_inspect) : NULL;
+            if (!r) {
+                r = pscalRecordObjCreate(NULL);
+            }
             pscalValueSetHeapPtrBits(&v, r);
             break;
         }
@@ -2896,10 +3289,9 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
              EnumObj *e = pscalEnumObjCreate();
              pscalValueSetHeapPtrBits(&v, e);
              e->ordinal = 0;
-             e->enum_name = (actual_type_def && actual_type_def->token && actual_type_def->token->value)
-                                      ? strdup(actual_type_def->token->value)
-                                      : strdup("<unknown_enum>");
-             if (!e->enum_name) { /* Malloc error */ EXIT_FAILURE_HANDLER(); }
+             e->enum_name = pscalInternName((actual_type_def && actual_type_def->token && actual_type_def->token->value)
+                                                ? actual_type_def->token->value
+                                                : "<unknown_enum>");
              e->enum_type_def = actual_type_def;
              break;
         }
@@ -3073,13 +3465,15 @@ static void closureEnvPayloadDestroy(ObjHeader *header) {
 }
 
 static pthread_once_t g_closure_env_destructor_once = PTHREAD_ONCE_INIT;
+static _Atomic bool g_closure_env_destructor_registered = false;
 static void registerClosureEnvDestructor(void) {
     pscalObjRegisterDestructor(TYPE_CLOSURE, closureEnvPayloadDestroy);
     pscalObjRegisterDestructor(TYPE_INTERFACE, closureEnvPayloadDestroy);
+    atomic_store_explicit(&g_closure_env_destructor_registered, true, memory_order_release);
 }
 
 ClosureEnvPayload* createClosureEnv(uint16_t slot_count, VarType owner_type) {
-    pthread_once(&g_closure_env_destructor_once, registerClosureEnvDestructor);
+    PSCAL_ENSURE_DESTRUCTOR(g_closure_env_destructor_registered, g_closure_env_destructor_once, registerClosureEnvDestructor);
     ClosureEnvPayload* env = (ClosureEnvPayload*)calloc(1, sizeof(ClosureEnvPayload));
     if (!env) {
         fprintf(stderr, "FATAL: Memory allocation failed in createClosureEnv\n");
@@ -3836,14 +4230,7 @@ static void ensureEnumMemberExported(AST* enum_type_node, AST* value_node, const
 
     const char* enum_name = enum_type_node->token ? enum_type_node->token->value : NULL;
     if (enum_name) {
-        if (exported_enum->enum_name) {
-            free(exported_enum->enum_name);
-        }
-        exported_enum->enum_name = strdup(enum_name);
-        if (!exported_enum->enum_name) {
-            fprintf(stderr, "Memory allocation failure while duplicating enum name for '%s'.\n", member_name);
-            EXIT_FAILURE_HANDLER();
-        }
+        exported_enum->enum_name = pscalInternName(enum_name);
     }
 
     if (unit_name && *unit_name) {
@@ -4187,11 +4574,7 @@ Value makeEnum(const char *enum_name, int ordinal) {
     v.type = TYPE_ENUM;
     EnumObj *e = pscalEnumObjCreate();
     pscalValueSetHeapPtrBits(&v, e);
-    e->enum_name = enum_name ? strdup(enum_name) : NULL; // Duplicate the name
-     if (enum_name && !e->enum_name) { // Check strdup result
-         fprintf(stderr, "FATAL: strdup failed for enum_name in makeEnum\n");
-         EXIT_FAILURE_HANDLER();
-     }
+    e->enum_name = pscalInternName(enum_name);
     e->ordinal = ordinal;
     return v;
 }
@@ -4573,11 +4956,7 @@ Value makeCopyOfValue(const Value *src) {
             pscalValueSetHeapPtrBits(&v, e);
             e->enum_meta = src_enum ? src_enum->enum_meta : NULL;
             e->ordinal = src_enum ? src_enum->ordinal : 0;
-            e->enum_name = (src_enum && src_enum->enum_name) ? strdup(src_enum->enum_name) : NULL;
-            if (src_enum && src_enum->enum_name && !e->enum_name) {
-                 fprintf(stderr, "Memory allocation failed in makeCopyOfValue (enum name strdup)\n");
-                 EXIT_FAILURE_HANDLER();
-            }
+            e->enum_name = src_enum ? src_enum->enum_name : NULL; // interned, shared
             e->enum_type_def = src_enum ? src_enum->enum_type_def : NULL;
             break;
         }
@@ -4586,8 +4965,7 @@ Value makeCopyOfValue(const Value *src) {
             // read src's fields before overwriting with a fresh wrapper,
             // never mutate the aliased pointer in place.
             RecordObj *src_rec = PSCAL_VALUE_PTR(*src, RecordObj);
-            FieldValue *src_fields = src_rec ? src_rec->fields : NULL;
-            RecordObj *r = pscalRecordObjCreate(copyRecord(src_fields));
+            RecordObj *r = pscalRecordObjCopy(src_rec);
             pscalValueSetHeapPtrBits(&v, r);
             break;
         }
@@ -5047,7 +5425,8 @@ static bool recordShapesMatch(const FieldValue *a, const FieldValue *b) {
     while (a && b) {
         if (a->owns_storage != b->owns_storage) return false;
         if ((a->name == NULL) != (b->name == NULL)) return false;
-        if (a->name && strcasecmp(a->name, b->name) != 0) return false;
+        // Names are interned, so the same spelling is the same pointer.
+        if (a->name != b->name && strcasecmp(a->name, b->name) != 0) return false;
         a = a->next;
         b = b->next;
     }

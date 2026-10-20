@@ -34,6 +34,7 @@ void reserveTypePlaceholder(const char *name, VarType kind) {
         } else if (existing->typeAST->var_type == TYPE_UNKNOWN && kind != TYPE_UNKNOWN) {
             setTypeAST(existing->typeAST, kind);
         }
+        pscalNoteTypeTablesChanged();
         return;
     }
 
@@ -62,6 +63,7 @@ void reserveTypePlaceholder(const char *name, VarType kind) {
     entry->typeAST = placeholder;
     entry->next = type_table;
     type_table = entry;
+    pscalNoteTypeTablesChanged();
 }
 
 void insertType(const char *name, AST *typeAST) {
@@ -95,6 +97,7 @@ void insertType(const char *name, AST *typeAST) {
             freeAST(existing->typeAST);
         }
         existing->typeAST = copy;
+        pscalNoteTypeTablesChanged();
         return;
     }
 
@@ -116,6 +119,7 @@ void insertType(const char *name, AST *typeAST) {
     entry->typeAST = copy;
     entry->next = type_table;
     type_table = entry;
+    pscalNoteTypeTablesChanged();
 }
 
 AST *lookupType(const char *name) {

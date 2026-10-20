@@ -412,6 +412,7 @@ AST *newASTNode(ASTNodeType type, Token *token) {
     node->unit_list = NULL; // Initialize unit_list
     node->type_def = NULL; // Initialize type definition link
     node->freed = false; // Guard flag must start false
+    node->record_layout = NULL;
 
     return node;
 }
@@ -642,6 +643,7 @@ void freeAST(AST *node) {
         freeToken(node->token);
         node->token = NULL;
     }
+    pscalRecordTypeLayoutDiscard(node);
     free(node);
 }
 

@@ -2004,9 +2004,10 @@ static bool readValueNested(Cursor* in, Value* out) {
             pscalEnumEnsureObj(out);
             EnumObj *enum_obj = PSCAL_VALUE_PTR(*out, EnumObj);
             size_t len = 0;
-            enum_obj->enum_name = curLenPrefixedString(in, &len);
-            if (in->error) return false;
-            if (len == 0) { free(enum_obj->enum_name); enum_obj->enum_name = NULL; }
+            char *enum_name = curLenPrefixedString(in, &len);
+            if (in->error) { free(enum_name); return false; }
+            enum_obj->enum_name = (len == 0) ? NULL : pscalInternName(enum_name);
+            free(enum_name);
             enum_obj->ordinal = curI32LE(in);
             if (in->error) return false;
             break;

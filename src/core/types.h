@@ -197,21 +197,6 @@ typedef struct StringObj {
     _Atomic uint32_t pins;
 } StringObj;
 
-// VM 2.0 Phase 4d (Docs/pscal_vm2_plan.md §5.10.4/§5.10.3): thin wrapper
-// only -- FieldValue itself is unchanged, still a linked list, still
-// supports the owns_storage/aliased-storage trick OOP field-address-taking
-// depends on (copyRecord/freeFieldValue operate entirely on FieldValue*,
-// never touching this wrapper). Verified before assuming: zero external
-// `AS_RECORD(v) = X` whole-pointer-reassignment sites and zero external
-// `SET_VALUE_TYPE(v, TYPE_RECORD)` field-by-field construction sites exist
-// anywhere in the tree -- record construction always goes through
-// makeRecord/makeValueForType/makeCopyOfValue, unlike strings (4c), so
-// this sub-phase needed no pscalStringEnsureObj-style lazy-init helper.
-typedef struct RecordObj {
-    ObjHeader header; // header.type is always TYPE_RECORD
-    FieldValue *fields;
-} RecordObj;
-
 // VM 2.0 Phase 4e/4f (Docs/pscal_vm2_plan.md §5.10.4/§5.10.3): the
 // highest-risk type family in Stage A, per the plan's own risk register.
 // `raw`/`elements` are plain owned pointers (matching StringObj/SetObj's
@@ -323,11 +308,13 @@ typedef struct EnumType {
 // TYPE_POINTER's own AST-node/sentinel usage pre-4i. Non-owned (never
 // freed by EnumObj's destructor, exactly like enum_meta and exactly like
 // the old top-level base_type_node field was never freed for any type).
+// `enum_name` is an interned string (pscalInternName): shared by every copy,
+// never freed, so copying an enum value no longer strdup's its type name.
 typedef struct EnumObj {
     ObjHeader header; // header.type is always TYPE_ENUM
     Type *enum_meta;
     int32_t ordinal;
-    char *enum_name;
+    const char *enum_name;
     struct AST *enum_type_def; // AST typedef not yet visible this early in the file
 } EnumObj;
 
@@ -1020,7 +1007,7 @@ static inline long double pscalValueDecodeRealLD(Value v) {
 #define ENUM_META(v)               (PSCAL_VALUE_PTR(v, EnumObj)->enum_meta)
 
 typedef struct FieldValue {
-    char *name;
+    const char *name; // interned (pscalInternName) or NULL; never freed
     struct ValueStruct value;
     struct ValueStruct *storage;
     struct AST *type_def;
@@ -1029,6 +1016,28 @@ typedef struct FieldValue {
     bool owns_storage;
     struct FieldValue *next;
 } FieldValue;
+
+// VM 2.0 Phase 4d (Docs/pscal_vm2_plan.md §5.10.4/§5.10.3), reshaped for
+// allocation cost after the 2026-10-20 VM audit: a record's fields live in
+// ONE allocation with the header, `field_count` FieldValues in `field_block`,
+// each `next`-linked to the one after it so every `for (f = AS_RECORD(v); f;
+// f = f->next)` walk still works. A copy is one allocation plus the field
+// values' own copies; a field's name is an interned string
+// (pscalInternName), shared, never freed. A field's storage stays where it
+// is for the record's whole life, so field addresses (GET_FIELD_ADDRESS,
+// VAR parameters) remain valid exactly as long as before. `fields` is
+// `field_block` (NULL for an empty record). Builders that assemble a
+// FieldValue list node by node hand it to pscalRecordObjCreate, which moves
+// it into a block; nothing may relink, append to or free single fields of a
+// record afterwards. Record construction always goes through
+// makeRecord/makeValueForType/makeCopyOfValue (no `AS_RECORD(v) = X` and no
+// SET_VALUE_TYPE(v, TYPE_RECORD) construction sites exist).
+typedef struct RecordObj {
+    ObjHeader header; // header.type is always TYPE_RECORD
+    FieldValue *fields;
+    uint32_t field_count;
+    FieldValue field_block[];
+} RecordObj;
 
 typedef enum {
     TOKEN_PROGRAM, TOKEN_VAR, TOKEN_BEGIN, TOKEN_END, TOKEN_IF, TOKEN_THEN,

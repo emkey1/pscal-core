@@ -109,19 +109,25 @@ void pscalObjRelease(ObjHeader *header) {
 // Registered once, on the first box, through pthread_once: an atomic
 // claim-once flag let a second thread create and release a box after the
 // first had claimed the flag but before it had registered the destructor,
-// and pscalObjRelease aborts on an unregistered type.
+// and pscalObjRelease aborts on an unregistered type. The flag below is only
+// set once registration has finished, so testing it first just skips the
+// pthread_once call on every later box.
 static void longDoubleBoxDestroy(ObjHeader *header) {
     free((LongDoubleBox *)header);
 }
 
 static pthread_once_t g_long_double_box_destructor_once = PTHREAD_ONCE_INIT;
+static _Atomic bool g_long_double_box_destructor_registered = false;
 
 static void registerLongDoubleBoxDestructor(void) {
     pscalObjRegisterDestructor(TYPE_LONG_DOUBLE, longDoubleBoxDestroy);
+    atomic_store_explicit(&g_long_double_box_destructor_registered, true, memory_order_release);
 }
 
 LongDoubleBox *pscalLongDoubleBoxCreate(long double value) {
-    pthread_once(&g_long_double_box_destructor_once, registerLongDoubleBoxDestructor);
+    if (!atomic_load_explicit(&g_long_double_box_destructor_registered, memory_order_acquire)) {
+        pthread_once(&g_long_double_box_destructor_once, registerLongDoubleBoxDestructor);
+    }
     LongDoubleBox *box = malloc(sizeof(LongDoubleBox));
     if (!box) {
         fprintf(stderr, "PSCAL VM 2.0: pscalLongDoubleBoxCreate: allocation failed.\n");

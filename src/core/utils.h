@@ -253,9 +253,41 @@ void dumpSymbol(Symbol *sym);
 // might not exist yet.
 StringObj *pscalStringObjCreate(int max_length, VarType owner_type);
 void pscalStringEnsureObj(Value *v);
-// VM 2.0 Phase 4d. `fields` may be NULL (no known content yet); the
-// wrapper itself is never NULL once created, matching StringObj/SetObj.
+// The process-lifetime copy of `name`, one per distinct spelling (NULL for
+// NULL). Record field names and enum type names are interned, so copying a
+// record or an enum shares the pointer. Safe from any thread; lookups of an
+// already-interned name take no lock.
+const char *pscalInternName(const char *name);
+
+// Bumped whenever a symbol table or the type table gains an entry, and at
+// each compile's start and end. A record type's cached layout (see
+// createEmptyRecord) is only reused while this is unchanged.
+void pscalNoteTypeTablesChanged(void);
+
+// VM 2.0 Phase 4d. `fields` is a builder list (separately allocated nodes,
+// interned names, each owning or aliasing storage within the list) or NULL
+// (no known content yet); it is moved into the record's own field block and
+// the nodes are freed. The wrapper itself is never NULL once created,
+// matching StringObj/SetObj.
 RecordObj *pscalRecordObjCreate(FieldValue *fields);
+// A record of `field_count` fields, each named NULL, typed TYPE_VOID, holding
+// nil in its own storage, with slot_index = its position (ALLOC_OBJECT's
+// shape).
+RecordObj *pscalRecordObjCreateAnonymous(uint32_t field_count);
+// A field-by-field copy (makeCopyOfValue of each owned value; fields that
+// share another field's storage keep sharing it in the copy).
+RecordObj *pscalRecordObjCopy(const RecordObj *src);
+// A fresh record of `recordType` with every field at its type's default, or
+// NULL (after a diagnostic) when recordType is not a record type.
+RecordObj *pscalRecordObjCreateForType(AST *recordType);
+// The declared name/type of the field a record of `recordType` holds at
+// `field_index` (the same lookup GET_FIELD_OFFSET does). Returns false when
+// recordType has no such field.
+bool pscalRecordTypeFieldInfo(AST *recordType, uint16_t field_index,
+                              const char **out_name, AST **out_type_def,
+                              VarType *out_declared_type);
+// Releases the layout cached on a record type node (freeAST).
+void pscalRecordTypeLayoutDiscard(AST *recordType);
 
 // VM 2.0 Phase 4e/4f. Returns a fresh ArrayObj with refcount=1 and every
 // field zeroed/NULL; callers set element_type/dimensions/bounds/etc.
@@ -308,8 +340,8 @@ MStream *createMStream(void);
 void retainMStream(MStream* ms);
 void releaseMStream(MStream* ms);
 SetObj *pscalSetObjCreate(void); // VM 2.0 Phase 4c: refcount=1, empty
-FieldValue *copyRecord(FieldValue *orig);
-FieldValue *createEmptyRecord(AST *recordType);
+// Frees a builder list that never became a record (values and nodes; names
+// are interned and stay).
 void freeFieldValue(FieldValue *fv);
 
 static inline Value *fieldValueStorage(FieldValue *field) {

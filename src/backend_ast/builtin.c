@@ -10985,12 +10985,7 @@ static bool appendThreadField(FieldValue** head, FieldValue** tail, const char* 
         freeValue(&value);
         return false;
     }
-    field->name = strdup(name);
-    if (!field->name) {
-        free(field);
-        freeValue(&value);
-        return false;
-    }
+    field->name = pscalInternName(name);
     field->value = value;
     field->storage = &field->value;
     field->type_def = NULL;

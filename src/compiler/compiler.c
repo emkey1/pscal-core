@@ -7302,6 +7302,9 @@ cleanup:
 bool compileASTToBytecode(AST* rootNode, BytecodeChunk* outputChunk) {
     if (!rootNode || !outputChunk) return false;
     if (!ensureProcedureTableInitialized()) return false;
+    // Type ASTs may change during a compile; record layouts cached before it
+    // (core/utils.c) must not outlive it.
+    pscalNoteTypeTablesChanged();
     resetAddressConstantTracking();
     if (!compiler_debug) {
         const char* d = getenv("REA_DEBUG");
@@ -7375,6 +7378,7 @@ bool compileASTToBytecode(AST* rootNode, BytecodeChunk* outputChunk) {
     if (vtable_state_pushed) {
         popVTableTrackerState();
     }
+    pscalNoteTypeTablesChanged();
     return !compiler_had_error;
 }
 

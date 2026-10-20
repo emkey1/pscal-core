@@ -1304,13 +1304,12 @@ static AST* resolveRecordTypeFromBaseValue(Value* base_val_ptr) {
     return NULL;
 }
 
+// ALLOC_OBJECT makes a record whose fields have no name or declared type;
+// fill in what this field's record type declares for it (an object reached
+// through a typed pointer), so later stores coerce to the field's type.
 static void hydrateFieldMetadataFromBaseValue(Value* base_val_ptr,
                                               FieldValue* field,
                                               uint16_t field_index) {
-    AST* record_type;
-    FieldValue* prototype_fields;
-    FieldValue* prototype_field;
-
     if (!field) {
         return;
     }
@@ -1321,33 +1320,26 @@ static void hydrateFieldMetadataFromBaseValue(Value* base_val_ptr,
         return;
     }
 
-    record_type = resolveRecordTypeFromBaseValue(base_val_ptr);
+    AST* record_type = resolveRecordTypeFromBaseValue(base_val_ptr);
     if (!record_type) {
         return;
     }
 
-    prototype_fields = createEmptyRecord(record_type);
-    if (!prototype_fields) {
+    const char* name = NULL;
+    AST* type_def = NULL;
+    VarType declared_type = TYPE_UNKNOWN;
+    if (!pscalRecordTypeFieldInfo(record_type, field_index, &name, &type_def, &declared_type)) {
         return;
     }
-
-    Value prototype_probe = makeRecord(prototype_fields);
-    prototype_field = findRecordFieldBySlot(&prototype_probe, field_index);
-    if (prototype_field) {
-        if (!field->name && prototype_field->name) {
-            field->name = strdup(prototype_field->name);
-        }
-        if (!field->type_def && prototype_field->type_def) {
-            field->type_def = prototype_field->type_def;
-        }
-        if (field->declared_type == TYPE_UNKNOWN || field->declared_type == TYPE_VOID) {
-            field->declared_type = prototype_field->declared_type;
-        }
+    if (!field->name && name) {
+        field->name = name;
     }
-
-    // The probe's RecordObj owns prototype_fields; freeing only the field
-    // list leaked the RecordObj on every call.
-    freeValue(&prototype_probe);
+    if (!field->type_def && type_def) {
+        field->type_def = type_def;
+    }
+    if (field->declared_type == TYPE_UNKNOWN || field->declared_type == TYPE_VOID) {
+        field->declared_type = declared_type;
+    }
 }
 
 static bool pushFieldValueByOffset(VM* vm, Value* base_val_ptr, uint16_t field_index) {
@@ -8876,6 +8868,301 @@ static InterpretResult vmApplyFxPolicy(VM* vm, int effective_id, const char* eff
     return INTERPRET_OK;
 }
 
+// SET_INDIRECT's store into an ordinary Value cell: the address's target
+// `target_lvalue_ptr`, whose pointer carried `declaredTypeNode` (the target's
+// declared type, a sentinel, or NULL). It may take over *value_to_set's
+// payload (leaving it detached); the caller frees *value_to_set either way.
+// Returns false after a runtime error that ends the instruction.
+static bool vmStoreThroughAddress(VM* vm, Value* target_lvalue_ptr, AST* declaredTypeNode,
+                                  Value* value_to_set) {
+    if (!target_lvalue_ptr) {
+        runtimeError(vm, "VM Error: SET_INDIRECT called with a nil LValue pointer.");
+        return false;
+    }
+    if (vmValueIsDisposed(target_lvalue_ptr)) {
+        runtimeError(vm, "VM Error: Assignment through a dangling pointer (its target was disposed).");
+        return false;
+    }
+
+    if (declaredTypeNode == OWNED_POINTER_SENTINEL) {
+        // GET_ELEMENT_ADDRESS's row of a multi-dimensional
+        // array (`m[1] := row`): a view whose storage is m's
+        // (or, for an array of arrays, the row array itself).
+        // It carries no declared type, and replacing the view
+        // Value would drop the write, so copy the elements
+        // through it.
+        if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_ARRAY) {
+            bool stored = VALUE_TYPE(*value_to_set) == TYPE_ARRAY &&
+                          valueAssignArrayElementsInPlace(target_lvalue_ptr, value_to_set);
+            if (!stored) {
+                runtimeError(vm, "Runtime Error: Cannot assign %s to an array row of a different shape.",
+                             VALUE_TYPE(*value_to_set) == TYPE_ARRAY ? "an array" : varTypeToString(VALUE_TYPE(*value_to_set)));
+            }
+            return stored;
+        }
+        declaredTypeNode = NULL;
+    }
+    VarType declaredType = vmDeclaredVarType(declaredTypeNode);
+    AST* resolvedDeclaredType = vmResolveTypeAlias(declaredTypeNode);
+    if (declaredType != TYPE_VOID) {
+        bool needs_reset = false;
+        if (declaredType == TYPE_POINTER) {
+            if (VALUE_TYPE(*target_lvalue_ptr) != TYPE_POINTER) {
+                needs_reset = true;
+            }
+        } else if (declaredType == TYPE_RECORD || declaredType == TYPE_ARRAY ||
+                   declaredType == TYPE_STRING || declaredType == TYPE_ENUM ||
+                   declaredType == TYPE_INTERFACE) {
+            if (VALUE_TYPE(*target_lvalue_ptr) != declaredType) {
+                needs_reset = true;
+            }
+        } else if (VALUE_TYPE(*target_lvalue_ptr) != declaredType) {
+            needs_reset = true;
+        }
+
+        if (needs_reset) {
+            freeValue(target_lvalue_ptr);
+            *target_lvalue_ptr = makeValueForType(declaredType, resolvedDeclaredType, NULL);
+        } else if (declaredType == TYPE_POINTER && resolvedDeclaredType &&
+                   resolvedDeclaredType->type == AST_POINTER_TYPE &&
+                   resolvedDeclaredType->right) {
+            PTR_BASE_TYPE_NODE(*target_lvalue_ptr) = resolvedDeclaredType->right;
+        }
+    }
+
+    // (Your existing logic for handling fixed-length strings, pointers, reals, etc. goes here)
+    // Dynamic-string targets get a whole new Value installed
+    // through replaceValueCell, never a free-then-rebuild of
+    // the cell in place: another thread copying this cell
+    // (copyValueForStack, under value_cell_mutex) could
+    // otherwise retain the StringObj just freed here.
+    if (isPascalStringType(VALUE_TYPE(*target_lvalue_ptr)) && STRING_MAX_LENGTH(*target_lvalue_ptr) <= 0) {
+        if (VALUE_TYPE(*value_to_set) == TYPE_CHAR || VALUE_TYPE(*value_to_set) == TYPE_WIDECHAR) {
+            VarType destType = VALUE_TYPE(*target_lvalue_ptr) == TYPE_UNICODE_STRING
+                                   ? TYPE_UNICODE_STRING
+                                   : TYPE_STRING;
+            char encoded[5] = {0};
+            size_t encoded_len = 0;
+            if (VALUE_TYPE(*value_to_set) == TYPE_CHAR) {
+                encoded[0] = (char)AS_CHAR(*value_to_set);
+                encoded_len = 1;
+            } else {
+                encoded_len = encodeUtf8Codepoint((uint32_t)AS_CHAR(*value_to_set), encoded);
+            }
+            Value replacement = (destType == TYPE_UNICODE_STRING)
+                                    ? makeUnicodeStringLen(encoded, encoded_len)
+                                    : makeStringLen(encoded, encoded_len);
+            replaceValueCell(target_lvalue_ptr, replacement, NULL);
+        } else if (isPascalStringType(VALUE_TYPE(*value_to_set)) && AS_STRING(*value_to_set)) {
+            VarType destType = VALUE_TYPE(*target_lvalue_ptr);
+            StringObj *src_s = PSCAL_VALUE_PTR((*value_to_set), StringObj);
+            Value replacement;
+            if (src_s->max_length > 0) {
+                /* A string[N] source's StringObj is still that
+                 * variable's own fixed buffer (GET_* shares it
+                 * by reference count). Taking it over would
+                 * share the buffer with the target and strip
+                 * its length cap, so copy the text into a
+                 * fresh dynamic string instead. */
+                replacement = (destType == TYPE_UNICODE_STRING)
+                                  ? makeUnicodeString(AS_STRING(*value_to_set))
+                                  : makeString(AS_STRING(*value_to_set));
+            } else {
+                /* Optimization: take over the temporary's
+                 * whole (dynamic) StringObj reference rather
+                 * than copying its buffer. */
+                pscalValueSetHeapPtrBits(value_to_set, NULL); /* Prevent double-free */
+                replacement = makeVoid();
+                SET_VALUE_TYPE(&replacement, destType);
+                pscalValueSetHeapPtrBits(&replacement, src_s);
+            }
+            replaceValueCell(target_lvalue_ptr, replacement, NULL);
+        } else {
+            runtimeError(vm, "Type mismatch: Cannot assign this type to a dynamic string.");
+        }
+    }
+    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_STRING && STRING_MAX_LENGTH(*target_lvalue_ptr) > 0) {
+        // The fixed buffer is written in place (char
+        // addresses into it stay valid), so first make sure
+        // this variable is its only holder: GET_* shares a
+        // StringObj by reference count, and a by-value
+        // parameter or a copy would otherwise change too.
+        valueEnsureUnique(target_lvalue_ptr);
+        if (isPascalStringType(VALUE_TYPE(*value_to_set)) && AS_STRING(*value_to_set)) {
+            strncpy(AS_STRING(*target_lvalue_ptr), AS_STRING(*value_to_set), STRING_MAX_LENGTH(*target_lvalue_ptr));
+            AS_STRING(*target_lvalue_ptr)[STRING_MAX_LENGTH(*target_lvalue_ptr)] = '\0'; // Ensure null termination
+        } else if (VALUE_TYPE(*value_to_set) == TYPE_CHAR ||
+                   VALUE_TYPE(*value_to_set) == TYPE_WIDECHAR) {
+            char encoded[5] = {0};
+            size_t encoded_len;
+            if (VALUE_TYPE(*value_to_set) == TYPE_CHAR) {
+                encoded[0] = (char)AS_CHAR(*value_to_set);
+                encoded_len = 1;
+            } else {
+                encoded_len = encodeUtf8Codepoint((uint32_t)AS_CHAR(*value_to_set), encoded);
+            }
+            size_t cap = (size_t)STRING_MAX_LENGTH(*target_lvalue_ptr);
+            if (encoded_len > cap) encoded_len = cap;
+            memcpy(AS_STRING(*target_lvalue_ptr), encoded, encoded_len);
+            AS_STRING(*target_lvalue_ptr)[encoded_len] = '\0';
+        } else {
+            runtimeError(vm, "Type mismatch: Cannot assign this type to a fixed-length string.");
+        }
+    }
+    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_POINTER && (VALUE_TYPE(*value_to_set) == TYPE_POINTER || VALUE_TYPE(*value_to_set) == TYPE_NIL)) {
+        if (VALUE_TYPE(*value_to_set) == TYPE_NIL) {
+            // Preserve base type when assigning nil
+            AS_POINTER(*target_lvalue_ptr) = NULL;
+        } else {
+            AS_POINTER(*target_lvalue_ptr) = AS_POINTER(*value_to_set);
+            if (PTR_BASE_TYPE_NODE(*value_to_set)) {
+                PTR_BASE_TYPE_NODE(*target_lvalue_ptr) = PTR_BASE_TYPE_NODE(*value_to_set);
+            }
+        }
+    }
+    else if (isRealType(VALUE_TYPE(*target_lvalue_ptr)) && isRealType(VALUE_TYPE(*value_to_set))) {
+        long double tmp = AS_REAL(*value_to_set);
+        SET_REAL_VALUE(target_lvalue_ptr, tmp);
+    }
+    else if (isRealType(VALUE_TYPE(*target_lvalue_ptr)) && isIntlikeType(VALUE_TYPE(*value_to_set))) {
+        long double tmp = asLd(*value_to_set);
+        SET_REAL_VALUE(target_lvalue_ptr, tmp);
+    }
+    else if (isIntlikeType(VALUE_TYPE(*target_lvalue_ptr)) && isRealType(VALUE_TYPE(*value_to_set))) {
+        assignRealToIntChecked(vm, target_lvalue_ptr, AS_REAL(*value_to_set));
+    }
+    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_BYTE && VALUE_TYPE(*value_to_set) == TYPE_INTEGER) {
+        if (VAL_INT(*value_to_set) < 0 || VAL_INT(*value_to_set) > 255) {
+            runtimeWarning(vm, "Warning: Range check error assigning INTEGER %lld to BYTE.", VAL_INT(*value_to_set));
+        }
+        SET_INT_VALUE(target_lvalue_ptr, VAL_INT(*value_to_set) & 0xFF);
+    }
+    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_WORD && VALUE_TYPE(*value_to_set) == TYPE_INTEGER) {
+        if (VAL_INT(*value_to_set) < 0 || VAL_INT(*value_to_set) > 65535) {
+            runtimeWarning(vm, "Warning: Range check error assigning INTEGER %lld to WORD.", VAL_INT(*value_to_set));
+        }
+        SET_INT_VALUE(target_lvalue_ptr, VAL_INT(*value_to_set) & 0xFFFF);
+    }
+    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_INTEGER &&
+             (VALUE_TYPE(*value_to_set) == TYPE_BYTE || VALUE_TYPE(*value_to_set) == TYPE_WORD || VALUE_TYPE(*value_to_set) == TYPE_BOOLEAN)) {
+        SET_INT_VALUE(target_lvalue_ptr, VAL_INT(*value_to_set));
+    }
+    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_INTEGER && VALUE_TYPE(*value_to_set) == TYPE_CHAR) {
+        SET_INT_VALUE(target_lvalue_ptr, (long long)AS_CHAR(*value_to_set));
+    }
+    else if (isIntlikeType(VALUE_TYPE(*target_lvalue_ptr)) && isIntlikeType(VALUE_TYPE(*value_to_set)) &&
+             VALUE_TYPE(*target_lvalue_ptr) != VALUE_TYPE(*value_to_set)) {
+        /* Catch-all for int-like-to-int-like assignments not
+         * handled by a more specific branch above (notably
+         * TYPE_INT64/TYPE_UINT64 targets, which have no
+         * dedicated branch here). Without this, execution
+         * falls through to the generic "replace the whole
+         * cell" branch at the bottom of this if-chain, which
+         * blindly copies value_to_set's OWN type onto the
+         * target -- clobbering a declared int64/uint64
+         * variable down to whatever narrower type the RHS
+         * literal/expression happened to be (e.g. `sum := 0`
+         * on an int64 `sum` silently downgraded it to
+         * TYPE_INT32). SET_INT_VALUE preserves the target's
+         * existing declared width instead. */
+        SET_INT_VALUE(target_lvalue_ptr, AS_INTEGER(*value_to_set));
+    }
+    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_CHAR) {
+        if (VALUE_TYPE(*value_to_set) == TYPE_CHAR) {
+            SET_CHAR_VALUE(target_lvalue_ptr, AS_CHAR(*value_to_set));
+        } else if (isPascalStringType(VALUE_TYPE(*value_to_set)) && AS_STRING(*value_to_set)) {
+            size_t len = strlen(AS_STRING(*value_to_set));
+            if (len == 1) {
+                SET_CHAR_VALUE(target_lvalue_ptr, (unsigned char)AS_STRING(*value_to_set)[0]);
+            } else if (len == 0) {
+                SET_CHAR_VALUE(target_lvalue_ptr, '\0');
+            } else {
+                runtimeError(vm, "Type mismatch: Cannot assign multi-character string to CHAR.");
+            }
+        } else if (VALUE_TYPE(*value_to_set) == TYPE_INTEGER) {
+            SET_CHAR_VALUE(target_lvalue_ptr, (int)VAL_INT(*value_to_set));
+        } else {
+            runtimeError(vm, "Type mismatch: Cannot assign %s to CHAR.", varTypeToString(VALUE_TYPE(*value_to_set)));
+        }
+        SET_INT_VALUE(target_lvalue_ptr, AS_CHAR(*target_lvalue_ptr));
+    }
+    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_WIDECHAR) {
+        if (VALUE_TYPE(*value_to_set) == TYPE_WIDECHAR || VALUE_TYPE(*value_to_set) == TYPE_CHAR) {
+            SET_CHAR_VALUE(target_lvalue_ptr, AS_CHAR(*value_to_set));
+        } else if (isPascalStringType(VALUE_TYPE(*value_to_set)) && AS_STRING(*value_to_set)) {
+            size_t len = strlen(AS_STRING(*value_to_set));
+            uint32_t codepoint = 0;
+            size_t advance = 0;
+            if (len == 0) {
+                SET_CHAR_VALUE(target_lvalue_ptr, 0);
+            } else if (decodeUtf8Codepoint(AS_STRING(*value_to_set), len, &codepoint, &advance) &&
+                       advance == len) {
+                SET_CHAR_VALUE(target_lvalue_ptr, (int)codepoint);
+            } else {
+                runtimeError(vm, "Type mismatch: Cannot assign multi-character string to WIDECHAR.");
+            }
+        } else if (VALUE_TYPE(*value_to_set) == TYPE_INTEGER) {
+            SET_CHAR_VALUE(target_lvalue_ptr, (int)VAL_INT(*value_to_set));
+        } else {
+            runtimeError(vm, "Type mismatch: Cannot assign %s to WIDECHAR.", varTypeToString(VALUE_TYPE(*value_to_set)));
+        }
+        SET_INT_VALUE(target_lvalue_ptr, AS_CHAR(*target_lvalue_ptr));
+    }
+    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_ENUM &&
+             isIntegerFamilyType(VALUE_TYPE(*value_to_set))) {
+        /* An integer stored into an enum variable: what a
+         * Pascal cast `e := T(k)` compiles to, since the cast
+         * itself emits no conversion. Replacing the whole
+         * cell made `e` an INTEGER that no longer compared
+         * with T's members ("Operands not comparable");
+         * keep the enum type and store the ordinal. */
+        long long ordinal = asI64(*value_to_set);
+        Type* meta = ENUM_META(*target_lvalue_ptr);
+        const char* enum_name = AS_ENUM(*target_lvalue_ptr).enum_name;
+        if (meta ? (ordinal < 0 || ordinal >= meta->member_count)
+                 : (ordinal < INT32_MIN || ordinal > INT32_MAX)) {
+            runtimeError(vm, "Runtime Error: Enum '%s' out of range (ordinal %lld).",
+                         enum_name ? enum_name : "<anon>", ordinal);
+            return false;
+        }
+        Value replacement = makeEnum(enum_name, (int)ordinal);
+        ENUM_META(replacement) = meta;
+        ENUM_TYPE_DEF(replacement) = ENUM_TYPE_DEF(*target_lvalue_ptr);
+        replaceValueCell(target_lvalue_ptr, replacement, NULL);
+    }
+    else {
+        // VM 2.0 Phase 4i: target_lvalue_ptr's type is never
+        // TYPE_POINTER at this point (that case is handled
+        // by the branch above) -- guard anyway rather than
+        // rely on that invariant holding forever, since
+        // PTR_BASE_TYPE_NODE now requires it.
+        AST* preserved_base = (VALUE_TYPE(*target_lvalue_ptr) == TYPE_POINTER)
+                                   ? PTR_BASE_TYPE_NODE(*target_lvalue_ptr)
+                                   : NULL;
+        if (VALUE_TYPE(*value_to_set) == TYPE_MEMORYSTREAM) {
+            /* Transfer ownership of the MStream pointer without freeing it
+             * when the temporary value is cleaned up below. */
+            Value replacement = (*value_to_set);
+            replaceValueCell(target_lvalue_ptr, replacement, preserved_base);
+            pscalValueSetHeapPtrBits(value_to_set, NULL);
+            // Detached the alias above without updating .bits
+            // (VM 2.0 Phase 4i checkpoint 3b) -- value_to_set
+            // is freeValue'd a few lines down and would
+            // otherwise abort on a stale non-NULL pointer tag.
+            pscalValueSetHeapPtrBits(value_to_set, NULL);
+        } else if (!valueAssignAggregateInPlace(target_lvalue_ptr, value_to_set)) {
+            // (A record or static array assigned over one of
+            // the same shape was instead copied into the
+            // target's own storage just now: Pascal keeps a
+            // variable's storage across `r := r2`, and VAR
+            // parameters may point into it.)
+            Value replacement = makeCopyOfValue(value_to_set);
+            replaceValueCell(target_lvalue_ptr, replacement, preserved_base);
+        }
+    }
+    return true;
+}
+
 // --- Main Interpretation Loop ---
 InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globals, HashTable* const_globals, HashTable* procedures, uint32_t entry) {
     if (!vm || !chunk) return INTERPRET_RUNTIME_ERROR;
@@ -9648,19 +9935,40 @@ dispatch_switch:
                     runtimeError(vm, "VM Error: Global slot %u out of bounds for GET_GSLOT_ADDRESS.", (unsigned)slot);
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                Value* global_cell;
                 if (vm->chunk->global_myself_slot >= 0 && (int)slot == vm->chunk->global_myself_slot) {
-                    push(vm, makePointer(&vm->threadMyself, NULL));
+                    global_cell = &vm->threadMyself;
+                } else {
+                    Symbol* sym = vm->chunk->global_slots[slot].symbol;
+                    if (!sym || !sym->value) {
+                        const char* name = vm->chunk->global_slot_names ? vm->chunk->global_slot_names[slot] : "?";
+                        runtimeError(vm, "Runtime Error: Global '%s' not found in symbol table.", name);
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    global_cell = sym->value;
+                }
+
+                // `global := expr`: the same one-store fast path as
+                // GET_LOCAL_ADDRESS's below.
+                if (vm->ip + 1 < vm->chunk->code + vm->chunk->count &&
+                    vm->ip[0] == SWAP && vm->ip[1] == SET_INDIRECT &&
+                    vm->stackTop > vm->stack && !opcode_profile_enabled &&
+                    vm->trace_head_instructions <= 0) {
+                    vm->lastInstruction = vm->ip + 1; // diagnostics name SET_INDIRECT, as before
+                    vm->ip += 2;
+                    Value value_to_set = pop(vm);
+                    if (vmPasExceptionPending(vm)) {
+                        freeValue(&value_to_set);
+                        break;
+                    }
+                    bool stored = vmStoreThroughAddress(vm, global_cell, NULL, &value_to_set);
+                    freeValue(&value_to_set);
+                    if (!stored) {
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
                     break;
                 }
-
-                Symbol* sym = vm->chunk->global_slots[slot].symbol;
-                if (!sym || !sym->value) {
-                    const char* name = vm->chunk->global_slot_names ? vm->chunk->global_slot_names[slot] : "?";
-                    runtimeError(vm, "Runtime Error: Global '%s' not found in symbol table.", name);
-                    return INTERPRET_RUNTIME_ERROR;
-                }
-
-                push(vm, makePointer(sym->value, NULL));
+                push(vm, makePointer(global_cell, NULL));
                 break;
             }
             case GET_LOCAL_ADDRESS: {
@@ -9669,6 +9977,29 @@ dispatch_switch:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 CallFrame* frame = &vm->frames[vm->frameCount - 1];
+                // `local := expr` compiles to <expr>; GET_LOCAL_ADDRESS s;
+                // SWAP; SET_INDIRECT. Run that triple as one store, with the
+                // same semantics, instead of allocating an address only for
+                // SET_INDIRECT to free it. (Skipped while profiling or
+                // tracing, which count each instruction.)
+                if (vm->ip + 1 < vm->chunk->code + vm->chunk->count &&
+                    vm->ip[0] == SWAP && vm->ip[1] == SET_INDIRECT &&
+                    vm->stackTop > vm->stack && !opcode_profile_enabled &&
+                    vm->trace_head_instructions <= 0) {
+                    vm->lastInstruction = vm->ip + 1; // diagnostics name SET_INDIRECT, as before
+                    vm->ip += 2;
+                    Value value_to_set = pop(vm);
+                    if (vmPasExceptionPending(vm)) {
+                        freeValue(&value_to_set);
+                        break;
+                    }
+                    bool stored = vmStoreThroughAddress(vm, &frame->slots[slot], NULL, &value_to_set);
+                    freeValue(&value_to_set);
+                    if (!stored) {
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    break;
+                }
                 push(vm, makePointer(&frame->slots[slot], NULL));
                 break;
             }
@@ -10367,65 +10698,27 @@ comparison_error_label:
             }
             case ALLOC_OBJECT: {
                 uint8_t field_count = READ_BYTE();
-                FieldValue* fields_head = NULL;
-                FieldValue** next_ptr = &fields_head;
-                for (uint16_t i = 0; i < field_count; i++) {
-                    FieldValue* field = calloc(1, sizeof(FieldValue));
-                    if (!field) {
-                        freeFieldValue(fields_head);
-                        runtimeError(vm, "VM Error: Out of memory allocating object field.");
-                        return INTERPRET_RUNTIME_ERROR;
-                    }
-                    field->name = NULL;
-                    field->value = makeNil();
-                    field->storage = &field->value;
-                    field->slot_index = (int)i;
-                    field->owns_storage = true;
-                    field->declared_type = TYPE_VOID;
-                    field->type_def = NULL;
-                    field->next = NULL;
-                    *next_ptr = field;
-                    next_ptr = &field->next;
-                }
                 Value* obj = malloc(sizeof(Value));
                 if (!obj) {
-                    freeFieldValue(fields_head);
                     runtimeError(vm, "VM Error: Out of memory allocating object value.");
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                *obj = makeRecord(fields_head);
+                memset(obj, 0, sizeof(Value));
+                obj->type = TYPE_RECORD;
+                pscalValueSetHeapPtrBits(obj, pscalRecordObjCreateAnonymous(field_count));
                 push(vm, makePointer(obj, NULL));
                 break;
             }
             case ALLOC_OBJECT16: {
                 uint16_t field_count = READ_SHORT(vm);
-                FieldValue* fields_head = NULL;
-                FieldValue** next_ptr = &fields_head;
-                for (uint16_t i = 0; i < field_count; i++) {
-                    FieldValue* field = calloc(1, sizeof(FieldValue));
-                    if (!field) {
-                        freeFieldValue(fields_head);
-                        runtimeError(vm, "VM Error: Out of memory allocating object field.");
-                        return INTERPRET_RUNTIME_ERROR;
-                    }
-                    field->name = NULL;
-                    field->value = makeNil();
-                    field->storage = &field->value;
-                    field->slot_index = (int)i;
-                    field->owns_storage = true;
-                    field->declared_type = TYPE_VOID;
-                    field->type_def = NULL;
-                    field->next = NULL;
-                    *next_ptr = field;
-                    next_ptr = &field->next;
-                }
                 Value* obj = malloc(sizeof(Value));
                 if (!obj) {
-                    freeFieldValue(fields_head);
                     runtimeError(vm, "VM Error: Out of memory allocating object value.");
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                *obj = makeRecord(fields_head);
+                memset(obj, 0, sizeof(Value));
+                obj->type = TYPE_RECORD;
+                pscalValueSetHeapPtrBits(obj, pscalRecordObjCreateAnonymous(field_count));
                 push(vm, makePointer(obj, NULL));
                 break;
             }
@@ -11916,304 +12209,11 @@ comparison_error_label:
                     freeValue(&pointer_to_lvalue);
                     return INTERPRET_RUNTIME_ERROR;
                 } else {
-                    // This is the start of your existing logic for other types
-                    Value* target_lvalue_ptr = (Value*)AS_POINTER(pointer_to_lvalue);
-                    if (!target_lvalue_ptr) {
-                        runtimeError(vm, "VM Error: SET_INDIRECT called with a nil LValue pointer.");
+                    if (!vmStoreThroughAddress(vm, (Value*)AS_POINTER(pointer_to_lvalue),
+                                               PTR_BASE_TYPE_NODE(pointer_to_lvalue), &value_to_set)) {
                         freeValue(&value_to_set);
                         freeValue(&pointer_to_lvalue);
                         return INTERPRET_RUNTIME_ERROR;
-                    }
-                    if (vmValueIsDisposed(target_lvalue_ptr)) {
-                        runtimeError(vm, "VM Error: Assignment through a dangling pointer (its target was disposed).");
-                        freeValue(&value_to_set);
-                        freeValue(&pointer_to_lvalue);
-                        return INTERPRET_RUNTIME_ERROR;
-                    }
-
-                    AST* declaredTypeNode = PTR_BASE_TYPE_NODE(pointer_to_lvalue);
-                    if (declaredTypeNode == OWNED_POINTER_SENTINEL) {
-                        // GET_ELEMENT_ADDRESS's row of a multi-dimensional
-                        // array (`m[1] := row`): a view whose storage is m's
-                        // (or, for an array of arrays, the row array itself).
-                        // It carries no declared type, and replacing the view
-                        // Value would drop the write, so copy the elements
-                        // through it.
-                        if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_ARRAY) {
-                            bool stored = VALUE_TYPE(value_to_set) == TYPE_ARRAY &&
-                                          valueAssignArrayElementsInPlace(target_lvalue_ptr, &value_to_set);
-                            if (!stored) {
-                                runtimeError(vm, "Runtime Error: Cannot assign %s to an array row of a different shape.",
-                                             VALUE_TYPE(value_to_set) == TYPE_ARRAY ? "an array" : varTypeToString(VALUE_TYPE(value_to_set)));
-                            }
-                            freeValue(&value_to_set);
-                            freeValue(&pointer_to_lvalue);
-                            if (!stored) {
-                                return INTERPRET_RUNTIME_ERROR;
-                            }
-                            break;
-                        }
-                        declaredTypeNode = NULL;
-                    }
-                    VarType declaredType = vmDeclaredVarType(declaredTypeNode);
-                    AST* resolvedDeclaredType = vmResolveTypeAlias(declaredTypeNode);
-                    if (declaredType != TYPE_VOID) {
-                        bool needs_reset = false;
-                        if (declaredType == TYPE_POINTER) {
-                            if (VALUE_TYPE(*target_lvalue_ptr) != TYPE_POINTER) {
-                                needs_reset = true;
-                            }
-                        } else if (declaredType == TYPE_RECORD || declaredType == TYPE_ARRAY ||
-                                   declaredType == TYPE_STRING || declaredType == TYPE_ENUM ||
-                                   declaredType == TYPE_INTERFACE) {
-                            if (VALUE_TYPE(*target_lvalue_ptr) != declaredType) {
-                                needs_reset = true;
-                            }
-                        } else if (VALUE_TYPE(*target_lvalue_ptr) != declaredType) {
-                            needs_reset = true;
-                        }
-
-                        if (needs_reset) {
-                            freeValue(target_lvalue_ptr);
-                            *target_lvalue_ptr = makeValueForType(declaredType, resolvedDeclaredType, NULL);
-                        } else if (declaredType == TYPE_POINTER && resolvedDeclaredType &&
-                                   resolvedDeclaredType->type == AST_POINTER_TYPE &&
-                                   resolvedDeclaredType->right) {
-                            PTR_BASE_TYPE_NODE(*target_lvalue_ptr) = resolvedDeclaredType->right;
-                        }
-                    }
-
-                    // (Your existing logic for handling fixed-length strings, pointers, reals, etc. goes here)
-                    // Dynamic-string targets get a whole new Value installed
-                    // through replaceValueCell, never a free-then-rebuild of
-                    // the cell in place: another thread copying this cell
-                    // (copyValueForStack, under value_cell_mutex) could
-                    // otherwise retain the StringObj just freed here.
-                    if (isPascalStringType(VALUE_TYPE(*target_lvalue_ptr)) && STRING_MAX_LENGTH(*target_lvalue_ptr) <= 0) {
-                        if (VALUE_TYPE(value_to_set) == TYPE_CHAR || VALUE_TYPE(value_to_set) == TYPE_WIDECHAR) {
-                            VarType destType = VALUE_TYPE(*target_lvalue_ptr) == TYPE_UNICODE_STRING
-                                                   ? TYPE_UNICODE_STRING
-                                                   : TYPE_STRING;
-                            char encoded[5] = {0};
-                            size_t encoded_len = 0;
-                            if (VALUE_TYPE(value_to_set) == TYPE_CHAR) {
-                                encoded[0] = (char)AS_CHAR(value_to_set);
-                                encoded_len = 1;
-                            } else {
-                                encoded_len = encodeUtf8Codepoint((uint32_t)AS_CHAR(value_to_set), encoded);
-                            }
-                            Value replacement = (destType == TYPE_UNICODE_STRING)
-                                                    ? makeUnicodeStringLen(encoded, encoded_len)
-                                                    : makeStringLen(encoded, encoded_len);
-                            replaceValueCell(target_lvalue_ptr, replacement, NULL);
-                        } else if (isPascalStringType(VALUE_TYPE(value_to_set)) && AS_STRING(value_to_set)) {
-                            VarType destType = VALUE_TYPE(*target_lvalue_ptr);
-                            StringObj *src_s = PSCAL_VALUE_PTR(value_to_set, StringObj);
-                            Value replacement;
-                            if (src_s->max_length > 0) {
-                                /* A string[N] source's StringObj is still that
-                                 * variable's own fixed buffer (GET_* shares it
-                                 * by reference count). Taking it over would
-                                 * share the buffer with the target and strip
-                                 * its length cap, so copy the text into a
-                                 * fresh dynamic string instead. */
-                                replacement = (destType == TYPE_UNICODE_STRING)
-                                                  ? makeUnicodeString(AS_STRING(value_to_set))
-                                                  : makeString(AS_STRING(value_to_set));
-                            } else {
-                                /* Optimization: take over the temporary's
-                                 * whole (dynamic) StringObj reference rather
-                                 * than copying its buffer. */
-                                pscalValueSetHeapPtrBits(&value_to_set, NULL); /* Prevent double-free */
-                                replacement = makeVoid();
-                                SET_VALUE_TYPE(&replacement, destType);
-                                pscalValueSetHeapPtrBits(&replacement, src_s);
-                            }
-                            replaceValueCell(target_lvalue_ptr, replacement, NULL);
-                        } else {
-                            runtimeError(vm, "Type mismatch: Cannot assign this type to a dynamic string.");
-                        }
-                    }
-                    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_STRING && STRING_MAX_LENGTH(*target_lvalue_ptr) > 0) {
-                        // The fixed buffer is written in place (char
-                        // addresses into it stay valid), so first make sure
-                        // this variable is its only holder: GET_* shares a
-                        // StringObj by reference count, and a by-value
-                        // parameter or a copy would otherwise change too.
-                        valueEnsureUnique(target_lvalue_ptr);
-                        if (isPascalStringType(VALUE_TYPE(value_to_set)) && AS_STRING(value_to_set)) {
-                            strncpy(AS_STRING(*target_lvalue_ptr), AS_STRING(value_to_set), STRING_MAX_LENGTH(*target_lvalue_ptr));
-                            AS_STRING(*target_lvalue_ptr)[STRING_MAX_LENGTH(*target_lvalue_ptr)] = '\0'; // Ensure null termination
-                        } else if (VALUE_TYPE(value_to_set) == TYPE_CHAR ||
-                                   VALUE_TYPE(value_to_set) == TYPE_WIDECHAR) {
-                            char encoded[5] = {0};
-                            size_t encoded_len;
-                            if (VALUE_TYPE(value_to_set) == TYPE_CHAR) {
-                                encoded[0] = (char)AS_CHAR(value_to_set);
-                                encoded_len = 1;
-                            } else {
-                                encoded_len = encodeUtf8Codepoint((uint32_t)AS_CHAR(value_to_set), encoded);
-                            }
-                            size_t cap = (size_t)STRING_MAX_LENGTH(*target_lvalue_ptr);
-                            if (encoded_len > cap) encoded_len = cap;
-                            memcpy(AS_STRING(*target_lvalue_ptr), encoded, encoded_len);
-                            AS_STRING(*target_lvalue_ptr)[encoded_len] = '\0';
-                        } else {
-                            runtimeError(vm, "Type mismatch: Cannot assign this type to a fixed-length string.");
-                        }
-                    }
-                    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_POINTER && (VALUE_TYPE(value_to_set) == TYPE_POINTER || VALUE_TYPE(value_to_set) == TYPE_NIL)) {
-                        if (VALUE_TYPE(value_to_set) == TYPE_NIL) {
-                            // Preserve base type when assigning nil
-                            AS_POINTER(*target_lvalue_ptr) = NULL;
-                        } else {
-                            AS_POINTER(*target_lvalue_ptr) = AS_POINTER(value_to_set);
-                            if (PTR_BASE_TYPE_NODE(value_to_set)) {
-                                PTR_BASE_TYPE_NODE(*target_lvalue_ptr) = PTR_BASE_TYPE_NODE(value_to_set);
-                            }
-                        }
-                    }
-                    else if (isRealType(VALUE_TYPE(*target_lvalue_ptr)) && isRealType(VALUE_TYPE(value_to_set))) {
-                        long double tmp = AS_REAL(value_to_set);
-                        SET_REAL_VALUE(target_lvalue_ptr, tmp);
-                    }
-                    else if (isRealType(VALUE_TYPE(*target_lvalue_ptr)) && isIntlikeType(VALUE_TYPE(value_to_set))) {
-                        long double tmp = asLd(value_to_set);
-                        SET_REAL_VALUE(target_lvalue_ptr, tmp);
-                    }
-                    else if (isIntlikeType(VALUE_TYPE(*target_lvalue_ptr)) && isRealType(VALUE_TYPE(value_to_set))) {
-                        assignRealToIntChecked(vm, target_lvalue_ptr, AS_REAL(value_to_set));
-                    }
-                    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_BYTE && VALUE_TYPE(value_to_set) == TYPE_INTEGER) {
-                        if (VAL_INT(value_to_set) < 0 || VAL_INT(value_to_set) > 255) {
-                            runtimeWarning(vm, "Warning: Range check error assigning INTEGER %lld to BYTE.", VAL_INT(value_to_set));
-                        }
-                        SET_INT_VALUE(target_lvalue_ptr, VAL_INT(value_to_set) & 0xFF);
-                    }
-                    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_WORD && VALUE_TYPE(value_to_set) == TYPE_INTEGER) {
-                        if (VAL_INT(value_to_set) < 0 || VAL_INT(value_to_set) > 65535) {
-                            runtimeWarning(vm, "Warning: Range check error assigning INTEGER %lld to WORD.", VAL_INT(value_to_set));
-                        }
-                        SET_INT_VALUE(target_lvalue_ptr, VAL_INT(value_to_set) & 0xFFFF);
-                    }
-                    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_INTEGER &&
-                             (VALUE_TYPE(value_to_set) == TYPE_BYTE || VALUE_TYPE(value_to_set) == TYPE_WORD || VALUE_TYPE(value_to_set) == TYPE_BOOLEAN)) {
-                        SET_INT_VALUE(target_lvalue_ptr, VAL_INT(value_to_set));
-                    }
-                    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_INTEGER && VALUE_TYPE(value_to_set) == TYPE_CHAR) {
-                        SET_INT_VALUE(target_lvalue_ptr, (long long)AS_CHAR(value_to_set));
-                    }
-                    else if (isIntlikeType(VALUE_TYPE(*target_lvalue_ptr)) && isIntlikeType(VALUE_TYPE(value_to_set)) &&
-                             VALUE_TYPE(*target_lvalue_ptr) != VALUE_TYPE(value_to_set)) {
-                        /* Catch-all for int-like-to-int-like assignments not
-                         * handled by a more specific branch above (notably
-                         * TYPE_INT64/TYPE_UINT64 targets, which have no
-                         * dedicated branch here). Without this, execution
-                         * falls through to the generic "replace the whole
-                         * cell" branch at the bottom of this if-chain, which
-                         * blindly copies value_to_set's OWN type onto the
-                         * target -- clobbering a declared int64/uint64
-                         * variable down to whatever narrower type the RHS
-                         * literal/expression happened to be (e.g. `sum := 0`
-                         * on an int64 `sum` silently downgraded it to
-                         * TYPE_INT32). SET_INT_VALUE preserves the target's
-                         * existing declared width instead. */
-                        SET_INT_VALUE(target_lvalue_ptr, AS_INTEGER(value_to_set));
-                    }
-                    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_CHAR) {
-                        if (VALUE_TYPE(value_to_set) == TYPE_CHAR) {
-                            SET_CHAR_VALUE(target_lvalue_ptr, AS_CHAR(value_to_set));
-                        } else if (isPascalStringType(VALUE_TYPE(value_to_set)) && AS_STRING(value_to_set)) {
-                            size_t len = strlen(AS_STRING(value_to_set));
-                            if (len == 1) {
-                                SET_CHAR_VALUE(target_lvalue_ptr, (unsigned char)AS_STRING(value_to_set)[0]);
-                            } else if (len == 0) {
-                                SET_CHAR_VALUE(target_lvalue_ptr, '\0');
-                            } else {
-                                runtimeError(vm, "Type mismatch: Cannot assign multi-character string to CHAR.");
-                            }
-                        } else if (VALUE_TYPE(value_to_set) == TYPE_INTEGER) {
-                            SET_CHAR_VALUE(target_lvalue_ptr, (int)VAL_INT(value_to_set));
-                        } else {
-                            runtimeError(vm, "Type mismatch: Cannot assign %s to CHAR.", varTypeToString(VALUE_TYPE(value_to_set)));
-                        }
-                        SET_INT_VALUE(target_lvalue_ptr, AS_CHAR(*target_lvalue_ptr));
-                    }
-                    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_WIDECHAR) {
-                        if (VALUE_TYPE(value_to_set) == TYPE_WIDECHAR || VALUE_TYPE(value_to_set) == TYPE_CHAR) {
-                            SET_CHAR_VALUE(target_lvalue_ptr, AS_CHAR(value_to_set));
-                        } else if (isPascalStringType(VALUE_TYPE(value_to_set)) && AS_STRING(value_to_set)) {
-                            size_t len = strlen(AS_STRING(value_to_set));
-                            uint32_t codepoint = 0;
-                            size_t advance = 0;
-                            if (len == 0) {
-                                SET_CHAR_VALUE(target_lvalue_ptr, 0);
-                            } else if (decodeUtf8Codepoint(AS_STRING(value_to_set), len, &codepoint, &advance) &&
-                                       advance == len) {
-                                SET_CHAR_VALUE(target_lvalue_ptr, (int)codepoint);
-                            } else {
-                                runtimeError(vm, "Type mismatch: Cannot assign multi-character string to WIDECHAR.");
-                            }
-                        } else if (VALUE_TYPE(value_to_set) == TYPE_INTEGER) {
-                            SET_CHAR_VALUE(target_lvalue_ptr, (int)VAL_INT(value_to_set));
-                        } else {
-                            runtimeError(vm, "Type mismatch: Cannot assign %s to WIDECHAR.", varTypeToString(VALUE_TYPE(value_to_set)));
-                        }
-                        SET_INT_VALUE(target_lvalue_ptr, AS_CHAR(*target_lvalue_ptr));
-                    }
-                    else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_ENUM &&
-                             isIntegerFamilyType(VALUE_TYPE(value_to_set))) {
-                        /* An integer stored into an enum variable: what a
-                         * Pascal cast `e := T(k)` compiles to, since the cast
-                         * itself emits no conversion. Replacing the whole
-                         * cell made `e` an INTEGER that no longer compared
-                         * with T's members ("Operands not comparable");
-                         * keep the enum type and store the ordinal. */
-                        long long ordinal = asI64(value_to_set);
-                        Type* meta = ENUM_META(*target_lvalue_ptr);
-                        const char* enum_name = AS_ENUM(*target_lvalue_ptr).enum_name;
-                        if (meta ? (ordinal < 0 || ordinal >= meta->member_count)
-                                 : (ordinal < INT32_MIN || ordinal > INT32_MAX)) {
-                            runtimeError(vm, "Runtime Error: Enum '%s' out of range (ordinal %lld).",
-                                         enum_name ? enum_name : "<anon>", ordinal);
-                            freeValue(&value_to_set);
-                            freeValue(&pointer_to_lvalue);
-                            return INTERPRET_RUNTIME_ERROR;
-                        }
-                        Value replacement = makeEnum(enum_name, (int)ordinal);
-                        ENUM_META(replacement) = meta;
-                        ENUM_TYPE_DEF(replacement) = ENUM_TYPE_DEF(*target_lvalue_ptr);
-                        replaceValueCell(target_lvalue_ptr, replacement, NULL);
-                    }
-                    else {
-                        // VM 2.0 Phase 4i: target_lvalue_ptr's type is never
-                        // TYPE_POINTER at this point (that case is handled
-                        // by the branch above) -- guard anyway rather than
-                        // rely on that invariant holding forever, since
-                        // PTR_BASE_TYPE_NODE now requires it.
-                        AST* preserved_base = (VALUE_TYPE(*target_lvalue_ptr) == TYPE_POINTER)
-                                                   ? PTR_BASE_TYPE_NODE(*target_lvalue_ptr)
-                                                   : NULL;
-                        if (VALUE_TYPE(value_to_set) == TYPE_MEMORYSTREAM) {
-                            /* Transfer ownership of the MStream pointer without freeing it
-                             * when the temporary value is cleaned up below. */
-                            Value replacement = value_to_set;
-                            replaceValueCell(target_lvalue_ptr, replacement, preserved_base);
-                            pscalValueSetHeapPtrBits(&value_to_set, NULL);
-                            // Detached the alias above without updating .bits
-                            // (VM 2.0 Phase 4i checkpoint 3b) -- value_to_set
-                            // is freeValue'd a few lines down and would
-                            // otherwise abort on a stale non-NULL pointer tag.
-                            pscalValueSetHeapPtrBits(&value_to_set, NULL);
-                        } else if (!valueAssignAggregateInPlace(target_lvalue_ptr, &value_to_set)) {
-                            // (A record or static array assigned over one of
-                            // the same shape was instead copied into the
-                            // target's own storage just now: Pascal keeps a
-                            // variable's storage across `r := r2`, and VAR
-                            // parameters may point into it.)
-                            Value replacement = makeCopyOfValue(&value_to_set);
-                            replaceValueCell(target_lvalue_ptr, replacement, preserved_base);
-                        }
                     }
                 }
 
