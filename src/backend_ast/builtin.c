@@ -837,6 +837,11 @@ static bool readStructuredValue(FILE* stream, Value* rawValue) {
     if (VALUE_TYPE(*value) == TYPE_POINTER && AS_POINTER(*value)) {
         value = (Value*)AS_POINTER(*value);
     }
+    // Strings, records and static arrays are filled in place (recursively,
+    // field by field), so unshare each level before writing into it: copies
+    // made by assignment or a by-value parameter share these payloads by
+    // reference count and would otherwise change too.
+    valueEnsureUnique(value);
 
     char token[1024];
     switch (VALUE_TYPE(*value)) {
@@ -4004,6 +4009,11 @@ Value vmBuiltinSetlength(VM* vm, int arg_count, Value* args) {
             runtimeError(vm, "SetLength expects a string or dynamic array target.");
             return makeVoid();
         }
+
+        // The buffer is replaced inside the target's StringObj below, which
+        // copies of the variable (and a string literal it was assigned from)
+        // may share by reference count: unshare it first.
+        valueEnsureUnique(target);
 
         size_t alloc_len = (size_t)new_len;
         size_t copy_len = 0;
@@ -7252,6 +7262,10 @@ Value vmBuiltinInc(VM* vm, int arg_count, Value* args) {
         }
 
         case TYPE_ENUM:
+            // The EnumObj may be shared by reference count with copies of
+            // the variable (a by-value parameter): unshare before the
+            // in-place write.
+            valueEnsureUnique(target);
             AS_ENUM(*target).ordinal += (int)delta;
             break;
 
@@ -7357,6 +7371,7 @@ Value vmBuiltinDec(VM* vm, int arg_count, Value* args) {
         }
 
         case TYPE_ENUM:
+            valueEnsureUnique(target); // shared EnumObj: see Inc
             AS_ENUM(*target).ordinal -= (int)delta;
             break;
 
@@ -8192,6 +8207,10 @@ Value vmBuiltinBlockread(VM* vm, int arg_count, Value* args) {
                 parameterError = true;
                 goto cleanup;
             }
+            // The elements are overwritten in place: unshare a static array
+            // that copies still share by reference count (dynamic arrays are
+            // reference types and stay shared).
+            valueEnsureUnique(bufferValue);
             if (ARRAY_IS_PACKED(*bufferValue) && ARRAY_ELEMENT_TYPE(*bufferValue) == TYPE_BYTE) {
                 if (!AS_ARRAY_RAW(*bufferValue) && bytesToRead > 0) {
                     runtimeError(vm, "BlockRead: packed byte buffer is NULL.");
