@@ -12455,6 +12455,9 @@ comparison_error_label:
                     }
                     vmUserProcSiteStore(vm, call_site, proc_symbol);
                 }
+                if (!vmCheckCallArity(vm, proc_symbol, declared_arity)) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
 
                 size_t target_address = (size_t)proc_symbol->bytecode_address;
                 if (!vm->chunk || target_address >= (size_t)vm->chunk->count) {
