@@ -411,6 +411,10 @@ typedef struct VM_s {
      * the only 0-based frontend, which became a trap once Aether joined. */
     bool zeroBasedIndexing;
 
+    // True between initVM and freeVM: counted in the process-wide live-VM
+    // total that decides when shared caches may be freed.
+    bool liveCounted;
+
     // VM mutexes this VM holds (touched only by its own thread), so a job's
     // end skips the registry scan in the common case of none.
     int heldMutexCount;

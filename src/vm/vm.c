@@ -261,6 +261,11 @@ static pthread_mutex_t gVmProcRegistryLock = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t value_cell_mutex = PTHREAD_MUTEX_INITIALIZER;
 static VM* gVmProcRegistry[VM_PROC_REGISTRY_CAPACITY];
 static size_t gVmProcRegistryCount = 0;
+// Every VM between initVM and freeVM, guarded by gVmProcRegistryLock. The
+// registry above stops at VM_PROC_REGISTRY_CAPACITY (a diagnostic listing),
+// while a pool can run up to PSCAL_VM_MAX_THREADS worker VMs, so its count
+// cannot say whether any VM is still alive.
+static size_t gVmLiveCount = 0;
 
 static size_t vmCountTableSymbols(const HashTable* table) {
     if (!table) {
@@ -280,6 +285,10 @@ static void vmProcRegister(VM* vm) {
         return;
     }
     pthread_mutex_lock(&gVmProcRegistryLock);
+    if (!vm->liveCounted) {
+        vm->liveCounted = true;
+        gVmLiveCount++;
+    }
     for (size_t i = 0; i < gVmProcRegistryCount; ++i) {
         if (gVmProcRegistry[i] == vm) {
             pthread_mutex_unlock(&gVmProcRegistryLock);
@@ -297,6 +306,12 @@ static void vmProcUnregister(VM* vm) {
         return;
     }
     pthread_mutex_lock(&gVmProcRegistryLock);
+    if (vm->liveCounted) {
+        vm->liveCounted = false;
+        if (gVmLiveCount > 0) {
+            gVmLiveCount--;
+        }
+    }
     for (size_t i = 0; i < gVmProcRegistryCount; ++i) {
         if (gVmProcRegistry[i] == vm) {
             gVmProcRegistry[i] = gVmProcRegistry[gVmProcRegistryCount - 1];
@@ -5453,7 +5468,7 @@ static void vmCleanupGlobalCachesIfIdle(void) {
     // before this phase. Fix: hold the registry lock across the check *and*
     // the frees, exactly like every other mutation of this registry does.
     pthread_mutex_lock(&gVmProcRegistryLock);
-    if (gVmProcRegistryCount == 0) {
+    if (gVmLiveCount == 0) {
         vmFreeRuntimeVTables();
         vmFreeShellBuiltinProfiles();
     }
@@ -6702,6 +6717,7 @@ void initVM(VM* vm) { // As in all.txt, with frameCount
     vm->frontendContext = NULL;
     vm->zeroBasedIndexing = frontendIsZeroBasedStrings();
     vm->heldMutexCount = 0;
+    vm->liveCounted = false; // vmProcRegister below counts it
 
     for (int i = 0; i < MAX_HOST_FUNCTIONS; i++) {
         vm->host_functions[i] = NULL;
