@@ -794,6 +794,8 @@ typedef struct HttpSession_s {
     char* last_headers;   // raw response headers from last request
     int   last_error_code; // VM-specific error code (0 on success)
     char* last_error_msg; // last libcurl error message
+    unsigned int gen;     // bumped on every httpAllocSession, so an async
+                          // result never lands on a reused slot
 } HttpSession;
 
 /* Callback for libcurl: accumulates raw response headers into the session */
@@ -813,6 +815,7 @@ static size_t headerAccumCallback(char *buffer, size_t size, size_t nitems, void
 
 #define MAX_HTTP_SESSIONS 32
 static HttpSession g_http_sessions[MAX_HTTP_SESSIONS];
+static unsigned int g_http_session_gen = 0;
 
 static int httpAllocSession(void) {
     for (int i = 0; i < MAX_HTTP_SESSIONS; i++) {
@@ -831,6 +834,7 @@ static int httpAllocSession(void) {
         g_http_sessions[i].retry_delay_ms = 0;
         g_http_sessions[i].max_recv_speed = 0;
         g_http_sessions[i].max_send_speed = 0;
+        g_http_sessions[i].gen = __atomic_add_fetch(&g_http_session_gen, 1, __ATOMIC_RELAXED);
         return i;
     }
     }
@@ -2649,6 +2653,7 @@ typedef struct HttpAsyncJob_s {
     int active;
     pthread_t th;
     int session;
+    unsigned int session_gen; // the session's gen at submission time
     char* method;
     char* url;
     char* body;
@@ -2802,36 +2807,25 @@ static Value* httpFindRecordField(Value record, const char* name) {
     return NULL;
 }
 
-// Shared tail for every exit path in httpAsyncWork (below): propagates
-// status/headers/error onto the owning HttpSession (mirrors what
-// vmBuiltinHttpAwait/vmBuiltinHttpTryAwait used to do at consumption time
-// in the pre-5a-iii design -- moved here, to job-completion time, so it
-// happens exactly once regardless of how many times the resulting task is
-// polled/awaited; matches this file's pre-existing no-dedicated-
-// session-lock discipline, which this migration does not change -- see the
-// plan doc's checkpoint 5a-iii writeup for why), then stores the result as
-// a small {status, body} record via the generic Task result-handoff
-// (vmThreadStoreResult). A bare MStream isn't enough here (unlike a plain
-// TaskSpawn'd function's single return value): HttpAwait's callers need
-// BOTH the numeric HTTP status and the body back, and reaching into `job`
-// itself from the awaiting thread to read job->session (the way the
-// pre-5a-iii design read g_http_async[id].session under a shared array
-// lock) is NOT safe here -- job is heap-allocated per request and freed by
-// httpAsyncJobFree shortly after this function returns, on this same
-// worker thread, with no synchronization forcing that free to wait for a
-// concurrent reader on another thread. Packing both pieces into the one
-// Value the result-handoff already carries sidesteps the problem entirely.
+// Shared tail for every exit path in httpAsyncWork (below): stores the
+// result as a small {status, body, session, session_gen, headers, error_code,
+// error_msg} record via
+// the generic Task result-handoff (vmThreadStoreResult). A bare MStream isn't
+// enough here (unlike a plain TaskSpawn'd function's single return value):
+// HttpAwait's callers need BOTH the numeric HTTP status and the body back,
+// and job itself is heap-allocated per request and freed by httpAsyncJobFree
+// shortly after this function returns, on this same worker thread.
+//
+// This worker never touches the owning HttpSession. The program's own thread
+// owns it: it may run a synchronous request on it (headerAccumCallback
+// reallocs last_headers mid-transfer) or httpClose it (which frees
+// last_headers) while this job is still running, and the session has no
+// lock. Writing last_status/last_headers/last_error_* here raced both and
+// freed last_headers twice when a cancelled job finished after httpClose.
+// httpTaskAwaitAndExtract applies the record's fields to the session instead,
+// on the awaiting thread, as the pre-5a-iii design did at consumption time.
 static void httpAsyncFinish(VM* threadVm, HttpAsyncJob* job) {
     bool success = job->status >= 0;
-    HttpSession* s = httpGet(job->session);
-    if (s) {
-        s->last_status = job->status;
-        if (s->last_headers) { free(s->last_headers); s->last_headers = NULL; }
-        if (job->last_headers) s->last_headers = strdup(job->last_headers);
-        s->last_error_code = job->last_error_code;
-        if (s->last_error_msg) { free(s->last_error_msg); s->last_error_msg = NULL; }
-        if (job->last_error_msg) s->last_error_msg = strdup(job->last_error_msg);
-    }
     Value bodyValue = job->result ? makeMStream(job->result) : makeNil();
     job->result = NULL; // ownership transferred into bodyValue
 
@@ -2839,6 +2833,13 @@ static void httpAsyncFinish(VM* threadVm, HttpAsyncJob* job) {
     FieldValue* tail = NULL;
     bool ok = httpAppendRecordField(&head, &tail, "status", makeInt(job->status));
     ok = ok && httpAppendRecordField(&head, &tail, "body", bodyValue);
+    ok = ok && httpAppendRecordField(&head, &tail, "session", makeInt(job->session));
+    ok = ok && httpAppendRecordField(&head, &tail, "session_gen", makeInt((int)job->session_gen));
+    ok = ok && httpAppendRecordField(&head, &tail, "headers",
+                                     job->last_headers ? makeString(job->last_headers) : makeNil());
+    ok = ok && httpAppendRecordField(&head, &tail, "error_code", makeInt(job->last_error_code));
+    ok = ok && httpAppendRecordField(&head, &tail, "error_msg",
+                                     job->last_error_msg ? makeString(job->last_error_msg) : makeNil());
     Value resultValue = ok ? makeRecord(head) : makeNil();
     if (!ok) {
         freeFieldValue(head);
@@ -3353,6 +3354,7 @@ Value vmBuiltinHttpRequestAsync(VM* vm, int arg_count, Value* args) {
     // Snapshot session options for thread safety
     HttpSession* s = httpGet(job->session);
     if (s) {
+        job->session_gen = s->gen;
         job->timeout_ms = s->timeout_ms; job->follow_redirects = s->follow_redirects;
         job->verify_peer = s->verify_peer; job->verify_host = s->verify_host; job->force_http2 = s->force_http2;
         job->user_agent = s->user_agent ? strdup(s->user_agent) : NULL;
@@ -3441,6 +3443,7 @@ Value vmBuiltinHttpRequestAsyncToFile(VM* vm, int arg_count, Value* args) {
     // Snapshot session options for thread safety
     HttpSession* s = httpGet(job->session);
     if (s) {
+        job->session_gen = s->gen;
         job->timeout_ms = s->timeout_ms; job->follow_redirects = s->follow_redirects;
         job->verify_peer = s->verify_peer; job->verify_host = s->verify_host; job->force_http2 = s->force_http2;
         job->user_agent = s->user_agent ? strdup(s->user_agent) : NULL;
@@ -3519,6 +3522,29 @@ static int httpTaskAwaitAndExtract(VM* vm, TaskObj* t, Value* outMstream) {
     Value* statusField = httpFindRecordField(result, "status");
     if (statusField && IS_INTLIKE(*statusField)) {
         status = (int)AS_INTEGER(*statusField);
+    }
+    // The session's last-request state, which httpAsyncFinish leaves to the
+    // awaiting thread (see there). Skipped when the session was closed, or
+    // closed and its slot reused, since the request started.
+    Value* sessionField = httpFindRecordField(result, "session");
+    Value* genField = httpFindRecordField(result, "session_gen");
+    HttpSession* s = (sessionField && IS_INTLIKE(*sessionField))
+                         ? httpGet((int)AS_INTEGER(*sessionField)) : NULL;
+    if (s && genField && IS_INTLIKE(*genField) &&
+        s->gen == (unsigned int)AS_INTEGER(*genField)) {
+        Value* headersField = httpFindRecordField(result, "headers");
+        Value* codeField = httpFindRecordField(result, "error_code");
+        Value* msgField = httpFindRecordField(result, "error_msg");
+        s->last_status = status;
+        if (s->last_headers) { free(s->last_headers); s->last_headers = NULL; }
+        if (headersField && isPascalStringType(VALUE_TYPE(*headersField)) && AS_STRING(*headersField)) {
+            s->last_headers = strdup(AS_STRING(*headersField));
+        }
+        s->last_error_code = (codeField && IS_INTLIKE(*codeField)) ? (int)AS_INTEGER(*codeField) : 0;
+        if (s->last_error_msg) { free(s->last_error_msg); s->last_error_msg = NULL; }
+        if (msgField && isPascalStringType(VALUE_TYPE(*msgField)) && AS_STRING(*msgField)) {
+            s->last_error_msg = strdup(AS_STRING(*msgField));
+        }
     }
     Value* bodyField = httpFindRecordField(result, "body");
     if (bodyField && VALUE_TYPE(*bodyField) == TYPE_MEMORYSTREAM &&
