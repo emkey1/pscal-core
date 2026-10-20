@@ -9101,6 +9101,13 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 Value* base_val_ptr = vm->stackTop - 1;
+                if (VALUE_TYPE(*base_val_ptr) == TYPE_RECORD) {
+                    // A record value, not its address: this opcode pops the
+                    // base, which frees the storage the field address would
+                    // point into. No compiler emits this.
+                    runtimeError(vm, "VM Error: GET_FIELD_ADDRESS needs a pointer to the record, not a record value.");
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 bool invalid_type = false;
                 Value* record_struct_ptr = resolveRecord(base_val_ptr, &invalid_type);
                 if (invalid_type) {
@@ -9144,6 +9151,13 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 Value* base_val_ptr = vm->stackTop - 1;
+                if (VALUE_TYPE(*base_val_ptr) == TYPE_RECORD) {
+                    // A record value, not its address: this opcode pops the
+                    // base, which frees the storage the field address would
+                    // point into. No compiler emits this.
+                    runtimeError(vm, "VM Error: GET_FIELD_ADDRESS16 needs a pointer to the record, not a record value.");
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 bool invalid_type = false;
                 Value* record_struct_ptr = resolveRecord(base_val_ptr, &invalid_type);
                 if (invalid_type) {
