@@ -331,6 +331,9 @@ typedef struct VM_s {
     HashTable* procedureTable;      // store procedure table for disassembly
     Symbol** procedureByAddress;    // Cache mapping bytecode offsets to procedure symbols
     size_t procedureByAddressSize;  // Number of cached entries
+    Symbol** userProcBySite;        // CALL_USER_PROC callee, indexed by the call's code offset
+    size_t userProcBySiteSize;      // Entries in userProcBySite (the chunk's code size)
+    const BytecodeChunk* userProcBySiteChunk; // Chunk userProcBySite was built for
     
     HostFn host_functions[MAX_HOST_FUNCTIONS];
 

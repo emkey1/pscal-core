@@ -5016,6 +5016,70 @@ static Symbol* findProcedureByName(HashTable* table, const char* lookup_name, VM
     return NULL;
 }
 
+// Resolves a CALL_USER_PROC callee the way the source scopes it: routines
+// nested in the calling routine first, then those nested in each enclosing
+// routine outward, then the global table. findProcedureByName (global table
+// first, then any nested routine whose parent is anywhere on the call
+// stack) stays as the last resort; on its own it ran the global routine
+// instead of a nested one that shadows it, and a sibling routine's nested
+// helper instead of the caller's own.
+static Symbol* vmResolveUserProc(VM* vm, const char* lookup_name) {
+    if (vm->frameCount > 0) {
+        for (Symbol* scope = vm->frames[vm->frameCount - 1].function_symbol;
+             scope; scope = scope->enclosing) {
+            HashTable* nested = (scope->type_def && scope->type_def->symbol_table)
+                                    ? (HashTable*)scope->type_def->symbol_table
+                                    : NULL;
+            Symbol* hit = nested ? resolveProcedureAlias(hashTableLookup(nested, lookup_name)) : NULL;
+            if (hit) {
+                return hit;
+            }
+        }
+    }
+    Symbol* global = resolveProcedureAlias(hashTableLookup(vm->procedureTable, lookup_name));
+    if (global) {
+        return global;
+    }
+    return findProcedureByName(vm->procedureTable, lookup_name, vm);
+}
+
+static void vmFreeUserProcSiteCache(VM* vm) {
+    free(vm->userProcBySite);
+    vm->userProcBySite = NULL;
+    vm->userProcBySiteSize = 0;
+    vm->userProcBySiteChunk = NULL;
+}
+
+// Lexical resolution depends only on where the call is, so each call site's
+// callee is looked up once per chunk instead of on every call (a name copy,
+// lowercase and hash lookup each time, and for a nested callee a scan of
+// every procedure table).
+static Symbol* vmUserProcSiteLookup(VM* vm, size_t site) {
+    if (vm->userProcBySiteChunk != vm->chunk || site >= vm->userProcBySiteSize) {
+        return NULL;
+    }
+    return vm->userProcBySite[site];
+}
+
+static void vmUserProcSiteStore(VM* vm, size_t site, Symbol* symbol) {
+    if (!vm->chunk || vm->chunk->count <= 0) {
+        return;
+    }
+    if (vm->userProcBySiteChunk != vm->chunk ||
+        vm->userProcBySiteSize != (size_t)vm->chunk->count) {
+        vmFreeUserProcSiteCache(vm);
+        vm->userProcBySite = (Symbol**)calloc((size_t)vm->chunk->count, sizeof(Symbol*));
+        if (!vm->userProcBySite) {
+            return;
+        }
+        vm->userProcBySiteSize = (size_t)vm->chunk->count;
+        vm->userProcBySiteChunk = vm->chunk;
+    }
+    if (site < vm->userProcBySiteSize) {
+        vm->userProcBySite[site] = symbol;
+    }
+}
+
 // push()/pop()/peek() can't return an error, so on a fault they report and
 // hand back nil (pop/peek) or drop the value (push). The handler finishes on
 // that and the dispatch loop stops before the next instruction (see
@@ -6469,6 +6533,7 @@ void vmResetExecutionState(VM* vm) {
         vm->procedureByAddress = NULL;
     }
     vm->procedureByAddressSize = 0;
+    vmFreeUserProcSiteCache(vm);
 
     vm->exit_requested = false;
     vm->abort_requested = false;
@@ -6578,6 +6643,9 @@ void initVM(VM* vm) { // As in all.txt, with frameCount
     vm->procedureTable = NULL;
     vm->procedureByAddress = NULL;
     vm->procedureByAddressSize = 0;
+    vm->userProcBySite = NULL;
+    vm->userProcBySiteSize = 0;
+    vm->userProcBySiteChunk = NULL;
 
     vm->exit_requested = false;
     vm->abort_requested = false;
@@ -6674,6 +6742,7 @@ void freeVM(VM* vm) {
         vm->procedureByAddress = NULL;
     }
     vm->procedureByAddressSize = 0;
+    vmFreeUserProcSiteCache(vm);
 
     atomic_store(&vm->shuttingDownWorkers, true);
     if (vm->jobQueue) {
@@ -11842,6 +11911,7 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
+                size_t call_site = (size_t)(vm->lastInstruction - vm->chunk->code);
                 uint16_t name_index = READ_SHORT(vm);
                 uint8_t declared_arity = READ_BYTE();
 
@@ -11851,37 +11921,42 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
-                if (!vm->chunk || name_index >= vm->chunk->constants_count) {
-                    runtimeError(vm, "VM Error: Invalid procedure name index %u for CALL_USER_PROC.", name_index);
-                    return INTERPRET_RUNTIME_ERROR;
-                }
-
-                Value* name_val = &vm->chunk->constants[name_index];
-                if (VALUE_TYPE(*name_val) != TYPE_STRING || !AS_STRING(*name_val)) {
-                    runtimeError(vm, "VM Error: CALL_USER_PROC requires string constant for callee name (index %u).", name_index);
-                    return INTERPRET_RUNTIME_ERROR;
-                }
-
-                const char* proc_name = AS_STRING(*name_val);
-                char lookup_name[MAX_SYMBOL_LENGTH + 1];
-                strncpy(lookup_name, proc_name, MAX_SYMBOL_LENGTH);
-                lookup_name[MAX_SYMBOL_LENGTH] = '\0';
-                toLowerString(lookup_name);
-
-                if (!vm->procedureTable) {
-                    runtimeError(vm, "VM Error: Procedure table not initialized when calling '%s'.", proc_name);
-                    return INTERPRET_RUNTIME_ERROR;
-                }
-
-                Symbol* proc_symbol = findProcedureByName(vm->procedureTable, lookup_name, vm);
+                Symbol* proc_symbol = vmUserProcSiteLookup(vm, call_site);
+                const char* proc_name = proc_symbol ? proc_symbol->name : NULL;
                 if (!proc_symbol) {
-                    runtimeError(vm, "VM Error: Procedure '%s' not found for CALL_USER_PROC.", proc_name);
-                    return INTERPRET_RUNTIME_ERROR;
-                }
-                if (!proc_symbol->is_defined || proc_symbol->bytecode_address < 0) {
-                    runtimeError(vm, "VM Error: Procedure '%s' has no compiled body.",
-                                 proc_symbol->name ? proc_symbol->name : proc_name);
-                    return INTERPRET_RUNTIME_ERROR;
+                    if (!vm->chunk || name_index >= vm->chunk->constants_count) {
+                        runtimeError(vm, "VM Error: Invalid procedure name index %u for CALL_USER_PROC.", name_index);
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+
+                    Value* name_val = &vm->chunk->constants[name_index];
+                    if (VALUE_TYPE(*name_val) != TYPE_STRING || !AS_STRING(*name_val)) {
+                        runtimeError(vm, "VM Error: CALL_USER_PROC requires string constant for callee name (index %u).", name_index);
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+
+                    proc_name = AS_STRING(*name_val);
+                    char lookup_name[MAX_SYMBOL_LENGTH + 1];
+                    strncpy(lookup_name, proc_name, MAX_SYMBOL_LENGTH);
+                    lookup_name[MAX_SYMBOL_LENGTH] = '\0';
+                    toLowerString(lookup_name);
+
+                    if (!vm->procedureTable) {
+                        runtimeError(vm, "VM Error: Procedure table not initialized when calling '%s'.", proc_name);
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+
+                    proc_symbol = vmResolveUserProc(vm, lookup_name);
+                    if (!proc_symbol) {
+                        runtimeError(vm, "VM Error: Procedure '%s' not found for CALL_USER_PROC.", proc_name);
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    if (!proc_symbol->is_defined || proc_symbol->bytecode_address < 0) {
+                        runtimeError(vm, "VM Error: Procedure '%s' has no compiled body.",
+                                     proc_symbol->name ? proc_symbol->name : proc_name);
+                        return INTERPRET_RUNTIME_ERROR;
+                    }
+                    vmUserProcSiteStore(vm, call_site, proc_symbol);
                 }
 
                 size_t target_address = (size_t)proc_symbol->bytecode_address;
