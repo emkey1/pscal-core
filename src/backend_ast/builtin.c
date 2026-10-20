@@ -745,6 +745,86 @@ static bool writeBinaryElement(FILE* stream, const Value* rawValue, VarType elem
     return true;
 }
 
+/* The reading half of writeBinaryElement: one element of a typed file
+ * (`file of Integer`, `file of Color`, ...) in the same fixed-size native
+ * layout. Read used to parse these files as text and came back with 0 for
+ * every element. A short read (end of file) reports IOResult 100, as in
+ * Turbo/Free Pascal. */
+static bool builtinSetEnumOrdinal(Value* dst, long long ordinal);
+
+static bool readBinaryElement(FILE* stream, Value* dst, VarType elementType,
+                              size_t elementSize, int* outErrno) {
+    if (outErrno) *outErrno = 0;
+    if (!stream || !dst || elementSize == 0 || elementSize > sizeof(long double)) {
+        if (outErrno) *outErrno = 1;
+        return false;
+    }
+    unsigned char buffer[sizeof(long double)] = {0};
+    errno = 0;
+    size_t got = fread(buffer, 1, elementSize, stream);
+    if (got != elementSize) {
+        if (outErrno) *outErrno = ferror(stream) ? (errno ? errno : 1) : 100;
+        return false;
+    }
+
+    bool is_real = false;
+    long long ival = 0;
+    long double rval = 0.0L;
+    switch (elementType) {
+        case TYPE_INT8:   { int8_t v;   memcpy(&v, buffer, sizeof(v)); ival = v; break; }
+        case TYPE_INT16:  { int16_t v;  memcpy(&v, buffer, sizeof(v)); ival = v; break; }
+        case TYPE_INT32:  { int32_t v;  memcpy(&v, buffer, sizeof(v)); ival = v; break; }
+        case TYPE_INT64:  { int64_t v;  memcpy(&v, buffer, sizeof(v)); ival = v; break; }
+        case TYPE_CHAR:
+        case TYPE_BOOLEAN:
+        case TYPE_BYTE:
+        case TYPE_UINT8:  ival = buffer[0]; break;
+        case TYPE_UINT16:
+        case TYPE_WORD:   { uint16_t v; memcpy(&v, buffer, sizeof(v)); ival = v; break; }
+        case TYPE_UINT32:
+        case TYPE_ENUM:   { uint32_t v; memcpy(&v, buffer, sizeof(v)); ival = v; break; }
+        case TYPE_UINT64: { uint64_t v; memcpy(&v, buffer, sizeof(v)); ival = (long long)v; break; }
+        case TYPE_FLOAT:  { float f;    memcpy(&f, buffer, sizeof(f)); rval = f; is_real = true; break; }
+        case TYPE_DOUBLE: { double d;   memcpy(&d, buffer, sizeof(d)); rval = d; is_real = true; break; }
+        case TYPE_LONG_DOUBLE: { long double ld; memcpy(&ld, buffer, sizeof(ld)); rval = ld; is_real = true; break; }
+        default:
+            if (outErrno) *outErrno = 1;
+            return false;
+    }
+
+    VarType dst_type = VALUE_TYPE(*dst);
+    if (dst_type == TYPE_ENUM) {
+        if (is_real || !builtinSetEnumOrdinal(dst, ival)) {
+            if (outErrno) *outErrno = 1;
+            return false;
+        }
+        return true;
+    }
+    if (isRealType(dst_type)) {
+        SET_REAL_VALUE(dst, is_real ? rval : (long double)ival);
+        return true;
+    }
+    if (is_real) {
+        if (outErrno) *outErrno = 1;
+        return false;
+    }
+    if (dst_type == TYPE_CHAR) {
+        SET_CHAR_VALUE(dst, (unsigned char)ival);
+        SET_INT_VALUE(dst, AS_CHAR(*dst));
+        return true;
+    }
+    if (dst_type == TYPE_BOOLEAN) {
+        SET_INT_VALUE(dst, ival != 0 ? 1 : 0);
+        return true;
+    }
+    if (IS_INTLIKE(*dst)) {
+        SET_INT_VALUE(dst, ival);
+        return true;
+    }
+    if (outErrno) *outErrno = 1;
+    return false;
+}
+
 static bool readToken(FILE* stream, char* buffer, size_t bufferSize) {
     if (!stream || !buffer || bufferSize == 0) {
         return false;
@@ -5483,6 +5563,12 @@ static void vmPrepareCanonicalInput(void) {
 
 static bool vmBufferIsPureDsr(const char *buf, size_t len);
 
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} VmLineBuf;
+
 #if defined(PSCAL_TARGET_IOS)
 typedef void (*VmSuspendWaitHookFn)(void);
 static __thread VmSuspendWaitHookFn gVmSuspendBeforeWaitHook = NULL;
@@ -5609,10 +5695,39 @@ static bool vmHandleCtrlZReadRequest(VM *vm, char *buffer) {
 }
 #endif
 
-static bool vmReadLineInterruptible(VM *vm, FILE *stream, char *buffer, size_t buffer_sz) {
-    if (!stream || !buffer || buffer_sz == 0) {
+/* Make room for at least `need` bytes in `line`. */
+static bool vmLineBufReserve(VmLineBuf *line, size_t need) {
+    if (line->data && line->cap >= need) {
+        return true;
+    }
+    size_t cap = line->cap ? line->cap : 128;
+    while (cap < need) {
+        if (cap > SIZE_MAX / 2) {
+            return false;
+        }
+        cap *= 2;
+    }
+    char *grown = (char *)realloc(line->data, cap);
+    if (!grown) {
         return false;
     }
+    line->data = grown;
+    line->cap = cap;
+    return true;
+}
+
+/* Read one line from `stream` into `line` (grown as needed, NUL-terminated,
+ * line->len set; the caller frees line->data). The line break is not
+ * stored. A line has no length limit: the fixed buffers this used to fill
+ * (1024 bytes for readln, 1 MiB for read_line) returned a longer line as
+ * several lines. */
+static bool vmReadLineInterruptible(VM *vm, FILE *stream, VmLineBuf *line) {
+    if (!stream || !line || !vmLineBufReserve(line, 128)) {
+        return false;
+    }
+    line->len = 0;
+    line->data[0] = '\0';
+    char *buffer = line->data;
     int fd = fileno(stream);
     bool is_stdin_stream = vmStreamTargetsSharedStdin(stream);
 #if defined(PSCAL_TARGET_IOS)
@@ -5715,7 +5830,13 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, char *buffer, size_t b
 #if defined(PSCAL_TARGET_IOS)
         bool pending_caret_control = false;
 #endif
-        while (len < buffer_sz - 1) {
+        for (;;) {
+            /* Room for the most one pass of this loop can store: one byte,
+             * a caret pair, or a pushed-back escape sequence (< 32 bytes). */
+            if (!vmLineBufReserve(line, len + 64)) {
+                break;
+            }
+            buffer = line->data;
 #if defined(PSCAL_TARGET_IOS)
             /* If a frontend thread was hard-stopped while blocked in select/poll,
              * convert that stop into a cooperative pending signal so ReadLn can
@@ -5871,9 +5992,6 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, char *buffer, size_t b
                         return false;
                     }
                     buffer[len++] = '^';
-                    if (len >= buffer_sz - 1) {
-                        break;
-                    }
                 }
                 if (ch == '^') {
                     pending_caret_control = true;
@@ -6136,7 +6254,7 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, char *buffer, size_t b
                     continue;
                 }
                 // Not a DSR; push everything we pulled back into the user buffer.
-                for (size_t k = 0; k < seq_len && len < buffer_sz - 1; k++) {
+                for (size_t k = 0; k < seq_len; k++) {
                     buffer[len++] = seq[k];
                 }
                 continue;
@@ -6162,6 +6280,7 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, char *buffer, size_t b
             buffer[len++] = ch;
         }
         buffer[len] = '\0';
+        line->len = len;
 #if defined(PSCAL_TARGET_IOS)
         if (tool_dbg && stream == stdin) {
             fprintf(stderr, "[readln] done len=%zu saw_nl=%d eof=%d\n",
@@ -6174,10 +6293,13 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, char *buffer, size_t b
         return false;
     }
 
-    if (fgets(buffer, buffer_sz, stream) == NULL) {
+    ssize_t got = getline(&line->data, &line->cap, stream);
+    if (got < 0) {
+        if (line->data) line->data[0] = '\0';
         return false;
     }
-    buffer[strcspn(buffer, "\r\n")] = '\0';
+    line->len = strcspn(line->data, "\r\n");
+    line->data[line->len] = '\0';
     return true;
 }
 
@@ -8661,11 +8783,98 @@ cleanup:
     return makeVoid();
 }
 
+/* The value range of an integer Read/Readln/Val destination. */
+static void builtinIntTypeRange(VarType type, long long* lo, unsigned long long* hi) {
+    switch (type) {
+        case TYPE_INT8:   *lo = INT8_MIN;  *hi = INT8_MAX;   break;
+        case TYPE_INT16:  *lo = INT16_MIN; *hi = INT16_MAX;  break;
+        case TYPE_INT32:  *lo = INT32_MIN; *hi = INT32_MAX;  break;
+        case TYPE_UINT8:
+        case TYPE_BYTE:   *lo = 0;         *hi = UINT8_MAX;  break;
+        case TYPE_UINT16:
+        case TYPE_WORD:   *lo = 0;         *hi = UINT16_MAX; break;
+        case TYPE_UINT32: *lo = 0;         *hi = UINT32_MAX; break;
+        case TYPE_UINT64: *lo = 0;         *hi = UINT64_MAX; break;
+        default:          *lo = LLONG_MIN; *hi = LLONG_MAX;  break;
+    }
+}
+
+/* Parse the decimal integer at `text` (leading whitespace skipped) for a
+ * destination of type `type`. False when there is no number or it does not
+ * fit the destination; SET_INT_VALUE would otherwise wrap it silently
+ * (99999999999 read into an Integer came back as 1215752191). On success
+ * *endp points past the digits. */
+static bool builtinParseIntForType(VarType type, const char* text, const char** endp, long long* out) {
+    long long lo;
+    unsigned long long hi;
+    builtinIntTypeRange(type, &lo, &hi);
+    const char* p = text;
+    while (isspace((unsigned char)*p)) p++;
+    char* e = NULL;
+    errno = 0;
+    if (lo == 0 && *p != '-') {
+        unsigned long long v = strtoull(p, &e, 10);
+        if (e == p || errno == ERANGE || v > hi) return false;
+        *out = (long long)v;
+    } else {
+        long long v = strtoll(p, &e, 10);
+        if (e == p || errno == ERANGE || v < lo || (v > 0 && (unsigned long long)v > hi)) return false;
+        *out = v;
+    }
+    *endp = e;
+    return true;
+}
+
+/* Turbo/Free Pascal's IOResult for text that is not a number of the
+ * destination's type. */
+#define VM_IO_INVALID_NUMERIC_FORMAT 106
+
+/* The next whitespace-delimited token of `stream`, in a buffer grown to fit
+ * (Read used to cut tokens at 1023 bytes and return the rest as the next
+ * token). The caller frees *out. False at end of input. */
+static bool readTokenAlloc(FILE* stream, char** out, size_t* out_len) {
+    int ch;
+    do {
+        ch = fgetc(stream);
+    } while (ch != EOF && isspace(ch));
+    if (ch == EOF) {
+        return false;
+    }
+    size_t len = 0, cap = 64;
+    char* buf = (char*)malloc(cap);
+    if (!buf) {
+        return false;
+    }
+    while (ch != EOF && !isspace(ch)) {
+        if (len + 1 >= cap) {
+            char* grown = (char*)realloc(buf, cap * 2);
+            if (!grown) {
+                free(buf);
+                return false;
+            }
+            buf = grown;
+            cap *= 2;
+        }
+        buf[len++] = (char)ch;
+        ch = fgetc(stream);
+    }
+    if (ch != EOF) {
+        ungetc(ch, stream);
+    }
+    buf[len] = '\0';
+    *out = buf;
+    *out_len = len;
+    return true;
+}
+
 Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
     FILE* input_stream = stdin;
     int var_start_index = 0;
     bool first_arg_is_file_by_value = false;
     int io_error = 0;
+    bool binary_file = false;
+    VarType binary_element_type = TYPE_VOID;
+    size_t binary_element_size = 0;
 
     // Determine input stream: allow FILE or ^FILE
     if (arg_count > 0) {
@@ -8681,6 +8890,18 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
             input_stream = AS_FILE(*a0);
             var_start_index = 1;
             if (VALUE_TYPE(args[0]) == TYPE_FILE) first_arg_is_file_by_value = true;
+            // A typed file of a scalar type holds its elements in the binary
+            // layout Write gives them (same test as Write's).
+            if (FILE_ELEMENT_TYPE(*a0) != TYPE_VOID && FILE_ELEMENT_TYPE(*a0) != TYPE_UNKNOWN &&
+                (FILE_RECORD_SIZE_EXPLICIT(*a0) || FILE_ELEMENT_TYPE_DEF(*a0) != NULL)) {
+                long long size_bytes = 0;
+                if (builtinSizeForVarType(FILE_ELEMENT_TYPE(*a0), &size_bytes) && size_bytes > 0 &&
+                    (size_t)size_bytes <= sizeof(long double)) {
+                    binary_file = true;
+                    binary_element_type = FILE_ELEMENT_TYPE(*a0);
+                    binary_element_size = (size_t)size_bytes;
+                }
+            }
         }
     }
 
@@ -8696,6 +8917,14 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
         }
         Value* dst = (Value*)AS_POINTER(args[i]);
 
+        if (binary_file) {
+            int read_error = 0;
+            if (!readBinaryElement(input_stream, dst, binary_element_type, binary_element_size, &read_error)) {
+                io_error = read_error ? read_error : 1;
+                break;
+            }
+            continue;
+        }
         if (VALUE_TYPE(*dst) == TYPE_CHAR) {
             int ch = fgetc(input_stream);
             if (ch == EOF) { io_error = feof(input_stream) ? 0 : 1; break; }
@@ -8711,33 +8940,44 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
             continue;
         }
 
-        char buffer[1024];
-        if (fscanf(input_stream, "%1023s", buffer) != 1) {
+        char* buffer = NULL;
+        size_t buffer_len = 0;
+        if (!readTokenAlloc(input_stream, &buffer, &buffer_len)) {
             io_error = feof(input_stream) ? 0 : 1;
             break;
         }
 
+        // A number is the whole token: "12x" is not 12.
         switch (VALUE_TYPE(*dst)) {
-            case TYPE_INTEGER:
+            case TYPE_INT8:
+            case TYPE_INT16:
+            case TYPE_INT32: /* TYPE_INTEGER */
+            case TYPE_INT64:
+            case TYPE_UINT8:
+            case TYPE_BYTE:
+            case TYPE_UINT16:
             case TYPE_WORD:
-            case TYPE_BYTE: {
-                errno = 0;
-                long long v = strtoll(buffer, NULL, 10);
-                if (errno == ERANGE) { io_error = 1; v = 0; }
+            case TYPE_UINT32:
+            case TYPE_UINT64: {
+                const char* endp = NULL;
+                long long v = 0;
+                if (!builtinParseIntForType(VALUE_TYPE(*dst), buffer, &endp, &v) || *endp != '\0') {
+                    io_error = VM_IO_INVALID_NUMERIC_FORMAT;
+                    break;
+                }
                 SET_INT_VALUE(dst, v);
                 break;
             }
-            case TYPE_FLOAT: {
+            case TYPE_FLOAT:
+            case TYPE_DOUBLE: /* TYPE_REAL */
+            case TYPE_LONG_DOUBLE: {
                 errno = 0;
-                float v = strtof(buffer, NULL);
-                if (errno == ERANGE) { io_error = 1; v = 0.0f; }
-                SET_REAL_VALUE(dst, v);
-                break;
-            }
-            case TYPE_REAL: {
-                errno = 0;
-                double v = strtod(buffer, NULL);
-                if (errno == ERANGE) { io_error = 1; v = 0.0; }
+                char* endp = NULL;
+                long double v = strtold(buffer, &endp);
+                if (endp == buffer || *endp != '\0' || errno == ERANGE) {
+                    io_error = VM_IO_INVALID_NUMERIC_FORMAT;
+                    break;
+                }
                 SET_REAL_VALUE(dst, v);
                 break;
             }
@@ -8753,12 +8993,13 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
                 break;
             }
             case TYPE_STRING:
+            case TYPE_UNICODE_STRING:
             case TYPE_NIL: {
-                SET_VALUE_TYPE(dst, TYPE_STRING);
-                pscalStringEnsureObj(dst); // dst may have arrived as TYPE_NIL with no wrapper
-                if (AS_STRING(*dst)) { free(AS_STRING(*dst)); }
-                AS_STRING(*dst) = strdup(buffer);
-                if (!AS_STRING(*dst)) { io_error = 1; }
+                // A fresh StringObj, the old one released (see
+                // builtinRebindStringValue); it used to be orphaned.
+                if (!builtinRebindStringValue(dst, buffer, buffer_len)) {
+                    io_error = 1;
+                }
                 break;
             }
             default:
@@ -8767,10 +9008,13 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
                 i = arg_count;
                 break;
         }
+        free(buffer);
+        if (io_error) {
+            break;
+        }
     }
 
     if (!io_error && ferror(input_stream)) io_error = 1;
-    else if (io_error != 1) io_error = 0;
 
     if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); pscalValueSetHeapPtrBits(&args[0], NULL); }
 
@@ -8816,8 +9060,9 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
     }
 
     // 2) Read full line
-    char line_buffer[1024];
-    if (!vmReadLineInterruptible(vm, input_stream, line_buffer, sizeof(line_buffer))) {
+    VmLineBuf line = {0};
+    if (!vmReadLineInterruptible(vm, input_stream, &line)) {
+        free(line.data);
         io_error = feof(input_stream) ? 0 : 1;
         if (getenv("PSCALI_TOOL_DEBUG")) {
             fprintf(stderr,
@@ -8833,6 +9078,7 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
         vmCommitLastIoError(io_error);
         return makeVoid();
     }
+    char* line_buffer = line.data;
     line_buffer[strcspn(line_buffer, "\r\n")] = '\0';
 
     // 3) Parse vars from buffer
@@ -8862,27 +9108,25 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
             case TYPE_INT8:
             case TYPE_INT16:
             case TYPE_INT32: /* TYPE_INTEGER */
-            case TYPE_INT64: {
-                errno = 0;
-                char* endp = NULL;
-                long long v = strtoll(p, &endp, 10);
-                if (endp == p || errno == ERANGE) { io_error = 1; v = 0; }
-                SET_INT_VALUE(dst, v);
-                p = endp ? endp : p;
-                break;
-            }
+            case TYPE_INT64:
             case TYPE_UINT8:
             case TYPE_BYTE:
             case TYPE_UINT16:
             case TYPE_WORD:
             case TYPE_UINT32:
             case TYPE_UINT64: {
-                errno = 0;
-                char* endp = NULL;
-                unsigned long long v = strtoull(p, &endp, 10);
-                if (endp == p || errno == ERANGE) { io_error = 1; v = 0; }
+                // The number may be followed directly by the next field
+                // ("42abc" reads 42, then "abc"), but it must fit the
+                // variable: out of range is an error, not a wrapped value.
+                const char* endp = p;
+                long long v = 0;
+                if (!builtinParseIntForType(VALUE_TYPE(*dst), p, &endp, &v)) {
+                    io_error = VM_IO_INVALID_NUMERIC_FORMAT;
+                    v = 0;
+                    endp = p;
+                }
                 SET_INT_VALUE(dst, v);
-                p = endp ? endp : p;
+                p = endp;
                 break;
             }
             case TYPE_FLOAT:
@@ -8891,7 +9135,7 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
                 errno = 0;
                 char* endp = NULL;
                 long double v = strtold(p, &endp);
-                if (endp == p || errno == ERANGE) { io_error = 1; v = 0.0; }
+                if (endp == p || errno == ERANGE) { io_error = VM_IO_INVALID_NUMERIC_FORMAT; v = 0.0; endp = (char*)p; }
                 SET_REAL_VALUE(dst, v);
                 p = endp ? endp : p;
                 break;
@@ -8927,13 +9171,6 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
 
             case TYPE_STRING:
             case TYPE_UNICODE_STRING: {
-                char* tmp = strdup(p);
-                if (!tmp) {
-                    runtimeError(vm, "Out of memory in Readln.");
-                    io_error = 1;
-                    break;
-                }
-                VarType dst_str_retype = (VALUE_TYPE(*dst) == TYPE_UNICODE_STRING) ? TYPE_UNICODE_STRING : TYPE_STRING;
                 // Rebind to a FRESH StringObj rather than overwriting the one
                 // already attached.
                 //
@@ -8953,13 +9190,15 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
                 // line, with no error. Allocating a new object leaves earlier
                 // copies pointing at the value they were given, which is what
                 // plain assignment already does (`s = t;` then `t = "x";`
-                // never disturbed `s`). The previous object is header-managed
-                // and is no longer freed here precisely because a sharer may
-                // still hold it.
-                StringObj* fresh_str_obj = pscalStringObjCreate(-1, dst_str_retype);
-                fresh_str_obj->buffer = tmp;
-                SET_VALUE_TYPE(dst, dst_str_retype);
-                pscalValueSetHeapPtrBits(dst, fresh_str_obj);
+                // never disturbed `s`). builtinRebindStringValue releases
+                // this variable's reference to the previous object (it used
+                // to leak, one object per line read) and keeps a string[N]
+                // limit.
+                if (!builtinRebindStringValue(dst, p, strlen(p))) {
+                    runtimeError(vm, "Out of memory in Readln.");
+                    io_error = 1;
+                    break;
+                }
                 i = arg_count; // consume the line; ignore trailing params
                 break;
             }
@@ -8972,8 +9211,8 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
         }
     }
 
+    free(line.data);
     if (!io_error && ferror(input_stream)) io_error = 1;
-    else if (io_error != 1) io_error = 0;
 
     // ***NEW***: neuter FILE-by-value arg so VM cleanup won’t fclose()
     if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); pscalValueSetHeapPtrBits(&args[0], NULL); }  // ***NEW***
@@ -9046,27 +9285,11 @@ static void vmWriteUnlockStream(void *stream) {
  * at end of input. read_all_stdin() -> Text: the rest of stdin, each line
  * ending in "\n". Aether's replacements for readln (D60); both go through
  * readln's own interruptible line reader, so ^C and the iOS session stdin
- * behave the same. */
-#define VM_STDIN_LINE_MAX ((size_t)1 << 20)
-
-static bool vmReadStdinLineAlloc(VM *vm, char **out_line) {
-    char *buf = (char *)malloc(VM_STDIN_LINE_MAX);
-    *out_line = NULL;
-    if (!buf) {
-        runtimeError(vm, "read_line: out of memory.");
-        return false;
-    }
-    FILE *input_stream = stdin;
-    vmPrepareCanonicalInput();
-    bool ok = vmReadLineInterruptible(vm, input_stream, buf, VM_STDIN_LINE_MAX);
-    vmEnableRawMode();
-    vmCommitLastIoError(ok || feof(input_stream) ? 0 : 1);
-    if (!ok) {
-        free(buf);
-        return false;
-    }
-    *out_line = buf;
-    return true;
+ * behave the same. Lines have no length limit (they were split at 1 MiB). */
+static bool vmReadStdinLine(VM *vm, VmLineBuf *line) {
+    bool ok = vmReadLineInterruptible(vm, stdin, line);
+    vmCommitLastIoError(ok || feof(stdin) ? 0 : 1);
+    return ok;
 }
 
 static Value vmBuiltinReadLine(VM *vm, int arg_count, Value *args) {
@@ -9076,10 +9299,12 @@ static Value vmBuiltinReadLine(VM *vm, int arg_count, Value *args) {
         runtimeError(vm, "read_line expects no arguments.");
         return makeUnicodeString("");
     }
-    char *line = NULL;
-    if (!vmReadStdinLineAlloc(vm, &line)) return makeUnicodeString("");
-    Value v = makeUnicodeString(line);
-    free(line);
+    VmLineBuf line = {0};
+    vmPrepareCanonicalInput();
+    bool ok = vmReadStdinLine(vm, &line);
+    vmEnableRawMode();
+    Value v = ok ? makeUnicodeString(line.data) : makeUnicodeString("");
+    free(line.data);
     return v;
 }
 
@@ -9092,30 +9317,35 @@ static Value vmBuiltinReadAllStdin(VM *vm, int arg_count, Value *args) {
     }
     char *acc = NULL;
     size_t len = 0, cap = 0;
-    char *line = NULL;
-    while (vmReadStdinLineAlloc(vm, &line)) {
-        size_t n = strlen(line);
+    VmLineBuf line = {0};
+    // The terminal is set up once for the whole read, not once per line:
+    // the per-line tcsetattr/tcflush (and a 1 MiB buffer per line) made
+    // reading 500k short lines take 13 s.
+    vmPrepareCanonicalInput();
+    while (vmReadStdinLine(vm, &line)) {
+        size_t n = strlen(line.data);
         if (len + n + 2 > cap) {
             size_t ncap = cap ? cap : 4096;
             while (ncap < len + n + 2) ncap *= 2;
             char *nb = (char *)realloc(acc, ncap);
             if (!nb) {
-                free(line);
+                free(line.data);
                 free(acc);
+                vmEnableRawMode();
                 runtimeError(vm, "read_all_stdin: out of memory.");
                 return makeUnicodeString("");
             }
             acc = nb;
             cap = ncap;
         }
-        memcpy(acc + len, line, n);
+        memcpy(acc + len, line.data, n);
         len += n;
         acc[len++] = '\n';
         acc[len] = '\0';
-        free(line);
-        line = NULL;
         if (vm && (vm->abort_requested || vm->exit_requested)) break;
     }
+    vmEnableRawMode();
+    free(line.data);
     Value v = makeUnicodeStringLen(acc ? acc : "", len);
     free(acc);
     return v;
@@ -9496,14 +9726,33 @@ Value vmBuiltinVal(VM* vm, int arg_count, Value* args) {
     }
 
     long long status;
-    if (VALUE_TYPE(*dst) == TYPE_REAL || VALUE_TYPE(*dst) == TYPE_FLOAT) {
+    if (isRealType(VALUE_TYPE(*dst))) {
+        // Every real type, Extended included (it used to take the integer
+        // branch, where SET_INT_VALUE on a real stores nothing, and still
+        // report Code 0).
         double r = 0.0;
         status = valScanReal(s, &r);
         if (status == 0) SET_REAL_VALUE(dst, r);
-    } else {
+    } else if (IS_INTLIKE(*dst)) {
         long long n = 0;
         status = valScanInt(s, &n);
-        if (status == 0) SET_INT_VALUE(dst, n);
+        if (status == 0) {
+            // The number must fit the variable: Val('99999999999', i, code)
+            // with an Integer i stored 1215752191 and Code 0. Out of range
+            // is reported one past the end, the variable left unchanged.
+            long long lo;
+            unsigned long long hi;
+            builtinIntTypeRange(VALUE_TYPE(*dst), &lo, &hi);
+            bool fits = (n < 0) ? (lo < 0 && n >= lo) : ((unsigned long long)n <= hi);
+            if (fits) {
+                SET_INT_VALUE(dst, n);
+            } else {
+                status = (long long)strlen(s) + 1;
+            }
+        }
+    } else {
+        runtimeError(vm, "Val expects a numeric variable, got %s.", varTypeToString(VALUE_TYPE(*dst)));
+        return makeVoid();
     }
     *code = makeInt(status);
     return makeVoid();
