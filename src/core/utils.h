@@ -384,6 +384,20 @@ Value makeNil(void);
 // type). TYPE_ARRAY with is_dynamic==true and TYPE_FILE are permanent
 // exemptions -- see Docs/pscal_vm2_plan.md sec 5.10.5.
 void valueEnsureUnique(Value *target);
+// Whole-value assignment of a record or static array into an existing one of
+// the same shape, copying field by field / element by element into the
+// target's own storage (recursively for nested records and static arrays)
+// instead of replacing it. Pascal requires this: a VAR parameter or other
+// address taken into the target must stay valid across `r := r2` / `a := b`.
+// Returns false, leaving *target untouched, when either side is not such an
+// aggregate, the shapes differ, or the target's storage is shared (the caller
+// then replaces the value as before).
+bool valueAssignAggregateInPlace(Value *target, const Value *src);
+// Like valueAssignAggregateInPlace for two arrays, but also writes into a
+// dynamic or shared target: used for a row/slice view (`m[1] := row`), whose
+// storage belongs to the array it was cut from. Returns false when the shapes
+// (element count per dimension, packing) differ.
+bool valueAssignArrayElementsInPlace(Value *target, const Value *src);
 // Exchanges the contents of two Value cells (the `Swap` builtin). A raw
 // three-way struct swap conserves whatever references each cell already
 // held (no clone, no retain/release needed either side), so this is just a

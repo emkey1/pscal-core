@@ -1221,6 +1221,19 @@ static bool vmResolveStringIndex(VM* vm,
     return true;
 }
 
+// The dynamic array a derived address must keep alive: the retained owner of
+// the pointer it was derived from (a field or element inside an element of a
+// dynamic array), retained once more for the new pointer. NULL otherwise.
+static ArrayObj* vmRetainPointerOwner(const Value* pointer) {
+    if (!pointer || VALUE_TYPE(*pointer) != TYPE_POINTER) return NULL;
+    PointerObj* po = PSCAL_VALUE_PTR(*pointer, PointerObj);
+    if (!po || !po->retained_array) return NULL;
+    pthread_mutex_lock(&dynamic_array_refcount_mutex);
+    pscalObjRetain(&po->retained_array->header);
+    pthread_mutex_unlock(&dynamic_array_refcount_mutex);
+    return po->retained_array;
+}
+
 static VarType vmResolveArrayElementType(AST* arrayType) {
     if (!arrayType || arrayType->type != AST_ARRAY_TYPE) {
         return TYPE_UNKNOWN;
@@ -8933,9 +8946,12 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 hydrateFieldMetadataFromBaseValue(base_val_ptr, current, field_index);
+                // A field of a dynamic array's element: the new address keeps
+                // that array alive as the element pointer did (retained_array).
+                ArrayObj* owner = vmRetainPointerOwner(base_val_ptr);
                 Value popped_base_val = pop(vm);
                 freeValue(&popped_base_val);
-                push(vm, makePointer(fieldValueStorage(current), current->type_def));
+                push(vm, makeRetainedArrayElementPointer(fieldValueStorage(current), current->type_def, owner));
                 break;
             }
             case GET_FIELD_OFFSET16: {
@@ -8966,9 +8982,12 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 hydrateFieldMetadataFromBaseValue(base_val_ptr, current, field_index);
+                // A field of a dynamic array's element: the new address keeps
+                // that array alive as the element pointer did (retained_array).
+                ArrayObj* owner = vmRetainPointerOwner(base_val_ptr);
                 Value popped_base_val = pop(vm);
                 freeValue(&popped_base_val);
-                push(vm, makePointer(fieldValueStorage(current), current->type_def));
+                push(vm, makeRetainedArrayElementPointer(fieldValueStorage(current), current->type_def, owner));
                 break;
             }
             case LOAD_FIELD_VALUE: {
@@ -9018,9 +9037,12 @@ comparison_error_label:
                 const char* field_name = AS_STRING(vm->chunk->constants[field_name_idx]);
                 FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
                 if (current) {
+                    // A field of a dynamic array's element: the new address keeps
+                    // that array alive as the element pointer did (retained_array).
+                    ArrayObj* owner = vmRetainPointerOwner(base_val_ptr);
                     Value popped_base_val = pop(vm);
                     freeValue(&popped_base_val);
-                    push(vm, makePointer(fieldValueStorage(current), current->type_def));
+                    push(vm, makeRetainedArrayElementPointer(fieldValueStorage(current), current->type_def, owner));
                     goto next_instruction;
                 }
 
@@ -9058,9 +9080,12 @@ comparison_error_label:
                 const char* field_name = AS_STRING(vm->chunk->constants[field_name_idx]);
                 FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
                 if (current) {
+                    // A field of a dynamic array's element: the new address keeps
+                    // that array alive as the element pointer did (retained_array).
+                    ArrayObj* owner = vmRetainPointerOwner(base_val_ptr);
                     Value popped_base_val = pop(vm);
                     freeValue(&popped_base_val);
-                    push(vm, makePointer(fieldValueStorage(current), current->type_def));
+                    push(vm, makeRetainedArrayElementPointer(fieldValueStorage(current), current->type_def, owner));
                     goto next_instruction;
                 }
 
@@ -9098,7 +9123,8 @@ comparison_error_label:
                 const char* field_name = AS_STRING(vm->chunk->constants[field_name_idx]);
                 FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
                 if (current) {
-                    push(vm, makePointer(fieldValueStorage(current), current->type_def));
+                    push(vm, makeRetainedArrayElementPointer(fieldValueStorage(current), current->type_def,
+                                                              vmRetainPointerOwner(base_val_ptr)));
                     goto next_instruction;
                 }
 
@@ -9136,7 +9162,8 @@ comparison_error_label:
                 const char* field_name = AS_STRING(vm->chunk->constants[field_name_idx]);
                 FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
                 if (current) {
-                    push(vm, makePointer(fieldValueStorage(current), current->type_def));
+                    push(vm, makeRetainedArrayElementPointer(fieldValueStorage(current), current->type_def,
+                                                              vmRetainPointerOwner(base_val_ptr)));
                     goto next_instruction;
                 }
 
@@ -9482,7 +9509,11 @@ comparison_error_label:
                                                                   BYTE_ARRAY_PTR_SENTINEL,
                                                                   PSCAL_VALUE_PTR(shared_snapshot, ArrayObj)));
                     } else {
-                        push(vm, makePointer(&AS_ARRAY_RAW(*array_val_ptr)[offset], BYTE_ARRAY_PTR_SENTINEL));
+                        // A static array inside a dynamic array's element
+                        // lives in that array's storage: keep it alive.
+                        push(vm, makeRetainedArrayElementPointer(&AS_ARRAY_RAW(*array_val_ptr)[offset],
+                                                                  BYTE_ARRAY_PTR_SENTINEL,
+                                                                  vmRetainPointerOwner(&operand)));
                     }
                 } else {
                     if (using_snapshot) {
@@ -9490,7 +9521,9 @@ comparison_error_label:
                                                                   element_base_type,
                                                                   PSCAL_VALUE_PTR(shared_snapshot, ArrayObj)));
                     } else {
-                        push(vm, makePointer(&AS_ARRAY(*array_val_ptr)[offset], element_base_type));
+                        push(vm, makeRetainedArrayElementPointer(&AS_ARRAY(*array_val_ptr)[offset],
+                                                                  element_base_type,
+                                                                  vmRetainPointerOwner(&operand)));
                     }
                 }
 
@@ -9673,7 +9706,11 @@ comparison_error_label:
                                                                   BYTE_ARRAY_PTR_SENTINEL,
                                                                   PSCAL_VALUE_PTR(shared_snapshot, ArrayObj)));
                     } else {
-                        push(vm, makePointer(&AS_ARRAY_RAW(*array_val_ptr)[flat_offset], BYTE_ARRAY_PTR_SENTINEL));
+                        // See GET_ELEMENT_ADDRESS: keep an enclosing dynamic
+                        // array alive.
+                        push(vm, makeRetainedArrayElementPointer(&AS_ARRAY_RAW(*array_val_ptr)[flat_offset],
+                                                                  BYTE_ARRAY_PTR_SENTINEL,
+                                                                  vmRetainPointerOwner(&operand)));
                     }
                 } else {
                     if (using_snapshot) {
@@ -9681,7 +9718,9 @@ comparison_error_label:
                                                                   element_base_type,
                                                                   PSCAL_VALUE_PTR(shared_snapshot, ArrayObj)));
                     } else {
-                        push(vm, makePointer(&AS_ARRAY(*array_val_ptr)[flat_offset], element_base_type));
+                        push(vm, makeRetainedArrayElementPointer(&AS_ARRAY(*array_val_ptr)[flat_offset],
+                                                                  element_base_type,
+                                                                  vmRetainPointerOwner(&operand)));
                     }
                 }
 
@@ -10231,6 +10270,29 @@ comparison_error_label:
                     }
 
                     AST* declaredTypeNode = PTR_BASE_TYPE_NODE(pointer_to_lvalue);
+                    if (declaredTypeNode == OWNED_POINTER_SENTINEL) {
+                        // GET_ELEMENT_ADDRESS's row of a multi-dimensional
+                        // array (`m[1] := row`): a view whose storage is m's
+                        // (or, for an array of arrays, the row array itself).
+                        // It carries no declared type, and replacing the view
+                        // Value would drop the write, so copy the elements
+                        // through it.
+                        if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_ARRAY) {
+                            bool stored = VALUE_TYPE(value_to_set) == TYPE_ARRAY &&
+                                          valueAssignArrayElementsInPlace(target_lvalue_ptr, &value_to_set);
+                            if (!stored) {
+                                runtimeError(vm, "Runtime Error: Cannot assign %s to an array row of a different shape.",
+                                             VALUE_TYPE(value_to_set) == TYPE_ARRAY ? "an array" : varTypeToString(VALUE_TYPE(value_to_set)));
+                            }
+                            freeValue(&value_to_set);
+                            freeValue(&pointer_to_lvalue);
+                            if (!stored) {
+                                return INTERPRET_RUNTIME_ERROR;
+                            }
+                            break;
+                        }
+                        declaredTypeNode = NULL;
+                    }
                     VarType declaredType = vmDeclaredVarType(declaredTypeNode);
                     AST* resolvedDeclaredType = vmResolveTypeAlias(declaredTypeNode);
                     if (declaredType != TYPE_VOID) {
@@ -10456,7 +10518,12 @@ comparison_error_label:
                             // is freeValue'd a few lines down and would
                             // otherwise abort on a stale non-NULL pointer tag.
                             pscalValueSetHeapPtrBits(&value_to_set, NULL);
-                        } else {
+                        } else if (!valueAssignAggregateInPlace(target_lvalue_ptr, &value_to_set)) {
+                            // (A record or static array assigned over one of
+                            // the same shape was instead copied into the
+                            // target's own storage just now: Pascal keeps a
+                            // variable's storage across `r := r2`, and VAR
+                            // parameters may point into it.)
                             Value replacement = makeCopyOfValue(&value_to_set);
                             replaceValueCell(target_lvalue_ptr, replacement, preserved_base);
                         }
@@ -10938,6 +11005,10 @@ comparison_error_label:
                         freeValue(&value_from_stack);
                         return INTERPRET_RUNTIME_ERROR;
                     }
+                } else if (valueAssignAggregateInPlace(target_slot, &value_from_stack)) {
+                    // A whole record or static array, copied into the slot's
+                    // own storage so addresses taken into it stay valid (see
+                    // SET_INDIRECT).
                 } else {
                     // This is the logic for all other types, including dynamic strings,
                     // numbers, records, etc., which requires a deep copy.
@@ -11065,6 +11136,9 @@ comparison_error_label:
                         freeValue(&value_from_stack);
                         return INTERPRET_RUNTIME_ERROR;
                     }
+                } else if (valueAssignAggregateInPlace(target_slot, &value_from_stack)) {
+                    // See SET_LOCAL: a whole record or static array keeps its
+                    // storage.
                 } else {
                     // VM 2.0 Phase 4i: target_slot can genuinely be
                     // TYPE_POINTER here (unlike SET_INDIRECT's fallback
