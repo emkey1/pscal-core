@@ -1618,6 +1618,20 @@ static int readKeyFetchConsoleByte(void) {
     }
 }
 
+// Real -> integer for int/trunc/round/floor/ceil. `x` is already integral (the
+// caller applied truncl/roundl/floorl/ceill). The result is as wide as it needs
+// to be: makeInt() alone tags TYPE_INT32, which turned int(5000000000.0) into
+// 705032704 and round(-3000000000.0) into 1294967296. A Real with no 64-bit
+// integer value (NaN, an infinity, |x| >= 2^63) is a runtime error, because
+// casting it is undefined behaviour in C (int(1e20) came back as -1).
+static Value vmRealToIntResult(VM* vm, const char* who, long double x) {
+    if (x >= -9223372036854775808.0L && x < 9223372036854775808.0L) {
+        return pscalIntResultNarrow((long long)x);
+    }
+    runtimeError(vm, "Runtime Error: %s(%.16Lg) has no 64-bit integer value.", who, x);
+    return makeInt(0);
+}
+
 // ---- CLike-style conversion helpers (Phase 1) ----
 static Value vmBuiltinToInt(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1) {
@@ -1627,10 +1641,9 @@ static Value vmBuiltinToInt(VM* vm, int arg_count, Value* args) {
     Value v = args[0];
     long long i = 0;
     if (isRealType(VALUE_TYPE(v))) {
-        long double d = AS_REAL(v);
-        i = (long long)d; // truncate toward zero like C cast
+        return vmRealToIntResult(vm, "int", truncl(AS_REAL(v))); // toward zero, like a C cast
     } else if (IS_INTLIKE(v)) {
-        i = AS_INTEGER(v);
+        return pscalIntResultLike1(v, AS_INTEGER(v));
     } else if (VALUE_TYPE(v) == TYPE_BOOLEAN) {
         i = VAL_INT(v) ? 1 : 0;
     } else if (VALUE_TYPE(v) == TYPE_CHAR) {
@@ -7074,20 +7087,20 @@ Value vmBuiltinClamp(VM* vm, int arg_count, Value* args) {
 Value vmBuiltinFloor(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1) { runtimeError(vm, "floor expects 1 argument."); return makeInt(0); }
     if (IS_INTLIKE(args[0])) return pscalIntResultLike1(args[0], AS_INTEGER(args[0]));
-    return makeInt((long long)floor((double)AS_REAL(args[0])));
+    return vmRealToIntResult(vm, "floor", floorl(AS_REAL(args[0])));
 }
 
 Value vmBuiltinCeil(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1) { runtimeError(vm, "ceil expects 1 argument."); return makeInt(0); }
     if (IS_INTLIKE(args[0])) return pscalIntResultLike1(args[0], AS_INTEGER(args[0]));
-    return makeInt((long long)ceil((double)AS_REAL(args[0])));
+    return vmRealToIntResult(vm, "ceil", ceill(AS_REAL(args[0])));
 }
 
 Value vmBuiltinTrunc(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1) { runtimeError(vm, "trunc expects 1 argument."); return makeInt(0); }
     Value arg = args[0];
     if (IS_INTLIKE(arg)) return pscalIntResultLike1(arg, AS_INTEGER(arg));
-    if (isRealType(VALUE_TYPE(arg))) return makeInt((long long)AS_REAL(arg));
+    if (isRealType(VALUE_TYPE(arg))) return vmRealToIntResult(vm, "trunc", truncl(AS_REAL(arg)));
     runtimeError(vm, "trunc expects a numeric argument.");
     return makeInt(0);
 }
@@ -10044,7 +10057,7 @@ Value vmBuiltinAbs(VM* vm, int arg_count, Value* args) {
 
 Value vmBuiltinRound(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1) { runtimeError(vm, "Round expects 1 argument."); return makeInt(0); }
-    if (isRealType(VALUE_TYPE(args[0]))) return makeInt((long long)llround(AS_REAL(args[0])));
+    if (isRealType(VALUE_TYPE(args[0]))) return vmRealToIntResult(vm, "round", roundl(AS_REAL(args[0])));
     if (IS_INTLIKE(args[0])) return pscalIntResultLike1(args[0], AS_INTEGER(args[0]));
     runtimeError(vm, "Round expects a numeric argument.");
     return makeInt(0);
