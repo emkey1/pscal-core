@@ -158,10 +158,36 @@ static int pscalArraysDeepEqual(const Value *a, const Value *b) {
     return pscalArraysDeepEqualD(a, b, 0);
 }
 
+/* Aether maps (D68, D24): the same key set and equal values, order ignored;
+ * values compare by the same structural rules (records field by field). */
+static int pscalMapsDeepEqualD(const Value *a, const Value *b, int depth) {
+    MapObj *ma = PSCAL_VALUE_PTR(*a, MapObj);
+    MapObj *mb = PSCAL_VALUE_PTR(*b, MapObj);
+    if (ma == mb) return 1;
+    int na = ma ? ma->live_count : 0, nb = mb ? mb->live_count : 0;
+    if (na != nb) return 0;
+    if (na == 0) return 1;
+    if (depth > PSCAL_DEEP_EQUAL_MAX_DEPTH) return -1;
+    for (int i = 0; i < ma->entry_count; i++) {
+        const MapEntry *e = &ma->entries[i];
+        if (!e->live) continue;
+        Value *other = pscalMapFind(mb, e->key, e->key_len);
+        if (!other) return 0;
+        int r = pscalValuesDeepEqualD(e->value, other, depth + 1);
+        if (r != 1) return r;
+    }
+    return 1;
+}
+
+static int pscalMapsDeepEqual(const Value *a, const Value *b) {
+    return pscalMapsDeepEqualD(a, b, 0);
+}
+
 static int pscalValuesDeepEqualD(const Value *a, const Value *b, int depth) {
     VarType ta = VALUE_TYPE(*a), tb = VALUE_TYPE(*b);
     if (depth > PSCAL_DEEP_EQUAL_MAX_DEPTH) return -1;
     if (ta == TYPE_ARRAY && tb == TYPE_ARRAY) return pscalArraysDeepEqualD(a, b, depth);
+    if (ta == TYPE_MAP && tb == TYPE_MAP) return pscalMapsDeepEqualD(a, b, depth);
     if (ta == TYPE_NIL && tb == TYPE_NIL) return 1;
     if (ta == TYPE_NIL || tb == TYPE_NIL) {
         const Value *other = (ta == TYPE_NIL) ? b : a;
@@ -4759,6 +4785,15 @@ static Value copyValueForStack(const Value* src) {
             pthread_mutex_unlock(&value_cell_mutex);
             return alias;
         }
+        case TYPE_MAP: {
+            // Aether maps (D68) are copy-on-write values: share here, clone
+            // in valueEnsureUnique before any write.
+            Value alias = *src;
+            MapObj *m = PSCAL_VALUE_PTR(alias, MapObj);
+            if (m) pscalObjRetain(&m->header);
+            pthread_mutex_unlock(&value_cell_mutex);
+            return alias;
+        }
         default:
             break;
     }
@@ -6870,6 +6905,7 @@ static bool vmSizeForVarType(VarType type, long long* out_bytes) {
         case TYPE_THREAD:
         case TYPE_TASK:
         case TYPE_CHANNEL:
+        case TYPE_MAP:
             *out_bytes = (long long)sizeof(void*);
             return true;
         case TYPE_ENUM:
@@ -8739,6 +8775,19 @@ dispatch_switch:
                         comparison_succeeded = true;
                     } else {
                         runtimeError(vm, "Runtime Error: Invalid operator for array comparison. Only '=' and '<>' are allowed. Got opcode %d.", instruction_val);
+                        freeValue(&a_val); freeValue(&b_val); return INTERPRET_RUNTIME_ERROR;
+                    }
+                }
+                // Aether maps (D68): structural equality, the same key set and
+                // equal values, order ignored. '=' and '<>' only.
+                else if (VALUE_TYPE(a_val) == TYPE_MAP && VALUE_TYPE(b_val) == TYPE_MAP) {
+                    if (instruction_val == EQUAL || instruction_val == NOT_EQUAL) {
+                        int eq = pscalMapsDeepEqual(&a_val, &b_val);
+                        if (eq < 0) goto comparison_error_label;
+                        result_val = makeBoolean(instruction_val == EQUAL ? (eq == 1) : (eq == 0));
+                        comparison_succeeded = true;
+                    } else {
+                        runtimeError(vm, "Runtime Error: maps can only be compared with == and !=.");
                         freeValue(&a_val); freeValue(&b_val); return INTERPRET_RUNTIME_ERROR;
                     }
                 }

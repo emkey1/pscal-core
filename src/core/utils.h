@@ -418,6 +418,22 @@ Value makeTask(int threadId, struct VM_s *owner);
 // resized -- see ChannelObj's comment in core/types.h.
 ChannelObj *createChannelObj(size_t capacity);
 Value makeChannel(size_t capacity);
+
+// Aether `Map[Text, T]` (D68; MapObj in core/types.h). pscalMapSet takes
+// ownership of `value`; pscalMapFind returns the stored cell or NULL.
+// pscalMapCopyValue copies a value the way a map stores it (arrays deeply,
+// maps shared copy-on-write); pscalMapShareValue is the cheap read-out copy.
+MapObj *pscalMapObjCreate(VarType value_type);
+Value makeMap(VarType value_type);
+Value *pscalMapFind(const MapObj *m, const char *key, size_t len);
+void pscalMapSet(MapObj *m, const char *key, size_t len, Value value);
+bool pscalMapRemove(MapObj *m, const char *key, size_t len);
+MapObj *pscalMapClone(const MapObj *src);
+Value pscalMapCopyValue(const Value *v);
+Value pscalMapShareValue(const Value *v);
+void pscalMapPrint(FILE *stream, const MapObj *m);
+// Python repr of a double: the shortest round-trip digits (D74).
+void pscalFormatRealRepr(double x, char *out, size_t n);
 Value makeVoid(void);
 Value makeValueForType(VarType type, AST *type_def, Symbol* context_symbol);
 // owner_type must be TYPE_CLOSURE or TYPE_INTERFACE -- both share this

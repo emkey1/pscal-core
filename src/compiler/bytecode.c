@@ -891,6 +891,10 @@ static void printConstantValue(const Value* value) {
             }
             break;
         }
+        case TYPE_MAP:
+            // The pooled default of a declared Aether map.
+            pscalMapPrint(stderr, PSCAL_VALUE_PTR(*value, MapObj));
+            break;
         case TYPE_TASK:
         case TYPE_CHANNEL:
             // A declaration pools only the unset handle.

@@ -127,6 +127,35 @@ typedef struct ChannelObj {
     bool closed;
 } ChannelObj;
 
+// Aether's `Map[Text, T]` (D68). Entries live in insertion order in
+// `entries`; `index` is an open-addressed hash table of entry positions
+// (-1 empty, -2 deleted) sized to a power of two. `remove` marks an entry
+// dead and the table compacts once dead entries outnumber live ones, so
+// iteration order is always insertion order. Values are boxed Values of any
+// type. A map is a VALUE: copies retain-and-share the MapObj
+// (copyValueForStack) and every mutation goes through valueEnsureUnique
+// first, which clones a shared map (makeCopyOfValue). `value_type` is the
+// declared value type (TYPE_UNKNOWN when not known): stores coerce Int to
+// Real for a Real map, and values() builds its array with it.
+typedef struct MapEntry {
+    char *key;               // owned, NUL-terminated UTF-8
+    size_t key_len;
+    uint64_t hash;
+    struct ValueStruct *value; // owned, one boxed Value
+    bool live;
+} MapEntry;
+
+typedef struct MapObj {
+    ObjHeader header;        // header.type is always TYPE_MAP
+    VarType value_type;
+    MapEntry *entries;
+    int entry_count;         // used slots in entries (live + dead)
+    int entry_cap;
+    int live_count;
+    int32_t *index;          // index_cap slots of entry positions
+    int index_cap;           // power of two, or 0 before the first insert
+} MapObj;
+
 // VM 2.0 Phase 4c (Docs/pscal_vm2_plan.md §5.10.4/§5.10.3): field names
 // (set_size, set_values) intentionally match the pre-4c embedded
 // `Value.set_val` struct's field names, so `AS_SET(v).set_size`/

@@ -1290,6 +1290,11 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
             *(sym->value) = makeCopyOfValue(&val);
             break;
 
+        case TYPE_MAP:
+            // Aether maps (D68) are copy-on-write: share, clone on write.
+            *(sym->value) = pscalMapShareValue(&val);
+            break;
+
         case TYPE_FILE:
             if (VALUE_TYPE(val) == TYPE_FILE) {
                 if (AS_FILE(*sym->value)) {

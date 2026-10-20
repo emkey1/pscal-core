@@ -437,6 +437,7 @@ const char *varTypeToString(VarType type) {
         case TYPE_THREAD:       return "THREAD";
         case TYPE_TASK:         return "TASK";
         case TYPE_CHANNEL:      return "CHANNEL";
+        case TYPE_MAP:          return "MAP";
         default:                return "UNKNOWN_VAR_TYPE";
     }
 }
@@ -792,6 +793,450 @@ Value makeChannel(size_t capacity) {
     v.type = TYPE_CHANNEL;
     pscalValueSetHeapPtrBits(&v, createChannelObj(capacity));
     return v;
+}
+
+// --------------------------------------------------------------------------
+// Aether `Map[Text, T]` (decision D68): MapObj, an insertion-ordered map with
+// Text keys and boxed values. See its comment in core/types.h.
+// --------------------------------------------------------------------------
+
+static void mapObjFreeContents(MapObj *m) {
+    for (int i = 0; i < m->entry_count; i++) {
+        MapEntry *e = &m->entries[i];
+        free(e->key);
+        if (e->value) {
+            freeValue(e->value);
+            free(e->value);
+        }
+    }
+    free(m->entries);
+    free(m->index);
+    m->entries = NULL;
+    m->index = NULL;
+    m->entry_count = m->entry_cap = m->live_count = m->index_cap = 0;
+}
+
+static void mapObjDestroy(ObjHeader *header) {
+    MapObj *m = (MapObj *)header;
+    mapObjFreeContents(m);
+    free(m);
+}
+
+static pthread_once_t g_map_destructor_once = PTHREAD_ONCE_INIT;
+static void registerMapObjDestructor(void) {
+    pscalObjRegisterDestructor(TYPE_MAP, mapObjDestroy);
+}
+
+MapObj *pscalMapObjCreate(VarType value_type) {
+    pthread_once(&g_map_destructor_once, registerMapObjDestructor);
+    MapObj *m = (MapObj *)calloc(1, sizeof(MapObj));
+    if (!m) {
+        fprintf(stderr, "Memory allocation error in pscalMapObjCreate\n");
+        EXIT_FAILURE_HANDLER();
+    }
+    pscalObjHeaderInit(&m->header, TYPE_MAP);
+    m->value_type = value_type;
+    return m;
+}
+
+Value makeMap(VarType value_type) {
+    Value v;
+    memset(&v, 0, sizeof(Value));
+    v.type = TYPE_MAP;
+    pscalValueSetHeapPtrBits(&v, pscalMapObjCreate(value_type));
+    return v;
+}
+
+static uint64_t mapHashKey(const char *key, size_t len) {
+    uint64_t h = 1469598103934665603ULL; /* FNV-1a */
+    for (size_t i = 0; i < len; i++) {
+        h ^= (unsigned char)key[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+/* Slot in m->index holding entry `pos`'s key, or the first free slot for it. */
+static int mapIndexFind(const MapObj *m, const char *key, size_t len, uint64_t h, bool *found) {
+    *found = false;
+    if (m->index_cap == 0) return -1;
+    size_t mask = (size_t)m->index_cap - 1;
+    size_t slot = (size_t)h & mask;
+    int firstDeleted = -1;
+    for (int probes = 0; probes < m->index_cap; probes++) {
+        int32_t pos = m->index[slot];
+        if (pos == -1) {
+            return firstDeleted >= 0 ? firstDeleted : (int)slot;
+        }
+        if (pos == -2) {
+            if (firstDeleted < 0) firstDeleted = (int)slot;
+        } else {
+            const MapEntry *e = &m->entries[pos];
+            if (e->hash == h && e->key_len == len && memcmp(e->key, key, len) == 0) {
+                *found = true;
+                return (int)slot;
+            }
+        }
+        slot = (slot + 1) & mask;
+    }
+    return firstDeleted;
+}
+
+/* Rebuild entries (dropping dead ones) and the index at `cap` slots. */
+static void mapRehash(MapObj *m, int cap) {
+    int w = 0;
+    for (int i = 0; i < m->entry_count; i++) {
+        if (m->entries[i].live) {
+            if (w != i) m->entries[w] = m->entries[i];
+            w++;
+        } else {
+            free(m->entries[i].key);
+            if (m->entries[i].value) {
+                freeValue(m->entries[i].value);
+                free(m->entries[i].value);
+            }
+        }
+    }
+    m->entry_count = w;
+    int32_t *idx = (int32_t *)malloc(sizeof(int32_t) * (size_t)cap);
+    if (!idx) {
+        fprintf(stderr, "Memory allocation error in map rehash\n");
+        EXIT_FAILURE_HANDLER();
+    }
+    for (int i = 0; i < cap; i++) idx[i] = -1;
+    size_t mask = (size_t)cap - 1;
+    for (int i = 0; i < m->entry_count; i++) {
+        size_t slot = (size_t)m->entries[i].hash & mask;
+        while (idx[slot] != -1) slot = (slot + 1) & mask;
+        idx[slot] = i;
+    }
+    free(m->index);
+    m->index = idx;
+    m->index_cap = cap;
+}
+
+Value *pscalMapFind(const MapObj *m, const char *key, size_t len) {
+    if (!m || !key) return NULL;
+    bool found = false;
+    int slot = mapIndexFind(m, key, len, mapHashKey(key, len), &found);
+    if (!found) return NULL;
+    return m->entries[m->index[slot]].value;
+}
+
+/* A stored value as Aether copies it: an array is a value, so a dynamic
+ * array (shared by reference in the engine) is copied, rows included; a map
+ * is shared copy-on-write; anything else copies as makeCopyOfValue does
+ * (a record stays shared: records are pointer-backed in Aether). */
+static Value mapNewDynamicArray(int n, VarType elemType, AST *elemDef) {
+    Value v;
+    if (n > 0) {
+        int lo = 0, hi = n - 1;
+        v = makeArrayND(1, &lo, &hi, elemType, elemDef);
+    } else {
+        v = makeEmptyArray(elemType, elemDef);
+        ArrayObj *a = PSCAL_VALUE_PTR(v, ArrayObj);
+        if (a) {
+            a->dimensions = 1;
+            a->lower_bounds = (int *)malloc(sizeof(int));
+            a->upper_bounds = (int *)malloc(sizeof(int));
+            if (a->lower_bounds) a->lower_bounds[0] = 0;
+            if (a->upper_bounds) a->upper_bounds[0] = -1;
+        }
+    }
+    ArrayObj *a = PSCAL_VALUE_PTR(v, ArrayObj);
+    if (a) {
+        a->is_dynamic = true;
+        a->lower_bound = 0;
+        a->upper_bound = n - 1;
+    }
+    return v;
+}
+
+Value pscalMapCopyValue(const Value *v) {
+    if (!v) return makeNil();
+    if (VALUE_TYPE(*v) == TYPE_MAP) {
+        Value alias = *v;
+        MapObj *m = PSCAL_VALUE_PTR(alias, MapObj);
+        if (m) pscalObjRetain(&m->header);
+        return alias;
+    }
+    if (VALUE_TYPE(*v) == TYPE_ARRAY) {
+        ArrayObj *a = PSCAL_VALUE_PTR(*v, ArrayObj);
+        if (a && a->is_dynamic && !a->is_packed && a->dimensions == 1 &&
+            a->lower_bounds && a->upper_bounds) {
+            int n = a->upper_bounds[0] - a->lower_bounds[0] + 1;
+            if (n < 0) n = 0;
+            Value out = mapNewDynamicArray(n, a->element_type, a->element_type_def);
+            ArrayObj *o = PSCAL_VALUE_PTR(out, ArrayObj);
+            for (int i = 0; o && o->elements && a->elements && i < n; i++) {
+                freeValue(&o->elements[i]);
+                o->elements[i] = pscalMapCopyValue(&a->elements[i]);
+            }
+            return out;
+        }
+    }
+    return makeCopyOfValue(v);
+}
+
+/* A value read out of a map: shared, not copied (the caller's own copy
+ * rules apply, as for an array element). */
+Value pscalMapShareValue(const Value *v) {
+    if (!v) return makeNil();
+    switch (VALUE_TYPE(*v)) {
+        case TYPE_MAP: {
+            Value alias = *v;
+            MapObj *m = PSCAL_VALUE_PTR(alias, MapObj);
+            if (m) pscalObjRetain(&m->header);
+            return alias;
+        }
+        case TYPE_ARRAY: {
+            Value alias = *v;
+            ArrayObj *a = PSCAL_VALUE_PTR(alias, ArrayObj);
+            if (a) pscalObjRetain(&a->header);
+            return alias;
+        }
+        default:
+            return makeCopyOfValue(v);
+    }
+}
+
+/* Coerce a value being stored to the map's declared value type: an Int into
+ * a Real map becomes a Real, a one-character Text stays Text. */
+static Value mapCoerceStored(const MapObj *m, Value v) {
+    VarType want = m->value_type;
+    VarType have = VALUE_TYPE(v);
+    if (isRealType(want) && isIntlikeType(have) && have != TYPE_BOOLEAN && have != TYPE_CHAR) {
+        Value r = makeReal(asLd(v));
+        freeValue(&v);
+        return r;
+    }
+    if (want == TYPE_INT64 && isIntlikeType(have) && have != TYPE_INT64 &&
+        have != TYPE_BOOLEAN && have != TYPE_CHAR && have != TYPE_WIDECHAR) {
+        Value r = makeInt64(asI64(v));
+        freeValue(&v);
+        return r;
+    }
+    if (isPascalStringType(want) && (have == TYPE_CHAR || have == TYPE_WIDECHAR)) {
+        char buf[5];
+        size_t n = (have == TYPE_CHAR) ? encodePascalCharUtf8(AS_CHAR(v), buf)
+                                       : encodeUtf8Codepoint((uint32_t)AS_CHAR(v), buf);
+        Value r = makeUnicodeStringLen(buf, n);
+        freeValue(&v);
+        return r;
+    }
+    return v;
+}
+
+void pscalMapSet(MapObj *m, const char *key, size_t len, Value value) {
+    if (!m || !key) {
+        freeValue(&value);
+        return;
+    }
+    value = mapCoerceStored(m, value);
+    uint64_t h = mapHashKey(key, len);
+    bool found = false;
+    int slot = mapIndexFind(m, key, len, h, &found);
+    if (found) {
+        MapEntry *e = &m->entries[m->index[slot]];
+        freeValue(e->value);
+        *e->value = value;
+        return;
+    }
+    /* Grow the index at 50% load (live + dead entries share it). */
+    if (m->index_cap == 0 || (m->entry_count + 1) * 2 > m->index_cap) {
+        /* The rehash drops dead entries, so size for the live ones. */
+        int cap = 8;
+        while ((m->live_count + 1) * 2 > cap) cap *= 2;
+        mapRehash(m, cap);
+        slot = mapIndexFind(m, key, len, h, &found);
+    }
+    if (m->entry_count == m->entry_cap) {
+        int ncap = m->entry_cap ? m->entry_cap * 2 : 8;
+        MapEntry *grown = (MapEntry *)realloc(m->entries, sizeof(MapEntry) * (size_t)ncap);
+        if (!grown) {
+            fprintf(stderr, "Memory allocation error in map insert\n");
+            EXIT_FAILURE_HANDLER();
+        }
+        m->entries = grown;
+        m->entry_cap = ncap;
+    }
+    MapEntry *e = &m->entries[m->entry_count];
+    e->key = (char *)malloc(len + 1);
+    e->value = (Value *)malloc(sizeof(Value));
+    if (!e->key || !e->value) {
+        fprintf(stderr, "Memory allocation error in map insert\n");
+        EXIT_FAILURE_HANDLER();
+    }
+    memcpy(e->key, key, len);
+    e->key[len] = '\0';
+    e->key_len = len;
+    e->hash = h;
+    *e->value = value;
+    e->live = true;
+    m->index[slot] = m->entry_count;
+    m->entry_count++;
+    m->live_count++;
+}
+
+bool pscalMapRemove(MapObj *m, const char *key, size_t len) {
+    if (!m || !key) return false;
+    bool found = false;
+    int slot = mapIndexFind(m, key, len, mapHashKey(key, len), &found);
+    if (!found) return false;
+    MapEntry *e = &m->entries[m->index[slot]];
+    e->live = false;
+    freeValue(e->value);
+    *e->value = makeNil();
+    m->index[slot] = -2;
+    m->live_count--;
+    if (m->entry_count > 16 && m->entry_count - m->live_count > m->live_count) {
+        int cap = 8;
+        while ((m->live_count + 1) * 2 > cap) cap *= 2;
+        mapRehash(m, cap);
+    }
+    return true;
+}
+
+MapObj *pscalMapClone(const MapObj *src) {
+    MapObj *m = pscalMapObjCreate(src ? src->value_type : TYPE_UNKNOWN);
+    if (!src) return m;
+    for (int i = 0; i < src->entry_count; i++) {
+        const MapEntry *e = &src->entries[i];
+        if (!e->live) continue;
+        pscalMapSet(m, e->key, e->key_len, pscalMapCopyValue(e->value));
+    }
+    return m;
+}
+
+/* Python's repr for a float: the shortest digits that read back to the same
+ * double, fixed notation for exponents -4..15, otherwise d.ddde+XX; a whole
+ * number keeps ".0" (decision D74). */
+void pscalFormatRealRepr(double x, char *out, size_t n) {
+    if (!out || n == 0) return;
+    if (isnan(x)) { snprintf(out, n, "nan"); return; }
+    if (isinf(x)) { snprintf(out, n, x < 0 ? "-inf" : "inf"); return; }
+    if (x == 0.0) { snprintf(out, n, signbit(x) ? "-0.0" : "0.0"); return; }
+    char sci[64];
+    int prec = 0;
+    for (prec = 0; prec < 17; prec++) {
+        snprintf(sci, sizeof(sci), "%.*e", prec, x);
+        if (strtod(sci, NULL) == x) break;
+    }
+    if (prec == 17) snprintf(sci, sizeof(sci), "%.16e", x);
+    /* sci is [-]d[.ddd]e[+-]XX */
+    bool neg = sci[0] == '-';
+    const char *p = sci + (neg ? 1 : 0);
+    char digits[40];
+    size_t nd = 0;
+    for (; *p && *p != 'e'; p++) {
+        if (*p >= '0' && *p <= '9' && nd < sizeof(digits) - 1) digits[nd++] = *p;
+    }
+    digits[nd] = '\0';
+    while (nd > 1 && digits[nd - 1] == '0') digits[--nd] = '\0';
+    int exp10 = (*p == 'e') ? atoi(p + 1) : 0;
+    char buf[96];
+    size_t w = 0;
+    if (neg) buf[w++] = '-';
+    if (exp10 >= -4 && exp10 < 16) {
+        if (exp10 < 0) {
+            buf[w++] = '0';
+            buf[w++] = '.';
+            for (int z = 0; z < -exp10 - 1; z++) buf[w++] = '0';
+            for (size_t i = 0; i < nd; i++) buf[w++] = digits[i];
+        } else {
+            size_t intDigits = (size_t)exp10 + 1;
+            for (size_t i = 0; i < intDigits; i++) buf[w++] = i < nd ? digits[i] : '0';
+            buf[w++] = '.';
+            if (nd > intDigits) {
+                for (size_t i = intDigits; i < nd; i++) buf[w++] = digits[i];
+            } else {
+                buf[w++] = '0';
+            }
+        }
+        buf[w] = '\0';
+    } else {
+        buf[w++] = digits[0];
+        if (nd > 1) {
+            buf[w++] = '.';
+            for (size_t i = 1; i < nd; i++) buf[w++] = digits[i];
+        }
+        buf[w] = '\0';
+        char tail[16];
+        snprintf(tail, sizeof(tail), "e%c%02d", exp10 < 0 ? '-' : '+', exp10 < 0 ? -exp10 : exp10);
+        strncat(buf, tail, sizeof(buf) - strlen(buf) - 1);
+    }
+    snprintf(out, n, "%s", buf);
+}
+
+static void mapPrintText(FILE *stream, const char *s, size_t len) {
+    fputc('"', stream);
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        switch (c) {
+            case '"': fputs("\\\"", stream); break;
+            case '\\': fputs("\\\\", stream); break;
+            case '\n': fputs("\\n", stream); break;
+            case '\t': fputs("\\t", stream); break;
+            case '\r': fputs("\\r", stream); break;
+            default: fputc(c, stream); break;
+        }
+    }
+    fputc('"', stream);
+}
+
+/* A value inside a printed map: Text quoted, Real in repr form, arrays and
+ * nested maps recursively. */
+static void mapPrintValue(FILE *stream, const Value *v) {
+    VarType t = VALUE_TYPE(*v);
+    if (isPascalStringType(t)) {
+        const char *s = AS_STRING(*v) ? AS_STRING(*v) : "";
+        mapPrintText(stream, s, strlen(s));
+    } else if (t == TYPE_CHAR || t == TYPE_WIDECHAR) {
+        char buf[5];
+        size_t n = (t == TYPE_CHAR) ? encodePascalCharUtf8(AS_CHAR(*v), buf)
+                                    : encodeUtf8Codepoint((uint32_t)AS_CHAR(*v), buf);
+        mapPrintText(stream, buf, n);
+    } else if (isRealType(t)) {
+        char buf[64];
+        pscalFormatRealRepr((double)asLd(*v), buf, sizeof(buf));
+        fputs(buf, stream);
+    } else if (t == TYPE_BOOLEAN) {
+        fputs(VAL_INT(*v) ? "true" : "false", stream);
+    } else if (t == TYPE_MAP) {
+        pscalMapPrint(stream, PSCAL_VALUE_PTR(*v, MapObj));
+    } else if (t == TYPE_ARRAY) {
+        ArrayObj *a = PSCAL_VALUE_PTR(*v, ArrayObj);
+        fputc('[', stream);
+        if (a && !a->is_packed && a->dimensions == 1 && a->lower_bounds && a->upper_bounds &&
+            a->elements) {
+            int n = a->upper_bounds[0] - a->lower_bounds[0] + 1;
+            for (int i = 0; i < n; i++) {
+                if (i) fputs(", ", stream);
+                mapPrintValue(stream, &a->elements[i]);
+            }
+        }
+        fputc(']', stream);
+    } else if (t == TYPE_NIL) {
+        fputs("nil", stream);
+    } else {
+        printValueToStream(*v, stream);
+    }
+}
+
+void pscalMapPrint(FILE *stream, const MapObj *m) {
+    if (!stream) stream = stdout;
+    fputc('{', stream);
+    bool first = true;
+    for (int i = 0; m && i < m->entry_count; i++) {
+        const MapEntry *e = &m->entries[i];
+        if (!e->live) continue;
+        if (!first) fputs(", ", stream);
+        first = false;
+        mapPrintText(stream, e->key, e->key_len);
+        fputs(": ", stream);
+        mapPrintValue(stream, e->value);
+    }
+    fputc('}', stream);
 }
 
 // VM 2.0 Phase 4c (Docs/pscal_vm2_plan.md §5.10.4/§5.10.3): SetObj replaces
@@ -2470,6 +2915,15 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
             // NULL PSCAL_VALUE_PTR as the empty/unset case, mirrored below).
             pscalValueSetHeapPtrBits(&v, NULL);
             break;
+        case TYPE_MAP: {
+            // A declared map starts empty (Aether D68). The value type rides
+            // on the type node's `right` (the Aether front end builds it).
+            VarType value_type = TYPE_UNKNOWN;
+            AST *map_type = actual_type_def ? actual_type_def : type_def_param;
+            if (map_type && map_type->right) value_type = map_type->right->var_type;
+            pscalValueSetHeapPtrBits(&v, pscalMapObjCreate(value_type));
+            break;
+        }
         case TYPE_INTERFACE: {
             InterfaceObj *iface = pscalInterfaceObjCreate();
             pscalValueSetHeapPtrBits(&v, iface);
@@ -2980,6 +3434,14 @@ void freeValue(Value *v) {
             ChannelObj *ch = PSCAL_VALUE_PTR(*v, ChannelObj);
             if (ch) {
                 pscalObjRelease(&ch->header);
+                pscalValueSetHeapPtrBits(v, NULL);
+            }
+            break;
+        }
+        case TYPE_MAP: {
+            MapObj *m = PSCAL_VALUE_PTR(*v, MapObj);
+            if (m) {
+                pscalObjRelease(&m->header);
                 pscalValueSetHeapPtrBits(v, NULL);
             }
             break;
@@ -3955,6 +4417,9 @@ void printValueToStream(Value v, FILE *stream) {
             }
             break;
         }
+        case TYPE_MAP:
+            pscalMapPrint(stream, PSCAL_VALUE_PTR(v, MapObj));
+            break;
         case TYPE_VOID:
             fprintf(stream, "<VOID_TYPE>");
             break;
@@ -4234,6 +4699,14 @@ Value makeCopyOfValue(const Value *src) {
             }
             break;
         }
+        case TYPE_MAP: {
+            // A map is a value (Aether D68): a copy is a fresh MapObj. The
+            // cheap retain-and-share copy is copyValueForStack's; a write
+            // through a shared one clones here via valueEnsureUnique.
+            MapObj *src_m = PSCAL_VALUE_PTR(*src, MapObj);
+            pscalValueSetHeapPtrBits(&v, src_m ? pscalMapClone(src_m) : NULL);
+            break;
+        }
         case TYPE_POINTER: {
             // `v = *src` above left v's bits ALIASING src->ptr_val --
             // corrected from an earlier draft that kept this a bare,
@@ -4371,6 +4844,11 @@ void valueEnsureUnique(Value *target) {
         case TYPE_ENUM: {
             EnumObj *e = PSCAL_VALUE_PTR(*target, EnumObj);
             if (e) hdr = &e->header;
+            break;
+        }
+        case TYPE_MAP: {
+            MapObj *m = PSCAL_VALUE_PTR(*target, MapObj);
+            if (m) hdr = &m->header;
             break;
         }
         case TYPE_ARRAY: {

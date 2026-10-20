@@ -10472,6 +10472,14 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                         // (input, var-out1, var-out2) shape exactly, called as
                         // ChannelTryReceive(channel, status, outValue);
                         ((strcasecmp(calleeName, "channeltryreceive") == 0) && param_index >= 1) ||
+                        // Aether maps (D68): the writers update the caller's
+                        // map in place; take/put also move a value through a
+                        // variable (the third argument).
+                        ((strcasecmp(calleeName, "aether_map_set") == 0 ||
+                          strcasecmp(calleeName, "aether_map_remove") == 0) && param_index == 0) ||
+                        ((strcasecmp(calleeName, "aether_map_take") == 0 ||
+                          strcasecmp(calleeName, "aether_map_put") == 0) &&
+                         (param_index == 0 || param_index == 2)) ||
                         (strcasecmp(calleeName, "getmousestate") == 0) ||
                         (strcasecmp(calleeName, "getscreensize") == 0 && param_index <= 1) ||
                         (strcasecmp(calleeName, "gettextsize") == 0 && param_index > 0) ||

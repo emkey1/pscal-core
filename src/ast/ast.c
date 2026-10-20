@@ -1950,6 +1950,13 @@ VarType getBuiltinReturnType(const char* name) {
         return TYPE_DOUBLE;
     }
     if (strcasecmp(name, "aether_mstream_load") == 0) return TYPE_MEMORYSTREAM;
+    /* Maps (D68). aether_map_get/aether_map_get_or are generic: the Aether
+     * front end types the call node with the map's value type. */
+    if (strcasecmp(name, "aether_map_has") == 0) return TYPE_BOOLEAN;
+    if (strcasecmp(name, "aether_map_length") == 0) return TYPE_INT64;
+    if (strcasecmp(name, "aether_map_keys") == 0 || strcasecmp(name, "aether_map_values") == 0)
+        return TYPE_ARRAY;
+    if (strcasecmp(name, "aether_map_of") == 0) return TYPE_MAP;
 
     /* Memory stream helpers */
     if (strcasecmp(name, "mstreamcreate") == 0) return TYPE_MEMORYSTREAM;

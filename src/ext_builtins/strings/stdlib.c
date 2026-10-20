@@ -22,6 +22,7 @@
 #include <strings.h>
 #include <sys/time.h>
 #include <time.h>
+#include <stdatomic.h>
 #include "core/utils.h"
 #include "core/globals.h"
 #include "backend_ast/builtin.h"
@@ -1440,6 +1441,269 @@ static Value vmBuiltinStdRepeatArray(struct VM_s *vm, int arg_count, Value *args
     return out;
 }
 
+/* ------------------------------------------------------------------ */
+/* Maps (D68): Aether's `Map[Text, T]`                                 */
+/* ------------------------------------------------------------------ */
+
+/* The front end lowers every map operation to these engine-private names:
+ * `m[k]` reads through aether_map_get, `m[k] = v` is aether_map_set, a write
+ * into a stored value (`m[k][i] = v`, `m[a][b] = v`) moves the value out with
+ * aether_map_take and back with aether_map_put, and a literal is
+ * aether_map_of(value type code, k1, v1, ...). Writers take the map as a VAR
+ * argument and clone it first when it is shared (valueEnsureUnique): maps
+ * are values, like arrays. */
+
+static MapObj *stdMapOf(Value *v) {
+    if (v && VALUE_TYPE(*v) == TYPE_POINTER && AS_POINTER(*v)) {
+        Value *p = (Value *)AS_POINTER(*v);
+        if (VALUE_TYPE(*p) == TYPE_MAP) v = p;
+    }
+    if (!v || VALUE_TYPE(*v) != TYPE_MAP) return NULL;
+    return PSCAL_VALUE_PTR(*v, MapObj);
+}
+
+/* The caller's map cell behind a VAR argument, made unique for a write. A
+ * cell that holds no map yet (an unset declaration) becomes an empty one. */
+static MapObj *stdMapForWrite(VM *vm, const char *who, Value *arg) {
+    if (!arg || VALUE_TYPE(*arg) != TYPE_POINTER || !AS_POINTER(*arg)) {
+        runtimeError(vm, "%s expects a map variable.", who);
+        return NULL;
+    }
+    Value *cell = (Value *)AS_POINTER(*arg);
+    if (VALUE_TYPE(*cell) != TYPE_MAP || !PSCAL_VALUE_PTR(*cell, MapObj)) {
+        if (VALUE_TYPE(*cell) != TYPE_MAP && VALUE_TYPE(*cell) != TYPE_NIL &&
+            VALUE_TYPE(*cell) != TYPE_VOID && VALUE_TYPE(*cell) != TYPE_UNKNOWN) {
+            runtimeError(vm, "%s expects a map.", who);
+            return NULL;
+        }
+        freeValue(cell);
+        *cell = makeMap(TYPE_UNKNOWN);
+    }
+    valueEnsureUnique(cell);
+    return PSCAL_VALUE_PTR(*cell, MapObj);
+}
+
+static const char *stdMapKey(VM *vm, const char *who, Value *v, char scratch5[5]) {
+    const char *k = stdText(v, scratch5);
+    if (!k) runtimeError(vm, "%s: a map key must be Text.", who);
+    return k;
+}
+
+/* A value about to be stored, owned by the map: a dynamic array no one else
+ * holds is kept as is (its shared rows copied), a shared one is copied. */
+static Value stdMapOwn(Value v) {
+    if (VALUE_TYPE(v) != TYPE_ARRAY) return v;
+    ArrayObj *a = PSCAL_VALUE_PTR(v, ArrayObj);
+    if (!a || !a->is_dynamic || a->is_packed || a->dimensions != 1 ||
+        !a->lower_bounds || !a->upper_bounds) {
+        return v;
+    }
+    if (atomic_load(&a->header.refcount) > 1) {
+        Value copy = pscalMapCopyValue(&v);
+        freeValue(&v);
+        return copy;
+    }
+    int n = a->upper_bounds[0] - a->lower_bounds[0] + 1;
+    for (int i = 0; a->elements && i < n; i++) a->elements[i] = stdMapOwn(a->elements[i]);
+    return v;
+}
+
+static void stdMapMissingKey(VM *vm, const char *key, Value *nameArg) {
+    char nb[5];
+    const char *name = nameArg ? stdText(nameArg, nb) : NULL;
+    if (!name || !*name) name = "m";
+    runtimeError(vm, "Runtime Error: key \"%s\" is not in the map; use has(%s, \"%s\") or get(%s, \"%s\", default).",
+                 key, name, key, name, key);
+}
+
+/* aether_map_of(type code, k1, v1, k2, v2, ...): a literal. */
+static Value vmBuiltinStdMapOf(struct VM_s *vm, int arg_count, Value *args) {
+    if (arg_count < 1 || (arg_count - 1) % 2 != 0) {
+        runtimeError(vm, "a map literal needs key: value pairs.");
+        return makeMap(TYPE_UNKNOWN);
+    }
+    VarType vt = IS_INTLIKE(args[0]) ? (VarType)asI64(args[0]) : TYPE_UNKNOWN;
+    Value out = makeMap(vt);
+    MapObj *m = PSCAL_VALUE_PTR(out, MapObj);
+    for (int i = 1; i + 1 < arg_count; i += 2) {
+        char kb[5];
+        const char *k = stdMapKey(vm, "a map literal", &args[i], kb);
+        if (!k) return out;
+        Value item = args[i + 1];
+        args[i + 1] = makeNil(); /* moved: the VM's argument cleanup frees nil */
+        pscalMapSet(m, k, strlen(k), stdMapOwn(item));
+    }
+    return out;
+}
+
+/* aether_map_get(m, k [, name]): `m[k]`; a missing key is a runtime error. */
+static Value vmBuiltinStdMapGet(struct VM_s *vm, int arg_count, Value *args) {
+    if (arg_count < 2 || arg_count > 3) {
+        runtimeError(vm, "m[k] expects a map and a key.");
+        return makeNil();
+    }
+    MapObj *m = stdMapOf(&args[0]);
+    char kb[5];
+    const char *k = stdMapKey(vm, "m[k]", &args[1], kb);
+    if (!k) return makeNil();
+    Value *cell = m ? pscalMapFind(m, k, strlen(k)) : NULL;
+    if (!cell) {
+        stdMapMissingKey(vm, k, arg_count == 3 ? &args[2] : NULL);
+        return makeNil();
+    }
+    return pscalMapShareValue(cell);
+}
+
+/* aether_map_get_or(m, k, default): `get(m, k, default)`. */
+static Value vmBuiltinStdMapGetOr(struct VM_s *vm, int arg_count, Value *args) {
+    if (arg_count != 3) {
+        runtimeError(vm, "get expects 3 arguments (map, key, default).");
+        return makeNil();
+    }
+    MapObj *m = stdMapOf(&args[0]);
+    char kb[5];
+    const char *k = stdMapKey(vm, "get", &args[1], kb);
+    if (!k) return makeNil();
+    Value *cell = m ? pscalMapFind(m, k, strlen(k)) : NULL;
+    if (cell) return pscalMapShareValue(cell);
+    Value d = args[2];
+    args[2] = makeNil();
+    if (m && isRealType(m->value_type) && IS_INTLIKE(d) && VALUE_TYPE(d) != TYPE_BOOLEAN) {
+        Value r = makeReal(asLd(d));
+        freeValue(&d);
+        return r;
+    }
+    return d;
+}
+
+static Value vmBuiltinStdMapHas(struct VM_s *vm, int arg_count, Value *args) {
+    if (arg_count != 2) {
+        runtimeError(vm, "has expects 2 arguments (map, key).");
+        return makeBoolean(0);
+    }
+    MapObj *m = stdMapOf(&args[0]);
+    char kb[5];
+    const char *k = stdMapKey(vm, "has", &args[1], kb);
+    if (!k) return makeBoolean(0);
+    return makeBoolean(m && pscalMapFind(m, k, strlen(k)) != NULL);
+}
+
+static Value vmBuiltinStdMapLength(struct VM_s *vm, int arg_count, Value *args) {
+    if (arg_count != 1) {
+        runtimeError(vm, "length expects 1 argument.");
+        return makeInt64(0);
+    }
+    MapObj *m = stdMapOf(&args[0]);
+    return makeInt64(m ? m->live_count : 0);
+}
+
+/* aether_map_set(var m, k, v): `m[k] = v`, insert or overwrite in place. */
+static Value vmBuiltinStdMapSet(struct VM_s *vm, int arg_count, Value *args) {
+    if (arg_count != 3) {
+        runtimeError(vm, "m[k] = v expects a map, a key and a value.");
+        return makeVoid();
+    }
+    char kb[5];
+    const char *k = stdMapKey(vm, "m[k] = v", &args[1], kb);
+    if (!k) return makeVoid();
+    MapObj *m = stdMapForWrite(vm, "m[k] = v", &args[0]);
+    if (!m) return makeVoid();
+    Value item = args[2];
+    args[2] = makeNil();
+    pscalMapSet(m, k, strlen(k), stdMapOwn(item));
+    return makeVoid();
+}
+
+/* aether_map_remove(var m, k): a no-op when k is absent. */
+static Value vmBuiltinStdMapRemove(struct VM_s *vm, int arg_count, Value *args) {
+    if (arg_count != 2) {
+        runtimeError(vm, "remove expects 2 arguments (map, key).");
+        return makeVoid();
+    }
+    char kb[5];
+    const char *k = stdMapKey(vm, "remove", &args[1], kb);
+    if (!k) return makeVoid();
+    MapObj *m = stdMapForWrite(vm, "remove", &args[0]);
+    if (m) pscalMapRemove(m, k, strlen(k));
+    return makeVoid();
+}
+
+/* aether_map_take(var m, k, var out [, name]): move m[k] into `out`, leaving
+ * the key in place; aether_map_put(var m, k, var v) moves it back. The pair
+ * brackets a write into a stored value, so the value is never copied. */
+static Value vmBuiltinStdMapTake(struct VM_s *vm, int arg_count, Value *args) {
+    if (arg_count < 3 || arg_count > 4 || VALUE_TYPE(args[2]) != TYPE_POINTER ||
+        !AS_POINTER(args[2])) {
+        runtimeError(vm, "map take expects a map, a key and a variable.");
+        return makeVoid();
+    }
+    char kb[5];
+    const char *k = stdMapKey(vm, "m[k]", &args[1], kb);
+    if (!k) return makeVoid();
+    MapObj *m = stdMapForWrite(vm, "m[k]", &args[0]);
+    if (!m) return makeVoid();
+    Value *cell = pscalMapFind(m, k, strlen(k));
+    if (!cell) {
+        stdMapMissingKey(vm, k, arg_count == 4 ? &args[3] : NULL);
+        return makeVoid();
+    }
+    Value *out = (Value *)AS_POINTER(args[2]);
+    freeValue(out);
+    *out = *cell;
+    *cell = makeNil();
+    return makeVoid();
+}
+
+static Value vmBuiltinStdMapPut(struct VM_s *vm, int arg_count, Value *args) {
+    if (arg_count != 3 || VALUE_TYPE(args[2]) != TYPE_POINTER || !AS_POINTER(args[2])) {
+        runtimeError(vm, "map put expects a map, a key and a variable.");
+        return makeVoid();
+    }
+    char kb[5];
+    const char *k = stdMapKey(vm, "m[k]", &args[1], kb);
+    if (!k) return makeVoid();
+    MapObj *m = stdMapForWrite(vm, "m[k]", &args[0]);
+    if (!m) return makeVoid();
+    Value *src = (Value *)AS_POINTER(args[2]);
+    Value item = *src;
+    *src = makeNil();
+    pscalMapSet(m, k, strlen(k), item);
+    return makeVoid();
+}
+
+static Value vmBuiltinStdMapKeys(struct VM_s *vm, int arg_count, Value *args) {
+    if (arg_count != 1) {
+        runtimeError(vm, "keys expects 1 argument (a map).");
+        return stdNewArray(0, TYPE_UNICODE_STRING, NULL);
+    }
+    MapObj *m = stdMapOf(&args[0]);
+    int n = m ? m->live_count : 0;
+    Value out = stdNewArray(n, TYPE_UNICODE_STRING, NULL);
+    for (int i = 0, w = 0; m && i < m->entry_count; i++) {
+        const MapEntry *e = &m->entries[i];
+        if (!e->live) continue;
+        stdArraySet(&out, w++, stdTextValueLen(e->key, e->key_len));
+    }
+    return out;
+}
+
+static Value vmBuiltinStdMapValues(struct VM_s *vm, int arg_count, Value *args) {
+    if (arg_count != 1) {
+        runtimeError(vm, "values expects 1 argument (a map).");
+        return stdNewArray(0, TYPE_INT64, NULL);
+    }
+    MapObj *m = stdMapOf(&args[0]);
+    int n = m ? m->live_count : 0;
+    VarType et = (m && m->value_type != TYPE_UNKNOWN) ? m->value_type : TYPE_INT64;
+    Value out = stdNewArray(n, et, NULL);
+    for (int i = 0, w = 0; m && i < m->entry_count; i++) {
+        const MapEntry *e = &m->entries[i];
+        if (!e->live) continue;
+        stdArraySet(&out, w++, pscalMapCopyValue(e->value));
+    }
+    return out;
+}
+
 /* Registered under Aether-private engine names (`aether_upper`, ...): the
  * Aether front end aliases its surface names (`upper`, `count`, `sum`) to
  * them. Plain names would join every front end's namespace, and Pascal
@@ -1499,4 +1763,17 @@ void registerStdlibBuiltins(void) {
     registerVmBuiltin("aether_mstream_load", vmBuiltinStdMStreamLoad, BUILTIN_TYPE_FUNCTION, NULL, FX_IO);
     /* Record identity (D24); appended last so no earlier builtin id moves. */
     registerVmBuiltin("aether_same", vmBuiltinStdSame, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    /* Maps (D68), after aether_same so no earlier id moves. The writers are procedures with a VAR map argument
+     * (compiler.c's builtin VAR-parameter table names them). */
+    registerVmBuiltin("aether_map_of", vmBuiltinStdMapOf, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("aether_map_get", vmBuiltinStdMapGet, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("aether_map_get_or", vmBuiltinStdMapGetOr, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("aether_map_has", vmBuiltinStdMapHas, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("aether_map_length", vmBuiltinStdMapLength, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("aether_map_keys", vmBuiltinStdMapKeys, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("aether_map_values", vmBuiltinStdMapValues, BUILTIN_TYPE_FUNCTION, NULL, FX_PURE);
+    registerVmBuiltin("aether_map_set", vmBuiltinStdMapSet, BUILTIN_TYPE_PROCEDURE, NULL, FX_PURE);
+    registerVmBuiltin("aether_map_remove", vmBuiltinStdMapRemove, BUILTIN_TYPE_PROCEDURE, NULL, FX_PURE);
+    registerVmBuiltin("aether_map_take", vmBuiltinStdMapTake, BUILTIN_TYPE_PROCEDURE, NULL, FX_PURE);
+    registerVmBuiltin("aether_map_put", vmBuiltinStdMapPut, BUILTIN_TYPE_PROCEDURE, NULL, FX_PURE);
 }

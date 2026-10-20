@@ -61,7 +61,13 @@ typedef enum {
     // was sized off the previous last member and aborted registering
     // TYPE_TASK's destructor as "out of range" until an actual TaskSpawn
     // smoke test caught it.
-    TYPE_CHANNEL
+    TYPE_CHANNEL,
+    // Aether's `Map[Text, T]` (decision D68): an insertion-ordered,
+    // Text-keyed map of boxed Values (MapObj, core/types.h). A value type
+    // with copy-on-write sharing, like the engine's records and strings.
+    // Appended for the same append-only reason as TYPE_TASK/TYPE_CHANNEL;
+    // core/obj_header.c sizes its destructor table off this last member.
+    TYPE_MAP
 } VarType;
 
 /*

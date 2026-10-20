@@ -1233,6 +1233,23 @@ static bool writeValue(ByteBuf* out, const Value* v) {
             }
             break;
         }
+        case TYPE_MAP: {
+            // The compiler pools the default (empty) value of a declared
+            // Aether map; encode its value type, then each entry in order.
+            const MapObj *m = PSCAL_VALUE_PTR(*v, MapObj);
+            bufU8(out, m ? 1 : 0);
+            if (m) {
+                bufU8(out, (uint8_t)m->value_type);
+                bufU32LE(out, (uint32_t)m->live_count);
+                for (int i = 0; i < m->entry_count; i++) {
+                    const MapEntry *e = &m->entries[i];
+                    if (!e->live) continue;
+                    bufLenPrefixedBytes(out, e->key, e->key_len);
+                    if (!writeValue(out, e->value)) return false;
+                }
+            }
+            break;
+        }
         case TYPE_MEMORYSTREAM: {
             // The compiler pools the default value of an mstream variable
             // (makeValueForType), so a program that merely declares one has a
@@ -1880,6 +1897,19 @@ static void hashValue(uint64_t* hash, const Value* v, ChunkHashContext* ctx) {
             fnv1aUpdateUInt64(hash, (uint64_t)(uintptr_t)address);
             break;
         }
+        case TYPE_MAP: {
+            const MapObj *m = PSCAL_VALUE_PTR(*v, MapObj);
+            fnv1aUpdateInt(hash, m ? (int)m->value_type : -1);
+            fnv1aUpdateInt(hash, m ? m->live_count : -1);
+            for (int i = 0; m && i < m->entry_count; i++) {
+                const MapEntry *e = &m->entries[i];
+                if (!e->live) continue;
+                fnv1aUpdateInt(hash, (int)e->key_len);
+                fnv1aUpdate(hash, e->key, e->key_len);
+                hashValue(hash, e->value, ctx);
+            }
+            break;
+        }
         case TYPE_MEMORYSTREAM: {
             // By content, as the PSB3 codec stores it: the address differs in
             // the process that loads the cache, so hashing it rejected every
@@ -2061,6 +2091,30 @@ static bool readValue(Cursor* in, Value* out) {
                         if (!readValue(in, &a->elements[i])) return false;
                     }
                 }
+            }
+            break;
+        }
+        case TYPE_MAP: {
+            uint8_t present = curU8(in);
+            if (in->error) return false;
+            if (!present) {
+                pscalValueSetHeapPtrBits(out, NULL);
+                break;
+            }
+            uint8_t vt = curU8(in);
+            uint32_t count = curU32LE(in);
+            if (in->error) return false;
+            MapObj *m = pscalMapObjCreate((VarType)vt);
+            pscalValueSetHeapPtrBits(out, m);
+            for (uint32_t i = 0; i < count; i++) {
+                size_t klen = 0;
+                char *key = curLenPrefixedString(in, &klen);
+                if (in->error || !key) { free(key); return false; }
+                Value item;
+                memset(&item, 0, sizeof(item));
+                if (!readValue(in, &item)) { free(key); return false; }
+                pscalMapSet(m, key, klen, item);
+                free(key);
             }
             break;
         }

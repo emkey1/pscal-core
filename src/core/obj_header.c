@@ -20,7 +20,7 @@
 // caught by an actual TaskSpawn smoke test -- re-verify with an actual
 // ChannelCreate smoke test after this change too, not just visual
 // inspection).
-#define PSCAL_OBJ_DESTRUCTOR_TABLE_SIZE ((size_t)TYPE_CHANNEL + 1)
+#define PSCAL_OBJ_DESTRUCTOR_TABLE_SIZE ((size_t)TYPE_MAP + 1)
 
 static PscalObjDestroyFn g_obj_destructors[PSCAL_OBJ_DESTRUCTOR_TABLE_SIZE];
 static bool g_obj_destructor_registered[PSCAL_OBJ_DESTRUCTOR_TABLE_SIZE];
