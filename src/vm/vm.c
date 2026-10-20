@@ -11577,9 +11577,6 @@ comparison_error_label:
                     }
                     vm->stackTop -= arg_count;
                     for (int i = 0; i < arg_count; i++) {
-                        if (VALUE_TYPE(args[i]) == TYPE_FILE) {
-                            continue;
-                        }
                         freeValue(&args[i]);
                     }
                     return INTERPRET_RUNTIME_ERROR;
@@ -11609,9 +11606,6 @@ comparison_error_label:
                     vm->current_builtin_name = previous_builtin_name;
                     vm->stackTop -= arg_count;
                     for (int i = 0; i < arg_count; i++) {
-                        if (VALUE_TYPE(args[i]) == TYPE_FILE) {
-                            continue;
-                        }
                         freeValue(&args[i]);
                     }
                     return fx_status;
@@ -11628,9 +11622,6 @@ comparison_error_label:
 
                 vm->stackTop -= arg_count;
                 for (int i = 0; i < arg_count; i++) {
-                    if (VALUE_TYPE(args[i]) == TYPE_FILE) {
-                        continue;
-                    }
                     freeValue(&args[i]);
                 }
 
@@ -11749,9 +11740,6 @@ comparison_error_label:
                         vm->current_builtin_name = previous_builtin_name;
                         vm->stackTop -= arg_count;
                         for (int i = 0; i < arg_count; i++) {
-                            if (VALUE_TYPE(args[i]) == TYPE_FILE) {
-                                continue;
-                            }
                             freeValue(&args[i]);
                         }
                         return fx_status;
@@ -11768,9 +11756,6 @@ comparison_error_label:
 
                     vm->stackTop -= arg_count;
                     for (int i = 0; i < arg_count; i++) {
-                        if (VALUE_TYPE(args[i]) == TYPE_FILE) {
-                            continue;
-                        }
                         freeValue(&args[i]);
                     }
 
@@ -11789,9 +11774,6 @@ comparison_error_label:
                     runtimeError(vm, "VM Error: Unimplemented or unknown built-in '%s' called.", builtin_name_original_case);
                     vm->stackTop -= arg_count;
                     for (int i = 0; i < arg_count; i++) {
-                        if (VALUE_TYPE(args[i]) == TYPE_FILE) {
-                            continue;
-                        }
                         freeValue(&args[i]);
                     }
                     return INTERPRET_RUNTIME_ERROR;

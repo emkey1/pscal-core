@@ -8497,7 +8497,6 @@ cleanup:
 Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
     FILE* input_stream = stdin;
     int var_start_index = 0;
-    bool first_arg_is_file_by_value = false;
     int io_error = 0;
 
     // Determine input stream: allow FILE or ^FILE
@@ -8513,7 +8512,6 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
             }
             input_stream = AS_FILE(*a0);
             var_start_index = 1;
-            if (VALUE_TYPE(args[0]) == TYPE_FILE) first_arg_is_file_by_value = true;
         }
     }
 
@@ -8605,8 +8603,6 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
     if (!io_error && ferror(input_stream)) io_error = 1;
     else if (io_error != 1) io_error = 0;
 
-    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); pscalValueSetHeapPtrBits(&args[0], NULL); }
-
     if (input_stream == stdin) {
         vmEnableRawMode();
     }
@@ -8619,7 +8615,6 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
     fflush(stdout);
     FILE* input_stream = stdin;
     int var_start_index = 0;
-    bool first_arg_is_file_by_value = false;
     // Clear any previous IO error so a successful read won't report stale
     // failures from earlier operations (e.g. failed parse on a prior call).
     int io_error = 0;
@@ -8637,10 +8632,6 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
             }
             input_stream = AS_FILE(*a0);
             var_start_index = 1;
-            // If the actual arg0 on the stack is a FILE by value (not a pointer),
-            // the VM will free it after we return, which would fclose() the stream.
-            // Prevent that by neutering the stack value before we return.
-            if (VALUE_TYPE(args[0]) == TYPE_FILE) first_arg_is_file_by_value = true;   // ***NEW***
         }
     }
 
@@ -8660,8 +8651,6 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
                     vm ? (int)vm->exit_requested : -1,
                     vm ? (int)vm->suspend_unwind_requested : -1);
         }
-        // ***NEW***: prevent VM cleanup from closing the stream we used
-        if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); pscalValueSetHeapPtrBits(&args[0], NULL); }  // ***NEW***
         if (input_stream == stdin) vmEnableRawMode();
         vmCommitLastIoError(io_error);
         return makeVoid();
@@ -8807,9 +8796,6 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
 
     if (!io_error && ferror(input_stream)) io_error = 1;
     else if (io_error != 1) io_error = 0;
-
-    // ***NEW***: neuter FILE-by-value arg so VM cleanup won’t fclose()
-    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[0], TYPE_NIL); pscalValueSetHeapPtrBits(&args[0], NULL); }  // ***NEW***
 
     if (input_stream == stdin) {
         vmEnableRawMode();
@@ -8981,7 +8967,6 @@ Value vmBuiltinWrite(VM* vm, int arg_count, Value* args) {
 
     FILE* output_stream = stdout;
     int start_index = 1;
-    bool first_arg_is_file_by_value = false;
     const Value* file_value = NULL;
     bool binary_file = false;
     VarType binary_element_type = TYPE_VOID;
@@ -8997,7 +8982,6 @@ Value vmBuiltinWrite(VM* vm, int arg_count, Value* args) {
             }
             output_stream = AS_FILE(*first);
             start_index = 2;
-            if (VALUE_TYPE(args[1]) == TYPE_FILE) first_arg_is_file_by_value = true;
             file_value = first;
             if (FILE_ELEMENT_TYPE(*file_value) != TYPE_VOID && FILE_ELEMENT_TYPE(*file_value) != TYPE_UNKNOWN) {
                 bool has_typed_metadata = FILE_RECORD_SIZE_EXPLICIT(*file_value) || FILE_ELEMENT_TYPE_DEF(*file_value) != NULL;
@@ -9136,7 +9120,6 @@ Value vmBuiltinWrite(VM* vm, int arg_count, Value* args) {
 #else
     pthread_cleanup_pop(1);
 #endif
-    if (first_arg_is_file_by_value) { SET_VALUE_TYPE(&args[1], TYPE_NIL); pscalValueSetHeapPtrBits(&args[1], NULL); }
 
     return makeVoid();
 }

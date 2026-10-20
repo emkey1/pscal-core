@@ -4732,9 +4732,9 @@ Value makeCopyOfValue(const Value *src) {
         case TYPE_POINTER: {
             // `v = *src` above left v's bits ALIASING src->ptr_val --
             // corrected from an earlier draft that kept this a bare,
-            // unretained alias (matching TYPE_FILE's pattern). That draft
-            // was wrong for pointers specifically: unlike TYPE_FILE
-            // arguments (which CALL_BUILTIN's cleanup always skips
+            // unretained alias (matching TYPE_FILE's pattern at the time).
+            // That draft was wrong for pointers specifically: unlike TYPE_FILE
+            // arguments (which CALL_BUILTIN's cleanup then skipped
             // freeValue for), a transient TYPE_POINTER copy gets
             // freeValue'd directly and unconditionally by plenty of other
             // opcodes (SET_INDIRECT among them) that have no such skip --
@@ -4788,21 +4788,24 @@ Value makeCopyOfValue(const Value *src) {
             }
             break;
         }
-        case TYPE_FILE:
-            // `v = *src` above left v's bits ALIASING src->f_val -- and,
-            // deliberately, that alias is NOT retained. This exactly
-            // reproduces pre-4g behavior (a bare, untracked raw-FILE*
-            // alias) rather than "fixing" it into a refcounted share,
-            // because CALL_BUILTIN's argument cleanup (vm.c) has always
-            // skipped freeValue for TYPE_FILE args specifically *because*
-            // copies were untracked aliases nothing ever released -- the
-            // real owning reference is exactly one symbol slot at a time,
-            // transferred (never copied) by updateSymbolInternal's
-            // dedicated TYPE_FILE move logic in symbol.c. Retaining here
-            // would add one reference per stack-argument push that
-            // CALL_BUILTIN's skip guarantees is never matched by a
-            // release -- a permanent leak, not a fix.
+        case TYPE_FILE: {
+            // `v = *src` above left v's bits pointing at src's FileObj. A
+            // file's handle has identity, so every copy shares that same
+            // FileObj (never a clone) -- and holds its own reference, since
+            // freeValue releases one for every copy: an argument slot freed
+            // by returnFromCall or CALL_BUILTIN, a record/array/map clone
+            // freed after a copy-on-write, a stack temporary. (Copies used
+            // to be unretained aliases, and freeing one closed and freed
+            // the original's file: a by-value `Text` parameter, or a record
+            // holding a Text field that was copied, left the caller's file
+            // dangling.) stdin/stdout/stderr wrappers are only flushed when
+            // their last reference goes (fileObjDestroy).
+            FileObj *fo = PSCAL_VALUE_PTR(*src, FileObj);
+            if (fo) {
+                pscalObjRetain(&fo->header);
+            }
             break;
+        }
         // VM 2.0 Phase 4i checkpoint 3c: `v = *src` above left v's bits
         // ALIASING src's box -- overwrite with a fresh one,
         // copy-on-construct, matching the STRING/ENUM/RECORD/SET

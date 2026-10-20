@@ -71,9 +71,8 @@ typedef struct MStream {
 // value semantics), a task has no meaningful value semantics at all -- it
 // is a handle to a singular, unrepeatable in-flight computation, so every
 // Value copy of a task must refer to the SAME underlying pool slot
-// (retain-and-share, matching TYPE_FILE's identity contract, but with real
-// refcounting rather than TYPE_FILE's deliberately-untracked-alias
-// exemption -- Task values flow through ordinary CALL_BUILTIN argument/
+// (retain-and-share with real refcounting, the same identity contract
+// TYPE_FILE has -- Task values flow through ordinary CALL_BUILTIN argument/
 // return paths, not VAR-parameter-only, so an untracked alias would leak or
 // double-release). `owner` is always resolved to whichever VM was actually
 // executing TaskSpawn (the same VM createThreadJob indexes `threads[]` on
@@ -390,7 +389,7 @@ typedef struct FileObj {
 // FRESH, independent PointerObj per copy (never pscalObjRetain an
 // existing one). An earlier draft of this file tried a bare, unretained
 // alias instead (reasoning by analogy from FileObj, where CALL_BUILTIN's
-// argument cleanup always skips freeValue for TYPE_FILE specifically) --
+// argument cleanup then skipped freeValue for TYPE_FILE specifically) --
 // that reasoning does NOT transfer to pointers: unlike file arguments,
 // transient TYPE_POINTER copies get freeValue'd directly and
 // unconditionally by plenty of opcodes that carry no such skip (found by
@@ -400,7 +399,7 @@ typedef struct FileObj {
 // real, persistent wrapper out from under it). Every copy must therefore
 // be genuinely independent (refcount 1, never shared) -- which in turn
 // means CALL_BUILTIN's argument cleanup (vm.c) must NOT skip freeValue
-// for TYPE_POINTER the way it still does for TYPE_FILE, since a fresh,
+// for TYPE_POINTER (nor, now that file copies retain, TYPE_FILE), since a fresh,
 // unshared wrapper needs exactly one release to avoid leaking, and
 // nothing else will ever provide it. `base_type_node` is copied forward
 // into the fresh wrapper by makeCopyOfValue exactly as `address` is --
