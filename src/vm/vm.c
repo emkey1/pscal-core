@@ -1359,6 +1359,9 @@ static bool adjustLocalByDelta(VM* vm, Value* slot, long long delta, const char*
     }
 
     if (VALUE_TYPE(*slot) == TYPE_ENUM) {
+        // The EnumObj may be shared by reference count with copies of this
+        // local: unshare it before the in-place write.
+        valueEnsureUnique(slot);
         long long new_ord = (long long)AS_ENUM(*slot).ordinal + delta;
         AS_ENUM(*slot).ordinal = (int)new_ord;
         SET_INT_VALUE(slot, AS_ENUM(*slot).ordinal);
@@ -1366,7 +1369,13 @@ static bool adjustLocalByDelta(VM* vm, Value* slot, long long delta, const char*
     }
 
     if (isIntlikeType(VALUE_TYPE(*slot))) {
-        long long new_val = AS_INTEGER(*slot) + delta;
+        // Same check as ADD/SUBTRACT on the GET_LOCAL/CONSTANT/SET_LOCAL
+        // sequence this opcode replaces.
+        long long new_val;
+        if (__builtin_add_overflow(AS_INTEGER(*slot), delta, &new_val)) {
+            runtimeError(vm, "Runtime Error: Integer overflow.");
+            return false;
+        }
         switch (VALUE_TYPE(*slot)) {
             case TYPE_BOOLEAN:
                 SET_INT_VALUE(slot, (new_val != 0));
