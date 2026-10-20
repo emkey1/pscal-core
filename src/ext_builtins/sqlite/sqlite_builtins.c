@@ -293,10 +293,11 @@ static Value vmSqliteFinalize(struct VM_s *vm, int arg_count, Value *args) {
     sqliteResetEntry(entry);
     pthread_mutex_unlock(&sqliteHandleMutex);
 
+    /* sqlite3_finalize always frees the statement; a nonzero result is the
+     * statement's last error (a failed step's SQLITE_CONSTRAINT, say), not a
+     * failure to finalize. Return it like step and reset do: stopping the
+     * program here made a statement whose step failed impossible to clean up. */
     int rc = sqlite3_finalize(stmt);
-    if (rc != SQLITE_OK) {
-        runtimeError(vm, "SqliteFinalize failed (%d).", rc);
-    }
     return makeInt(rc);
 }
 
