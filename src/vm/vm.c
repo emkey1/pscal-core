@@ -6264,6 +6264,18 @@ static AST* vmBuiltinPointerBaseNode(const char* tn) {
     return node;
 }
 
+// A call must pass exactly as many arguments as the callee has parameters:
+// otherwise they land in the wrong slots (the frame window keeps that
+// memory-safe, not correct). Reports a runtime error and returns false.
+static bool vmCheckCallArity(VM* vm, const Symbol* callee, int passed) {
+    if (callee->arity != passed) {
+        runtimeError(vm, "VM Error: '%s' takes %d argument(s) but the call passes %d.",
+                     callee->name ? callee->name : "<anonymous>", (int)callee->arity, passed);
+        return false;
+    }
+    return true;
+}
+
 // Checks one dimension of a local or field array before makeArrayND sees
 // it: both bounds must fit an int (a plain cast turned array[1..4294967297]
 // into array[1..1]) and the dimension must hold between 1 and INT_MAX
@@ -12256,6 +12268,10 @@ comparison_error_label:
                     vm->frameCount--;
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                if (!vmCheckCallArity(vm, proc_symbol, declared_arity)) {
+                    vm->frameCount--;
+                    return INTERPRET_RUNTIME_ERROR;
+                }
 
                 if (proc_symbol->type_def && proc_symbol->type_def->child_count >= declared_arity) {
                     for (int i = 0; i < declared_arity; i++) {
@@ -12380,6 +12396,13 @@ comparison_error_label:
                         releaseClosureEnv(captured_env);
                     }
                     runtimeError(vm, "VM Error: No procedure found at address %04u for indirect call.", target_address);
+                    vm->frameCount--;
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+                if (!vmCheckCallArity(vm, proc_symbol, declared_arity)) {
+                    if (captured_env) {
+                        releaseClosureEnv(captured_env);
+                    }
                     vm->frameCount--;
                     return INTERPRET_RUNTIME_ERROR;
                 }
@@ -12555,6 +12578,10 @@ comparison_error_label:
                                  method_index, target_address);
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                // The receiver is the method's first parameter.
+                if (!vmCheckCallArity(vm, method_symbol, declared_arity + 1)) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
 
                 if (!vmEnsureFrameCapacity(vm)) {
                     runtimeError(vm, "VM Error: Call stack overflow.");
@@ -12685,6 +12712,13 @@ comparison_error_label:
                         releaseClosureEnv(captured_env);
                     }
                     runtimeError(vm, "VM Error: No procedure found at address %04u for indirect call.", target_address);
+                    vm->frameCount--;
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+                if (!vmCheckCallArity(vm, proc_symbol, declared_arity)) {
+                    if (captured_env) {
+                        releaseClosureEnv(captured_env);
+                    }
                     vm->frameCount--;
                     return INTERPRET_RUNTIME_ERROR;
                 }
