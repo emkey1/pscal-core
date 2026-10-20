@@ -7316,9 +7316,13 @@ static InterpretResult handleDefineGlobalSlot(VM* vm, uint16_t slot, int define_
         Value typeNameVal = vm->chunk->constants[type_name_idx];
         // (debug logging removed)
         AST* type_def_node = NULL;
+        // True when type_def_node was built here rather than looked up: the
+        // symbol takes it over when created, otherwise it is freed below.
+        bool type_def_built = false;
         if (declaredType == TYPE_STRING && str_len > 0) {
             Token* strTok = newToken(TOKEN_IDENTIFIER, "string", 0, 0);
             type_def_node = newASTNode(AST_VARIABLE, strTok);
+            type_def_built = true;
             setTypeAST(type_def_node, TYPE_STRING);
             freeToken(strTok);
             char buf[32];
@@ -7337,6 +7341,7 @@ static InterpretResult handleDefineGlobalSlot(VM* vm, uint16_t slot, int define_
                 // Fall back to simple base types mapping
                 Token* baseTok = newToken(TOKEN_IDENTIFIER, AS_STRING(typeNameVal), 0, 0);
                 type_def_node = newASTNode(AST_VARIABLE, baseTok);
+                type_def_built = true;
                 const char* tn = AS_STRING(typeNameVal);
                 if      (strcasecmp(tn, "integer") == 0 || strcasecmp(tn, "int") == 0) setTypeAST(type_def_node, TYPE_INT32);
                 else if (strcasecmp(tn, "real")    == 0 || strcasecmp(tn, "double") == 0) setTypeAST(type_def_node, TYPE_DOUBLE);
@@ -7364,6 +7369,7 @@ static InterpretResult handleDefineGlobalSlot(VM* vm, uint16_t slot, int define_
             // Final safety: default pointer base to integer if not provided
             Token* baseTok = newToken(TOKEN_IDENTIFIER, "integer", 0, 0);
             type_def_node = newASTNode(AST_VARIABLE, baseTok);
+            type_def_built = true;
             setTypeAST(type_def_node, TYPE_INT32);
             freeToken(baseTok);
         }
@@ -7376,8 +7382,21 @@ static InterpretResult handleDefineGlobalSlot(VM* vm, uint16_t slot, int define_
                 return INTERPRET_RUNTIME_ERROR;
             }
             hashTableInsert(vm->vmGlobalSymbols, sym);
-        } else if (warn_on_redefine) {
-            runtimeWarning(vm, "VM Warning: Global variable '%.*s' redefined.", sourceNameLen, varName);
+        } else {
+            if (warn_on_redefine) {
+                runtimeWarning(vm, "VM Warning: Global variable '%.*s' redefined.", sourceNameLen, varName);
+            } else if (sym->value) {
+                // This same DEFINE running again (a declaration in a
+                // top-level loop body): start the variable over from its
+                // type's default each iteration, as the array branch above
+                // does and as a function local would, instead of carrying
+                // the previous iteration's value forward.
+                replaceValueCell(sym->value, makeValueForType(declaredType, sym->type_def, sym), NULL);
+            }
+            if (type_def_built) {
+                freeAST(type_def_node);
+                type_def_node = NULL;
+            }
         }
 
         if (declaredType == TYPE_FILE && sym && sym->value) {
