@@ -50,7 +50,8 @@
  * an element pair has no defined equality (the caller then reports exactly what
  * it would for those scalars on their own). */
 int calculateArrayTotalSize(const Value* array_val);
-static int pscalValuesDeepEqualD(const Value *a, const Value *b, int depth);
+typedef struct PscalEqMemo PscalEqMemo;
+static int pscalValuesDeepEqualD(const Value *a, const Value *b, int depth, PscalEqMemo *memo);
 
 /* ---- Aether record equality (D24) -------------------------------------------
  * Under Aether, `==` / `<>` on two records (and tuples, which are records)
@@ -58,12 +59,74 @@ static int pscalValuesDeepEqualD(const Value *a, const Value *b, int depth);
  * identity comparison is the `same(a, b)` builtin. Records are pointers to a
  * TYPE_RECORD value, so this replaces the pointer-identity compare for two
  * non-nil record pointers. The front end rejects `==` on a self-referential
- * record type (REC-001), so the value graph compared here is acyclic; the depth
- * cap is a backstop that reports "no defined equality" (-1) rather than
- * recursing without end. Other front ends keep pointer identity. */
+ * record type (REC-001), but not one that reaches itself through a map, so the
+ * graph compared here can share substructure and even be cyclic. Past a small
+ * depth, every pair of records being compared is remembered and a pair met
+ * again counts as equal: it is either already proven equal or still being
+ * compared further up (a cycle, which is equal if nothing else differs). That
+ * keeps the walk linear in the size of the graph -- without it a DAG whose
+ * nodes are each reached twice took time exponential in its depth -- and lets
+ * cycles compare instead of hitting the depth cap. Results on acyclic data are
+ * unchanged, since any difference ends the whole comparison the moment it is
+ * found. The depth cap remains a backstop that reports "no defined equality"
+ * (-1). Other front ends keep pointer identity. */
 #define PSCAL_DEEP_EQUAL_MAX_DEPTH 512
+#define PSCAL_DEEP_EQUAL_MEMO_DEPTH 8
 
-static int pscalRecordFieldsDeepEqual(const FieldValue *fa, const FieldValue *fb, int depth) {
+typedef struct {
+    const void *a;
+    const void *b;
+} PscalEqPair;
+
+struct PscalEqMemo {
+    PscalEqPair *slots; /* open addressing; a == NULL marks an empty slot */
+    size_t cap;         /* a power of two, or 0 before first use */
+    size_t count;
+};
+
+static size_t pscalEqPairHash(const void *a, const void *b) {
+    uint64_t h = (uint64_t)(uintptr_t)a * 0x9E3779B97F4A7C15ULL;
+    h ^= (uint64_t)(uintptr_t)b * 0xC2B2AE3D27D4EB4FULL;
+    h ^= h >> 29;
+    return (size_t)h;
+}
+
+/* Records the record pair (a, b); true if it was already recorded. If the
+ * table cannot grow the pair simply goes unrecorded (the walk is then only
+ * slower, and a cycle falls back to the depth cap). */
+static bool pscalEqMemoSeen(PscalEqMemo *m, const void *a, const void *b) {
+    if (m->count + 1 > m->cap / 2) {
+        size_t new_cap = m->cap ? m->cap * 2 : 64;
+        PscalEqPair *grown = (PscalEqPair *)calloc(new_cap, sizeof(PscalEqPair));
+        if (!grown) {
+            return false;
+        }
+        for (size_t i = 0; i < m->cap; i++) {
+            if (!m->slots[i].a) continue;
+            size_t j = pscalEqPairHash(m->slots[i].a, m->slots[i].b) & (new_cap - 1);
+            while (grown[j].a) j = (j + 1) & (new_cap - 1);
+            grown[j] = m->slots[i];
+        }
+        free(m->slots);
+        m->slots = grown;
+        m->cap = new_cap;
+    }
+    size_t j = pscalEqPairHash(a, b) & (m->cap - 1);
+    while (m->slots[j].a) {
+        if (m->slots[j].a == a && m->slots[j].b == b) return true;
+        j = (j + 1) & (m->cap - 1);
+    }
+    m->slots[j].a = a;
+    m->slots[j].b = b;
+    m->count++;
+    return false;
+}
+
+static int pscalRecordFieldsDeepEqual(const FieldValue *fa, const FieldValue *fb, int depth,
+                                      PscalEqMemo *memo) {
+    if (depth > PSCAL_DEEP_EQUAL_MEMO_DEPTH && fa && fb && pscalEqMemoSeen(memo, fa, fb)) {
+        return 1;
+    }
     while (fa && fb) {
         /* Compiler-owned fields (the hidden __vtable) are not data. */
         bool hiddenA = fa->name && fa->name[0] == '_' && fa->name[1] == '_';
@@ -76,7 +139,7 @@ static int pscalRecordFieldsDeepEqual(const FieldValue *fa, const FieldValue *fb
             if (!va || !vb) {
                 if (va != vb) return 0;
             } else {
-                int r = pscalValuesDeepEqualD(va, vb, depth);
+                int r = pscalValuesDeepEqualD(va, vb, depth, memo);
                 if (r != 1) return r;
             }
         }
@@ -87,14 +150,14 @@ static int pscalRecordFieldsDeepEqual(const FieldValue *fa, const FieldValue *fb
 }
 
 /* Two record pointers under Aether: identical, both nil, or field-wise equal. */
-static int pscalRecordPointersDeepEqual(const Value *a, const Value *b, int depth) {
+static int pscalRecordPointersDeepEqualD(const Value *a, const Value *b, int depth, PscalEqMemo *memo) {
     Value *pa = AS_POINTER(*a);
     Value *pb = AS_POINTER(*b);
     if (pa == pb) return 1;
     if (!pa || !pb) return 0;
     if (depth > PSCAL_DEEP_EQUAL_MAX_DEPTH) return -1;
     if (VALUE_TYPE(*pa) == TYPE_RECORD && VALUE_TYPE(*pb) == TYPE_RECORD)
-        return pscalRecordFieldsDeepEqual(AS_RECORD(*pa), AS_RECORD(*pb), depth + 1);
+        return pscalRecordFieldsDeepEqual(AS_RECORD(*pa), AS_RECORD(*pb), depth + 1, memo);
     return 0;
 }
 
@@ -111,7 +174,7 @@ static const char *pscalTextForCompare(const Value *v, char *buf /* >= 5 bytes *
     return buf;
 }
 
-static int pscalArraysDeepEqualD(const Value *a, const Value *b, int depth) {
+static int pscalArraysDeepEqualD(const Value *a, const Value *b, int depth, PscalEqMemo *memo) {
     ArrayObj *pa = PSCAL_VALUE_PTR(*a, ArrayObj);
     ArrayObj *pb = PSCAL_VALUE_PTR(*b, ArrayObj);
     if (pa == pb) return 1;
@@ -148,19 +211,22 @@ static int pscalArraysDeepEqualD(const Value *a, const Value *b, int depth) {
     }
     if (!pa->elements || !pb->elements) return (pa->elements == pb->elements) ? 1 : 0;
     for (int i = 0; i < total; i++) {
-        int r = pscalValuesDeepEqualD(&pa->elements[i], &pb->elements[i], depth + 1);
+        int r = pscalValuesDeepEqualD(&pa->elements[i], &pb->elements[i], depth + 1, memo);
         if (r != 1) return r;
     }
     return 1;
 }
 
 static int pscalArraysDeepEqual(const Value *a, const Value *b) {
-    return pscalArraysDeepEqualD(a, b, 0);
+    PscalEqMemo memo = {0};
+    int r = pscalArraysDeepEqualD(a, b, 0, &memo);
+    free(memo.slots);
+    return r;
 }
 
 /* Aether maps (D68, D24): the same key set and equal values, order ignored;
  * values compare by the same structural rules (records field by field). */
-static int pscalMapsDeepEqualD(const Value *a, const Value *b, int depth) {
+static int pscalMapsDeepEqualD(const Value *a, const Value *b, int depth, PscalEqMemo *memo) {
     MapObj *ma = PSCAL_VALUE_PTR(*a, MapObj);
     MapObj *mb = PSCAL_VALUE_PTR(*b, MapObj);
     if (ma == mb) return 1;
@@ -173,21 +239,31 @@ static int pscalMapsDeepEqualD(const Value *a, const Value *b, int depth) {
         if (!e->live) continue;
         Value *other = pscalMapFind(mb, e->key, e->key_len);
         if (!other) return 0;
-        int r = pscalValuesDeepEqualD(e->value, other, depth + 1);
+        int r = pscalValuesDeepEqualD(e->value, other, depth + 1, memo);
         if (r != 1) return r;
     }
     return 1;
 }
 
 static int pscalMapsDeepEqual(const Value *a, const Value *b) {
-    return pscalMapsDeepEqualD(a, b, 0);
+    PscalEqMemo memo = {0};
+    int r = pscalMapsDeepEqualD(a, b, 0, &memo);
+    free(memo.slots);
+    return r;
 }
 
-static int pscalValuesDeepEqualD(const Value *a, const Value *b, int depth) {
+static int pscalRecordPointersDeepEqual(const Value *a, const Value *b) {
+    PscalEqMemo memo = {0};
+    int r = pscalRecordPointersDeepEqualD(a, b, 0, &memo);
+    free(memo.slots);
+    return r;
+}
+
+static int pscalValuesDeepEqualD(const Value *a, const Value *b, int depth, PscalEqMemo *memo) {
     VarType ta = VALUE_TYPE(*a), tb = VALUE_TYPE(*b);
     if (depth > PSCAL_DEEP_EQUAL_MAX_DEPTH) return -1;
-    if (ta == TYPE_ARRAY && tb == TYPE_ARRAY) return pscalArraysDeepEqualD(a, b, depth);
-    if (ta == TYPE_MAP && tb == TYPE_MAP) return pscalMapsDeepEqualD(a, b, depth);
+    if (ta == TYPE_ARRAY && tb == TYPE_ARRAY) return pscalArraysDeepEqualD(a, b, depth, memo);
+    if (ta == TYPE_MAP && tb == TYPE_MAP) return pscalMapsDeepEqualD(a, b, depth, memo);
     if (ta == TYPE_NIL && tb == TYPE_NIL) return 1;
     if (ta == TYPE_NIL || tb == TYPE_NIL) {
         const Value *other = (ta == TYPE_NIL) ? b : a;
@@ -204,11 +280,11 @@ static int pscalValuesDeepEqualD(const Value *a, const Value *b, int depth) {
         return strcmp(pscalTextForCompare(a, abuf), pscalTextForCompare(b, bbuf)) == 0 ? 1 : 0;
     }
     if (ta == TYPE_POINTER && tb == TYPE_POINTER) {
-        if (frontendIsAether()) return pscalRecordPointersDeepEqual(a, b, depth);
+        if (frontendIsAether()) return pscalRecordPointersDeepEqualD(a, b, depth, memo);
         return AS_POINTER(*a) == AS_POINTER(*b) ? 1 : 0;
     }
     if (ta == TYPE_RECORD && tb == TYPE_RECORD && frontendIsAether())
-        return pscalRecordFieldsDeepEqual(AS_RECORD(*a), AS_RECORD(*b), depth + 1);
+        return pscalRecordFieldsDeepEqual(AS_RECORD(*a), AS_RECORD(*b), depth + 1, memo);
     if (ta == TYPE_MEMORYSTREAM && tb == TYPE_MEMORYSTREAM) return AS_MSTREAM(*a) == AS_MSTREAM(*b) ? 1 : 0;
     return -1;
 }
@@ -9007,7 +9083,7 @@ dispatch_switch:
                         ptrs_equal = (AS_POINTER(a_val) == NULL);
                     } else if (frontendIsAether()) {
                         /* D24: records compare field by field under Aether. */
-                        int eq = pscalRecordPointersDeepEqual(&a_val, &b_val, 0);
+                        int eq = pscalRecordPointersDeepEqual(&a_val, &b_val);
                         if (eq < 0) goto comparison_error_label;
                         ptrs_equal = (eq == 1);
                     } else {
