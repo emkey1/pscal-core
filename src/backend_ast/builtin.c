@@ -4128,7 +4128,10 @@ Value vmBuiltinRealtostr(VM* vm, int arg_count, Value* args) {
         return makeString("");
     }
     char buffer[128];
-    snprintf(buffer, sizeof(buffer), "%Lf", AS_REAL(args[0]));
+    if (frontendIsAether())
+        pscalFormatRealRepr((double)AS_REAL(args[0]), buffer, sizeof(buffer)); /* D74 */
+    else
+        snprintf(buffer, sizeof(buffer), "%Lf", AS_REAL(args[0]));
     return makeString(buffer);
 }
 

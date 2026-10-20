@@ -10,6 +10,9 @@
 #include <strings.h>
 #include <assert.h>
 #include <ctype.h>
+#include <math.h>
+#include <stdlib.h>
+#include "common/frontend_kind.h"
 #include "ast/ast.h"
 #include "core/documented_units.h"
 #include "compiler/compiler.h"
@@ -4234,13 +4237,22 @@ void printValueToStream(Value v, FILE *stream) {
             fprintf(stream, "%llu", VAL_UINT(v));
             break;
         case TYPE_FLOAT:
-            fprintf(stream, "%f", (double)VAL_REAL32(v));
-            break;
         case TYPE_DOUBLE:
-            fprintf(stream, "%f", VAL_REAL64(v));
-            break;
         case TYPE_LONG_DOUBLE:
-            fprintf(stream, "%Lf", VAL_REAL_LD(v));
+            if (frontendIsAether()) {
+                /* D74: the shortest round-trip form, not six decimals. */
+                double dv = v.type == TYPE_FLOAT ? (double)VAL_REAL32(v)
+                          : v.type == TYPE_DOUBLE ? VAL_REAL64(v) : (double)VAL_REAL_LD(v);
+                char rb[64];
+                pscalFormatRealRepr(dv, rb, sizeof(rb));
+                fputs(rb, stream);
+            } else if (v.type == TYPE_FLOAT) {
+                fprintf(stream, "%f", (double)VAL_REAL32(v));
+            } else if (v.type == TYPE_DOUBLE) {
+                fprintf(stream, "%f", VAL_REAL64(v));
+            } else {
+                fprintf(stream, "%Lf", VAL_REAL_LD(v));
+            }
             break;
         case TYPE_BOOLEAN:
             if (gUppercaseBooleans) {
