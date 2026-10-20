@@ -5217,7 +5217,9 @@ Value setIntersection(Value setA, Value setB) {
 
 // Helper function to map 0-15 to ANSI FG codes
 int map16FgColorToAnsi(int pscalColorCode, bool isBold) {
-    int basePscalColor = pscalColorCode % 8;
+    // ((x % 8) + 8) % 8: C's % keeps the sign, and a negative index read
+    // outside pscalToAnsiBase.
+    int basePscalColor = ((pscalColorCode % 8) + 8) % 8;
     bool isBright = isBold || (pscalColorCode >= 8);
     int ansiBaseOffset = pscalToAnsiBase[basePscalColor];
     return (isBright ? 90 : 30) + ansiBaseOffset;
@@ -5225,7 +5227,7 @@ int map16FgColorToAnsi(int pscalColorCode, bool isBold) {
 
 // Helper function to map 0-7 to ANSI BG codes
 int map16BgColorToAnsi(int pscalColorCode) {
-    int basePscalColor = pscalColorCode % 8;
+    int basePscalColor = ((pscalColorCode % 8) + 8) % 8;
     return 40 + pscalToAnsiBase[basePscalColor];
 }
 

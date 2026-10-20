@@ -6894,7 +6894,9 @@ Value vmBuiltinTextcolor(VM* vm, int arg_count, Value* args) {
         return makeVoid();
     }
     long long colorCode = AS_INTEGER(args[0]);
-    gCurrentTextColor = (int)(colorCode % 16);
+    // Reduced into 0..15 also for a negative code (C's % keeps the sign,
+    // and TextColor(-100) indexed the colour table at -4).
+    gCurrentTextColor = (int)(((colorCode % 16) + 16) % 16);
     gCurrentTextBold = (colorCode >= 8 && colorCode <= 15);
     gCurrentColorIsExt = false;
 
@@ -6909,7 +6911,7 @@ Value vmBuiltinTextbackground(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "TextBackground expects 1 integer argument.");
         return makeVoid();
     }
-    gCurrentTextBackground = (int)(AS_INTEGER(args[0]) % 8);
+    gCurrentTextBackground = (int)(((AS_INTEGER(args[0]) % 8) + 8) % 8);
     gCurrentBgIsExt = false;
 
     markTextAttrDirty();
@@ -9707,6 +9709,41 @@ Value vmBuiltinRandomize(VM* vm, int arg_count, Value* args) {
     return makeVoid();
 }
 
+/* A uniformly distributed integer in [0, n), n >= 1. One rand_r draw covers
+ * RAND_MAX + 1 values; draws from the incomplete block at its top are
+ * rejected, so every result is equally likely (plain `% n` favoured the low
+ * values). For the usual small n that rejection almost never happens, so a
+ * run without Randomize still reproduces the numbers it always did. An n
+ * beyond one draw's range takes 64 bits from several draws (Random(n) could
+ * never return 2^31 or more). */
+static unsigned long long randUniformBelow(unsigned long long n) {
+    const unsigned long long draw_range = (unsigned long long)RAND_MAX + 1ULL;
+    if (n <= draw_range) {
+        unsigned long long limit = draw_range - (draw_range % n);
+        for (;;) {
+            unsigned long long r = (unsigned long long)rand_r(&rand_seed);
+            if (r < limit) {
+                return r % n;
+            }
+        }
+    }
+    int bits_per_draw = 0;
+    for (unsigned long long m = (unsigned long long)RAND_MAX; m; m >>= 1) {
+        bits_per_draw++;
+    }
+    // 2^64 mod n: draws below it belong to the incomplete top block.
+    unsigned long long threshold = (0ULL - n) % n;
+    for (;;) {
+        unsigned long long r = 0;
+        for (int bits = 0; bits < 64; bits += bits_per_draw) {
+            r = (r << bits_per_draw) | (unsigned long long)rand_r(&rand_seed);
+        }
+        if (r >= threshold) {
+            return r % n;
+        }
+    }
+}
+
 Value vmBuiltinRandom(VM* vm, int arg_count, Value* args) {
     if (arg_count == 0) {
         randEnsureSeeded();
@@ -9716,7 +9753,7 @@ Value vmBuiltinRandom(VM* vm, int arg_count, Value* args) {
         long long n = AS_INTEGER(args[0]);
         if (n <= 0) { runtimeError(vm, "Random argument must be > 0."); return makeInt(0); }
         randEnsureSeeded();
-        return makeInt(rand_r(&rand_seed) % n);
+        return pscalIntResultNarrow((long long)randUniformBelow((unsigned long long)n));
     }
     runtimeError(vm, "Random requires 0 arguments, or 1 integer argument.");
     return makeVoid();
@@ -10557,6 +10594,19 @@ Value vmBuiltinStr(VM* vm, int arg_count, Value* args) {
     if (isPascalStringType(VALUE_TYPE(val))) {
         const char* src = AS_STRING(val) ? AS_STRING(val) : "";
         new_buf = strdup(src);
+    } else if (isRealType(VALUE_TYPE(val))) {
+        // The text Write gives the same real with no width (printValueToStream),
+        // sized to fit: a 64-byte buffer cut Str(1e300) to its first 63 digits,
+        // a number a factor 10^246 too small.
+        if (frontendIsAether()) {
+            char repr[64];
+            pscalFormatRealRepr((double)AS_REAL(val), repr, sizeof(repr)); /* D74 */
+            new_buf = strdup(repr);
+        } else if (VALUE_TYPE(val) == TYPE_LONG_DOUBLE) {
+            new_buf = builtinAsprintf("%Lf", AS_REAL(val));
+        } else {
+            new_buf = builtinAsprintf("%f", (double)AS_REAL(val));
+        }
     } else {
         char buffer[64];
         switch (VALUE_TYPE(val)) {
@@ -10575,8 +10625,6 @@ Value vmBuiltinStr(VM* vm, int arg_count, Value* args) {
             default:
                 if (IS_INTLIKE(val)) {
                     snprintf(buffer, sizeof(buffer), "%lld", AS_INTEGER(val));
-                } else if (isRealType(VALUE_TYPE(val))) {
-                    snprintf(buffer, sizeof(buffer), "%Lf", AS_REAL(val));
                 } else {
                     runtimeError(vm, "Str expects a numeric, char, or formatted string argument.");
                     return makeVoid();
