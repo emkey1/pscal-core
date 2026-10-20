@@ -1734,6 +1734,25 @@ static bool adjustLocalByDelta(VM* vm, Value* slot, long long delta, const char*
     return false;
 }
 
+// TYPE_DOUBLE/TYPE_FLOAT operands can be computed and compared in double
+// directly. Going through long double gives bit-identical results for them
+// (one +,-,*,/ rounded to long double and then to double is the same as
+// rounding once, since long double carries at least 2*53+2 bits wherever
+// it is wider than double) but on Linux/aarch64 long double is software
+// binary128, so every real op paid for emulated arithmetic and conversions.
+// Integers stay on the long double path: one above 2^53 would round
+// differently if converted to double first.
+static inline bool vmIsDoubleOrFloat(VarType type) {
+    return type == TYPE_DOUBLE || type == TYPE_FLOAT;
+}
+
+static inline Value vmMakeDoubleValue(double d) {
+    Value v;
+    v.type = TYPE_DOUBLE;
+    v.bits = pscalBoxDouble(d);
+    return v;
+}
+
 // True for the types whose whole payload lives in Value.bits (no heap data).
 static inline bool vmTypeIsInlineScalar(VarType type) {
     switch (type) {
@@ -8625,18 +8644,30 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
             if (IS_NUMERIC(a_val_popped) && IS_NUMERIC(b_val_popped)) { \
                 bool a_real = IS_REAL(a_val_popped); \
                 bool b_real = IS_REAL(b_val_popped); \
-                if (a_real || b_real) { \
-                    /*
-                     * When an integer participates in real arithmetic, operate on
-                     * temporary copies so the original integer Value retains its
-                     * type.  This prevents implicit widening of integer operands.
-                     */ \
-                    Value a_tmp = makeCopyOfValue(&a_val_popped); \
-                    Value b_tmp = makeCopyOfValue(&b_val_popped); \
-                    long double fa = asLd(a_tmp); \
-                    long double fb = asLd(b_tmp); \
-                    freeValue(&a_tmp); \
-                    freeValue(&b_tmp); \
+                if ((a_real || b_real) && \
+                    vmIsDoubleOrFloat(VALUE_TYPE(a_val_popped)) && \
+                    vmIsDoubleOrFloat(VALUE_TYPE(b_val_popped))) { \
+                    double da = VAL_REAL64(a_val_popped); \
+                    double db = VAL_REAL64(b_val_popped); \
+                    if (current_instruction_code == DIVIDE && db == 0.0) { \
+                        runtimeError(vm, "Runtime Error: Division by zero."); \
+                        freeValue(&a_val_popped); freeValue(&b_val_popped); \
+                        return INTERPRET_RUNTIME_ERROR; \
+                    } \
+                    switch (current_instruction_code) { \
+                        case ADD:      result_val = vmMakeDoubleValue(da + db); break; \
+                        case SUBTRACT: result_val = vmMakeDoubleValue(da - db); break; \
+                        case MULTIPLY: result_val = vmMakeDoubleValue(da * db); break; \
+                        case DIVIDE:   result_val = vmMakeDoubleValue(da / db); break; \
+                        default: \
+                            runtimeError(vm, "Runtime Error: Invalid arithmetic opcode %d for real numbers.", current_instruction_code); \
+                            freeValue(&a_val_popped); freeValue(&b_val_popped); \
+                            return INTERPRET_RUNTIME_ERROR; \
+                    } \
+                } else if (a_real || b_real) { \
+                    /* asLd reads its operands; it never retypes them. */ \
+                    long double fa = asLd(a_val_popped); \
+                    long double fb = asLd(b_val_popped); \
                     if (current_instruction_code == DIVIDE && fb == 0.0L) { \
                         runtimeError(vm, "Runtime Error: Division by zero."); \
                         freeValue(&a_val_popped); freeValue(&b_val_popped); \
@@ -9262,7 +9293,19 @@ dispatch_switch:
                     bool a_real = isRealType(VALUE_TYPE(a_val));
                     bool b_real = isRealType(VALUE_TYPE(b_val));
 
-                    if (a_real || b_real) {
+                    if (vmIsDoubleOrFloat(VALUE_TYPE(a_val)) && vmIsDoubleOrFloat(VALUE_TYPE(b_val))) {
+                        double da = VAL_REAL64(a_val);
+                        double db = VAL_REAL64(b_val);
+                        switch (instruction_val) {
+                            case EQUAL:         result_val = makeBoolean(da == db); break;
+                            case NOT_EQUAL:     result_val = makeBoolean(da != db); break;
+                            case GREATER:       result_val = makeBoolean(da >  db); break;
+                            case GREATER_EQUAL: result_val = makeBoolean(da >= db); break;
+                            case LESS:          result_val = makeBoolean(da <  db); break;
+                            case LESS_EQUAL:    result_val = makeBoolean(da <= db); break;
+                            default: goto comparison_error_label;
+                        }
+                    } else if (a_real || b_real) {
                         long double fa = asLd(a_val);
                         long double fb = asLd(b_val);
                         switch (instruction_val) {

@@ -820,8 +820,16 @@ static inline long double pscalValueDecodeRealLD(Value v) {
 #define SET_INT_VALUE(dest, val) \
     do { long long _pscal_set_int_tmp = (long long)(val); \
          pscalValueSetIntBits((dest), _pscal_set_int_tmp); } while(0)
+// A TYPE_DOUBLE target converts `val` straight to double: widening a double
+// to long double and back is exact but, where long double is software
+// binary128 (Linux/aarch64), costs two emulated conversions per store.
 #define SET_REAL_VALUE(dest, val) \
-    do { pscalValueSetRealBits((dest), (long double)(val)); } while(0)
+    do { Value *_pscal_srv_dest = (dest); \
+         if (PSCAL_VALUE_FIELD(*_pscal_srv_dest, type) == TYPE_DOUBLE) { \
+             _pscal_srv_dest->bits = pscalBoxDouble((double)(val)); \
+         } else { \
+             pscalValueSetRealBits(_pscal_srv_dest, (long double)(val)); \
+         } } while(0)
 #define SET_CHAR_VALUE(dest, val) \
     do { pscalValueSetCharBits((dest), (val)); } while(0)
 // Retypes `dest` and resets `bits` to the new type's zero placeholder. A
