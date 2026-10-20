@@ -303,6 +303,47 @@ static bool verifyOperands(VCtx* ctx) {
     return true;
 }
 
+// =============== Upvalue descriptors (PROC section) ========================
+//
+// A call to a nested routine binds each of its upvalues to its enclosing
+// routine's frame: upvalues[i].index is a slot of that frame when isLocal,
+// else one of that frame's own upvalues. The VM turns the index straight
+// into a Value* (vm.c's call opcodes), so an index the enclosing routine
+// does not have would hand the callee a pointer outside the frame. The
+// enclosing routine's frame holds arity + locals_count slots and
+// upvalue_count upvalues. A routine with no enclosing routine binds to its
+// caller's frame, which is only known at run time; the VM checks that case
+// (and re-checks this one) when it binds.
+static bool verifyUpvaluesInTable(VCtx* ctx, HashTable* table) {
+    if (!table) return true;
+    for (int b = 0; b < HASHTABLE_SIZE; b++) {
+        for (Symbol* s = table->buckets[b]; s; s = s->next) {
+            if (!s->is_alias && s->upvalue_count > 0) {
+                Symbol* enclosing = s->enclosing;
+                if (enclosing && enclosing->is_alias && enclosing->real_symbol) {
+                    enclosing = enclosing->real_symbol;
+                }
+                for (int i = 0; enclosing && i < s->upvalue_count; i++) {
+                    uint32_t index = s->upvalues[i].index;
+                    uint32_t limit = s->upvalues[i].isLocal
+                                         ? (uint32_t)enclosing->arity + enclosing->locals_count
+                                         : (uint32_t)enclosing->upvalue_count;
+                    if (index >= limit) {
+                        return vfail(ctx, "routine %s: upvalue %d refers to %s %u of %s, which has %u",
+                                     s->name ? s->name : "?", i,
+                                     s->upvalues[i].isLocal ? "slot" : "upvalue", index,
+                                     enclosing->name ? enclosing->name : "its enclosing routine", limit);
+                    }
+                }
+            }
+            if (s->type_def && s->type_def->symbol_table) {
+                if (!verifyUpvaluesInTable(ctx, (HashTable*)s->type_def->symbol_table)) return false;
+            }
+        }
+    }
+    return true;
+}
+
 // ============== Pass 3: per-entry abstract stack-depth walk ================
 //
 // Each walk starts at depth 0 from an entry point where the VM begins a
@@ -798,6 +839,7 @@ bool pscalVerifyBytecodeChunk(const BytecodeChunk* chunk, HashTable* procedures,
 
     bool ok = verifyInstructionStream(&ctx) &&
               verifyOperands(&ctx) &&
+              verifyUpvaluesInTable(&ctx, procedures) &&
               verifyStackDepths(&ctx);
 
     free(ctx.boundary);

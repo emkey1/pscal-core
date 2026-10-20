@@ -6702,6 +6702,54 @@ void freeVM(VM* vm) {
     vmFreeMutexStorage(vm);
 }
 
+// Binds a called routine's upvalues into frame->upvalues (already allocated
+// by the caller, which also found parent_frame, the enclosing routine's
+// frame): each is a slot of parent_frame (isLocal) or one of parent_frame's
+// own upvalues. The descriptors come from the PROC section of a .bc file or
+// cache entry. The verifier bounds them by the enclosing routine's arity,
+// locals and upvalue count, but a routine with no enclosing routine binds to
+// its caller, whatever that is, so the index is checked against the frame
+// actually found: its declared slots, and never past the new frame's
+// arguments. (The program's own frame has no routine and no declared size;
+// everything below the new frame belongs to it or to frames above it.) On
+// failure this reports a runtime error and frees frame->upvalues; the caller
+// pops the frame.
+static bool vmBindCallUpvalues(VM* vm, CallFrame* frame, const CallFrame* parent_frame,
+                               const Symbol* proc_symbol) {
+    const char* name = proc_symbol->name ? proc_symbol->name : "<anonymous>";
+    if (!frame->upvalues) {
+        frame->owns_upvalues = false;
+        runtimeError(vm, "VM Error: Out of memory binding the upvalues of '%s'.", name);
+        return false;
+    }
+    ptrdiff_t below_frame = frame->slots - parent_frame->slots;
+    size_t parent_slots = below_frame > 0 ? (size_t)below_frame : 0;
+    if (parent_frame->function_symbol && parent_frame->slotCount < parent_slots) {
+        parent_slots = parent_frame->slotCount;
+    }
+    for (int i = 0; i < proc_symbol->upvalue_count; i++) {
+        uint8_t index = proc_symbol->upvalues[i].index;
+        if (proc_symbol->upvalues[i].isLocal) {
+            if (index < parent_slots) {
+                frame->upvalues[i] = parent_frame->slots + index;
+                continue;
+            }
+        } else if (parent_frame->upvalues && index < parent_frame->upvalue_count) {
+            frame->upvalues[i] = parent_frame->upvalues[index];
+            continue;
+        }
+        runtimeError(vm, "VM Error: Upvalue %d of '%s' refers to %s %u, outside its enclosing frame.",
+                     i, name, proc_symbol->upvalues[i].isLocal ? "slot" : "upvalue", index);
+        if (frame->owns_upvalues) {
+            free(frame->upvalues);
+        }
+        frame->upvalues = NULL;
+        frame->owns_upvalues = false;
+        return false;
+    }
+    return true;
+}
+
 // Unwind the current call frame. If there are no more frames, the VM should halt.
 // The 'halted' flag is set to true when the VM has returned from the top-level frame.
 static InterpretResult returnFromCall(VM* vm, bool* halted) {
@@ -11891,12 +11939,9 @@ comparison_error_label:
                         return INTERPRET_RUNTIME_ERROR;
                     }
 
-                    for (int i = 0; i < proc_symbol->upvalue_count; i++) {
-                        if (proc_symbol->upvalues[i].isLocal) {
-                            frame->upvalues[i] = parent_frame->slots + proc_symbol->upvalues[i].index;
-                        } else {
-                            frame->upvalues[i] = parent_frame->upvalues[proc_symbol->upvalues[i].index];
-                        }
+                    if (!vmBindCallUpvalues(vm, frame, parent_frame, proc_symbol)) {
+                        vm->frameCount--;
+                        return INTERPRET_RUNTIME_ERROR;
                     }
                 }
 
@@ -11967,6 +12012,7 @@ comparison_error_label:
 
                 if (proc_symbol->upvalue_count > 0) {
                     frame->upvalues = malloc(sizeof(Value*) * proc_symbol->upvalue_count);
+                    frame->owns_upvalues = true;
                     CallFrame* parent_frame = NULL;
                     if (proc_symbol->enclosing) {
                         for (int fi = vm->frameCount - 2; fi >= 0; fi--) {
@@ -11990,12 +12036,9 @@ comparison_error_label:
                         return INTERPRET_RUNTIME_ERROR;
                     }
 
-                    for (int i = 0; i < proc_symbol->upvalue_count; i++) {
-                        if (proc_symbol->upvalues[i].isLocal) {
-                            frame->upvalues[i] = parent_frame->slots + proc_symbol->upvalues[i].index;
-                        } else {
-                            frame->upvalues[i] = parent_frame->upvalues[proc_symbol->upvalues[i].index];
-                        }
+                    if (!vmBindCallUpvalues(vm, frame, parent_frame, proc_symbol)) {
+                        vm->frameCount--;
+                        return INTERPRET_RUNTIME_ERROR;
                     }
                 }
 
@@ -12130,12 +12173,9 @@ comparison_error_label:
                         return INTERPRET_RUNTIME_ERROR;
                     }
 
-                    for (int i = 0; i < proc_symbol->upvalue_count; i++) {
-                        if (proc_symbol->upvalues[i].isLocal) {
-                            frame->upvalues[i] = parent_frame->slots + proc_symbol->upvalues[i].index;
-                        } else {
-                            frame->upvalues[i] = parent_frame->upvalues[proc_symbol->upvalues[i].index];
-                        }
+                    if (!vmBindCallUpvalues(vm, frame, parent_frame, proc_symbol)) {
+                        vm->frameCount--;
+                        return INTERPRET_RUNTIME_ERROR;
                     }
                 } else if (captured_env) {
                     releaseClosureEnv(captured_env);
@@ -12294,12 +12334,9 @@ comparison_error_label:
                         vm->frameCount--;
                         return INTERPRET_RUNTIME_ERROR;
                     }
-                    for (int i = 0; i < method_symbol->upvalue_count; i++) {
-                        if (method_symbol->upvalues[i].isLocal) {
-                            frame->upvalues[i] = parent_frame->slots + method_symbol->upvalues[i].index;
-                        } else {
-                            frame->upvalues[i] = parent_frame->upvalues[method_symbol->upvalues[i].index];
-                        }
+                    if (!vmBindCallUpvalues(vm, frame, parent_frame, method_symbol)) {
+                        vm->frameCount--;
+                        return INTERPRET_RUNTIME_ERROR;
                     }
                 }
 
@@ -12433,12 +12470,9 @@ comparison_error_label:
                         vm->frameCount--;
                         return INTERPRET_RUNTIME_ERROR;
                     }
-                    for (int i = 0; i < proc_symbol->upvalue_count; i++) {
-                        if (proc_symbol->upvalues[i].isLocal) {
-                            frame->upvalues[i] = parent_frame->slots + proc_symbol->upvalues[i].index;
-                        } else {
-                            frame->upvalues[i] = parent_frame->upvalues[proc_symbol->upvalues[i].index];
-                        }
+                    if (!vmBindCallUpvalues(vm, frame, parent_frame, proc_symbol)) {
+                        vm->frameCount--;
+                        return INTERPRET_RUNTIME_ERROR;
                     }
                 } else if (captured_env) {
                     releaseClosureEnv(captured_env);
