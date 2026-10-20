@@ -255,6 +255,17 @@ static bool verifyOperands(VCtx* ctx) {
             return vfail(ctx, "pc %d: LOAD_ELEMENT_VALUE has no indices", pc);
         }
 
+        // PUSH_TYPE_DEFAULT builds one default per chunk and pushes shared
+        // copies of it. Compilers emit it only for record, interface and
+        // pointer defaults (whose type ASTs the constant codec cannot encode);
+        // a handle such as a file must not be shared that way.
+        if (opcode == PUSH_TYPE_DEFAULT) {
+            VarType type = (VarType)code[pc + 1];
+            if (type != TYPE_RECORD && type != TYPE_INTERFACE && type != TYPE_POINTER) {
+                return vfail(ctx, "pc %d: PUSH_TYPE_DEFAULT of type %s", pc, varTypeToString(type));
+            }
+        }
+
         int cursor = pc + 1;
         for (const char* p = info->operands; *p; ++p) {
             switch (*p) {

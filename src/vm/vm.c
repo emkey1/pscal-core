@@ -11563,6 +11563,12 @@ comparison_error_label:
             case PUSH_TYPE_DEFAULT: {
                 VarType type = (VarType)READ_BYTE();
                 uint16_t type_name_idx = READ_SHORT(vm);
+                // As the verifier requires: the one prototype is shared by
+                // every push, which only these types' defaults tolerate.
+                if (type != TYPE_RECORD && type != TYPE_INTERFACE && type != TYPE_POINTER) {
+                    runtimeError(vm, "VM Error: PUSH_TYPE_DEFAULT of type %s.", varTypeToString(type));
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 const Value* prototype = vmTypeDefaultPrototype(vm, type, type_name_idx);
                 if (!prototype) {
                     return INTERPRET_RUNTIME_ERROR;
