@@ -6928,6 +6928,31 @@ static bool vmStackHasOperands(VM* vm, uint8_t opcode, int depth) {
     return false;
 }
 
+// Whether the current frame has local `slot`, for the local-slot opcodes
+// (GET_LOCAL, SET_LOCAL, INIT_LOCAL_*, ...), whose operand the verifier does
+// not check; reports a runtime error when it has not. A routine's frame has
+// exactly slotCount slots, its arguments and locals, even when that is zero.
+// The program's own frame (no routine) has no declared size: the inliner
+// (compiler.c) pushes an inlined routine's locals onto it as it goes, so its
+// slots are whatever is on the stack. Neither reaches past stackTop, where a
+// slot already popped can still hold a stale copy of a value since freed.
+static inline bool vmLocalSlotInFrame(VM* vm, uint8_t slot) {
+    CallFrame* frame = &vm->frames[vm->frameCount - 1];
+    size_t declared_window = frame->slotCount;
+    ptrdiff_t live = vm->stackTop - frame->slots;
+    size_t live_window = live > 0 ? (size_t)live : 0;
+    size_t frame_window = live_window;
+    if (frame->function_symbol && declared_window < frame_window) {
+        frame_window = declared_window;
+    }
+    if (slot >= frame_window) {
+        runtimeError(vm, "VM Error: Local slot index %u out of range (declared window=%zu, live window=%zu).",
+                     slot, declared_window, live_window);
+        return false;
+    }
+    return true;
+}
+
 static bool vmSizeForVarType(VarType type, long long* out_bytes) {
     if (!out_bytes) {
         return false;
@@ -8277,15 +8302,10 @@ dispatch_switch:
             }
             case GET_LOCAL_ADDRESS: {
                 uint8_t slot = READ_BYTE();
-                CallFrame* frame = &vm->frames[vm->frameCount - 1];
-                size_t declared_window = frame->slotCount;
-                size_t live_window = (size_t)(vm->stackTop - frame->slots);
-                size_t frame_window = declared_window ? declared_window : live_window;
-                if (slot >= frame_window) {
-                    runtimeError(vm, "VM Error: Local slot index %u out of range (declared window=%zu, live window=%zu).",
-                                 slot, declared_window, live_window);
+                if (!vmLocalSlotInFrame(vm, slot)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                CallFrame* frame = &vm->frames[vm->frameCount - 1];
                 push(vm, makePointer(&frame->slots[slot], NULL));
                 break;
             }
@@ -10904,29 +10924,19 @@ comparison_error_label:
             }
             case GET_LOCAL: {
                 uint8_t slot = READ_BYTE();
-                CallFrame* frame = &vm->frames[vm->frameCount - 1];
-                size_t declared_window = frame->slotCount;
-                size_t live_window = (size_t)(vm->stackTop - frame->slots);
-                size_t frame_window = declared_window ? declared_window : live_window;
-                if (slot >= frame_window) {
-                    runtimeError(vm, "VM Error: Local slot index %u out of range (declared window=%zu, live window=%zu).",
-                                 slot, declared_window, live_window);
+                if (!vmLocalSlotInFrame(vm, slot)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                CallFrame* frame = &vm->frames[vm->frameCount - 1];
                 push(vm, copyValueForStack(&frame->slots[slot]));
                 break;
             }
             case RESET_LOCAL: {
                 uint8_t slot = READ_BYTE();
-                CallFrame* frame = &vm->frames[vm->frameCount - 1];
-                size_t declared_window = frame->slotCount;
-                size_t live_window = (size_t)(vm->stackTop - frame->slots);
-                size_t frame_window = declared_window ? declared_window : live_window;
-                if (slot >= frame_window) {
-                    runtimeError(vm, "VM Error: Local slot index %u out of range (declared window=%zu, live window=%zu).",
-                                 slot, declared_window, live_window);
+                if (!vmLocalSlotInFrame(vm, slot)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                CallFrame* frame = &vm->frames[vm->frameCount - 1];
                 Value* target_slot = &frame->slots[slot];
                 freeValue(target_slot);
                 *target_slot = makeNil();
@@ -10934,15 +10944,10 @@ comparison_error_label:
             }
             case SET_LOCAL: {
                 uint8_t slot = READ_BYTE();
-                CallFrame* frame = &vm->frames[vm->frameCount - 1];
-                size_t declared_window = frame->slotCount;
-                size_t live_window = (size_t)(vm->stackTop - frame->slots);
-                size_t frame_window = declared_window ? declared_window : live_window;
-                if (slot >= frame_window) {
-                    runtimeError(vm, "VM Error: Local slot index %u out of range (declared window=%zu, live window=%zu).",
-                                 slot, declared_window, live_window);
+                if (!vmLocalSlotInFrame(vm, slot)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                CallFrame* frame = &vm->frames[vm->frameCount - 1];
                 Value* target_slot = &frame->slots[slot];
                 Value value_from_stack = pop(vm);
                 if (vmPasExceptionPending(vm)) {
@@ -11072,15 +11077,10 @@ comparison_error_label:
             }
             case INC_LOCAL: {
                 uint8_t slot = READ_BYTE();
-                CallFrame* frame = &vm->frames[vm->frameCount - 1];
-                size_t declared_window = frame->slotCount;
-                size_t live_window = (size_t)(vm->stackTop - frame->slots);
-                size_t frame_window = declared_window ? declared_window : live_window;
-                if (slot >= frame_window) {
-                    runtimeError(vm, "VM Error: Local slot index %u out of range (declared window=%zu, live window=%zu).",
-                                 slot, declared_window, live_window);
+                if (!vmLocalSlotInFrame(vm, slot)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                CallFrame* frame = &vm->frames[vm->frameCount - 1];
                 Value* target_slot = &frame->slots[slot];
                 if (!adjustLocalByDelta(vm, target_slot, 1, "INC_LOCAL")) {
                     return INTERPRET_RUNTIME_ERROR;
@@ -11089,15 +11089,10 @@ comparison_error_label:
             }
             case DEC_LOCAL: {
                 uint8_t slot = READ_BYTE();
-                CallFrame* frame = &vm->frames[vm->frameCount - 1];
-                size_t declared_window = frame->slotCount;
-                size_t live_window = (size_t)(vm->stackTop - frame->slots);
-                size_t frame_window = declared_window ? declared_window : live_window;
-                if (slot >= frame_window) {
-                    runtimeError(vm, "VM Error: Local slot index %u out of range (declared window=%zu, live window=%zu).",
-                                 slot, declared_window, live_window);
+                if (!vmLocalSlotInFrame(vm, slot)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                CallFrame* frame = &vm->frames[vm->frameCount - 1];
                 Value* target_slot = &frame->slots[slot];
                 if (!adjustLocalByDelta(vm, target_slot, -1, "DEC_LOCAL")) {
                     return INTERPRET_RUNTIME_ERROR;
@@ -11289,6 +11284,10 @@ comparison_error_label:
                 free(lower_idx);
                 free(upper_idx);
 
+                if (!vmLocalSlotInFrame(vm, slot)) {
+                    freeValue(&array_value);
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 CallFrame* frame = &vm->frames[vm->frameCount - 1];
                 Value* target_slot = &frame->slots[slot];
                 freeValue(target_slot);
@@ -11427,6 +11426,9 @@ comparison_error_label:
                 uint8_t slot = READ_BYTE();
                 VarType element_type = (VarType)READ_BYTE();
                 uint16_t type_name_index = READ_SHORT(vm);
+                if (!vmLocalSlotInFrame(vm, slot)) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 AST* element_type_def = NULL;
                 if (type_name_index != 0xFFFF && type_name_index < vm->chunk->constants_count) {
                     Value type_name_val = vm->chunk->constants[type_name_index];
@@ -11454,6 +11456,9 @@ comparison_error_label:
             case INIT_LOCAL_POINTER: {
                 uint8_t slot = READ_BYTE();
                 uint16_t type_name_idx = READ_SHORT(vm);
+                if (!vmLocalSlotInFrame(vm, slot)) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 AST* type_def = NULL;
                 Value type_name_val = vm->chunk->constants[type_name_idx];
                 if (VALUE_TYPE(type_name_val) == TYPE_STRING && AS_STRING(type_name_val) && AS_STRING(type_name_val)[0] != '\0') {
@@ -11506,6 +11511,9 @@ comparison_error_label:
             case INIT_LOCAL_STRING: {
                 uint8_t slot = READ_BYTE();
                 uint8_t length = READ_BYTE();
+                if (!vmLocalSlotInFrame(vm, slot)) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 CallFrame* frame = &vm->frames[vm->frameCount - 1];
                 Value* target_slot = &frame->slots[slot];
                 freeValue(target_slot);
