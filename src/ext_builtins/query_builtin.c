@@ -167,6 +167,9 @@ static const AetherBuiltinMeta kAetherBuiltinMeta[] = {
      "Capability probe for the yyjson/TOON backend.", "capability", false},
     {"has_ai", NULL, "function", "Bool", "has_ai() -> Bool",
      "Capability probe for the OpenAI-compatible AI backend.", "capability", false},
+    /* Aether's front end turns this call into a string literal (no engine builtin). */
+    {"aether_version", NULL, "function", "Text", "aether_version() -> Text",
+     "The compiler's version as `aether --version` prints it after \"Version:\": the language version and the release label, e.g. \"2026-10-20-13 (1.0-beta3)\".", "capability", false},
     {"has_builtin", "hasextbuiltin", "function", "Bool",
      "has_builtin(category: Text, function: Text) -> Bool",
      "Capability probe for extended builtin categories/functions.", "capability", false},
