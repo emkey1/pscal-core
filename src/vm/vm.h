@@ -546,8 +546,9 @@ size_t vmSnapshotProcWorkers(uintptr_t vm_address, VMProcWorkerSnapshot* out, si
 void vmRegisterClassMethod(VM* vm, const char* className, uint16_t methodIndex, Symbol* methodSymbol);
 Symbol* vmFindClassMethod(VM* vm, const char* className, uint16_t methodIndex);
 
-void runtimeError(VM* vm, const char* format, ...);
-void runtimeWarning(VM* vm, const char* format, ...);
+// printf-style: the compiler checks every call's arguments against its format.
+void runtimeError(VM* vm, const char* format, ...) __attribute__((format(printf, 2, 3)));
+void runtimeWarning(VM* vm, const char* format, ...) __attribute__((format(printf, 2, 3)));
 void vmDumpStackInfo(VM* vm);
 void vmDumpStackInfoDetailed(VM* vm, const char* context_message);
 void vmSetSuppressStateDump(bool suppress);

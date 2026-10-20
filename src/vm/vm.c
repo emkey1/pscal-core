@@ -1392,6 +1392,23 @@ static FieldValue* findRecordFieldByName(Value* record_struct_ptr, const char* f
     return NULL;
 }
 
+// The field name GET_FIELD_ADDRESS[16]/_KEEP[16] read from the constant pool,
+// or NULL after a runtime error when that constant is not a string (the
+// verifier rejects such a chunk; this keeps a chunk that skipped it from
+// reading a non-string's payload as a StringObj).
+static const char* vmFieldNameOperand(VM* vm, uint16_t field_name_idx) {
+    const Value* name_val = (field_name_idx < vm->chunk->constants_count)
+                            ? &vm->chunk->constants[field_name_idx]
+                            : NULL;
+    const char* field_name = (name_val && VALUE_TYPE(*name_val) == TYPE_STRING)
+                              ? AS_STRING(*name_val)
+                              : NULL;
+    if (!field_name) {
+        runtimeError(vm, "VM Error: Field name constant is invalid or NULL.");
+    }
+    return field_name;
+}
+
 static bool pushFieldValueByName(VM* vm, Value* base_val_ptr, const char* field_name) {
     if (!field_name) {
         runtimeError(vm, "VM Error: Field name constant is invalid or NULL.");
@@ -7973,6 +7990,54 @@ void freeVM(VM* vm) {
     vmFreeMutexStorage(vm);
 }
 
+// Binds a called routine's upvalues into frame->upvalues (already allocated
+// by the caller, which also found parent_frame, the enclosing routine's
+// frame): each is a slot of parent_frame (isLocal) or one of parent_frame's
+// own upvalues. The descriptors come from the PROC section of a .bc file or
+// cache entry. The verifier bounds them by the enclosing routine's arity,
+// locals and upvalue count, but a routine with no enclosing routine binds to
+// its caller, whatever that is, so the index is checked against the frame
+// actually found: its declared slots, and never past the new frame's
+// arguments. (The program's own frame has no routine and no declared size;
+// everything below the new frame belongs to it or to frames above it.) On
+// failure this reports a runtime error and frees frame->upvalues; the caller
+// pops the frame.
+static bool vmBindCallUpvalues(VM* vm, CallFrame* frame, const CallFrame* parent_frame,
+                               const Symbol* proc_symbol) {
+    const char* name = proc_symbol->name ? proc_symbol->name : "<anonymous>";
+    if (!frame->upvalues) {
+        frame->owns_upvalues = false;
+        runtimeError(vm, "VM Error: Out of memory binding the upvalues of '%s'.", name);
+        return false;
+    }
+    ptrdiff_t below_frame = frame->slots - parent_frame->slots;
+    size_t parent_slots = below_frame > 0 ? (size_t)below_frame : 0;
+    if (parent_frame->function_symbol && parent_frame->slotCount < parent_slots) {
+        parent_slots = parent_frame->slotCount;
+    }
+    for (int i = 0; i < proc_symbol->upvalue_count; i++) {
+        uint8_t index = proc_symbol->upvalues[i].index;
+        if (proc_symbol->upvalues[i].isLocal) {
+            if (index < parent_slots) {
+                frame->upvalues[i] = parent_frame->slots + index;
+                continue;
+            }
+        } else if (parent_frame->upvalues && index < parent_frame->upvalue_count) {
+            frame->upvalues[i] = parent_frame->upvalues[index];
+            continue;
+        }
+        runtimeError(vm, "VM Error: Upvalue %d of '%s' refers to %s %u, outside its enclosing frame.",
+                     i, name, proc_symbol->upvalues[i].isLocal ? "slot" : "upvalue", index);
+        if (frame->owns_upvalues) {
+            free(frame->upvalues);
+        }
+        frame->upvalues = NULL;
+        frame->owns_upvalues = false;
+        return false;
+    }
+    return true;
+}
+
 // Unwind the current call frame. If there are no more frames, the VM should halt.
 // The 'halted' flag is set to true when the VM has returned from the top-level frame.
 static InterpretResult returnFromCall(VM* vm, bool* halted) {
@@ -7986,6 +8051,19 @@ static InterpretResult returnFromCall(VM* vm, bool* halted) {
     }
 
     CallFrame* currentFrame = &vm->frames[vm->frameCount - 1];
+
+    // Returning resets stackTop to the frame's base. Below the base are the
+    // caller's slots; if the callee has popped into them (possible only past
+    // a CALL_INDIRECT/CALL_METHOD/CALL_HOST, whose stack effect the verifier
+    // cannot follow), the values it moved out are gone, and raising stackTop
+    // back over their stale copies would hand them to the caller to use and
+    // free a second time.
+    if (vm->stackTop < currentFrame->slots) {
+        runtimeError(vm, "VM Error: Stack underflow into the caller's frame on return.");
+        if (halted) *halted = true;
+        return INTERPRET_RUNTIME_ERROR;
+    }
+
     bool has_result = (currentFrame->function_symbol != NULL) &&
                       (currentFrame->function_symbol->type != TYPE_VOID);
 
@@ -8133,6 +8211,31 @@ static bool vmStackHasOperands(VM* vm, uint8_t opcode, int depth) {
     runtimeError(vm, "VM Error: Stack underflow (%s requires stack depth >= %d but have %ld).",
                  kOpcodeNames[opcode], depth, have);
     return false;
+}
+
+// Whether the current frame has local `slot`, for the local-slot opcodes
+// (GET_LOCAL, SET_LOCAL, INIT_LOCAL_*, ...), whose operand the verifier does
+// not check; reports a runtime error when it has not. A routine's frame has
+// exactly slotCount slots, its arguments and locals, even when that is zero.
+// The program's own frame (no routine) has no declared size: the inliner
+// (compiler.c) pushes an inlined routine's locals onto it as it goes, so its
+// slots are whatever is on the stack. Neither reaches past stackTop, where a
+// slot already popped can still hold a stale copy of a value since freed.
+static inline bool vmLocalSlotInFrame(VM* vm, uint8_t slot) {
+    CallFrame* frame = &vm->frames[vm->frameCount - 1];
+    size_t declared_window = frame->slotCount;
+    ptrdiff_t live = vm->stackTop - frame->slots;
+    size_t live_window = live > 0 ? (size_t)live : 0;
+    size_t frame_window = live_window;
+    if (frame->function_symbol && declared_window < frame_window) {
+        frame_window = declared_window;
+    }
+    if (slot >= frame_window) {
+        runtimeError(vm, "VM Error: Local slot index %u out of range (declared window=%zu, live window=%zu).",
+                     slot, declared_window, live_window);
+        return false;
+    }
+    return true;
 }
 
 static bool vmSizeForVarType(VarType type, long long* out_bytes) {
@@ -9460,8 +9563,14 @@ dispatch_switch:
                 break;
             }
             case CONSTANT: {
-                Value constant = READ_CONSTANT();
-                push(vm, copyValueForStackUnlocked(&constant));
+                // The verifier range-checks this operand; checked here too,
+                // as CONSTANT16 is, for code it did not see.
+                uint8_t idx = READ_BYTE();
+                if (idx >= vm->chunk->constants_count) {
+                    runtimeError(vm, "VM Error: Constant index %u out of bounds for CONSTANT.", idx);
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+                push(vm, copyValueForStackUnlocked(&vm->chunk->constants[idx]));
                 break;
             }
                 
@@ -9556,15 +9665,10 @@ dispatch_switch:
             }
             case GET_LOCAL_ADDRESS: {
                 uint8_t slot = READ_BYTE();
-                CallFrame* frame = &vm->frames[vm->frameCount - 1];
-                size_t declared_window = frame->slotCount;
-                size_t live_window = (size_t)(vm->stackTop - frame->slots);
-                size_t frame_window = declared_window ? declared_window : live_window;
-                if (slot >= frame_window) {
-                    runtimeError(vm, "VM Error: Local slot index %u out of range (declared window=%zu, live window=%zu).",
-                                 slot, declared_window, live_window);
+                if (!vmLocalSlotInFrame(vm, slot)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                CallFrame* frame = &vm->frames[vm->frameCount - 1];
                 push(vm, makePointer(&frame->slots[slot], NULL));
                 break;
             }
@@ -10435,7 +10539,18 @@ comparison_error_label:
                 if (!vmStackHasOperands(vm, GET_FIELD_ADDRESS, 1)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                const char* field_name = vmFieldNameOperand(vm, field_name_idx);
+                if (!field_name) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 Value* base_val_ptr = vm->stackTop - 1;
+                if (VALUE_TYPE(*base_val_ptr) == TYPE_RECORD) {
+                    // A record value, not its address: this opcode pops the
+                    // base, which frees the storage the field address would
+                    // point into. No compiler emits this.
+                    runtimeError(vm, "VM Error: GET_FIELD_ADDRESS needs a pointer to the record, not a record value.");
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 bool invalid_type = false;
                 Value* record_struct_ptr = resolveRecord(base_val_ptr, &invalid_type);
                 if (invalid_type) {
@@ -10458,7 +10573,6 @@ comparison_error_label:
                 // resolving the field's storage address.
                 valueEnsureUnique(record_struct_ptr);
 
-                const char* field_name = AS_STRING(vm->chunk->constants[field_name_idx]);
                 FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
                 if (current) {
                     // A field of a dynamic array's element: the new address keeps
@@ -10478,7 +10592,18 @@ comparison_error_label:
                 if (!vmStackHasOperands(vm, GET_FIELD_ADDRESS16, 1)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                const char* field_name = vmFieldNameOperand(vm, field_name_idx);
+                if (!field_name) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 Value* base_val_ptr = vm->stackTop - 1;
+                if (VALUE_TYPE(*base_val_ptr) == TYPE_RECORD) {
+                    // A record value, not its address: this opcode pops the
+                    // base, which frees the storage the field address would
+                    // point into. No compiler emits this.
+                    runtimeError(vm, "VM Error: GET_FIELD_ADDRESS16 needs a pointer to the record, not a record value.");
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 bool invalid_type = false;
                 Value* record_struct_ptr = resolveRecord(base_val_ptr, &invalid_type);
                 if (invalid_type) {
@@ -10501,7 +10626,6 @@ comparison_error_label:
                 // resolving the field's storage address.
                 valueEnsureUnique(record_struct_ptr);
 
-                const char* field_name = AS_STRING(vm->chunk->constants[field_name_idx]);
                 FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
                 if (current) {
                     // A field of a dynamic array's element: the new address keeps
@@ -10521,6 +10645,10 @@ comparison_error_label:
                 if (!vmStackHasOperands(vm, GET_FIELD_ADDRESS_KEEP, 1)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                const char* field_name = vmFieldNameOperand(vm, field_name_idx);
+                if (!field_name) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 Value* base_val_ptr = vm->stackTop - 1;
                 bool invalid_type = false;
                 Value* record_struct_ptr = resolveRecord(base_val_ptr, &invalid_type);
@@ -10544,7 +10672,6 @@ comparison_error_label:
                 // resolving the field's storage address.
                 valueEnsureUnique(record_struct_ptr);
 
-                const char* field_name = AS_STRING(vm->chunk->constants[field_name_idx]);
                 FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
                 if (current) {
                     push(vm, makeRetainedArrayElementPointer(fieldValueStorage(current), current->type_def,
@@ -10560,6 +10687,10 @@ comparison_error_label:
                 if (!vmStackHasOperands(vm, GET_FIELD_ADDRESS_KEEP16, 1)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                const char* field_name = vmFieldNameOperand(vm, field_name_idx);
+                if (!field_name) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 Value* base_val_ptr = vm->stackTop - 1;
                 bool invalid_type = false;
                 Value* record_struct_ptr = resolveRecord(base_val_ptr, &invalid_type);
@@ -10583,7 +10714,6 @@ comparison_error_label:
                 // resolving the field's storage address.
                 valueEnsureUnique(record_struct_ptr);
 
-                const char* field_name = AS_STRING(vm->chunk->constants[field_name_idx]);
                 FieldValue* current = findRecordFieldByName(record_struct_ptr, field_name);
                 if (current) {
                     push(vm, makeRetainedArrayElementPointer(fieldValueStorage(current), current->type_def,
@@ -10794,11 +10924,36 @@ comparison_error_label:
                         return INTERPRET_RUNTIME_ERROR;
                     }
                 } else if (VALUE_TYPE(operand) == TYPE_ARRAY) {
-                    array_val_ptr = &operand;
+                    // An array value, not its address: the element address
+                    // handed out would point into storage only this popped
+                    // copy keeps alive, so the copy could never be freed.
+                    // No compiler emits this.
+                    runtimeError(vm, "VM Error: GET_ELEMENT_ADDRESS needs a pointer to the array, not an array value.");
+                    free(indices);
+                    freeValue(&operand);
+                    return INTERPRET_RUNTIME_ERROR;
                 } else {
                     runtimeError(vm, "[AETH-RUNTIME-INDEX-NOT-ARRAY] cannot index this value: it is not an array. hint: indexing a 1-D array two-dimensionally (dp[i][j]) does this -- a `let dp: Int[]` is flat, so use a single index dp[i * width + j], or build an array of arrays.");
                     if (indices != indices_inline) free(indices);
                     freeValue(&operand);
+                    return INTERPRET_RUNTIME_ERROR;
+                }
+
+                // More indices than the array has dimensions: the extra ones
+                // used to be dropped silently. (A dimensionless array is an
+                // empty dynamic one; the bounds check below reports that.)
+                if (ARRAY_DIMENSIONS(*array_val_ptr) > 0 &&
+                    dimension_count > ARRAY_DIMENSIONS(*array_val_ptr)) {
+                    runtimeError(vm, "VM Error: %u indices for an array of %d dimension(s).",
+                                 dimension_count, ARRAY_DIMENSIONS(*array_val_ptr));
+                    free(indices);
+                    freeValue(&operand);
+                    if (using_wrapper) {
+                        vmFreeArrayIndexWrapper(&temp_wrapper);
+                    }
+                    if (using_snapshot) {
+                        freeValue(&shared_snapshot);
+                    }
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
@@ -12427,29 +12582,19 @@ comparison_error_label:
             }
             case GET_LOCAL: {
                 uint8_t slot = READ_BYTE();
-                CallFrame* frame = &vm->frames[vm->frameCount - 1];
-                size_t declared_window = frame->slotCount;
-                size_t live_window = (size_t)(vm->stackTop - frame->slots);
-                size_t frame_window = declared_window ? declared_window : live_window;
-                if (slot >= frame_window) {
-                    runtimeError(vm, "VM Error: Local slot index %u out of range (declared window=%zu, live window=%zu).",
-                                 slot, declared_window, live_window);
+                if (!vmLocalSlotInFrame(vm, slot)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                CallFrame* frame = &vm->frames[vm->frameCount - 1];
                 push(vm, copyValueForStack(&frame->slots[slot]));
                 break;
             }
             case RESET_LOCAL: {
                 uint8_t slot = READ_BYTE();
-                CallFrame* frame = &vm->frames[vm->frameCount - 1];
-                size_t declared_window = frame->slotCount;
-                size_t live_window = (size_t)(vm->stackTop - frame->slots);
-                size_t frame_window = declared_window ? declared_window : live_window;
-                if (slot >= frame_window) {
-                    runtimeError(vm, "VM Error: Local slot index %u out of range (declared window=%zu, live window=%zu).",
-                                 slot, declared_window, live_window);
+                if (!vmLocalSlotInFrame(vm, slot)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                CallFrame* frame = &vm->frames[vm->frameCount - 1];
                 Value* target_slot = &frame->slots[slot];
                 freeValue(target_slot);
                 *target_slot = makeNil();
@@ -12457,15 +12602,10 @@ comparison_error_label:
             }
             case SET_LOCAL: {
                 uint8_t slot = READ_BYTE();
-                CallFrame* frame = &vm->frames[vm->frameCount - 1];
-                size_t declared_window = frame->slotCount;
-                size_t live_window = (size_t)(vm->stackTop - frame->slots);
-                size_t frame_window = declared_window ? declared_window : live_window;
-                if (slot >= frame_window) {
-                    runtimeError(vm, "VM Error: Local slot index %u out of range (declared window=%zu, live window=%zu).",
-                                 slot, declared_window, live_window);
+                if (!vmLocalSlotInFrame(vm, slot)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                CallFrame* frame = &vm->frames[vm->frameCount - 1];
                 Value* target_slot = &frame->slots[slot];
                 Value value_from_stack = pop(vm);
                 if (vmPasExceptionPending(vm)) {
@@ -12602,15 +12742,10 @@ comparison_error_label:
             }
             case INC_LOCAL: {
                 uint8_t slot = READ_BYTE();
-                CallFrame* frame = &vm->frames[vm->frameCount - 1];
-                size_t declared_window = frame->slotCount;
-                size_t live_window = (size_t)(vm->stackTop - frame->slots);
-                size_t frame_window = declared_window ? declared_window : live_window;
-                if (slot >= frame_window) {
-                    runtimeError(vm, "VM Error: Local slot index %u out of range (declared window=%zu, live window=%zu).",
-                                 slot, declared_window, live_window);
+                if (!vmLocalSlotInFrame(vm, slot)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                CallFrame* frame = &vm->frames[vm->frameCount - 1];
                 Value* target_slot = &frame->slots[slot];
                 if (!adjustLocalByDelta(vm, target_slot, 1, "INC_LOCAL")) {
                     return INTERPRET_RUNTIME_ERROR;
@@ -12619,15 +12754,10 @@ comparison_error_label:
             }
             case DEC_LOCAL: {
                 uint8_t slot = READ_BYTE();
-                CallFrame* frame = &vm->frames[vm->frameCount - 1];
-                size_t declared_window = frame->slotCount;
-                size_t live_window = (size_t)(vm->stackTop - frame->slots);
-                size_t frame_window = declared_window ? declared_window : live_window;
-                if (slot >= frame_window) {
-                    runtimeError(vm, "VM Error: Local slot index %u out of range (declared window=%zu, live window=%zu).",
-                                 slot, declared_window, live_window);
+                if (!vmLocalSlotInFrame(vm, slot)) {
                     return INTERPRET_RUNTIME_ERROR;
                 }
+                CallFrame* frame = &vm->frames[vm->frameCount - 1];
                 Value* target_slot = &frame->slots[slot];
                 if (!adjustLocalByDelta(vm, target_slot, -1, "DEC_LOCAL")) {
                     return INTERPRET_RUNTIME_ERROR;
@@ -12834,6 +12964,10 @@ comparison_error_label:
                 free(lower_idx);
                 free(upper_idx);
 
+                if (!vmLocalSlotInFrame(vm, slot)) {
+                    freeValue(&array_value);
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 CallFrame* frame = &vm->frames[vm->frameCount - 1];
                 Value* target_slot = &frame->slots[slot];
                 freeValue(target_slot);
@@ -12983,6 +13117,9 @@ comparison_error_label:
                 uint8_t slot = READ_BYTE();
                 VarType element_type = (VarType)READ_BYTE();
                 uint16_t type_name_index = READ_SHORT(vm);
+                if (!vmLocalSlotInFrame(vm, slot)) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 AST* element_type_def = NULL;
                 if (type_name_index != 0xFFFF && type_name_index < vm->chunk->constants_count) {
                     Value type_name_val = vm->chunk->constants[type_name_index];
@@ -13010,6 +13147,9 @@ comparison_error_label:
             case INIT_LOCAL_POINTER: {
                 uint8_t slot = READ_BYTE();
                 uint16_t type_name_idx = READ_SHORT(vm);
+                if (!vmLocalSlotInFrame(vm, slot)) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 AST* type_def = NULL;
                 Value type_name_val = vm->chunk->constants[type_name_idx];
                 if (VALUE_TYPE(type_name_val) == TYPE_STRING && AS_STRING(type_name_val) && AS_STRING(type_name_val)[0] != '\0') {
@@ -13047,6 +13187,9 @@ comparison_error_label:
             case INIT_LOCAL_STRING: {
                 uint8_t slot = READ_BYTE();
                 uint8_t length = READ_BYTE();
+                if (!vmLocalSlotInFrame(vm, slot)) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 CallFrame* frame = &vm->frames[vm->frameCount - 1];
                 Value* target_slot = &frame->slots[slot];
                 freeValue(target_slot);
@@ -13063,6 +13206,12 @@ comparison_error_label:
             case PUSH_TYPE_DEFAULT: {
                 VarType type = (VarType)READ_BYTE();
                 uint16_t type_name_idx = READ_SHORT(vm);
+                // As the verifier requires: the one prototype is shared by
+                // every push, which only these types' defaults tolerate.
+                if (type != TYPE_RECORD && type != TYPE_INTERFACE && type != TYPE_POINTER) {
+                    runtimeError(vm, "VM Error: PUSH_TYPE_DEFAULT of type %s.", varTypeToString(type));
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 const Value* prototype = vmTypeDefaultPrototype(vm, type, type_name_idx);
                 if (!prototype) {
                     return INTERPRET_RUNTIME_ERROR;
@@ -13525,12 +13674,9 @@ comparison_error_label:
                         return INTERPRET_RUNTIME_ERROR;
                     }
 
-                    for (int i = 0; i < proc_symbol->upvalue_count; i++) {
-                        if (proc_symbol->upvalues[i].isLocal) {
-                            frame->upvalues[i] = parent_frame->slots + proc_symbol->upvalues[i].index;
-                        } else {
-                            frame->upvalues[i] = parent_frame->upvalues[proc_symbol->upvalues[i].index];
-                        }
+                    if (!vmBindCallUpvalues(vm, frame, parent_frame, proc_symbol)) {
+                        vm->frameCount--;
+                        return INTERPRET_RUNTIME_ERROR;
                     }
                 }
 
@@ -13605,6 +13751,7 @@ comparison_error_label:
 
                 if (proc_symbol->upvalue_count > 0) {
                     frame->upvalues = malloc(sizeof(Value*) * proc_symbol->upvalue_count);
+                    frame->owns_upvalues = true;
                     CallFrame* parent_frame = NULL;
                     if (proc_symbol->enclosing) {
                         for (int fi = vm->frameCount - 2; fi >= 0; fi--) {
@@ -13628,12 +13775,9 @@ comparison_error_label:
                         return INTERPRET_RUNTIME_ERROR;
                     }
 
-                    for (int i = 0; i < proc_symbol->upvalue_count; i++) {
-                        if (proc_symbol->upvalues[i].isLocal) {
-                            frame->upvalues[i] = parent_frame->slots + proc_symbol->upvalues[i].index;
-                        } else {
-                            frame->upvalues[i] = parent_frame->upvalues[proc_symbol->upvalues[i].index];
-                        }
+                    if (!vmBindCallUpvalues(vm, frame, parent_frame, proc_symbol)) {
+                        vm->frameCount--;
+                        return INTERPRET_RUNTIME_ERROR;
                     }
                 }
 
@@ -13775,12 +13919,9 @@ comparison_error_label:
                         return INTERPRET_RUNTIME_ERROR;
                     }
 
-                    for (int i = 0; i < proc_symbol->upvalue_count; i++) {
-                        if (proc_symbol->upvalues[i].isLocal) {
-                            frame->upvalues[i] = parent_frame->slots + proc_symbol->upvalues[i].index;
-                        } else {
-                            frame->upvalues[i] = parent_frame->upvalues[proc_symbol->upvalues[i].index];
-                        }
+                    if (!vmBindCallUpvalues(vm, frame, parent_frame, proc_symbol)) {
+                        vm->frameCount--;
+                        return INTERPRET_RUNTIME_ERROR;
                     }
                 } else if (captured_env) {
                     releaseClosureEnv(captured_env);
@@ -13943,12 +14084,9 @@ comparison_error_label:
                         vm->frameCount--;
                         return INTERPRET_RUNTIME_ERROR;
                     }
-                    for (int i = 0; i < method_symbol->upvalue_count; i++) {
-                        if (method_symbol->upvalues[i].isLocal) {
-                            frame->upvalues[i] = parent_frame->slots + method_symbol->upvalues[i].index;
-                        } else {
-                            frame->upvalues[i] = parent_frame->upvalues[method_symbol->upvalues[i].index];
-                        }
+                    if (!vmBindCallUpvalues(vm, frame, parent_frame, method_symbol)) {
+                        vm->frameCount--;
+                        return INTERPRET_RUNTIME_ERROR;
                     }
                 }
 
@@ -14089,12 +14227,9 @@ comparison_error_label:
                         vm->frameCount--;
                         return INTERPRET_RUNTIME_ERROR;
                     }
-                    for (int i = 0; i < proc_symbol->upvalue_count; i++) {
-                        if (proc_symbol->upvalues[i].isLocal) {
-                            frame->upvalues[i] = parent_frame->slots + proc_symbol->upvalues[i].index;
-                        } else {
-                            frame->upvalues[i] = parent_frame->upvalues[proc_symbol->upvalues[i].index];
-                        }
+                    if (!vmBindCallUpvalues(vm, frame, parent_frame, proc_symbol)) {
+                        vm->frameCount--;
+                        return INTERPRET_RUNTIME_ERROR;
                     }
                 } else if (captured_env) {
                     releaseClosureEnv(captured_env);

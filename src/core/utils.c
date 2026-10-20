@@ -1565,6 +1565,12 @@ static bool ensureFieldSlotCapacity(FieldValue*** slotOwners, int* capacity, int
     if (!slotOwners || !capacity || requiredSlots <= *capacity) {
         return true;
     }
+    // Field slot operands are at most 16 bits wide. A larger slot index can
+    // only come from a malformed type (one read from a .bc file), and
+    // doubling toward it overflowed the int capacity.
+    if (requiredSlots > 0x10000) {
+        return false;
+    }
 
     int newCapacity = (*capacity > 0) ? *capacity : 4;
     while (newCapacity < requiredSlots) {
@@ -2398,30 +2404,24 @@ Value makeArrayND(int dimensions, int *lower_bounds, int *upper_bounds, VarType 
     arr->upper_bounds = malloc(sizeof(int) * dimensions);
     if (!arr->lower_bounds || !arr->upper_bounds) {
         fprintf(stderr, "Memory allocation error for bounds in makeArrayND.\n");
-        free(arr->lower_bounds);
-        free(arr->upper_bounds);
         EXIT_FAILURE_HANDLER();
-        goto fail;
+        goto fail; // frees the bounds
     }
 
     // Calculate total size and copy bounds
+    // The one cap is on the element storage's size: 256 MB holds 16M Values
+    // or 256M packed bytes. (A separate 2M-element cap used to reject
+    // arrays well under it, e.g. array[1..3000000] of integer at 48 MB.)
     size_t total_size = 1;
-    const size_t MAX_ARRAY_ELEMENTS = 2 * 1000 * 1000; // hard cap to avoid runaway allocations
     const size_t MAX_ARRAY_BYTES = 256 * 1024 * 1024;  // 256 MB ceiling
     size_t element_bytes = use_packed ? sizeof(uint8_t) : sizeof(Value);
-    size_t max_by_bytes = element_bytes > 0 ? (MAX_ARRAY_BYTES / element_bytes) : 0;
-    size_t absolute_cap = max_by_bytes;
-    if (!use_packed && MAX_ARRAY_ELEMENTS < absolute_cap) {
-        absolute_cap = MAX_ARRAY_ELEMENTS;
-    }
-    if (absolute_cap == 0) {
-        absolute_cap = MAX_ARRAY_ELEMENTS;
-    }
+    size_t absolute_cap = MAX_ARRAY_BYTES / element_bytes;
 
     for (int i = 0; i < dimensions; i++) {
         arr->lower_bounds[i] = lower_bounds[i];
         arr->upper_bounds[i] = upper_bounds[i];
-        int size_i = (upper_bounds[i] - lower_bounds[i] + 1);
+        // In 64 bits: bounds like -2^31..2^31-1 overflow an int span.
+        long long size_i = (long long)upper_bounds[i] - (long long)lower_bounds[i] + 1;
         if (size_i <= 0) {
             fprintf(stderr, "Error: Invalid array dimension size (%d..%d) in makeArrayND.\n", lower_bounds[i], upper_bounds[i]);
             EXIT_FAILURE_HANDLER();
@@ -2828,15 +2828,14 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
                  } else if (dims > 0 && elemType != TYPE_VOID && elemType != TYPE_UNKNOWN) {
                      int *lbs = (int*)malloc(sizeof(int) * dims);
                      int *ubs = (int*)malloc(sizeof(int) * dims);
+                     bool bounds_ok = true;
                      if (!lbs || !ubs) {
                          fprintf(stderr, "Memory allocation error for bounds in makeValueForType.\n");
-                         if(lbs) free(lbs);
-                         if(ubs) free(ubs);
                          EXIT_FAILURE_HANDLER();
+                         bounds_ok = false; // reached only when the exit is suppressed
                      }
 
-                     bool bounds_ok = true;
-                     for (int i = 0; i < dims; i++) {
+                     for (int i = 0; bounds_ok && i < dims; i++) {
                          AST *subrange = definition_node_for_array->children[i];
                          if (!subrange || subrange->type != AST_SUBRANGE || !subrange->left || !subrange->right) {
                              bounds_ok = false; break;
@@ -2869,6 +2868,9 @@ Value makeValueForType(VarType type, AST *type_def_param, Symbol* context_symbol
                          v = makeArrayND(dims, lbs, ubs, elemType, elemTypeDefNode);
                      } else {
                          fprintf(stderr, "Error: Failed to initialize array in makeValueForType due to invalid or non-integer bounds.\n");
+                         // Still a real (empty) array: every TYPE_ARRAY Value
+                         // has an ArrayObj, which AS_ARRAY and friends assume.
+                         v = makeEmptyArray(elemType, elemTypeDefNode);
                      }
                      free(lbs);
                      free(ubs);
@@ -3338,11 +3340,15 @@ void freeValue(Value *v) {
                 // comment (core/types.h) -- releases the reference this
                 // pointer was keeping the target array's owning ArrayObj
                 // alive with, independent of the sentinel handling above.
+                // Released without dynamic_array_refcount_mutex, like any
+                // other ArrayObj reference (TYPE_ARRAY below): the count is
+                // atomic, and a last release destroys the array, whose
+                // elements can hold pointers with retained arrays of their
+                // own -- re-locking that non-recursive mutex here deadlocked.
                 if (po->retained_array) {
-                    pthread_mutex_lock(&dynamic_array_refcount_mutex);
-                    pscalObjRelease(&po->retained_array->header);
-                    pthread_mutex_unlock(&dynamic_array_refcount_mutex);
+                    ArrayObj *retained = po->retained_array;
                     po->retained_array = NULL;
+                    pscalObjRelease(&retained->header);
                 }
                 if (po->retained_string) {
                     releaseStringCharPin(po->retained_string);
@@ -3692,6 +3698,9 @@ char *findUnitFile(const char *unit_name) {
             int written = snprintf(status, sizeof(status), "  - %s (directory not found)\n", base_dir);
             if (written > 0) {
                 size_t copy_len = (size_t)written;
+                if (copy_len >= sizeof(status)) {
+                    copy_len = sizeof(status) - 1; // snprintf truncated
+                }
                 if (error_len + copy_len >= error_buf_size) {
                     if (error_len + 1 >= error_buf_size) {
                         copy_len = 0;
@@ -3732,6 +3741,9 @@ char *findUnitFile(const char *unit_name) {
         int written = snprintf(status, sizeof(status), "  - %s (missing %s.pl)\n", base_dir, unit_name);
         if (written > 0) {
             size_t copy_len = (size_t)written;
+            if (copy_len >= sizeof(status)) {
+                copy_len = sizeof(status) - 1; // snprintf truncated
+            }
             if (error_len + copy_len >= error_buf_size) {
                 if (error_len + 1 >= error_buf_size) {
                     copy_len = 0;

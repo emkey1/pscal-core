@@ -16,7 +16,7 @@
 #include "ast/ast.h"
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <dirent.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -162,11 +162,6 @@ const char* pscalCacheLastLoadError(void) {
 #define FNV1A64_OFFSET 1469598103934665603ULL
 #define FNV1A64_PRIME 1099511628211ULL
 
-
-typedef struct {
-    char* path;
-    time_t mtime;
-} CacheCandidate;
 
 typedef struct {
     const BytecodeChunk** items;
@@ -496,6 +491,8 @@ typedef struct {
     size_t size;
     size_t pos;
     bool error;
+    int depth;     /* readAst/readValue nesting; see curEnterNested */
+    bool too_deep; /* error was CACHE_MAX_NESTING, not a short section */
 } Cursor;
 
 static void curInit(Cursor* c, const uint8_t* data, size_t size) {
@@ -503,6 +500,30 @@ static void curInit(Cursor* c, const uint8_t* data, size_t size) {
     c->size = size;
     c->pos = 0;
     c->error = false;
+    c->depth = 0;
+    c->too_deep = false;
+}
+
+/* readAst and readValue recurse once per level of the AST or Value they
+ * decode (a node's children, an array's elements, a map's values, a nested
+ * shell closure's whole chunk), and they run before the verifier sees
+ * anything. Without a limit, a file nesting deeply enough ran the C stack
+ * out. No compiler writes anything near this deep: type ASTs nest a few
+ * levels per declared type, constants a level per array/map dimension. */
+#define CACHE_MAX_NESTING 1000
+
+static bool curEnterNested(Cursor* c) {
+    if (c->depth >= CACHE_MAX_NESTING) {
+        c->error = true;
+        c->too_deep = true;
+        return false;
+    }
+    c->depth++;
+    return true;
+}
+
+static void curLeaveNested(Cursor* c) {
+    c->depth--;
 }
 
 static bool curEnsure(Cursor* c, size_t n) {
@@ -707,74 +728,6 @@ static uint64_t computeCombinedHash(uint64_t source_hash, const BytecodeChunk* c
     return combined;
 }
 
-static CacheCandidate* gatherCacheCandidates(const char* dir, const char* prefix, size_t* out_count) {
-    if (out_count) *out_count = 0;
-    if (!dir || !prefix) return NULL;
-    DIR* cache_dir = opendir(dir);
-    if (!cache_dir) return NULL;
-
-    CacheCandidate* candidates = NULL;
-    size_t candidate_count = 0;
-    size_t candidate_capacity = 0;
-    struct dirent* entry;
-    size_t prefix_length = strlen(prefix);
-    while ((entry = readdir(cache_dir)) != NULL) {
-        if (entry->d_name[0] == '.') continue;
-        if (strncmp(entry->d_name, prefix, prefix_length) != 0) continue;
-        size_t name_len = strlen(entry->d_name);
-        if (name_len < 3 || strcmp(entry->d_name + name_len - 3, ".bc") != 0) continue;
-
-        size_t path_len = strlen(dir) + 1 + name_len + 1;
-        char* full_path = (char*)malloc(path_len);
-        if (!full_path) continue;
-        snprintf(full_path, path_len, "%s/%s", dir, entry->d_name);
-
-        struct stat st;
-        if (stat(full_path, &st) != 0) {
-            free(full_path);
-            continue;
-        }
-
-        if (candidate_count == candidate_capacity) {
-            size_t new_cap = candidate_capacity ? candidate_capacity * 2 : 4;
-            CacheCandidate* new_arr = (CacheCandidate*)realloc(candidates, new_cap * sizeof(CacheCandidate));
-            if (!new_arr) {
-                free(full_path);
-                continue;
-            }
-            candidates = new_arr;
-            candidate_capacity = new_cap;
-        }
-        candidates[candidate_count].path = full_path;
-        candidates[candidate_count].mtime = st.st_mtime;
-        candidate_count++;
-    }
-    closedir(cache_dir);
-
-    if (candidate_count > 1) {
-        for (size_t i = 0; i < candidate_count - 1; ++i) {
-            for (size_t j = i + 1; j < candidate_count; ++j) {
-                if (candidates[j].mtime > candidates[i].mtime) {
-                    CacheCandidate tmp = candidates[i];
-                    candidates[i] = candidates[j];
-                    candidates[j] = tmp;
-                }
-            }
-        }
-    }
-
-    if (out_count) *out_count = candidate_count;
-    return candidates;
-}
-
-static void freeCandidates(CacheCandidate* candidates, size_t count) {
-    if (!candidates) return;
-    for (size_t i = 0; i < count; ++i) {
-        free(candidates[i].path);
-    }
-    free(candidates);
-}
-
 static void resetChunk(BytecodeChunk* chunk, int read_consts) {
     if (!chunk) return;
     if (chunk->constants) {
@@ -843,7 +796,9 @@ static char* ensureCacheDirectory(const char* compiler_id, char* out_safe_id, si
         return NULL;
     }
     snprintf(dir, dir_len, "%s/%s", root, CACHE_DIR);
-    if (mkdir(dir, 0777) != 0 && errno != EEXIST) {
+    // Private, like the root above (it used to be created 0777). chmod too,
+    // so a directory an older build created is tightened as well.
+    if ((mkdir(dir, 0700) != 0 && errno != EEXIST) || chmod(dir, 0700) != 0) {
         free(dir);
         free(root);
         return NULL;
@@ -857,54 +812,50 @@ static char* ensureCacheDirectory(const char* compiler_id, char* out_safe_id, si
     return dir;
 }
 
-char* buildCachePath(const char* source_path, const char* compiler_id) {
-    char safe_id[32];
-    char* dir = ensureCacheDirectory(compiler_id, safe_id, sizeof(safe_id));
-    if (!dir) return NULL;
-
-    const char* base_name = basenameForPath(source_path);
-    char* sanitized_base = sanitizeFileComponent(base_name);
-    if (!sanitized_base) {
-        free(dir);
-        return NULL;
-    }
-
-    uint64_t source_hash = 0;
-    if (!computeSourceHash(source_path, true, &source_hash)) {
-        free(dir);
-        free(sanitized_base);
-        return NULL;
-    }
-
-    char source_hex[17];
-    snprintf(source_hex, sizeof(source_hex), "%016llx", (unsigned long long)source_hash);
+/* Cache layout: one entry per compiler and source path,
+ *     $HOME/.pscal/bc_cache/<compiler>-<file name>-<path hash>.bc
+ * so finding a source's entry is a single open(), and compiling a new version
+ * of the source replaces the entry instead of adding another. The entry's
+ * META section records which source contents it was compiled from
+ * (loadBytecodeFromCache compares that hash before using it), along with the
+ * integrity hash of the chunk itself.
+ *
+ * This replaced names that also carried the source and chunk hashes, which
+ * made every lookup and save read the whole directory to find the matching
+ * prefix (seconds per run once it held a few hundred thousand entries) and
+ * kept one entry per source version forever. Entries in that older form are
+ * never opened now; they can be deleted. */
+static char* cacheEntryPath(const char* dir, const char* safe_id, const char* source_path) {
+    char* sanitized_base = sanitizeFileComponent(basenameForPath(source_path));
+    if (!sanitized_base) return NULL;
 
     uint64_t path_hash = computePathHash(source_path, sanitized_base);
     char path_hex[17];
     snprintf(path_hex, sizeof(path_hex), "%016llx", (unsigned long long)path_hash);
 
-    size_t prefix_len = strlen(safe_id) + strlen(sanitized_base) + strlen(path_hex) + strlen(source_hex) + 5;
-    char* prefix = (char*)malloc(prefix_len);
-    if (!prefix) {
-        free(dir);
-        free(sanitized_base);
-        return NULL;
+    size_t path_len = strlen(dir) + 1 + strlen(safe_id) + 1 + strlen(sanitized_base) + 1 +
+                      strlen(path_hex) + strlen(".bc") + 1;
+    char* path = (char*)malloc(path_len);
+    if (path) {
+        snprintf(path, path_len, "%s/%s-%s-%s.bc", dir, safe_id, sanitized_base, path_hex);
     }
-    snprintf(prefix, prefix_len, "%s-%s-%s-%s-", safe_id, sanitized_base, path_hex, source_hex);
-
-    size_t candidate_count = 0;
-    CacheCandidate* candidates = gatherCacheCandidates(dir, prefix, &candidate_count);
-
-    char* result = NULL;
-    if (candidate_count > 0 && candidates) {
-        result = strdup(candidates[0].path);
-    }
-
-    freeCandidates(candidates, candidate_count);
-    free(prefix);
     free(sanitized_base);
+    return path;
+}
+
+char* buildCachePath(const char* source_path, const char* compiler_id) {
+    char safe_id[32];
+    char* dir = ensureCacheDirectory(compiler_id, safe_id, sizeof(safe_id));
+    if (!dir) return NULL;
+
+    char* path = cacheEntryPath(dir, safe_id, source_path);
     free(dir);
-    return result;
+    struct stat st;
+    if (path && stat(path, &st) != 0) {
+        free(path);
+        path = NULL;
+    }
+    return path;
 }
 
 static char* resolveExecutablePath(const char* executable) {
@@ -1074,7 +1025,16 @@ static void writeAst(ByteBuf* out, const AST* node) {
     }
 }
 
+static AST* readAstNested(Cursor* in);
+
 static AST* readAst(Cursor* in) {
+    if (!curEnterNested(in)) return NULL;
+    AST* node = readAstNested(in);
+    curLeaveNested(in);
+    return node;
+}
+
+static AST* readAstNested(Cursor* in) {
     uint8_t has = curU8(in);
     if (in->error || !has) return NULL;
     ASTNodeType t = (ASTNodeType)curU32LE(in);
@@ -1097,7 +1057,13 @@ static AST* readAst(Cursor* in) {
         node->extra = readAst(in); if (node->extra) node->extra->parent = node;
         if (in->error) { freeAST(node); return NULL; }
         int32_t child_count = curI32LE(in);
-        if (in->error || child_count < 0) { freeAST(node); return NULL; }
+        // Each child takes at least its one presence byte, so a count the
+        // rest of the section cannot hold is malformed; refuse it before
+        // allocating for it.
+        if (in->error || child_count < 0 || (size_t)child_count > in->size - in->pos) {
+            freeAST(node);
+            return NULL;
+        }
         if (child_count > 0) {
             node->children = (AST**)malloc(sizeof(AST*) * (size_t)child_count);
             if (!node->children) { freeAST(node); return NULL; }
@@ -1107,6 +1073,7 @@ static AST* readAst(Cursor* in) {
                 node->children[i] = readAst(in);
                 if (node->children[i]) node->children[i]->parent = node;
             }
+            if (in->error) { freeAST(node); return NULL; }
         }
     }
     return node;
@@ -1301,9 +1268,14 @@ static void writeCodeSection(ByteBuf* out, const BytecodeChunk* chunk) {
     }
 }
 
+/* Far above any compiled program, and low enough that the verifier's
+ * per-instruction tables (int-indexed, 4 entries per code byte for the
+ * worklist) stay well inside int range. */
+#define PSB3_MAX_CODE_BYTES (64u * 1024u * 1024u)
+
 static bool readCodeSection(Cursor* in, BytecodeChunk* chunk) {
     uint64_t count = curVarint(in);
-    if (in->error || count > (uint64_t)INT32_MAX) return false;
+    if (in->error || count > (uint64_t)PSB3_MAX_CODE_BYTES) return false;
     uint64_t cache_count = curVarint(in);
     // cache_id operands are u16 (opcodes.def's 'c' spec), so no chunk can
     // legitimately need more than 65536 distinct cache slots.
@@ -1939,8 +1911,20 @@ static void hashValue(uint64_t* hash, const Value* v, ChunkHashContext* ctx) {
     }
 }
 
+static bool readValueNested(Cursor* in, Value* out);
+
 static bool readValue(Cursor* in, Value* out) {
     if (!out) return false;
+    if (!curEnterNested(in)) {
+        memset(out, 0, sizeof(Value));
+        return false;
+    }
+    bool ok = readValueNested(in, out);
+    curLeaveNested(in);
+    return ok;
+}
+
+static bool readValueNested(Cursor* in, Value* out) {
     memset(out, 0, sizeof(Value));
     out->type = (VarType)curU32LE(in);
     if (in->error) return false;
@@ -2074,6 +2058,10 @@ static bool readValue(Cursor* in, Value* out) {
             }
             int total = arrayCodecElementCount(dims, a->lower_bounds, a->upper_bounds);
             if (total < 0) return false;
+            // Every element starts with its 4-byte type, so bounds the rest
+            // of the section cannot hold are malformed; refuse them before
+            // allocating for them.
+            if ((size_t)total > (in->size - in->pos) / 4) return false;
             if (total > 0) {
                 if (a->is_packed) {
                     a->raw = (uint8_t*)calloc((size_t)total, sizeof(uint8_t));
@@ -2802,6 +2790,11 @@ static bool psb3ReadChunk(const Psb3File* pf, BytecodeChunk* chunk) {
     if (!failed) return true;
 
     resetChunk(chunk, read_consts);
+    if (at->too_deep) {
+        return loadFail("%s section%s%s: nested more than %d levels deep at byte %zu of %zu", failed,
+                        g_loadDetail[0] ? ", " : "", g_loadDetail, CACHE_MAX_NESTING,
+                        at->pos, at->size);
+    }
     return loadFail("%s section%s%s: %s at byte %zu of %zu", failed,
                     g_loadDetail[0] ? ", " : "", g_loadDetail,
                     at->error ? "read past the end of the section" : "malformed data",
@@ -2938,33 +2931,17 @@ bool loadBytecodeFromCache(const char* source_path,
     char* dir = ensureCacheDirectory(compiler_id, safe_id, sizeof(safe_id));
     if (!dir) return loadFail("no usable cache directory under $HOME/" CACHE_ROOT "/" CACHE_DIR);
 
-    char* sanitized_base = sanitizeFileComponent(basenameForPath(source_path));
-    if (!sanitized_base) {
-        free(dir);
-        return loadFail("out of memory");
-    }
-
     uint64_t source_hash = 0;
     if (!computeSourceHash(source_path, true, &source_hash)) {
         free(dir);
-        free(sanitized_base);
         return loadFail("cannot read the source %s", source_path);
     }
 
-    char source_hex[17];
-    snprintf(source_hex, sizeof(source_hex), "%016llx", (unsigned long long)source_hash);
-    uint64_t path_hash = computePathHash(source_path, sanitized_base);
-    char path_hex[17];
-    snprintf(path_hex, sizeof(path_hex), "%016llx", (unsigned long long)path_hash);
-
-    size_t prefix_len = strlen(safe_id) + strlen(sanitized_base) + strlen(path_hex) + strlen(source_hex) + 5;
-    char* prefix = (char*)malloc(prefix_len);
-    if (!prefix) {
+    char* cache_path = cacheEntryPath(dir, safe_id, source_path);
+    if (!cache_path) {
         free(dir);
-        free(sanitized_base);
         return loadFail("out of memory");
     }
-    snprintf(prefix, prefix_len, "%s-%s-%s-%s-", safe_id, sanitized_base, path_hex, source_hex);
 
     char* resolved_frontend = NULL;
     const char* frontend_for_cache = NULL;
@@ -2983,16 +2960,9 @@ bool loadBytecodeFromCache(const char* source_path,
      * cached bytecode that was produced by a different binary (common when
      * in-process tool runners set argv[0] to just the tool name). */
     if (frontend_path && frontend_path[0] && !frontend_for_cache) {
-        free(prefix);
-        free(sanitized_base);
+        free(cache_path);
         free(dir);
         return loadFail("cannot find the frontend binary %s to check the cache against", frontend_path);
-    }
-
-    size_t candidate_count = 0;
-    CacheCandidate* candidates = gatherCacheCandidates(dir, prefix, &candidate_count);
-    if (candidate_count == 0) {
-        loadFail("no cache entry for this source");
     }
 
     bool ok = false;
@@ -3001,11 +2971,19 @@ bool loadBytecodeFromCache(const char* source_path,
     bool strict = strict_env && strict_env[0] != '\0';
     uint32_t vm_ver = pscal_vm_version();
 
-    for (size_t idx = 0; idx < candidate_count && !ok; ++idx) {
-        const char* cache_path = candidates[idx].path;
+    struct stat entry_stat;
+    bool have_entry = stat(cache_path, &entry_stat) == 0;
+    if (!have_entry) {
+        loadFail("no cache entry for this source");
+    }
+
+    // Each check below that rejects the entry breaks out of this block (and
+    // most delete the entry, which the recompile then rewrites).
+    do {
+        if (!have_entry) break;
 
         /*
-         * Rely on the source hash encoded in the cache filename/header to
+         * Rely on the source hash recorded in the entry's META section to
          * validate the script contents. Tools like shellbench rewrite
          * temporary scripts for each run, so their file modification times are
          * always newer than any cached bytecode. Ignoring the source mtime
@@ -3016,7 +2994,7 @@ bool loadBytecodeFromCache(const char* source_path,
         if (stale) {
             loadFail("%s: the frontend binary %s %s", cache_path, frontend_for_cache, stale);
             unlink(cache_path);
-            continue;
+            break;
         }
 
         for (int dep_idx = 0; dependencies && dep_idx < dep_count && !stale; ++dep_idx) {
@@ -3027,14 +3005,14 @@ bool loadBytecodeFromCache(const char* source_path,
         }
         if (stale) {
             unlink(cache_path);
-            continue;
+            break;
         }
 
         Psb3File pf;
         if (!psb3Load(cache_path, &pf)) {
             prefixLoadError(cache_path);
             unlink(cache_path);
-            continue;
+            break;
         }
 
         uint32_t ver = pf.vm_version;
@@ -3059,7 +3037,7 @@ bool loadBytecodeFromCache(const char* source_path,
             loadFail("%s: no readable META section", cache_path);
             psb3FileFree(&pf);
             unlink(cache_path);
-            continue;
+            break;
         }
 
         if (meta.source_hash != source_hash) {
@@ -3067,7 +3045,7 @@ bool loadBytecodeFromCache(const char* source_path,
             free(meta.source_path);
             psb3FileFree(&pf);
             unlink(cache_path);
-            continue;
+            break;
         }
 
         if (!verifySourcePathString(meta.source_path, source_path, strict)) {
@@ -3075,7 +3053,7 @@ bool loadBytecodeFromCache(const char* source_path,
             free(meta.source_path);
             psb3FileFree(&pf);
             unlink(cache_path);
-            continue;
+            break;
         }
         free(meta.source_path);
 
@@ -3087,7 +3065,7 @@ bool loadBytecodeFromCache(const char* source_path,
             fprintf(stderr, "Warning: rejecting unreadable cached bytecode %s\n", g_loadError);
             psb3FileFree(&pf);
             unlink(cache_path);
-            continue;
+            break;
         }
 
         uint64_t computed_combined = computeCombinedHash(source_hash, chunk);
@@ -3096,7 +3074,7 @@ bool loadBytecodeFromCache(const char* source_path,
             resetChunk(chunk, chunk->constants_count);
             psb3FileFree(&pf);
             unlink(cache_path);
-            continue;
+            break;
         }
 
         // VM 2.0 Phase 2b (plan §5.7): the load-time link step must run
@@ -3112,7 +3090,7 @@ bool loadBytecodeFromCache(const char* source_path,
             resetChunk(chunk, chunk->constants_count);
             psb3FileFree(&pf);
             unlink(cache_path);
-            continue;
+            break;
         }
 
         if (!psb3VerificationSkipped(&pf)) {
@@ -3124,7 +3102,7 @@ bool loadBytecodeFromCache(const char* source_path,
                 resetChunk(chunk, chunk->constants_count);
                 psb3FileFree(&pf);
                 unlink(cache_path);
-                continue;
+                break;
             }
         }
 
@@ -3134,12 +3112,10 @@ bool loadBytecodeFromCache(const char* source_path,
 
         g_loadError[0] = '\0';
         ok = true;
-    }
+    } while (0);
 
     if (resolved_frontend) free(resolved_frontend);
-    freeCandidates(candidates, candidate_count);
-    free(prefix);
-    free(sanitized_base);
+    free(cache_path);
     free(dir);
 
     if (!ok || abort_all) {
@@ -3255,73 +3231,43 @@ void saveBytecodeToCache(const char* source_path, const char* compiler_id, const
     char* dir = ensureCacheDirectory(compiler_id, safe_id, sizeof(safe_id));
     if (!dir) return;
 
-    char* sanitized_base = sanitizeFileComponent(basenameForPath(source_path));
-    if (!sanitized_base) {
-        free(dir);
-        return;
-    }
-
-    char source_hex[17];
-    char combined_hex[17];
-    snprintf(source_hex, sizeof(source_hex), "%016llx", (unsigned long long)source_hash);
-    snprintf(combined_hex, sizeof(combined_hex), "%016llx", (unsigned long long)combined_hash);
-
-    uint64_t path_hash = computePathHash(source_path, sanitized_base);
-    char path_hex[17];
-    snprintf(path_hex, sizeof(path_hex), "%016llx", (unsigned long long)path_hash);
-
-    size_t prefix_len = strlen(safe_id) + strlen(sanitized_base) + strlen(path_hex) + strlen(source_hex) + 5;
-    char* prefix = (char*)malloc(prefix_len);
-    if (!prefix) {
-        free(sanitized_base);
-        free(dir);
-        return;
-    }
-    snprintf(prefix, prefix_len, "%s-%s-%s-%s-", safe_id, sanitized_base, path_hex, source_hex);
-
-    size_t path_len = strlen(dir) + strlen(prefix) + strlen(combined_hex) + 5;
-    char* cache_path = (char*)malloc(path_len);
-    if (!cache_path) {
-        free(prefix);
-        free(sanitized_base);
-        free(dir);
-        return;
-    }
-    snprintf(cache_path, path_len, "%s/%s%s.bc", dir, prefix, combined_hex);
-
-    size_t candidate_count = 0;
-    CacheCandidate* candidates = gatherCacheCandidates(dir, prefix, &candidate_count);
-    if (candidates) {
-        for (size_t i = 0; i < candidate_count; ++i) {
-            if (strcmp(candidates[i].path, cache_path) != 0) {
-                unlink(candidates[i].path);
-            }
-        }
-    }
-    freeCandidates(candidates, candidate_count);
-
-    FILE* f = fopen(cache_path, "wb");
-    if (!f) {
-        free(cache_path);
-        free(prefix);
-        free(sanitized_base);
-        free(dir);
-        return;
-    }
-    if (!serializeBytecodeChunk(f, source_path, chunk, source_hash, combined_hash, true)) {
-        fclose(f);
-        unlink(cache_path);
-        free(cache_path);
-        free(prefix);
-        free(sanitized_base);
-        free(dir);
-        return;
-    }
-    fclose(f);
-    free(cache_path);
-    free(prefix);
-    free(sanitized_base);
+    char* cache_path = cacheEntryPath(dir, safe_id, source_path);
     free(dir);
+    if (!cache_path) return;
+
+    // Written beside the entry and renamed over it, so a reader -- another
+    // process compiling or running the same source -- sees the old entry or
+    // the new one, never a partly written file. The pid keeps two writers'
+    // temporaries apart; one a crashed writer left behind is replaced.
+    size_t tmp_len = strlen(cache_path) + 32;
+    char* tmp_path = (char*)malloc(tmp_len);
+    if (!tmp_path) {
+        free(cache_path);
+        return;
+    }
+    snprintf(tmp_path, tmp_len, "%s.tmp.%ld", cache_path, (long)getpid());
+    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0 && errno == EEXIST) {
+        unlink(tmp_path);
+        fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    }
+    FILE* f = fd >= 0 ? fdopen(fd, "wb") : NULL;
+    if (!f) {
+        if (fd >= 0) {
+            close(fd);
+            unlink(tmp_path);
+        }
+        free(tmp_path);
+        free(cache_path);
+        return;
+    }
+    bool ok = serializeBytecodeChunk(f, source_path, chunk, source_hash, combined_hash, true);
+    if (fclose(f) != 0) ok = false;
+    if (!ok || rename(tmp_path, cache_path) != 0) {
+        unlink(tmp_path);
+    }
+    free(tmp_path);
+    free(cache_path);
 }
 
 bool saveBytecodeToFile(const char* file_path, const char* source_path, const BytecodeChunk* chunk) {

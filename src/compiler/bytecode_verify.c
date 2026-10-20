@@ -12,6 +12,7 @@
 #include "core/utils.h"
 #include "core/globals.h"
 
+#include <limits.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -235,6 +236,36 @@ static bool verifyOperands(VCtx* ctx) {
             continue;
         }
 
+        // The field-address opcodes use their constant as the field's name,
+        // straight through AS_STRING, so it has to be a string.
+        if (opcode == GET_FIELD_ADDRESS || opcode == GET_FIELD_ADDRESS16 ||
+            opcode == GET_FIELD_ADDRESS_KEEP || opcode == GET_FIELD_ADDRESS_KEEP16) {
+            bool wide = (opcode == GET_FIELD_ADDRESS16 || opcode == GET_FIELD_ADDRESS_KEEP16);
+            uint32_t name_idx = wide ? verifyReadU16BE(code, pc + 1) : code[pc + 1];
+            if (!checkConstIndex(ctx, name_idx, pc, info->name)) return false;
+            if (VALUE_TYPE(chunk->constants[name_idx]) != TYPE_STRING) {
+                return vfail(ctx, "pc %d: %s field name constant %u is not a string",
+                             pc, info->name, name_idx);
+            }
+            continue;
+        }
+
+        // An element read with no index reads nothing; no compiler emits it.
+        if (opcode == LOAD_ELEMENT_VALUE && code[pc + 1] == 0) {
+            return vfail(ctx, "pc %d: LOAD_ELEMENT_VALUE has no indices", pc);
+        }
+
+        // PUSH_TYPE_DEFAULT builds one default per chunk and pushes shared
+        // copies of it. Compilers emit it only for record, interface and
+        // pointer defaults (whose type ASTs the constant codec cannot encode);
+        // a handle such as a file must not be shared that way.
+        if (opcode == PUSH_TYPE_DEFAULT) {
+            VarType type = (VarType)code[pc + 1];
+            if (type != TYPE_RECORD && type != TYPE_INTERFACE && type != TYPE_POINTER) {
+                return vfail(ctx, "pc %d: PUSH_TYPE_DEFAULT of type %s", pc, varTypeToString(type));
+            }
+        }
+
         int cursor = pc + 1;
         for (const char* p = info->operands; *p; ++p) {
             switch (*p) {
@@ -297,6 +328,47 @@ static bool verifyOperands(VCtx* ctx) {
                     break;
                 default:
                     break;
+            }
+        }
+    }
+    return true;
+}
+
+// =============== Upvalue descriptors (PROC section) ========================
+//
+// A call to a nested routine binds each of its upvalues to its enclosing
+// routine's frame: upvalues[i].index is a slot of that frame when isLocal,
+// else one of that frame's own upvalues. The VM turns the index straight
+// into a Value* (vm.c's call opcodes), so an index the enclosing routine
+// does not have would hand the callee a pointer outside the frame. The
+// enclosing routine's frame holds arity + locals_count slots and
+// upvalue_count upvalues. A routine with no enclosing routine binds to its
+// caller's frame, which is only known at run time; the VM checks that case
+// (and re-checks this one) when it binds.
+static bool verifyUpvaluesInTable(VCtx* ctx, HashTable* table) {
+    if (!table) return true;
+    for (int b = 0; b < HASHTABLE_SIZE; b++) {
+        for (Symbol* s = table->buckets[b]; s; s = s->next) {
+            if (!s->is_alias && s->upvalue_count > 0) {
+                Symbol* enclosing = s->enclosing;
+                if (enclosing && enclosing->is_alias && enclosing->real_symbol) {
+                    enclosing = enclosing->real_symbol;
+                }
+                for (int i = 0; enclosing && i < s->upvalue_count; i++) {
+                    uint32_t index = s->upvalues[i].index;
+                    uint32_t limit = s->upvalues[i].isLocal
+                                         ? (uint32_t)enclosing->arity + enclosing->locals_count
+                                         : (uint32_t)enclosing->upvalue_count;
+                    if (index >= limit) {
+                        return vfail(ctx, "routine %s: upvalue %d refers to %s %u of %s, which has %u",
+                                     s->name ? s->name : "?", i,
+                                     s->upvalues[i].isLocal ? "slot" : "upvalue", index,
+                                     enclosing->name ? enclosing->name : "its enclosing routine", limit);
+                    }
+                }
+            }
+            if (s->type_def && s->type_def->symbol_table) {
+                if (!verifyUpvaluesInTable(ctx, (HashTable*)s->type_def->symbol_table)) return false;
             }
         }
     }
@@ -726,11 +798,20 @@ static bool verifyStackDepths(VCtx* ctx) {
     qsort(addrs, (size_t)addr_count, sizeof(AddrSym), cmpAddrSym);
 
     // Dedupe identical addresses (aliases resolving to the same target, a
-    // procedure at pc 0, a thread entry at a procedure) and drop any that are
-    // not an instruction start of this chunk (stale cross-chunk metadata).
+    // procedure at pc 0, a thread entry at a procedure) and drop any past the
+    // end of the code (stale cross-chunk metadata; the VM refuses a call
+    // there). An address inside the code must be an instruction start: the
+    // VM enters a routine wherever its symbol says (by name, by address, or
+    // through a closure or V-table that resolves to it), and dropping such a
+    // routine here left the bytes it starts on unverified.
     int n = 0;
     for (int i = 0; i < addr_count; i++) {
-        if (addrs[i].addr >= (uint32_t)chunk->count || !ctx->boundary[addrs[i].addr]) continue;
+        if (addrs[i].addr >= (uint32_t)chunk->count) continue;
+        if (!ctx->boundary[addrs[i].addr]) {
+            ok = vfail(ctx, "%s starts at pc %u, which is not an instruction boundary",
+                       entryName(&addrs[i]), addrs[i].addr);
+            goto done;
+        }
         if (n > 0 && addrs[n - 1].addr == addrs[i].addr) continue;
         addrs[n++] = addrs[i];
     }
@@ -744,8 +825,15 @@ static bool verifyStackDepths(VCtx* ctx) {
     // once for a known depth, once for an unknown one (see
     // VISITED_KNOWN/VISITED_UNKNOWN above) -- and each processed pc pushes
     // at most two successors (JUMP_IF_FALSE), so 4*count+8 is a proven upper
-    // bound reusable across every walk (see verifyWalk()).
-    int worklist_cap = chunk->count * 4 + 8;
+    // bound reusable across every walk (see verifyWalk()). The loader caps a
+    // CODE section far below the size where that overflows an int
+    // (cache.c's PSB3_MAX_CODE_BYTES); this refuses anything bigger anyway.
+    size_t worklist_size = (size_t)chunk->count * 4 + 8;
+    if (worklist_size > (size_t)INT_MAX) {
+        ok = vfail(ctx, "code section of %d bytes is too large to verify", chunk->count);
+        goto done;
+    }
+    int worklist_cap = (int)worklist_size;
     worklist = (WorkItem*)calloc((size_t)worklist_cap, sizeof(WorkItem));
     if (!owner || !visited || !depths || !worklist) {
         ok = vfail(ctx, "out of memory building verifier walk state");
@@ -798,6 +886,7 @@ bool pscalVerifyBytecodeChunk(const BytecodeChunk* chunk, HashTable* procedures,
 
     bool ok = verifyInstructionStream(&ctx) &&
               verifyOperands(&ctx) &&
+              verifyUpvaluesInTable(&ctx, procedures) &&
               verifyStackDepths(&ctx);
 
     free(ctx.boundary);
