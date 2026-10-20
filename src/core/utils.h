@@ -219,6 +219,10 @@ static inline long double asLd(Value v) {
              * three kept in sync simultaneously.
              */
             return VAL_REAL_LD(v);
+        case TYPE_UINT64:
+            // asI64() is the signed reading of the bits; a qword of 2^63
+            // or more must not turn negative when widened to a real.
+            return (long double)VAL_UINT(v);
         default:
             return (long double)asI64(v);
     }

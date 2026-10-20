@@ -4474,6 +4474,113 @@ static int vmSetIsSubset(const Value* sub, const Value* super) {
     return result;
 }
 
+// --- Integer arithmetic with a UINT64 operand ---
+//
+// asI64() reads a UINT64 as its two's-complement bit pattern, so a qword of
+// 2^63 or more turns negative in signed arithmetic and compares. These
+// helpers carry each operand as sign + magnitude instead: a UINT64 is never
+// negative, and every other integer keeps the sign asI64() gives it.
+typedef struct {
+    bool neg;
+    unsigned long long mag;
+} VmWideInt;
+
+static inline VmWideInt vmWideIntOf(Value v) {
+    VmWideInt w;
+    if (VALUE_TYPE(v) == TYPE_UINT64) {
+        w.neg = false;
+        w.mag = VAL_UINT(v);
+        return w;
+    }
+    long long s = asI64(v);
+    w.neg = s < 0;
+    w.mag = w.neg ? 0ULL - (unsigned long long)s : (unsigned long long)s;
+    return w;
+}
+
+// Three-way compare of two integer-like Values, exact over both the INT64
+// and the UINT64 range.
+static inline int vmCompareIntlike(Value a, Value b) {
+    if (VALUE_TYPE(a) != TYPE_UINT64 && VALUE_TYPE(b) != TYPE_UINT64) {
+        long long ia = asI64(a);
+        long long ib = asI64(b);
+        return (ia > ib) - (ia < ib);
+    }
+    VmWideInt x = vmWideIntOf(a);
+    VmWideInt y = vmWideIntOf(b);
+    if (x.neg != y.neg) {
+        return x.neg ? -1 : 1;
+    }
+    int c = (x.mag > y.mag) - (x.mag < y.mag);
+    return x.neg ? -c : c;
+}
+
+// Packs a result back into the 64-bit word a UINT64 result is stored in.
+// Like every other integer op, the result only has to fit 64 bits read one
+// way or the other, [INT64_MIN, UINT64_MAX]: a negative result wraps (qword
+// 0 - 1 is high(qword)) the way a narrower unsigned type wraps at its store.
+static inline bool vmWideIntToBits(VmWideInt r, unsigned long long* out) {
+    if (r.mag == 0) {
+        r.neg = false;
+    }
+    if (r.neg && r.mag > (1ULL << 63)) {
+        return false;
+    }
+    *out = r.neg ? 0ULL - r.mag : r.mag;
+    return true;
+}
+
+// a + b, a - b or a * b when either side is UINT64. False on overflow.
+static bool vmUInt64Arith(int op, Value a, Value b, unsigned long long* out) {
+    VmWideInt x = vmWideIntOf(a);
+    VmWideInt y = vmWideIntOf(b);
+    VmWideInt r = { false, 0 };
+    if (op == SUBTRACT) {
+        y.neg = !y.neg && y.mag != 0;
+        op = ADD;
+    }
+    if (op == ADD) {
+        if (x.neg == y.neg) {
+            if (__builtin_add_overflow(x.mag, y.mag, &r.mag)) {
+                return false;
+            }
+            r.neg = x.neg;
+        } else if (x.mag >= y.mag) {
+            r.mag = x.mag - y.mag;
+            r.neg = x.neg;
+        } else {
+            r.mag = y.mag - x.mag;
+            r.neg = y.neg;
+        }
+    } else if (op == MULTIPLY) {
+        if (__builtin_mul_overflow(x.mag, y.mag, &r.mag)) {
+            return false;
+        }
+        r.neg = x.neg != y.neg;
+    } else {
+        return false;
+    }
+    return vmWideIntToBits(r, out);
+}
+
+// a div b, or a mod b when want_mod, when either side is UINT64 (b != 0).
+// Both truncate, as for the signed types: the quotient's sign combines the
+// operands' signs and the remainder takes the dividend's. False on overflow
+// (high(qword) div -1).
+static bool vmUInt64DivMod(Value a, Value b, bool want_mod, unsigned long long* out) {
+    VmWideInt x = vmWideIntOf(a);
+    VmWideInt y = vmWideIntOf(b);
+    VmWideInt r;
+    if (want_mod) {
+        r.mag = x.mag % y.mag;
+        r.neg = x.neg;
+    } else {
+        r.mag = x.mag / y.mag;
+        r.neg = x.neg != y.neg;
+    }
+    return vmWideIntToBits(r, out);
+}
+
 // Scans all global symbols and the entire VM value stack to find and nullify
 // any pointers that are aliases of a memory address that is being disposed.
 //
@@ -7998,21 +8105,30 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
                     } \
                     long long iresult = 0; \
                     bool overflow = false; \
+                    /* A UINT64 operand: exact unsigned arithmetic, not the \
+                     * signed reading of its bits (2^63 - 1 was an overflow). */ \
+                    bool uint64_op = (VALUE_TYPE(a_val_popped) == TYPE_UINT64 || \
+                                      VALUE_TYPE(b_val_popped) == TYPE_UINT64); \
+                    unsigned long long uresult = 0; \
                     switch (current_instruction_code) { \
                         case ADD: \
-                            overflow = __builtin_add_overflow(ia, ib, &iresult); \
-                            break; \
                         case SUBTRACT: \
-                            overflow = __builtin_sub_overflow(ia, ib, &iresult); \
-                            break; \
                         case MULTIPLY: \
-                            overflow = __builtin_mul_overflow(ia, ib, &iresult); \
+                            if (uint64_op) { \
+                                overflow = !vmUInt64Arith(current_instruction_code, a_val_popped, b_val_popped, &uresult); \
+                            } else if (current_instruction_code == ADD) { \
+                                overflow = __builtin_add_overflow(ia, ib, &iresult); \
+                            } else if (current_instruction_code == SUBTRACT) { \
+                                overflow = __builtin_sub_overflow(ia, ib, &iresult); \
+                            } else { \
+                                overflow = __builtin_mul_overflow(ia, ib, &iresult); \
+                            } \
                             break; \
                         case DIVIDE: \
-                            result_val = makeReal((long double)ia / (long double)ib); \
+                            result_val = makeReal(asLd(a_val_popped) / asLd(b_val_popped)); \
                             break; \
                         case MOD: \
-                            iresult = ib == 0 ? 0 : ia % ib; \
+                            iresult = (ib == 0 || ib == -1) ? 0 : ia % ib; \
                             break; \
         default: \
                             runtimeError(vm, "Runtime Error: Invalid arithmetic opcode %d for integers.", current_instruction_code); \
@@ -8021,6 +8137,8 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
                     } \
                     if (current_instruction_code == DIVIDE) { \
                         /* result_val already set for division */ \
+                    } else if (uint64_op && !overflow && current_instruction_code != MOD) { \
+                        result_val = makeUInt64(uresult); \
                     } else if (overflow) { \
                         runtimeError(vm, "Runtime Error: Integer overflow."); \
                         freeValue(&a_val_popped); \
@@ -8425,6 +8543,18 @@ dispatch_switch:
                         freeValue(&a_val); freeValue(&b_val);
                         return INTERPRET_RUNTIME_ERROR;
                     }
+                    if (VALUE_TYPE(a_val) == TYPE_UINT64 || VALUE_TYPE(b_val) == TYPE_UINT64) {
+                        unsigned long long uq = 0;
+                        if (!vmUInt64DivMod(a_val, b_val, false, &uq)) {
+                            runtimeError(vm, "Runtime Error: Integer overflow.");
+                            freeValue(&a_val); freeValue(&b_val);
+                            return INTERPRET_RUNTIME_ERROR;
+                        }
+                        push(vm, makeUInt64(uq));
+                        freeValue(&a_val);
+                        freeValue(&b_val);
+                        break;
+                    }
                     if (ia == LLONG_MIN && ib == -1) {
                         runtimeError(vm, "Runtime Error: Integer overflow.");
                         freeValue(&a_val); freeValue(&b_val);
@@ -8465,7 +8595,17 @@ dispatch_switch:
                         freeValue(&a_val); freeValue(&b_val);
                         return INTERPRET_RUNTIME_ERROR;
                     }
-                    push(vm, pscalIntResultLike2(a_val, b_val, ia % ib));
+                    if (VALUE_TYPE(a_val) == TYPE_UINT64 || VALUE_TYPE(b_val) == TYPE_UINT64) {
+                        unsigned long long ur = 0;
+                        vmUInt64DivMod(a_val, b_val, true, &ur); // |a mod b| <= |a|: cannot overflow
+                        push(vm, makeUInt64(ur));
+                        freeValue(&a_val);
+                        freeValue(&b_val);
+                        break;
+                    }
+                    // LLONG_MIN % -1 overflows (it traps on x86-64); any
+                    // x mod -1 is 0.
+                    push(vm, pscalIntResultLike2(a_val, b_val, ib == -1 ? 0 : ia % ib));
                 } else {
                     runtimeError(vm, "Runtime Error: Operands for 'mod' must be integers. Got %s and %s.",
                                  varTypeToString(VALUE_TYPE(a_val)), varTypeToString(VALUE_TYPE(b_val)));
@@ -8570,15 +8710,14 @@ dispatch_switch:
                             default: goto comparison_error_label;
                         }
                     } else {
-                        long long ia = asI64(a_val);
-                        long long ib = asI64(b_val);
+                        int cmp = vmCompareIntlike(a_val, b_val);
                         switch (instruction_val) {
-                            case EQUAL:         result_val = makeBoolean(ia == ib); break;
-                            case NOT_EQUAL:     result_val = makeBoolean(ia != ib); break;
-                            case GREATER:       result_val = makeBoolean(ia >  ib); break;
-                            case GREATER_EQUAL: result_val = makeBoolean(ia >= ib); break;
-                            case LESS:          result_val = makeBoolean(ia <  ib); break;
-                            case LESS_EQUAL:    result_val = makeBoolean(ia <= ib); break;
+                            case EQUAL:         result_val = makeBoolean(cmp == 0); break;
+                            case NOT_EQUAL:     result_val = makeBoolean(cmp != 0); break;
+                            case GREATER:       result_val = makeBoolean(cmp >  0); break;
+                            case GREATER_EQUAL: result_val = makeBoolean(cmp >= 0); break;
+                            case LESS:          result_val = makeBoolean(cmp <  0); break;
+                            case LESS_EQUAL:    result_val = makeBoolean(cmp <= 0); break;
                             default: goto comparison_error_label;
                         }
                     }
