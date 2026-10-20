@@ -350,6 +350,14 @@ typedef struct VM_s {
     size_t stackReservedValues;  // total virtual reservation size, in Values (the hard ceiling)
     size_t stackMappedBytes;     // exact byte length passed to mmap (for munmap in freeVM)
 
+    // Closure environments that still point into this VM's stack, and the
+    // highest stack slot any of them points at. returnFromCall moves the
+    // slots of a returning frame into heap cells (vmCloseCaptures).
+    struct VmOpenCapture* openCaptures;
+    int openCaptureCount;
+    int openCaptureCapacity;
+    Value* openCaptureHigh;
+
     HashTable* vmGlobalSymbols;      // VM's own symbol table for runtime global variable storage
     HashTable* vmConstGlobalSymbols; // Separate table for constant globals (read-only, no mutex)
     HashTable* procedureTable;      // store procedure table for disassembly

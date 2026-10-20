@@ -298,3 +298,10 @@ OP(GET_GSLOT_ADDRESS,          0x67, "s",    0,  1)
 // cacheable. The VM builds each default once per chunk and pushes shared
 // copies, as CONSTANT does.
 OP(PUSH_TYPE_DEFAULT,          0x68, "bK",   0,  1)
+
+// --- Wide field formatting ---
+// FORMAT_VALUE16 [width:w][prec:w]: FORMAT_VALUE for a width or precision
+// that does not fit its byte operands (`s:300` used to print with width 44);
+// prec 0xFFFF means "no precision". The compiler emits FORMAT_VALUE whenever
+// both fit, so existing bytecode is unchanged.
+OP(FORMAT_VALUE16,             0x69, "ww",   1,  1)

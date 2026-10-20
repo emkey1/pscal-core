@@ -38,6 +38,14 @@ static VarType deduceLocalSymbolTypeFromName(const char *name) {
     if (strcasecmp(name, "integer") == 0) return TYPE_INT32;
     if (strcasecmp(name, "longint") == 0) return TYPE_INT64;
     if (strcasecmp(name, "cardinal") == 0) return TYPE_UINT32;
+    // FPC's other spellings of the fixed-width integers.
+    if (strcasecmp(name, "longword") == 0) return TYPE_UINT32;
+    if (strcasecmp(name, "uint32") == 0) return TYPE_UINT32;
+    if (strcasecmp(name, "int32") == 0) return TYPE_INT32;
+    if (strcasecmp(name, "int16") == 0) return TYPE_INT16;
+    if (strcasecmp(name, "uint16") == 0) return TYPE_WORD;
+    if (strcasecmp(name, "int8") == 0) return TYPE_INT8;
+    if (strcasecmp(name, "uint8") == 0) return TYPE_BYTE;
     if (strcasecmp(name, "shortint") == 0) return TYPE_INT8;
     if (strcasecmp(name, "smallint") == 0) return TYPE_INT16;
     if (strcasecmp(name, "int64") == 0) return TYPE_INT64;

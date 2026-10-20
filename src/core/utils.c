@@ -2020,6 +2020,14 @@ VarType lookupBuiltinPascalTypeName(const char *name) {
     if (strcasecmp(name, "integer") == 0) return TYPE_INT32;
     if (strcasecmp(name, "longint") == 0) return TYPE_INT64;
     if (strcasecmp(name, "cardinal") == 0) return TYPE_UINT32;
+    // FPC's other spellings of the fixed-width integers.
+    if (strcasecmp(name, "longword") == 0) return TYPE_UINT32;
+    if (strcasecmp(name, "uint32") == 0) return TYPE_UINT32;
+    if (strcasecmp(name, "int32") == 0) return TYPE_INT32;
+    if (strcasecmp(name, "int16") == 0) return TYPE_INT16;
+    if (strcasecmp(name, "uint16") == 0) return TYPE_WORD;
+    if (strcasecmp(name, "int8") == 0) return TYPE_INT8;
+    if (strcasecmp(name, "uint8") == 0) return TYPE_BYTE;
     if (strcasecmp(name, "shortint") == 0) return TYPE_INT8;
     if (strcasecmp(name, "smallint") == 0) return TYPE_INT16;
     if (strcasecmp(name, "int64") == 0) return TYPE_INT64;
@@ -3440,28 +3448,76 @@ void pscalPointerDropOwners(PointerObj *po) {
 // both TYPE_CLOSURE and TYPE_INTERFACE, since both Value variants share
 // this exact payload shape and identical teardown logic -- the
 // distinction that matters (whether a slot's cell is owned and must be
-// freed) is already carried by env->symbol, not by which VarType created
-// the payload.
+// freed) is carried by the payload itself, not by which VarType created it:
+// a closure's slot is either a reference to a ClosureCell (env->cells[i]) or
+// a pointer into a live stack frame, which it does not own, and only an
+// interface payload (no symbol) owns plain malloc'd cells. Ownership used to
+// follow env->symbol->closure_escapes, a per-routine flag, which would free
+// stack slots once one routine had both kinds of closure.
 static void closureEnvPayloadDestroy(ObjHeader *header) {
     ClosureEnvPayload *env = (ClosureEnvPayload *)header;
     if (env->slot_count > 0 && env->slots) {
         for (uint16_t i = 0; i < env->slot_count; ++i) {
-            Value* cell = env->slots[i];
-            if (!cell) {
+            if (env->cells && env->cells[i]) {
+                closureCellRelease(env->cells[i]);
                 continue;
             }
-            bool owns_cell = true;
-            if (env->symbol) {
-                owns_cell = env->symbol->closure_escapes;
-            }
-            if (owns_cell) {
+            Value* cell = env->slots[i];
+            if (cell && !env->symbol) {
                 freeValue(cell);
                 free(cell);
             }
         }
         free(env->slots);
     }
+    free(env->cells);
     free(env);
+}
+
+ClosureCell* closureCellCreate(Value value) {
+    ClosureCell* cell = (ClosureCell*)malloc(sizeof(ClosureCell));
+    if (!cell) {
+        fprintf(stderr, "FATAL: Memory allocation failed in closureCellCreate\n");
+        EXIT_FAILURE_HANDLER();
+    }
+    atomic_init(&cell->refcount, 1);
+    cell->value = value;
+    return cell;
+}
+
+void closureCellRetain(ClosureCell* cell) {
+    if (cell) {
+        atomic_fetch_add_explicit(&cell->refcount, 1, memory_order_relaxed);
+    }
+}
+
+void closureCellRelease(ClosureCell* cell) {
+    if (cell && atomic_fetch_sub_explicit(&cell->refcount, 1, memory_order_acq_rel) == 1) {
+        freeValue(&cell->value);
+        free(cell);
+    }
+}
+
+void closureEnvBindCell(ClosureEnvPayload* env, uint16_t index, ClosureCell* cell) {
+    if (!env || index >= env->slot_count || !cell) {
+        return;
+    }
+    if (!env->cells) {
+        env->cells = (ClosureCell**)calloc(env->slot_count, sizeof(ClosureCell*));
+        if (!env->cells) {
+            fprintf(stderr, "FATAL: Memory allocation failed in closureEnvBindCell\n");
+            EXIT_FAILURE_HANDLER();
+        }
+    }
+    closureCellRetain(cell);
+    ClosureCell* old = env->cells[index];
+    env->cells[index] = cell;
+    // A worker thread running this closure reads slots[index] through its
+    // frame's upvalue array, which aliases env->slots.
+    __atomic_store_n(&env->slots[index], &cell->value, __ATOMIC_RELEASE);
+    if (old) {
+        closureCellRelease(old);
+    }
 }
 
 static pthread_once_t g_closure_env_destructor_once = PTHREAD_ONCE_INIT;

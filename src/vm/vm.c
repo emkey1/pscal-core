@@ -1932,8 +1932,6 @@ typedef struct ThreadJob {
     int builtin_id;
     char* builtin_name;
     VM* parentVm;
-    Value** capturedUpvalues;
-    uint8_t capturedUpvalueCount;
     ClosureEnvPayload* closureEnv;
     Symbol* closureSymbol;
     Thread* assignedThread;
@@ -2080,10 +2078,6 @@ static void vmThreadJobDestroy(ThreadJob* job) {
     if (job->closureEnv) {
         releaseClosureEnv(job->closureEnv);
         job->closureEnv = NULL;
-    }
-    if (job->capturedUpvalues) {
-        free(job->capturedUpvalues);
-        job->capturedUpvalues = NULL;
     }
     if (job->args) {
         for (int i = 0; i < job->argc; ++i) {
@@ -2262,8 +2256,6 @@ static ThreadJob* vmThreadJobCreate(VM* vm,
     job->builtin_id = builtin_id;
     job->builtin_name = builtin_name ? strdup(builtin_name) : NULL;
     job->parentVm = vm;
-    job->capturedUpvalues = NULL;
-    job->capturedUpvalueCount = 0;
     job->closureEnv = NULL;
     job->closureSymbol = closureSymbol;
     job->assignedThread = NULL;
@@ -2370,6 +2362,203 @@ static AST* vmProcParamDecl(const Symbol* proc, int index) {
     return NULL;
 }
 
+// --- Captured variables that outlive their frame ---
+//
+// A closure, or a thread running a nested routine, captures a variable by
+// pointing at it: while the frame that owns the variable is live,
+// env->slots[i] is that frame's stack slot and writes on either side are
+// shared. Such an env is registered with the VM whose stack it points into.
+// When a frame returns, every registered slot at or above the frame's base
+// is closed: its value moves into a ClosureCell (one per stack slot, however
+// many closures captured it) and each env points at the cell instead.
+// Without this a closure passed to a routine that kept it (in a global, a
+// list, a thread) went on pointing at the dead slot: it read whatever the
+// next call left there and wrote into another frame's locals.
+//
+// Only the owning VM's stack is covered: a closure created on a worker
+// thread that captures, through an upvalue, a variable on the spawning
+// thread's stack still points straight at that slot.
+typedef struct VmOpenCapture {
+    ClosureEnvPayload* env;  // retained while registered
+    Value* high;             // highest slot of this VM's stack env points at
+} VmOpenCapture;
+
+static inline bool vmStackHolds(const VM* vm, const Value* p) {
+    return vm->stack && p >= vm->stack && p < vm->stack + vm->stackReservedValues;
+}
+
+// The cell `target` is the value of, if a closure frame on this VM's call
+// stack holds one: a closure that captures an upvalue of a closed closure
+// shares its cell (and keeps it alive) instead of pointing into it.
+static ClosureCell* vmFindCaptureCell(VM* vm, const Value* target) {
+    for (int fi = vm->frameCount - 1; fi >= 0; --fi) {
+        ClosureEnvPayload* env = vm->frames[fi].closureEnv;
+        if (!env || !env->cells) {
+            continue;
+        }
+        for (uint16_t i = 0; i < env->slot_count; ++i) {
+            if (env->cells[i] && &env->cells[i]->value == target) {
+                return env->cells[i];
+            }
+        }
+    }
+    return NULL;
+}
+
+// Binds slot `index` of a closure env being built to `target`: a slot of
+// this VM's stack (returns true; register the env afterwards), the cell of
+// an enclosing closure, or anything else (a var parameter's referent off
+// the stack), which is used as is.
+static bool vmBindCapturedSlot(VM* vm, ClosureEnvPayload* env, uint16_t index, Value* target) {
+    env->slots[index] = target;
+    if (vmStackHolds(vm, target)) {
+        return true;
+    }
+    ClosureCell* cell = vmFindCaptureCell(vm, target);
+    if (cell) {
+        closureEnvBindCell(env, index, cell);
+    }
+    return false;
+}
+
+static Value* vmOpenCaptureHigh(const VM* vm, const ClosureEnvPayload* env) {
+    Value* high = NULL;
+    for (uint16_t i = 0; i < env->slot_count; ++i) {
+        Value* slot = env->slots[i];
+        if ((!env->cells || !env->cells[i]) && vmStackHolds(vm, slot) && slot > high) {
+            high = slot;
+        }
+    }
+    return high;
+}
+
+// Drops the entries nothing but the registry still references.
+static void vmPruneOpenCaptures(VM* vm) {
+    int kept = 0;
+    Value* high = NULL;
+    for (int i = 0; i < vm->openCaptureCount; ++i) {
+        VmOpenCapture entry = vm->openCaptures[i];
+        if (atomic_load_explicit(&entry.env->header.refcount, memory_order_acquire) <= 1) {
+            releaseClosureEnv(entry.env);
+            continue;
+        }
+        if (entry.high > high) {
+            high = entry.high;
+        }
+        vm->openCaptures[kept++] = entry;
+    }
+    vm->openCaptureCount = kept;
+    vm->openCaptureHigh = high;
+}
+
+static void vmRegisterOpenCapture(VM* vm, ClosureEnvPayload* env) {
+    Value* high = vmOpenCaptureHigh(vm, env);
+    if (!high) {
+        return;
+    }
+    if (vm->openCaptureCount == vm->openCaptureCapacity) {
+        vmPruneOpenCaptures(vm);
+    }
+    if (vm->openCaptureCount == vm->openCaptureCapacity) {
+        int cap = vm->openCaptureCapacity ? vm->openCaptureCapacity * 2 : 16;
+        VmOpenCapture* grown = (VmOpenCapture*)realloc(vm->openCaptures, (size_t)cap * sizeof(VmOpenCapture));
+        if (!grown) {
+            fprintf(stderr, "Fatal VM Error: Out of memory tracking closure captures.\n");
+            EXIT_FAILURE_HANDLER();
+        }
+        vm->openCaptures = grown;
+        vm->openCaptureCapacity = cap;
+    }
+    retainClosureEnv(env);
+    vm->openCaptures[vm->openCaptureCount].env = env;
+    vm->openCaptures[vm->openCaptureCount].high = high;
+    vm->openCaptureCount++;
+    if (high > vm->openCaptureHigh) {
+        vm->openCaptureHigh = high;
+    }
+}
+
+typedef struct {
+    Value* slot;
+    ClosureCell* cell;
+} VmClosedSlot;
+
+// Closes every registered capture of a stack slot at or above `base`, which
+// is about to be released.
+static void vmCloseCaptures(VM* vm, Value* base) {
+    if (vm->openCaptureCount == 0 || vm->openCaptureHigh < base) {
+        return;
+    }
+    VmClosedSlot* closed = NULL;
+    int closed_count = 0;
+    int closed_cap = 0;
+    int kept = 0;
+    Value* high = NULL;
+    for (int i = 0; i < vm->openCaptureCount; ++i) {
+        VmOpenCapture entry = vm->openCaptures[i];
+        if (entry.high < base) {
+            if (entry.high > high) {
+                high = entry.high;
+            }
+            vm->openCaptures[kept++] = entry;
+            continue;
+        }
+        ClosureEnvPayload* env = entry.env;
+        if (atomic_load_explicit(&env->header.refcount, memory_order_acquire) <= 1) {
+            // Nothing else can reach this closure any more.
+            releaseClosureEnv(env);
+            continue;
+        }
+        for (uint16_t s = 0; s < env->slot_count; ++s) {
+            Value* slot = env->slots[s];
+            if ((env->cells && env->cells[s]) || slot < base || !vmStackHolds(vm, slot)) {
+                continue;
+            }
+            ClosureCell* cell = NULL;
+            for (int c = 0; c < closed_count; ++c) {
+                if (closed[c].slot == slot) {
+                    cell = closed[c].cell;
+                    break;
+                }
+            }
+            if (!cell) {
+                if (closed_count == closed_cap) {
+                    closed_cap = closed_cap ? closed_cap * 2 : 8;
+                    VmClosedSlot* grown = (VmClosedSlot*)realloc(closed, (size_t)closed_cap * sizeof(VmClosedSlot));
+                    if (!grown) {
+                        fprintf(stderr, "Fatal VM Error: Out of memory closing closure captures.\n");
+                        EXIT_FAILURE_HANDLER();
+                    }
+                    closed = grown;
+                }
+                // The frame is going away: move the value rather than copy it.
+                cell = closureCellCreate(*slot);
+                *slot = makeNil();
+                closed[closed_count].slot = slot;
+                closed[closed_count].cell = cell;
+                closed_count++;
+            }
+            closureEnvBindCell(env, s, cell);
+        }
+        Value* rest = vmOpenCaptureHigh(vm, env);
+        if (!rest) {
+            releaseClosureEnv(env);
+            continue;
+        }
+        entry.high = rest;
+        if (rest > high) {
+            high = rest;
+        }
+        vm->openCaptures[kept++] = entry;
+    }
+    vm->openCaptureCount = kept;
+    vm->openCaptureHigh = high;
+    for (int c = 0; c < closed_count; ++c) {
+        closureCellRelease(closed[c].cell);
+    }
+    free(closed);
+}
+
 static bool vmThreadCaptureUpvaluesForJob(VM* vm, ThreadJob* job) {
     if (!vm || !job || job->kind != THREAD_JOB_BYTECODE) {
         return true;
@@ -2408,13 +2597,11 @@ static bool vmThreadCaptureUpvaluesForJob(VM* vm, ThreadJob* job) {
         return false;
     }
 
-    job->capturedUpvalueCount = proc_symbol->upvalue_count;
-    job->capturedUpvalues = (Value**)calloc(job->capturedUpvalueCount, sizeof(Value*));
-    if (!job->capturedUpvalues) {
-        job->capturedUpvalueCount = 0;
-        runtimeError(vm, "VM Error: Out of memory capturing upvalues for thread spawn of '%s'.", proc_name);
-        return false;
-    }
+    // The thread runs the routine as a closure over the parent's variables,
+    // registered like any other so that they survive the parent's return.
+    ClosureEnvPayload* env = createClosureEnv((uint16_t)proc_symbol->upvalue_count, TYPE_CLOSURE);
+    env->symbol = proc_symbol;
+    bool open = false;
 
     for (int i = 0; i < proc_symbol->upvalue_count; ++i) {
         Value* slot_ptr = NULL;
@@ -2432,15 +2619,19 @@ static bool vmThreadCaptureUpvaluesForJob(VM* vm, ThreadJob* job) {
 
         if (!slot_ptr) {
             runtimeError(vm, "VM Error: Failed to capture lexical variable for thread spawn of '%s'.", proc_name);
-            free(job->capturedUpvalues);
-            job->capturedUpvalues = NULL;
-            job->capturedUpvalueCount = 0;
+            releaseClosureEnv(env);
             return false;
         }
 
-        job->capturedUpvalues[i] = slot_ptr;
+        if (vmBindCapturedSlot(vm, env, (uint16_t)i, slot_ptr)) {
+            open = true;
+        }
     }
 
+    if (open) {
+        vmRegisterOpenCapture(vm, env);
+    }
+    job->closureEnv = env;  // the job takes createClosureEnv's reference
     return true;
 }
 
@@ -3116,13 +3307,12 @@ static void* threadStart(void* arg) {
                             frame->owns_upvalues = false;
                         }
                     } else if (proc_symbol && proc_symbol->upvalue_count > 0) {
-                        frame->upvalues = calloc(proc_symbol->upvalue_count, sizeof(Value*));
-                        frame->owns_upvalues = frame->upvalues != NULL;
-                        if (frame->upvalues) {
-                            for (int i = 0; i < proc_symbol->upvalue_count; i++) {
-                                frame->upvalues[i] = NULL;
-                            }
-                        }
+                        // vmThreadCaptureUpvaluesForJob gives every such job
+                        // an environment.
+                        runtimeError(workerVm,
+                                     "VM Error: Missing lexical context for thread entry '%s'.",
+                                     proc_symbol->name ? proc_symbol->name : "<anonymous>");
+                        ready_for_execution = false;
                     }
 
                     // Every argument the job carries, up to the declared
@@ -3163,27 +3353,6 @@ static void* threadStart(void* arg) {
                         frame->slotCount = (uint16_t)(pushed_args + proc_symbol->locals_count);
                     } else {
                         frame->slotCount = (uint16_t)pushed_args;
-                    }
-
-                    if (ready_for_execution && proc_symbol && proc_symbol->upvalue_count > 0 && !job->closureEnv) {
-                        if (!frame->upvalues || !job->capturedUpvalues ||
-                            job->capturedUpvalueCount != proc_symbol->upvalue_count) {
-                            runtimeError(workerVm,
-                                         "VM Error: Missing lexical context for thread entry '%s'.",
-                                         proc_symbol->name ? proc_symbol->name : "<anonymous>");
-                            ready_for_execution = false;
-                        } else {
-                            for (int i = 0; i < proc_symbol->upvalue_count; i++) {
-                                frame->upvalues[i] = job->capturedUpvalues[i];
-                                if (!frame->upvalues[i]) {
-                                    runtimeError(workerVm,
-                                                 "VM Error: Incomplete lexical capture for thread entry '%s'.",
-                                                 proc_symbol->name ? proc_symbol->name : "<anonymous>");
-                                    ready_for_execution = false;
-                                    break;
-                                }
-                            }
-                        }
                     }
 
                     if (!ready_for_execution) {
@@ -6282,12 +6451,15 @@ static bool vmResolveThreadTarget(VM* vm, Value target, const char* what, uint32
     return false;
 }
 
-// A spawn passes exactly the routine's parameters: there is no other check
+// A spawn passes at least the routine's parameters: there is no other check
 // between the spawn site and the new frame, and a short argument list left
-// the frame's slots misaligned ("Local slot index out of range").
-static bool vmCheckThreadArity(VM* vm, const Symbol* proc, int argc, const char* what) {
+// the frame's slots misaligned ("Local slot index out of range"). With
+// allow_extra, arguments past the parameters are dropped (the worker pushes
+// only as many as the routine takes): CreateThread(@P, arg) passes its one
+// argument whether or not P takes it.
+static bool vmCheckThreadArity(VM* vm, const Symbol* proc, int argc, const char* what, bool allow_extra) {
     int expected = vmProcParamCount(proc);
-    if (expected < 0 || expected == argc) {
+    if (expected < 0 || expected == argc || (allow_extra && argc > expected)) {
         return true;
     }
     runtimeError(vm, "VM Error: %s of '%s' passes %d argument(s); it takes %d.", what,
@@ -6296,82 +6468,56 @@ static bool vmCheckThreadArity(VM* vm, const Symbol* proc, int argc, const char*
 }
 
 static Value vmHostCreateThreadAddr(VM* vm) {
-    // New layout: [addr, arg0, arg1, ..., argc] — argc on top.
+    // [addr, arg0, arg1, ..., argc] -- argc on top. CreateThread compiles to
+    // [addr, arg, 1]. It used to compile to [addr, arg], read as argc when
+    // arg was an integer: CreateThread(@P, 3) popped three "arguments" and
+    // underflowed, and CreateThread(@P, 0) needed a guess.
     Value argcVal = pop(vm);
-    if (IS_INTLIKE(argcVal)) {
-        int argc = (int)AS_INTEGER(argcVal);
-        if (argc < 0) argc = 0;
-        if (vm->stackTop - vm->stack < argc + 1) {
-            freeValue(&argcVal);
-            runtimeError(vm, "VM Error: Stack underflow in CreateThread.");
-            return makeInt(-1);
-        }
-        // All of them: this used to keep only the first 8 (a fixed array)
-        // and drop the rest.
-        Value* args = argc > 0 ? (Value*)calloc((size_t)argc, sizeof(Value)) : NULL;
-        if (argc > 0 && !args) {
-            runtimeError(vm, "VM Error: Out of memory starting a thread.");
-            return makeInt(-1);
-        }
-        for (int i = argc - 1; i >= 0; i--) {
-            args[i] = pop(vm);
-        }
-        Value addrVal = pop(vm);
-        uint32_t entry = 0;
-        ClosureEnvPayload* closureEnv = NULL;
-        Symbol* closureSymbol = NULL;
-        bool validEntry = vmResolveThreadTarget(vm, addrVal, "CreateThread", &entry, &closureEnv, &closureSymbol);
-        freeValue(&addrVal);
-
-        int id = -1;
-        if (!validEntry) {
-            if (!vm->abort_requested) {
-                runtimeError(vm, "VM Error: CreateThread requires a procedure pointer or closure.");
-            }
-        } else if (argc == 0 && vmProcParamCount(closureSymbol) == 1) {
-            // CreateThread(proc, 0) compiles to [addr, 0] -- the legacy
-            // [addr, arg] layout below -- which is byte for byte a spawn
-            // with no arguments. A target taking one parameter settles it:
-            // it is the legacy call, and the 0 is its argument (it used to
-            // run with that argument missing).
-            id = createThreadWithArgs(vm, entry, closureEnv, closureSymbol, 1, &argcVal, NULL);
-        } else if (vmCheckThreadArity(vm, closureSymbol, argc, "spawn")) {
-            id = createThreadWithArgs(vm, entry, closureEnv, closureSymbol, argc, args, NULL);
-        }
-        if (closureEnv) {
-            releaseClosureEnv(closureEnv);
-        }
-        // The job holds its own copies (vmThreadJobCreate); these were leaked.
-        for (int i = 0; i < argc; ++i) {
-            freeValue(&args[i]);
-        }
-        free(args);
+    if (!IS_INTLIKE(argcVal)) {
         freeValue(&argcVal);
-        return makeInt(id < 0 ? -1 : id);
-    } else {
-        // Backwards-compatible path: [addr, arg]
-        Value argVal = argcVal; // already popped
-        Value addrVal = pop(vm);
-        uint32_t entry = 0;
-        ClosureEnvPayload* closureEnv = NULL;
-        Symbol* closureSymbol = NULL;
-        bool validEntry = vmResolveThreadTarget(vm, addrVal, "CreateThread", &entry, &closureEnv, &closureSymbol);
-        freeValue(&addrVal);
-
-        int id = -1;
-        if (!validEntry) {
-            if (!vm->abort_requested) {
-                runtimeError(vm, "VM Error: CreateThread requires a procedure pointer or closure.");
-            }
-        } else {
-            id = createThreadWithArgs(vm, entry, closureEnv, closureSymbol, 1, &argVal, NULL);
-        }
-        if (closureEnv) {
-            releaseClosureEnv(closureEnv);
-        }
-        freeValue(&argVal); // the job holds its own copy
-        return makeInt(id < 0 ? -1 : id);
+        runtimeError(vm, "VM Error: CreateThread expects an argument count on top of the stack.");
+        return makeInt(-1);
     }
+    int argc = (int)AS_INTEGER(argcVal);
+    freeValue(&argcVal);
+    if (argc < 0 || vm->stackTop - vm->stack < argc + 1) {
+        runtimeError(vm, "VM Error: Stack underflow in CreateThread.");
+        return makeInt(-1);
+    }
+    // All of them: this used to keep only the first 8 (a fixed array)
+    // and drop the rest.
+    Value* args = argc > 0 ? (Value*)calloc((size_t)argc, sizeof(Value)) : NULL;
+    if (argc > 0 && !args) {
+        runtimeError(vm, "VM Error: Out of memory starting a thread.");
+        return makeInt(-1);
+    }
+    for (int i = argc - 1; i >= 0; i--) {
+        args[i] = pop(vm);
+    }
+    Value addrVal = pop(vm);
+    uint32_t entry = 0;
+    ClosureEnvPayload* closureEnv = NULL;
+    Symbol* closureSymbol = NULL;
+    bool validEntry = vmResolveThreadTarget(vm, addrVal, "CreateThread", &entry, &closureEnv, &closureSymbol);
+    freeValue(&addrVal);
+
+    int id = -1;
+    if (!validEntry) {
+        if (!vm->abort_requested) {
+            runtimeError(vm, "VM Error: CreateThread requires a procedure pointer or closure.");
+        }
+    } else if (vmCheckThreadArity(vm, closureSymbol, argc, "spawn", true)) {
+        id = createThreadWithArgs(vm, entry, closureEnv, closureSymbol, argc, args, NULL);
+    }
+    if (closureEnv) {
+        releaseClosureEnv(closureEnv);
+    }
+    // The job holds its own copies (vmThreadJobCreate); these were leaked.
+    for (int i = 0; i < argc; ++i) {
+        freeValue(&args[i]);
+    }
+    free(args);
+    return makeInt(id < 0 ? -1 : id);
 }
 
 // VM 2.0 Phase 5a checkpoint 5a-i (Docs/pscal_vm2_plan.md Sec 6.1):
@@ -6399,7 +6545,7 @@ int vmHostCreateTaskEntry(VM* vm, Value fnVal, int argc, const Value* argv, uint
         }
         return -1;
     }
-    if (!vmCheckThreadArity(vm, closureSymbol, argc, "TaskSpawn")) {
+    if (!vmCheckThreadArity(vm, closureSymbol, argc, "TaskSpawn", false)) {
         if (closureEnv) {
             releaseClosureEnv(closureEnv);
         }
@@ -6467,6 +6613,7 @@ static Value vmHostCreateClosure(VM* vm) {
 
     ClosureEnvPayload* env = createClosureEnv((uint16_t)capture_count, TYPE_CLOSURE);
     env->symbol = proc_symbol;
+    bool open = false;
 
     for (int i = capture_count - 1; i >= 0; --i) {
         Value captured = pop(vm);
@@ -6476,22 +6623,22 @@ static Value vmHostCreateClosure(VM* vm) {
             runtimeError(vm, "VM Error: Expected pointer for captured closure variable.");
             return makeNil();
         }
+        Value* target = (Value*)AS_POINTER(captured);
         if (proc_symbol->closure_escapes) {
-            Value* cell = (Value*)malloc(sizeof(Value));
-            if (!cell) {
-                freeValue(&captured);
-                releaseClosureEnv(env);
-                runtimeError(vm, "VM Error: Out of memory initialising escaping closure environment.");
-                return makeNil();
-            }
-            *cell = makeCopyOfValue((Value*)AS_POINTER(captured));
-            env->slots[i] = cell;
-        } else {
-            env->slots[i] = (Value*)AS_POINTER(captured);
+            // The compiler saw this closure stored past the routine: it
+            // takes a copy of each variable as it is now.
+            ClosureCell* cell = closureCellCreate(makeCopyOfValue(target));
+            closureEnvBindCell(env, (uint16_t)i, cell);
+            closureCellRelease(cell);
+        } else if (vmBindCapturedSlot(vm, env, (uint16_t)i, target)) {
+            open = true;
         }
         freeValue(&captured);
     }
 
+    if (open) {
+        vmRegisterOpenCapture(vm, env);
+    }
     Value closure = makeClosure(entry, proc_symbol, env);
     releaseClosureEnv(env);
     return closure;
@@ -7636,6 +7783,9 @@ static Value vmHostShellLoopIsReadyHost(VM* vm) {
 static void vmReleaseExecutionResources(VM* vm) {
     if (!vm) return;
 
+    if (vm->stack) {
+        vmCloseCaptures(vm, vm->stack);
+    }
     for (Value* slot = vm->stack; slot < vm->stackTop; ++slot) {
         freeValue(slot);
     }
@@ -7798,6 +7948,11 @@ void initVM(VM* vm) { // As in all.txt, with frameCount
                          "(%zu Values).\n", pscalVmStackCeilingValues());
         EXIT_FAILURE_HANDLER();
     }
+
+    vm->openCaptures = NULL;
+    vm->openCaptureCount = 0;
+    vm->openCaptureCapacity = 0;
+    vm->openCaptureHigh = NULL;
 
     vm->frames = NULL;
     vm->frameCapacity = 0;
@@ -7971,6 +8126,9 @@ void freeVM(VM* vm) {
     // underlying storage itself (the mmap reservation and the frames[]
     // heap array) remains to be released now that the VM is being torn down.
     vmFreeStackStorage(vm);
+    free(vm->openCaptures);
+    vm->openCaptures = NULL;
+    vm->openCaptureCapacity = 0;
     if (vm->frames) {
         free(vm->frames);
         vm->frames = NULL;
@@ -8091,6 +8249,9 @@ static InterpretResult returnFromCall(VM* vm, bool* halted) {
         }
     }
 
+    if (vm->openCaptureCount > 0) {
+        vmCloseCaptures(vm, currentFrame->slots);
+    }
     for (Value* slot = currentFrame->slots; slot < vm->stackTop; slot++) {
         freeValue(slot);
     }
@@ -14414,10 +14575,19 @@ comparison_error_label:
                 freeValue(&popped_mid);
                 break;
             }
-            case FORMAT_VALUE: {
-                uint8_t width = READ_BYTE();
-                uint8_t precision_raw = READ_BYTE();
-                int precision = (precision_raw == 0xFF) ? -1 : precision_raw;
+            case FORMAT_VALUE:
+            case FORMAT_VALUE16: {
+                int width;
+                int precision;
+                if (instruction_val == FORMAT_VALUE16) {
+                    width = READ_SHORT(vm);
+                    uint16_t precision_raw = READ_SHORT(vm);
+                    precision = (precision_raw == 0xFFFF) ? -1 : precision_raw;
+                } else {
+                    width = READ_BYTE();
+                    uint8_t precision_raw = READ_BYTE();
+                    precision = (precision_raw == 0xFF) ? -1 : precision_raw;
+                }
 
                 Value raw_val = pop(vm);
 

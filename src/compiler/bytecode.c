@@ -1550,6 +1550,13 @@ int disassembleInstruction(BytecodeChunk* chunk, int offset, HashTable* procedur
             fprintf(stderr, "%-16s width:%d prec:%d\n", "FORMAT_VALUE", width, (int8_t)precision);
             return offset + 3;
         }
+        case FORMAT_VALUE16: {
+            uint16_t width = (uint16_t)((chunk->code[offset + 1] << 8) | chunk->code[offset + 2]);
+            uint16_t precision = (uint16_t)((chunk->code[offset + 3] << 8) | chunk->code[offset + 4]);
+            fprintf(stderr, "%-16s width:%u prec:%d\n", "FORMAT_VALUE16", (unsigned)width,
+                    precision == 0xFFFF ? -1 : (int)precision);
+            return offset + 5;
+        }
         case THREAD_CREATE: {
             uint32_t entry = readU32BE(chunk, offset + 1);
             fprintf(stderr, "%-16s %04u\n", "THREAD_CREATE", entry);

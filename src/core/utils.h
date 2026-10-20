@@ -508,6 +508,20 @@ Value makeValueForType(VarType type, AST *type_def, Symbol* context_symbol);
 ClosureEnvPayload* createClosureEnv(uint16_t slot_count, VarType owner_type);
 void retainClosureEnv(ClosureEnvPayload* env);
 void releaseClosureEnv(ClosureEnvPayload* env);
+// A captured variable that has outlived its stack frame (see the comment on
+// ClosureEnvPayload). Shared by every closure that captured the same slot,
+// so they still see each other's writes.
+typedef struct ClosureCell {
+    _Atomic uint32_t refcount;
+    Value value;
+} ClosureCell;
+// Returns a cell with refcount 1 that takes ownership of `value`.
+ClosureCell* closureCellCreate(Value value);
+void closureCellRetain(ClosureCell* cell);
+void closureCellRelease(ClosureCell* cell);
+// Makes slot `index` of `env` hold a reference to `cell` (retained here)
+// and point at its value.
+void closureEnvBindCell(ClosureEnvPayload* env, uint16_t index, ClosureCell* cell);
 Value makeClosure(uint32_t entry_offset, struct Symbol_s* symbol, ClosureEnvPayload* env);
 Value makeInterface(AST* interfaceType, ClosureEnvPayload* payload);
 

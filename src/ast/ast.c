@@ -1432,7 +1432,13 @@ resolved_field: ;
                 if (procSymbol) {
                     node->var_type = procSymbol->type;
                 } else {
-                    if (node->token) {
+                    AST *castType = (node->token && node->child_count == 1 && !isBuiltin(node->token->value))
+                                        ? resolveTypeAlias(lookupType(node->token->value)) : NULL;
+                    if (castType && castType->type == AST_ENUM_TYPE) {
+                        // An enum cast `T(k)` is a T (the compiler converts it).
+                        node->var_type = TYPE_ENUM;
+                        node->type_def = castType;
+                    } else if (node->token) {
                          node->var_type = getBuiltinReturnType(node->token->value);
                           if (node->var_type == TYPE_VOID && isBuiltin(node->token->value)) {
                               // Known built-in procedure

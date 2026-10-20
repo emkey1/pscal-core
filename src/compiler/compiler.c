@@ -4,6 +4,7 @@
 #include <string.h> // For strcmp, strdup, atoll
 #include <math.h>
 #include <ctype.h>
+#include <errno.h>
 #include <strings.h>
 #include <limits.h>
 #include <stdint.h>
@@ -5262,6 +5263,68 @@ static void reportReadOnlyLoopControlError(int line, const LoopControlTarget* ta
     compiler_had_error = true;
 }
 
+// Pushes the last value a for-loop control variable can take in the loop's
+// direction: its type's high (low for downto), or an enum's last (first)
+// member. Returns false, pushing nothing, when the range is not known here;
+// with no chunk it only answers whether it is.
+static bool emitForLoopTypeLimit(AST* var_node, bool is_downto, BytecodeChunk* chunk, int line) {
+    long long lo = 0, hi = 0;
+    switch (var_node ? var_node->var_type : TYPE_UNKNOWN) {
+        case TYPE_INT8:   lo = INT8_MIN;  hi = INT8_MAX;   break;
+        case TYPE_UINT8:
+        case TYPE_BYTE:   lo = 0;         hi = UINT8_MAX;  break;
+        case TYPE_INT16:  lo = INT16_MIN; hi = INT16_MAX;  break;
+        case TYPE_UINT16:
+        case TYPE_WORD:   lo = 0;         hi = UINT16_MAX; break;
+        case TYPE_INT32:  lo = INT32_MIN; hi = INT32_MAX;  break;
+        case TYPE_UINT32: lo = 0;         hi = UINT32_MAX; break;
+        case TYPE_INT64:  lo = LLONG_MIN; hi = LLONG_MAX;  break;
+        case TYPE_CHAR:   lo = 0;         hi = 255;        break;
+        case TYPE_UINT64:
+            if (!is_downto) {
+                if (chunk) {
+                    Value top = makeUInt64(ULLONG_MAX);
+                    emitConstant(chunk, addConstantToChunk(chunk, &top), line);
+                }
+                return true;
+            }
+            break;
+        case TYPE_BOOLEAN:
+            if (chunk) {
+                writeBytecodeChunk(chunk, is_downto ? CONST_FALSE : CONST_TRUE, line);
+            }
+            return true;
+        case TYPE_ENUM: {
+            AST* enum_type = resolveTypeAlias(var_node->type_def);
+            if (!enum_type || enum_type->type != AST_ENUM_TYPE || enum_type->child_count == 0) {
+                return false;
+            }
+            AST* member = enum_type->children[is_downto ? 0 : enum_type->child_count - 1];
+            if (!member || !member->token) {
+                return false;
+            }
+            if (!chunk) {
+                return true;
+            }
+            AST member_ref;
+            memset(&member_ref, 0, sizeof(AST));
+            member_ref.type = AST_VARIABLE;
+            member_ref.token = member->token;
+            member_ref.var_type = TYPE_ENUM;
+            member_ref.type_def = enum_type;
+            member_ref.parent = var_node;
+            compileRValue(&member_ref, chunk, line);
+            return true;
+        }
+        default:
+            return false;
+    }
+    if (chunk) {
+        emitConstant(chunk, addIntConstant(chunk, is_downto ? lo : hi), line);
+    }
+    return true;
+}
+
 static bool validateForLoopControlTarget(AST* node, int line) {
     if (!node) {
         fprintf(stderr, "L%d: Compiler error: missing FOR loop control variable.\n", line);
@@ -5593,6 +5656,27 @@ static Value foldCompileTimeStringConcat(const Value *left_val, const Value *rig
     return result;
 }
 
+// A Pascal decimal integer literal past INT64_MAX that fits 64 bits
+// unsigned (18446744073709551615, qword's high): its value as a UINT64.
+// atoll() clamped it to INT64_MAX. Only Pascal has an unsigned 64-bit type
+// to hold one; Rea and Aether literals are Int (int64) and keep the old
+// reading.
+static bool decimalLiteralAboveInt64(const char* text, unsigned long long* out) {
+    if (!frontendIsPascal() || !text || !isdigit((unsigned char)text[0])) {
+        return false;
+    }
+    errno = 0;
+    char* end = NULL;
+    unsigned long long v = strtoull(text, &end, 10);
+    if (errno == ERANGE || !end || *end != '\0' || v <= (unsigned long long)LLONG_MAX) {
+        return false;
+    }
+    if (out) {
+        *out = v;
+    }
+    return true;
+}
+
 Value evaluateCompileTimeValue(AST* node) {
     if (!node) return makeVoid(); // Or some error indicator
 
@@ -5607,9 +5691,14 @@ Value evaluateCompileTimeValue(AST* node) {
                         unsigned long long v = strtoull(node->token->value, NULL, 16);
                         return makeInt64((long long)v);
                     } else {
-                        unsigned long v = strtoul(node->token->value, NULL, 16);
-                        return makeInt((long long)v);
+                        unsigned long long v = strtoull(node->token->value, NULL, 16);
+                        return v > (unsigned long long)INT32_MAX ? makeInt64((long long)v)
+                                                                : makeInt((long long)v);
                     }
+                } else if (node->token->type == TOKEN_INTEGER_CONST &&
+                           decimalLiteralAboveInt64(node->token->value, NULL)) {
+                    unsigned long long big = strtoull(node->token->value, NULL, 10);
+                    return makeUInt64(big);
                 } else if (node->var_type == TYPE_INT64 || node->var_type == TYPE_UINT64) {
                     /*
                      * REA treats plain integer literals as 64-bit values.  The old
@@ -5619,7 +5708,12 @@ Value evaluateCompileTimeValue(AST* node) {
                      */
                     return makeInt64(atoll(node->token->value));
                 } else {
-                    return makeInt(atoll(node->token->value));
+                    // A literal outside INT32 widens, as addIntConstant's do:
+                    // makeInt() keeps 32 bits, so Pascal's `const X =
+                    // 3000000000` was -1294967296 and an array bound of
+                    // 4294967297 was 1.
+                    long long v = atoll(node->token->value);
+                    return (v > INT32_MAX || v < INT32_MIN) ? makeInt64(v) : makeInt(v);
                 }
             }
             break;
@@ -6288,11 +6382,21 @@ static bool computeConstantArrayAccess(AST* node, ConstArrayAccessInfo* info) {
     // level's declared dimensions are *fully* consumed, however many
     // segments that took.
     int dim_cursor = 0;
+    // Set once the base array's own dimensions are all indexed. The *_CONST
+    // opcodes take a flat offset into that one array; an element that is
+    // itself an array (`array[1..3] of array[1..3] of integer`) is a separate
+    // value, so indexing into it cannot fold into the same offset. It used to:
+    // `b[1][2] := 5` became offset 1 into b and overwrote all of b[2].
+    bool base_level_done = false;
 
     for (int seg = chain_len - 1; seg >= 0 && success; --seg) {
         AST* segment = chain[seg];
 
         for (int idx = 0; idx < segment->child_count && success; ++idx) {
+            if (base_level_done) {
+                success = false;
+                break;
+            }
             AST* array_type = resolveTypeAlias(current_type);
             if (!array_type || array_type->type != AST_ARRAY_TYPE || dim_cursor >= array_type->child_count) {
                 success = false;
@@ -6341,6 +6445,7 @@ static bool computeConstantArrayAccess(AST* node, ConstArrayAccessInfo* info) {
             if (dim_cursor >= array_type->child_count) {
                 current_type = resolveTypeAlias(array_type->right);
                 dim_cursor = 0;
+                base_level_done = true;
             }
         }
     }
@@ -9557,44 +9662,74 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
             startLoop(-1); // Start address is not needed for FOR loop's break handling
             bool pushed_loop_target = pushLoopControlTarget(var_node);
 
-            int loopStart = chunk->count;
-
-            // 3. The loop condition check
+            // 3. Enter the loop only if start <= end (>= for downto).
             compileRValue(var_node, chunk, getLine(var_node));
             compileRValue(end_node, chunk, getLine(end_node));
-            
             writeBytecodeChunk(chunk, is_downto ? GREATER_EQUAL : LESS_EQUAL, line);
-
             writeBytecodeChunk(chunk, JUMP_IF_FALSE, line);
-            int exitJump = chunk->count;
+            int entryExitJump = chunk->count;
             emitInt32(chunk, 0xFFFFFFFF, line);
+
+            int bodyStart = chunk->count;
 
             // 4. Compile the loop body
             compileStatement(body_node, chunk, getLine(body_node));
-            
-            // 5. Increment/Decrement the loop variable
-            // Any 'continue' in the body should land here (the post step), not at the condition.
+
+            // 5. The post step. Any 'continue' in the body lands here, not at
+            // the entry check. It leaves once the variable has reached the
+            // bound, before stepping it: stepping first and then comparing
+            // with `<=` never ended a loop to the type's last value
+            // (`for b := 250 to 255` on a byte, `for i := ... to maxint`),
+            // since the step wrapped or overflowed instead of passing it.
+            // `var < end` before the step is `var + 1 <= end` after it, so
+            // every other loop runs as before, a bound the body changes
+            // included.
             loop_stack[loop_depth].continue_target = chunk->count;
             patchContinuesTo(chunk, chunk->count);
+            compileRValue(var_node, chunk, getLine(var_node));
+            compileRValue(end_node, chunk, getLine(end_node));
+            writeBytecodeChunk(chunk, is_downto ? GREATER : LESS, line);
+            writeBytecodeChunk(chunk, JUMP_IF_FALSE, line);
+            int stepExitJump = chunk->count;
+            emitInt32(chunk, 0xFFFFFFFF, line);
             compileRValue(var_node, chunk, getLine(var_node));
             int one_const_idx = addIntConstant(chunk, 1);
             emitConstant(chunk, one_const_idx, line);
             writeBytecodeChunk(chunk, is_downto ? SUBTRACT : ADD, line);
             compileLoopControlStore(var_node, chunk, line);
 
-            // The value from the increment/decrement is still on the stack.
-            // Pop it to prevent stack overflow.
-            //writeBytecodeChunk(chunk, POP, line);
-
-            // 6. Jump back to the top of the loop to re-evaluate the condition
+            // 6. Jump back to the body.
             writeBytecodeChunk(chunk, JUMP, line);
-            int backward_jump_offset = loopStart - (chunk->count + 4);
+            int backward_jump_offset = bodyStart - (chunk->count + 4);
             emitInt32(chunk, (uint32_t)backward_jump_offset, line);
 
-            // 7. This is the exit point for the loop. Patch the initial condition jump.
-            patchInt32(chunk, exitJump, (uint32_t)(chunk->count - (exitJump + 4)));
+            // 7. A loop that ran to its bound still leaves the variable one
+            // past it, as stepping first always did (`for i := 1 to 3` leaves
+            // i = 4), where the type can hold that value; at the type's last
+            // value it stays there.
+            patchInt32(chunk, stepExitJump, (uint32_t)(chunk->count - (stepExitJump + 4)));
+            int limitSkipJump = -1;
+            if (emitForLoopTypeLimit(var_node, is_downto, NULL, line)) {
+                compileRValue(var_node, chunk, getLine(var_node));
+                emitForLoopTypeLimit(var_node, is_downto, chunk, line);
+                writeBytecodeChunk(chunk, is_downto ? GREATER : LESS, line);
+                writeBytecodeChunk(chunk, JUMP_IF_FALSE, line);
+                limitSkipJump = chunk->count;
+                emitInt32(chunk, 0xFFFFFFFF, line);
+            }
+            compileRValue(var_node, chunk, getLine(var_node));
+            emitConstant(chunk, one_const_idx, line);
+            writeBytecodeChunk(chunk, is_downto ? SUBTRACT : ADD, line);
+            compileLoopControlStore(var_node, chunk, line);
+            if (limitSkipJump >= 0) {
+                patchInt32(chunk, limitSkipJump, (uint32_t)(chunk->count - (limitSkipJump + 4)));
+            }
+
+            // 8. This is the exit point for the loop: no pass at all, or a
+            // break, leaves the variable as it is.
+            patchInt32(chunk, entryExitJump, (uint32_t)(chunk->count - (entryExitJump + 4)));
             
-            // 8. Patch any 'break' statements that occurred inside the loop body.
+            // Patch any 'break' statements that occurred inside the loop body.
             patchBreaks(chunk);
             if (pushed_loop_target) {
                 popLoopControlTarget();
@@ -10637,6 +10772,10 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                     } else {
                         emitConstant(chunk, addNilConstant(chunk), line); // default arg = nil
                     }
+                    // [addr, arg, 1]: the spawn layout with one argument. The
+                    // bare [addr, arg] this used to emit could not be told
+                    // from [addr, argc] when arg was an integer.
+                    emitConstant(chunk, addIntConstant(chunk, 1), line);
                     writeBytecodeChunk(chunk, CALL_HOST, line);
                     writeBytecodeChunk(chunk, (uint8_t)HOST_FN_CREATE_THREAD_ADDR, line);
                 } else if (strcasecmp(calleeName, "waitforthread") == 0) {
@@ -10956,7 +11095,13 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                 unsigned long long v = strtoull(node_token->value, NULL, 16);
                 constIndex = addIntConstant(chunk, (long long)v);
             } else {
-                constIndex = addIntConstant(chunk, atoll(node_token->value));
+                unsigned long long big = 0;
+                if (decimalLiteralAboveInt64(node_token->value, &big)) {
+                    Value bigVal = makeUInt64(big);
+                    constIndex = addConstantToChunk(chunk, &bigVal);
+                } else {
+                    constIndex = addIntConstant(chunk, atoll(node_token->value));
+                }
             }
             emitConstant(chunk, constIndex, line);
             break;
@@ -10971,10 +11116,24 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                 sscanf(node->token->value, "%d,%d", &width, &decimals);
             }
 
-            // Emit the format opcode and its operands
-            writeBytecodeChunk(chunk, FORMAT_VALUE, line);
-            writeBytecodeChunk(chunk, (uint8_t)width, line);
-            writeBytecodeChunk(chunk, (uint8_t)decimals, line); // Using -1 (0xFF) for "not specified"
+            // Emit the format opcode and its operands. FORMAT_VALUE's are
+            // bytes (precision 0xFF meaning "not specified"); a width or
+            // precision past them takes FORMAT_VALUE16 (`s:300` used to
+            // print with width 300 & 0xFF = 44).
+            if (width < 0 || decimals < -1 || width > 0xFFFE || decimals > 0xFFFE) {
+                fprintf(stderr, "L%d: Compiler error: field width and precision must be between 0 and 65534.\n", line);
+                compiler_had_error = true;
+                break;
+            }
+            if (width <= 0xFF && decimals < 0xFF) {
+                writeBytecodeChunk(chunk, FORMAT_VALUE, line);
+                writeBytecodeChunk(chunk, (uint8_t)width, line);
+                writeBytecodeChunk(chunk, (uint8_t)decimals, line);
+            } else {
+                writeBytecodeChunk(chunk, FORMAT_VALUE16, line);
+                emitShort(chunk, (uint16_t)width, line);
+                emitShort(chunk, (uint16_t)decimals, line);
+            }
             break;
         }
         case AST_STRING: {
@@ -11691,6 +11850,8 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                 } else {
                     emitConstant(chunk, addNilConstant(chunk), line); // default arg
                 }
+                // [addr, arg, 1]; see the statement form above.
+                emitConstant(chunk, addIntConstant(chunk, 1), line);
                 writeBytecodeChunk(chunk, CALL_HOST, line);
                 writeBytecodeChunk(chunk, (uint8_t)HOST_FN_CREATE_THREAD_ADDR, line);
                 break;
@@ -12173,6 +12334,35 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                             writeBytecodeChunk(chunk, POP, line);
                         }
                         emitConstant(chunk, addNilConstant(chunk), line);
+                    } else if (resolvedCast && resolvedCast->type == AST_ENUM_TYPE &&
+                               resolvedCast->child_count > 0 && resolvedCast->children[0] &&
+                               resolvedCast->children[0]->token) {
+                        // An enum cast `T(k)` converts: `ord(k) + <T's first
+                        // member>`, which the VM evaluates to the member of T
+                        // with that ordinal (range-checked against T). It
+                        // used to leave k as it was, so only a store into an
+                        // enum variable converted it; `T(k) = rb` failed with
+                        // "Operands not comparable" and `succ(T(0))` was 1.
+                        AST* argNode = (receiver_offset < node->child_count) ? node->children[receiver_offset] : NULL;
+                        bool already_t = argNode && argNode->var_type == TYPE_ENUM &&
+                                         resolveTypeAlias(argNode->type_def) == resolvedCast;
+                        if (!already_t) {
+                            if (!argNode || !isIntegerFamilyType(argNode->var_type)) {
+                                int ordIndex = ensureBuiltinStringConstants(chunk, "ord", NULL);
+                                writeBytecodeChunk(chunk, CALL_BUILTIN, line);
+                                emitShort(chunk, (uint16_t)ordIndex, line);
+                                writeBytecodeChunk(chunk, 1, line);
+                            }
+                            AST firstMember;
+                            memset(&firstMember, 0, sizeof(AST));
+                            firstMember.type = AST_VARIABLE;
+                            firstMember.token = resolvedCast->children[0]->token;
+                            firstMember.var_type = TYPE_ENUM;
+                            firstMember.type_def = resolvedCast;
+                            firstMember.parent = node;
+                            compileRValue(&firstMember, chunk, line);
+                            writeBytecodeChunk(chunk, ADD, line);
+                        }
                     }
                     break;
                 }

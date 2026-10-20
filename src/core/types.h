@@ -46,11 +46,21 @@ struct Symbol_s;
 // interface's receiver/table/class payload) -- both are set correctly at
 // construction time by createClosureEnv's caller (VM 2.0 Phase 4b,
 // Docs/pscal_vm2_plan.md §5.10.4/§5.10.3).
+//
+// A closure's slots[i] points at the variable it captured. While the
+// defining frame is live that is the frame's own stack slot; when the frame
+// returns, the VM moves the value into a ClosureCell on the heap and points
+// slots[i] there (vmCloseCaptures), so a closure that outlives its frame
+// never reads a dead slot. cells[i] is the cell slots[i] holds a reference
+// to, or NULL while slots[i] still points into a stack (or, for an
+// interface payload, at a cell the payload owns outright).
+struct ClosureCell;
 typedef struct ClosureEnvPayload {
     ObjHeader header;
     uint16_t slot_count;
     struct Symbol_s *symbol;
     struct ValueStruct **slots;
+    struct ClosureCell **cells;
 } ClosureEnvPayload;
 
 // VarType and the TYPE_INTEGER/TYPE_REAL backwards-compatibility aliases

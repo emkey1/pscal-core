@@ -101,10 +101,10 @@ enum {
 };
 _Static_assert(PSCAL_OPCODE_DEF_ENTRY_COUNT == OPCODE_COUNT,
                "opcodes.def must define every ordinal exactly once (no holes, no duplicates)");
-_Static_assert(OPCODE_COUNT == 0x69,
-               "published opcode page is 0x00-0x68 (0x64-0x67: VM 2.0 Phase 2b slot-"
-               "addressed globals; 0x68: PUSH_TYPE_DEFAULT); append new opcodes "
-               "after PUSH_TYPE_DEFAULT and update this assert deliberately");
+_Static_assert(OPCODE_COUNT == 0x6A,
+               "published opcode page is 0x00-0x69 (0x64-0x67: VM 2.0 Phase 2b slot-"
+               "addressed globals; 0x68: PUSH_TYPE_DEFAULT; 0x69: FORMAT_VALUE16); "
+               "append new opcodes after FORMAT_VALUE16 and update this assert deliberately");
 
 // Per-opcode metadata generated from compiler/opcodes.def.  `operands` is the
 // encoding-spec string documented at the top of opcodes.def ("?" = variable

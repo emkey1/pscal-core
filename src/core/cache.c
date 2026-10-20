@@ -90,7 +90,12 @@
  * bump above: "any change that makes old CODE bytes mean something
  * different", here by changing the conventions they are executed under
  * rather than the bytes themselves. */
-#define PSB3_FORMAT_VERSION 5u
+/* format_ver 6: CreateThread compiles to [addr, arg, 1] instead of
+ * [addr, arg], and the VM dropped its reader for the old layout, which it
+ * could not tell from a spawn's [addr, ..., argc] when arg was an integer.
+ * A format-5 chunk would hand an integer argument to the spawn path as its
+ * argument count. */
+#define PSB3_FORMAT_VERSION 6u
 
 /* Header `flags` layout. Bits 8..31 are still reserved and written 0.
  *
