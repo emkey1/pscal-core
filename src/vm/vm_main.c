@@ -45,11 +45,29 @@ static const char *PSCALVM_USAGE = "Usage: pscalvm <bytecode_file> [program_para
 
 int pscalvm_main(int argc, char* argv[]) {
     FrontendKind previousKind = frontendPushKind(FRONTEND_KIND_PASCAL);
-#define PSCALVM_RETURN(value)           \
-    do {                                \
-        int __vm_rc = (value);          \
-        frontendPopKind(previousKind);  \
-        return __vm_rc;                 \
+    /* The symbol tables are process globals. Hosted in-process (the iOS tool
+     * runner), another tool's tables may be installed when this runs, and
+     * whatever this run creates must not be left behind -- freed but still
+     * installed, or installed and leaked -- for the next tool to use. */
+    HashTable* previousGlobalSymbols = globalSymbols;
+    HashTable* previousConstGlobalSymbols = constGlobalSymbols;
+    HashTable* previousProcedureTable = procedure_table;
+    HashTable* previousCurrentProcedureTable = current_procedure_table;
+    bool ownsSymbolTables = false;
+#define PSCALVM_RETURN(value)                                     \
+    do {                                                          \
+        int __vm_rc = (value);                                    \
+        if (ownsSymbolTables) {                                   \
+            if (globalSymbols) freeHashTable(globalSymbols);      \
+            if (constGlobalSymbols) freeHashTable(constGlobalSymbols); \
+            if (procedure_table) freeHashTable(procedure_table);  \
+            globalSymbols = previousGlobalSymbols;                \
+            constGlobalSymbols = previousConstGlobalSymbols;      \
+            procedure_table = previousProcedureTable;             \
+            current_procedure_table = previousCurrentProcedureTable; \
+        }                                                         \
+        frontendPopKind(previousKind);                            \
+        return __vm_rc;                                           \
     } while (0)
     vmInitTerminalState();
     if (argc >= 2 && (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0)) {
@@ -78,6 +96,7 @@ int pscalvm_main(int argc, char* argv[]) {
     gParamValues = (gParamCount > 0) ? &argv[argi + 1] : NULL;
 
     initSymbolSystem();
+    ownsSymbolTables = true;
     registerAllBuiltins();
 
     BytecodeChunk chunk;
@@ -106,9 +125,6 @@ int pscalvm_main(int argc, char* argv[]) {
     InterpretResult result = interpretBytecode(&vm, &chunk, globalSymbols, constGlobalSymbols, procedure_table, 0);
     freeVM(&vm);
     freeBytecodeChunk(&chunk);
-    if (globalSymbols) freeHashTable(globalSymbols);
-    if (constGlobalSymbols) freeHashTable(constGlobalSymbols);
-    if (procedure_table) freeHashTable(procedure_table);
 
     PSCALVM_RETURN(vmExitWithCleanup(result == INTERPRET_OK ? EXIT_SUCCESS : EXIT_FAILURE));
 }
