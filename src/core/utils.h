@@ -364,6 +364,11 @@ static inline Value pscalIntResultLike2(Value a, Value b, long long result) {
     return pscalIntResultNarrow(result);
 }
 
+/* Aether checked I/O (D73): whether the last aether_try_* read on this thread
+ * succeeded; the try_ helpers read it right after the read. */
+void pscalAetherSetLastIoOk(bool ok);
+bool pscalAetherLastIoOk(void);
+
 Value makeByte(unsigned char val);
 Value makeWord(unsigned int val);
 Value makeNil(void);

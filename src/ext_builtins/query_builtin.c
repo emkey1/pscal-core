@@ -29,7 +29,7 @@ typedef struct {
   const char *signature;
   const char *usage;
   const char *category;
-  bool effectful;          /* informational; emit derives from pscalBuiltinNameIsEffectful() */
+  bool effectful;          /* emit derives from the live effect mask; used only with no backend */
   const char *source;      /* NULL => "aether_alias"; raw VM builtins set "vm_builtin" */
 } AetherBuiltinMeta;
 
@@ -312,6 +312,15 @@ static const AetherBuiltinMeta kAetherBuiltinMeta[] = {
     {"read_lines", "aether_read_lines", "function", "Text[]",
      "read_lines(path: Text) -> Text[]",
      "The file's lines without their line breaks.", "filesystem", true},
+    {"try_read_file", NULL, "function", "(Text, Bool)",
+     "try_read_file(path: Text) -> (Text, Bool)",
+     "(text, ok): ok is false (text \"\") when the file cannot be read; never a run-time error.", "filesystem", true},
+    {"try_read_lines", NULL, "function", "(Text[], Bool)",
+     "try_read_lines(path: Text) -> (Text[], Bool)",
+     "(lines, ok): ok is false (lines []) when the file cannot be read; never a run-time error.", "filesystem", true},
+    {"try_toon_parse_file", NULL, "function", "(ToonDoc, Bool)",
+     "try_toon_parse_file(path: Text) -> (ToonDoc, Bool)",
+     "(doc, ok): ok is false when the file cannot be read or is not JSON; doc is then JSON null (close it as usual).", "filesystem", true},
     {"write_file", "aether_write_file", "procedure", "Void",
      "write_file(path: Text, text: Text) -> Void",
      "Create or truncate the file and write text.", "filesystem", true},
@@ -723,10 +732,13 @@ static bool appendAetherMetaObject(JsonText *json,
   if (!jsonTextAppendEscaped(json, meta->category)) return false;
   if (!jsonTextAppend(json, ",\"effectful\":")) return false;
   /* An alias is as effectful as the builtin it names (file_exists ->
-   * fileexists); the alias itself is not registered. */
+   * fileexists); the alias itself is not registered. A front-end helper with
+   * no engine builtin of its own (try_read_file, a declared fn over hidden
+   * builtins) has nothing live to ask, so its entry's flag stands. */
   bool effectful = pscalBuiltinNameEffectMaskLive(meta->aether_name) != FX_PURE ||
                    (meta->backend_name &&
-                    pscalBuiltinNameEffectMaskLive(meta->backend_name) != FX_PURE);
+                    pscalBuiltinNameEffectMaskLive(meta->backend_name) != FX_PURE) ||
+                   (!meta->backend_name && meta->effectful);
   if (!jsonTextAppend(json, effectful ? "true" : "false")) return false;
   if (!jsonTextAppend(json, ",\"return_type\":")) return false;
   if (!jsonTextAppendEscaped(json, meta->return_type)) return false;

@@ -354,6 +354,35 @@ static Value vmBuiltinYyjsonReadFile(struct VM_s *vm, int arg_count, Value *args
     return makeInt(handle);
 }
 
+/* D73 checked I/O, the hidden half of try_toon_parse_file: never a runtime
+ * error for a missing file or bad JSON. A failure records ok = false and still
+ * returns a usable document (JSON `null`), so toon_root / toon_close and every
+ * accessor degrade instead of stopping the program. */
+static Value vmBuiltinAetherTryToonReadFile(struct VM_s *vm, int arg_count, Value *args) {
+    pscalAetherSetLastIoOk(false);
+    if (arg_count != 1 || !isPascalStringType(VALUE_TYPE(args[0]))) {
+        runtimeError(vm, "try_toon_parse_file expects a single Text path.");
+        return makeInt(YYJSON_UNUSED_HANDLE);
+    }
+    const char *path = AS_STRING(args[0]) ? AS_STRING(args[0]) : "";
+    yyjson_read_err err;
+    yyjson_doc *doc = yyjson_read_file(path, 0, NULL, &err);
+    bool ok = doc != NULL;
+    if (!doc) doc = yyjson_read("null", 4, 0);
+    if (!doc) {
+        runtimeError(vm, "try_toon_parse_file: unable to allocate a document.");
+        return makeInt(YYJSON_UNUSED_HANDLE);
+    }
+    int handle = jsonAllocDocHandle(doc);
+    if (handle == YYJSON_UNUSED_HANDLE) {
+        yyjson_doc_free(doc);
+        runtimeError(vm, "try_toon_parse_file: unable to allocate document handle.");
+        return makeInt(YYJSON_UNUSED_HANDLE);
+    }
+    pscalAetherSetLastIoOk(ok);
+    return makeInt(handle);
+}
+
 static Value vmBuiltinYyjsonDocFree(struct VM_s *vm, int arg_count, Value *args) {
     (void)vm;
     if (arg_count != 1 || !IS_INTLIKE(args[0])) {
@@ -861,6 +890,11 @@ static Value vmBuiltinYyjsonGetBoolOr(struct VM_s *vm, int arg_count, Value *arg
 
 void registerYyjsonReadBuiltin(void) {
     registerVmBuiltin("yyjsonread", vmBuiltinYyjsonRead, BUILTIN_TYPE_FUNCTION, "YyjsonRead", FX_PURE);
+}
+
+void registerAetherTryToonReadFileBuiltin(void) {
+    registerVmBuiltin("aether_try_toon_read_file", vmBuiltinAetherTryToonReadFile,
+                      BUILTIN_TYPE_FUNCTION, NULL, FX_IO);
 }
 
 void registerYyjsonReadFileBuiltin(void) {

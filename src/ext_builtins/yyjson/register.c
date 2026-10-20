@@ -3,6 +3,7 @@
 
 void registerYyjsonReadBuiltin(void);
 void registerYyjsonReadFileBuiltin(void);
+void registerAetherTryToonReadFileBuiltin(void);
 void registerYyjsonDocFreeBuiltin(void);
 void registerYyjsonFreeValueBuiltin(void);
 void registerYyjsonGetRootBuiltin(void);
@@ -69,4 +70,6 @@ void registerYyjsonBuiltins(void) {
     registerYyjsonGetIntOrBuiltin();
     registerYyjsonGetNumberOrBuiltin();
     registerYyjsonGetBoolOrBuiltin();
+    /* Checked I/O (D73), appended last so no earlier id moves. */
+    registerAetherTryToonReadFileBuiltin();
 }

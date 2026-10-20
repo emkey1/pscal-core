@@ -2138,6 +2138,16 @@ void freeFieldValue(FieldValue *fv) {
 }
 
 // Value constructors
+static PSCAL_THREAD_LOCAL bool s_aetherLastIoOk = false;
+
+void pscalAetherSetLastIoOk(bool ok) {
+    s_aetherLastIoOk = ok;
+}
+
+bool pscalAetherLastIoOk(void) {
+    return s_aetherLastIoOk;
+}
+
 Value makeInt(long long val) {
     Value v;
     memset(&v, 0, sizeof(Value)); // Initialize all fields to 0/NULL

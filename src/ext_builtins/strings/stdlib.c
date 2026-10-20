@@ -1109,10 +1109,12 @@ static const char *stdErrnoText(int err) {
     }
 }
 
-static bool stdReadWholeFile(VM *vm, const char *who, const char *path, StdBuf *b) {
+/* Read a whole file into b. `quiet` (the try_ helpers, D73) reports nothing and
+ * just returns false; otherwise a failure is a runtime error. */
+static bool stdReadWholeFileQ(VM *vm, const char *who, const char *path, StdBuf *b, bool quiet) {
     FILE *f = fopen(path, "rb");
     if (!f) {
-        runtimeError(vm, "%s: cannot open '%s': %s.", who, path, stdErrnoText(errno));
+        if (!quiet) runtimeError(vm, "%s: cannot open '%s': %s.", who, path, stdErrnoText(errno));
         return false;
     }
     char chunk[65536];
@@ -1123,7 +1125,7 @@ static bool stdReadWholeFile(VM *vm, const char *who, const char *path, StdBuf *
             fclose(f);
             free(b->data);
             b->data = NULL;
-            runtimeError(vm, "%s: '%s' is too large.", who, path);
+            if (!quiet) runtimeError(vm, "%s: '%s' is too large.", who, path);
             return false;
         }
     }
@@ -1133,10 +1135,14 @@ static bool stdReadWholeFile(VM *vm, const char *who, const char *path, StdBuf *
     if (bad) {
         free(b->data);
         b->data = NULL;
-        runtimeError(vm, "%s: cannot read '%s': %s.", who, path, stdErrnoText(err));
+        if (!quiet) runtimeError(vm, "%s: cannot read '%s': %s.", who, path, stdErrnoText(err));
         return false;
     }
     return true;
+}
+
+static bool stdReadWholeFile(VM *vm, const char *who, const char *path, StdBuf *b) {
+    return stdReadWholeFileQ(vm, who, path, b, false);
 }
 
 static const char *stdPathArg(VM *vm, Value *v, const char *who, char scratch5[5]) {
@@ -1158,20 +1164,11 @@ static Value vmBuiltinStdReadFile(struct VM_s *vm, int arg_count, Value *args) {
     return stdBufToText(&b);
 }
 
-/* read_lines(path): the file's lines without their "\n" or "\r\n"; a final
- * line break does not start an extra empty line. */
-static Value vmBuiltinStdReadLines(struct VM_s *vm, int arg_count, Value *args) {
-    if (arg_count != 1) {
-        runtimeError(vm, "read_lines expects 1 argument (path).");
-        return stdNewArray(0, TYPE_UNICODE_STRING, NULL);
-    }
-    char pb[5];
-    const char *path = stdPathArg(vm, &args[0], "read_lines", pb);
-    if (!path) return stdNewArray(0, TYPE_UNICODE_STRING, NULL);
-    StdBuf b = {0};
-    if (!stdReadWholeFile(vm, "read_lines", path, &b)) {
-        return stdNewArray(0, TYPE_UNICODE_STRING, NULL);
-    }
+/* The lines of a file read into b (consumed), or *ok = false when there are
+ * too many (an error unless quiet). */
+static Value stdLinesFromBuf(VM *vm, const char *path, StdBuf *bp, bool quiet, bool *ok) {
+    StdBuf b = *bp;
+    *ok = true;
     const char *data = b.data ? b.data : "";
     size_t len = b.len;
     int lines = 0;
@@ -1179,7 +1176,8 @@ static Value vmBuiltinStdReadLines(struct VM_s *vm, int arg_count, Value *args) 
     if (len > 0 && data[len - 1] != '\n') lines++;
     if (lines > 2000000) {
         free(b.data);
-        runtimeError(vm, "read_lines: '%s' has too many lines.", path);
+        if (!quiet) runtimeError(vm, "read_lines: '%s' has too many lines.", path);
+        *ok = false;
         return stdNewArray(0, TYPE_UNICODE_STRING, NULL);
     }
     Value out = stdNewArray(lines, TYPE_UNICODE_STRING, NULL);
@@ -1195,6 +1193,70 @@ static Value vmBuiltinStdReadLines(struct VM_s *vm, int arg_count, Value *args) 
     }
     free(b.data);
     return out;
+}
+
+/* read_lines(path): the file's lines without their "\n" or "\r\n"; a final
+ * line break does not start an extra empty line. */
+static Value vmBuiltinStdReadLines(struct VM_s *vm, int arg_count, Value *args) {
+    if (arg_count != 1) {
+        runtimeError(vm, "read_lines expects 1 argument (path).");
+        return stdNewArray(0, TYPE_UNICODE_STRING, NULL);
+    }
+    char pb[5];
+    const char *path = stdPathArg(vm, &args[0], "read_lines", pb);
+    if (!path) return stdNewArray(0, TYPE_UNICODE_STRING, NULL);
+    StdBuf b = {0};
+    if (!stdReadWholeFile(vm, "read_lines", path, &b)) {
+        return stdNewArray(0, TYPE_UNICODE_STRING, NULL);
+    }
+    bool ok;
+    return stdLinesFromBuf(vm, path, &b, false, &ok);
+}
+
+/* D73 checked I/O, the hidden halves of try_read_file / try_read_lines (the
+ * Aether prelude pairs each with aether_last_io_ok): never a runtime error for
+ * a missing, unreadable or oversized file -- "" or [] and the flag false. */
+static Value vmBuiltinStdTryReadFileText(struct VM_s *vm, int arg_count, Value *args) {
+    pscalAetherSetLastIoOk(false);
+    if (arg_count != 1) {
+        runtimeError(vm, "try_read_file expects 1 argument (path).");
+        return stdTextValue("");
+    }
+    char pb[5];
+    const char *path = stdPathArg(vm, &args[0], "try_read_file", pb);
+    if (!path) return stdTextValue("");
+    StdBuf b = {0};
+    if (!stdReadWholeFileQ(vm, "try_read_file", path, &b, true)) return stdTextValue("");
+    pscalAetherSetLastIoOk(true);
+    return stdBufToText(&b);
+}
+
+static Value vmBuiltinStdTryReadLinesList(struct VM_s *vm, int arg_count, Value *args) {
+    pscalAetherSetLastIoOk(false);
+    if (arg_count != 1) {
+        runtimeError(vm, "try_read_lines expects 1 argument (path).");
+        return stdNewArray(0, TYPE_UNICODE_STRING, NULL);
+    }
+    char pb[5];
+    const char *path = stdPathArg(vm, &args[0], "try_read_lines", pb);
+    if (!path) return stdNewArray(0, TYPE_UNICODE_STRING, NULL);
+    StdBuf b = {0};
+    if (!stdReadWholeFileQ(vm, "try_read_lines", path, &b, true)) {
+        return stdNewArray(0, TYPE_UNICODE_STRING, NULL);
+    }
+    bool ok;
+    Value out = stdLinesFromBuf(vm, path, &b, true, &ok);
+    pscalAetherSetLastIoOk(ok);
+    return out;
+}
+
+static Value vmBuiltinStdLastIoOk(struct VM_s *vm, int arg_count, Value *args) {
+    (void)args;
+    if (arg_count != 0) {
+        runtimeError(vm, "aether_last_io_ok expects no arguments.");
+        return makeBoolean(false);
+    }
+    return makeBoolean(pscalAetherLastIoOk());
 }
 
 static Value stdWriteImpl(VM *vm, int arg_count, Value *args, const char *mode, const char *who) {
@@ -1776,4 +1838,8 @@ void registerStdlibBuiltins(void) {
     registerVmBuiltin("aether_map_remove", vmBuiltinStdMapRemove, BUILTIN_TYPE_PROCEDURE, NULL, FX_PURE);
     registerVmBuiltin("aether_map_take", vmBuiltinStdMapTake, BUILTIN_TYPE_PROCEDURE, NULL, FX_PURE);
     registerVmBuiltin("aether_map_put", vmBuiltinStdMapPut, BUILTIN_TYPE_PROCEDURE, NULL, FX_PURE);
+    /* Checked I/O (D73), appended after the maps so no earlier id moves. */
+    registerVmBuiltin("aether_try_read_file_text", vmBuiltinStdTryReadFileText, BUILTIN_TYPE_FUNCTION, NULL, FX_IO);
+    registerVmBuiltin("aether_try_read_lines_list", vmBuiltinStdTryReadLinesList, BUILTIN_TYPE_FUNCTION, NULL, FX_IO);
+    registerVmBuiltin("aether_last_io_ok", vmBuiltinStdLastIoOk, BUILTIN_TYPE_FUNCTION, NULL, FX_IO);
 }

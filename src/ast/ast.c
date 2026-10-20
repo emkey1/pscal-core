@@ -1927,6 +1927,7 @@ VarType getBuiltinReturnType(const char* name) {
     if (strcasecmp(name, "aether_upper") == 0 || strcasecmp(name, "aether_lower") == 0 ||
         strcasecmp(name, "aether_replace") == 0 || strcasecmp(name, "aether_repeat") == 0 ||
         strcasecmp(name, "aether_join") == 0 || strcasecmp(name, "aether_read_file") == 0 ||
+        strcasecmp(name, "aether_try_read_file_text") == 0 ||
         strcasecmp(name, "aether_read_line") == 0 || strcasecmp(name, "aether_read_all_stdin") == 0 ||
         strcasecmp(name, "aether_now_text") == 0) {
         return TYPE_STRING;
@@ -1938,7 +1939,7 @@ VarType getBuiltinReturnType(const char* name) {
         strcasecmp(name, "aether_is_digit") == 0 || strcasecmp(name, "aether_is_alpha") == 0 ||
         strcasecmp(name, "aether_is_alnum") == 0 || strcasecmp(name, "aether_is_space") == 0 ||
         strcasecmp(name, "aether_is_upper") == 0 || strcasecmp(name, "aether_is_lower") == 0 ||
-        strcasecmp(name, "aether_same") == 0) {
+        strcasecmp(name, "aether_same") == 0 || strcasecmp(name, "aether_last_io_ok") == 0) {
         return TYPE_BOOLEAN;
     }
     if (strcasecmp(name, "aether_index_of") == 0 || strcasecmp(name, "aether_count") == 0 ||
