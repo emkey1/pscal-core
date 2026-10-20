@@ -11355,7 +11355,11 @@ comparison_error_label:
                     return INTERPRET_RUNTIME_ERROR;
                 }
 
-                if (!gTextAttrInitialized &&
+                // Cheap first-letter test before the four compares: until
+                // TextAttr is first touched (for most programs, never) they
+                // ran on every global read.
+                if (!gTextAttrInitialized && sym->name &&
+                    ((sym->name[0] | 0x20) == 't' || (sym->name[0] | 0x20) == 'c') &&
                     (strcasecmp(sym->name, "CRT.TextAttr") == 0 ||
                      strcasecmp(sym->name, "TextAttr") == 0 ||
                      strcasecmp(sym->name, "crt.textattr") == 0 ||
