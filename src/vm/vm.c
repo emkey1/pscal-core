@@ -12399,11 +12399,23 @@ comparison_error_label:
                     freeValue(&popped_tid);
                     return INTERPRET_RUNTIME_ERROR;
                 }
-                if (!vmThreadTakeResult(vm, tid, NULL, true, NULL, true)) {
+                bool joined_ok = true;
+                bool have_status = vmThreadTakeResult(vm, tid, NULL, true, &joined_ok, true);
+                if (!have_status) {
                     joinThreadInternal(vm, tid);
                 }
                 Value popped_tid = pop(vm);
                 freeValue(&popped_tid);
+                // Aether lowers `par` to spawn + join and has no way to ask a
+                // thread's status, so a branch that failed (its runtime error
+                // already printed) must fail the program here, as the same
+                // call would have run sequentially. Other front ends keep
+                // join's discard-the-status contract and ask ThreadGetStatus.
+                if (have_status && !joined_ok && frontendIsAether()) {
+                    vm->abort_requested = true;
+                    vm->runtime_error_raised = true;
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 break;
             }
             case MUTEX_CREATE: {
