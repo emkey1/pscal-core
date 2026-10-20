@@ -1301,6 +1301,7 @@ StringObj *pscalStringObjCreate(int max_length, VarType owner_type) {
     pscalObjHeaderInit(&s->header, owner_type);
     s->max_length = max_length;
     s->buffer = NULL;
+    atomic_init(&s->pins, 0u);
     return s;
 }
 
@@ -2993,6 +2994,29 @@ Value makeRetainedArrayElementPointer(void* address, AST* base_type_node, ArrayO
     return v;
 }
 
+Value makeStringCharPointer(Value* string_val, size_t index, bool index_is_codepoint, char* address) {
+    Value v = makePointer(address, STRING_CHAR_PTR_SENTINEL);
+    StringObj *s = (string_val && isPascalStringType(string_val->type))
+                       ? PSCAL_VALUE_PTR(*string_val, StringObj)
+                       : NULL;
+    if (s) {
+        PointerObj *po = PSCAL_VALUE_PTR(v, PointerObj);
+        pscalObjRetain(&s->header);
+        atomic_fetch_add_explicit(&s->pins, 1u, memory_order_relaxed);
+        po->retained_string = s;
+        po->string_index = index;
+        po->string_index_is_codepoint = index_is_codepoint;
+    }
+    return v;
+}
+
+// Drops a character pointer's pin and reference (see StringObj.pins).
+static void releaseStringCharPin(StringObj *s) {
+    if (!s) return;
+    atomic_fetch_sub_explicit(&s->pins, 1u, memory_order_relaxed);
+    pscalObjRelease(&s->header);
+}
+
 // VM 2.0 Phase 4b (Docs/pscal_vm2_plan.md §5.10.4/§5.10.3): ClosureEnvPayload
 // already carried its own ad hoc refcount; this routes it through the
 // generic ObjHeader mechanism instead. One destructor, registered under
@@ -3305,6 +3329,10 @@ void freeValue(Value *v) {
                     pscalObjRelease(&po->retained_array->header);
                     pthread_mutex_unlock(&dynamic_array_refcount_mutex);
                     po->retained_array = NULL;
+                }
+                if (po->retained_string) {
+                    releaseStringCharPin(po->retained_string);
+                    po->retained_string = NULL;
                 }
                 pscalObjRelease(&po->header);
             }
@@ -4786,6 +4814,15 @@ Value makeCopyOfValue(const Value *src) {
                 pthread_mutex_unlock(&dynamic_array_refcount_mutex);
                 po->retained_array = src_retained_array;
             }
+            // Same for a pinned string character pointer
+            // (PointerObj.retained_string): each copy holds its own pin.
+            if (src_po && src_po->retained_string) {
+                pscalObjRetain(&src_po->retained_string->header);
+                atomic_fetch_add_explicit(&src_po->retained_string->pins, 1u, memory_order_relaxed);
+                po->retained_string = src_po->retained_string;
+                po->string_index = src_po->string_index;
+                po->string_index_is_codepoint = src_po->string_index_is_codepoint;
+            }
             break;
         }
         case TYPE_FILE:
@@ -4846,11 +4883,15 @@ void valueEnsureUnique(Value *target) {
     pthread_mutex_lock(&value_cell_mutex);
 
     ObjHeader *hdr = NULL;
+    uint32_t pins = 0;
     switch (target->type) {
         case TYPE_STRING:
         case TYPE_UNICODE_STRING: {
             StringObj *s = PSCAL_VALUE_PTR(*target, StringObj);
-            if (s) hdr = &s->header;
+            if (s) {
+                hdr = &s->header;
+                pins = atomic_load_explicit(&s->pins, memory_order_acquire);
+            }
             break;
         }
         case TYPE_SET: {
@@ -4902,7 +4943,9 @@ void valueEnsureUnique(Value *target) {
             break;
     }
 
-    if (hdr && atomic_load_explicit(&hdr->refcount, memory_order_acquire) > 1) {
+    // Character pointers into a string (`pins`) keep it alive without
+    // owning its text; only another Value sharing it forces the clone.
+    if (hdr && atomic_load_explicit(&hdr->refcount, memory_order_acquire) > 1u + pins) {
         Value fresh = makeCopyOfValue(target);
         freeValue(target);
         *target = fresh;

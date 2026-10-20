@@ -882,6 +882,161 @@ static Value* resolveRecordForField(VM* vm, Value* base_val_ptr) {
     return record_struct_ptr;
 }
 
+static bool vmResolveStringIndex(VM* vm, long long raw_index, size_t len, size_t* out_offset,
+                                 bool allow_length_query, bool* out_length_query);
+
+// The byte a STRING_CHAR_PTR_SENTINEL pointer names. One made by
+// makeStringCharPointer re-indexes its pinned StringObj's current buffer, with
+// a bounds check: the string may have been reassigned (the pin keeps the old
+// one alive) or shortened in place since the address was taken. A raw one
+// made elsewhere uses its address. Reports and returns NULL when there is no
+// such character any more.
+static char* vmStringCharTarget(VM* vm, const Value* pointer, const char* null_message) {
+    PointerObj* po = PSCAL_VALUE_PTR(*pointer, PointerObj);
+    if (!po || !po->retained_string) {
+        char* addr = po ? (char*)po->address : NULL;
+        if (!addr) {
+            runtimeError(vm, "%s", null_message);
+        }
+        return addr;
+    }
+    char* buf = po->retained_string->buffer;
+    // memchr finds a terminator at or before string_index iff the string
+    // is now too short to hold that character.
+    if (!buf || memchr(buf, '\0', po->string_index + 1) != NULL) {
+        runtimeError(vm, "Runtime Error: String index out of range: the string was shortened after the character was addressed.");
+        return NULL;
+    }
+    return buf + po->string_index;
+}
+
+// Byte span of character `index` of a UnicodeString's UTF-8 `buf`. Text that is
+// all ASCII or not valid UTF-8 is indexed by byte, like utf8CodepointCount and
+// GET_CHAR_FROM_STRING do.
+static bool vmUnicodeCharSpan(const char* buf, size_t index, size_t* out_offset, size_t* out_len) {
+    size_t blen = strlen(buf);
+    if (utf8CodepointCount(buf, blen) == blen) {
+        if (index >= blen) return false;
+        *out_offset = index;
+        *out_len = 1;
+        return true;
+    }
+    size_t offset = utf8ByteOffsetForCodepointIndex(buf, blen, index);
+    if (offset >= blen) return false;
+    uint32_t codepoint = 0;
+    size_t advance = 1;
+    if (!decodeUtf8Codepoint(buf + offset, blen - offset, &codepoint, &advance)) {
+        advance = 1;
+    }
+    *out_offset = offset;
+    *out_len = advance;
+    return true;
+}
+
+// Reads the character a code-point-indexed (UnicodeString) char pointer names.
+static bool vmLoadUnicodeChar(VM* vm, const PointerObj* po, Value* out) {
+    const char* buf = po->retained_string->buffer;
+    size_t offset = 0, len = 0;
+    if (!buf || !vmUnicodeCharSpan(buf, po->string_index, &offset, &len)) {
+        runtimeError(vm, "Runtime Error: String index out of range: the string was shortened after the character was addressed.");
+        return false;
+    }
+    uint32_t codepoint = 0;
+    size_t advance = 0;
+    if (!decodeUtf8Codepoint(buf + offset, len, &codepoint, &advance)) {
+        codepoint = (unsigned char)buf[offset];
+    }
+    *out = makeWideChar((int)codepoint);
+    return true;
+}
+
+// Stores `value` as character po->string_index of a UnicodeString: encodes it
+// as UTF-8 and splices it over the old character's bytes (their lengths can
+// differ), so the text stays valid UTF-8.
+static bool vmStoreUnicodeChar(VM* vm, PointerObj* po, const Value* value) {
+    uint32_t codepoint = 0;
+    if (VALUE_TYPE(*value) == TYPE_CHAR) {
+        codepoint = (unsigned char)AS_CHAR(*value);
+    } else if (VALUE_TYPE(*value) == TYPE_WIDECHAR) {
+        long long wide = AS_CHAR(*value);
+        if (wide < 0 || wide > 0x10FFFF) {
+            runtimeError(vm, "VM Error: Invalid character code point %lld.", wide);
+            return false;
+        }
+        codepoint = (uint32_t)wide;
+    } else if (isPascalStringType(VALUE_TYPE(*value)) && AS_STRING(*value)) {
+        const char* text = AS_STRING(*value);
+        size_t text_len = strlen(text);
+        size_t advance = 0;
+        if (text_len == 0 || !decodeUtf8Codepoint(text, text_len, &codepoint, &advance) || advance != text_len) {
+            runtimeError(vm, "VM Error: Cannot assign multi-character or empty string to a single character location.");
+            return false;
+        }
+    } else {
+        runtimeError(vm, "VM Error: Type mismatch for character assignment. Expected CHAR or single-char STRING, got %s.",
+                     varTypeToString(VALUE_TYPE(*value)));
+        return false;
+    }
+
+    StringObj* so = po->retained_string;
+    size_t offset = 0, old_len = 0;
+    if (!so->buffer || !vmUnicodeCharSpan(so->buffer, po->string_index, &offset, &old_len)) {
+        runtimeError(vm, "Runtime Error: String index out of range: the string was shortened after the character was addressed.");
+        return false;
+    }
+    char encoded[5] = {0};
+    size_t encoded_len = encodeUtf8Codepoint(codepoint, encoded);
+    if (encoded_len == old_len) {
+        memcpy(so->buffer + offset, encoded, encoded_len);
+        return true;
+    }
+    size_t old_total = strlen(so->buffer);
+    size_t new_total = old_total - old_len + encoded_len;
+    if (so->max_length > 0 && new_total > (size_t)so->max_length) {
+        runtimeError(vm, "Runtime Error: Character does not fit in string[%d].", so->max_length);
+        return false;
+    }
+    // A string[N] buffer keeps its N+1 capacity; other code writes up to it.
+    size_t capacity = (so->max_length > 0 && (size_t)so->max_length > new_total) ? (size_t)so->max_length : new_total;
+    char* spliced = (char*)calloc(capacity + 1, 1);
+    if (!spliced) {
+        runtimeError(vm, "VM Error: Out of memory writing a string character.");
+        return false;
+    }
+    memcpy(spliced, so->buffer, offset);
+    memcpy(spliced + offset, encoded, encoded_len);
+    memcpy(spliced + offset + encoded_len, so->buffer + offset + old_len, old_total - offset - old_len);
+    free(so->buffer);
+    so->buffer = spliced;
+    return true;
+}
+
+// Character `raw_index` (as the program wrote it) of the string in
+// *string_val, as a pinned char pointer (makeStringCharPointer): bounds-
+// checked by byte, or by code point for a UnicodeString. Pushes it, or a
+// STRING_LENGTH_SENTINEL pointer for Pascal's s[0], and returns false after
+// reporting an out-of-range index. The string must already be unique.
+static bool vmPushStringCharAddress(VM* vm, Value* string_val, long long raw_index, bool allow_length_query) {
+    const char* str = AS_STRING(*string_val) ? AS_STRING(*string_val) : "";
+    size_t byte_len = strlen(str);
+    bool unicode = VALUE_TYPE(*string_val) == TYPE_UNICODE_STRING;
+    size_t len = unicode ? utf8CodepointCount(str, byte_len) : byte_len;
+    size_t char_offset = 0;
+    bool wants_length = false;
+    if (!vmResolveStringIndex(vm, raw_index, len, &char_offset, allow_length_query, &wants_length)) {
+        return false;
+    }
+    if (!frontendIsZeroBasedStrings() && wants_length) {
+        push(vm, makePointer(string_val, STRING_LENGTH_SENTINEL));
+        return true;
+    }
+    size_t byte_offset = (unicode && len != byte_len)
+                             ? utf8ByteOffsetForCodepointIndex(str, byte_len, char_offset)
+                             : char_offset;
+    push(vm, makeStringCharPointer(string_val, char_offset, unicode, &AS_STRING(*string_val)[byte_offset]));
+    return true;
+}
+
 static AST* vmResolveTypeAlias(AST* type_node) {
     AST* last = NULL;
     while (type_node && type_node != last) {
@@ -8181,22 +8336,18 @@ dispatch_switch:
                 freeValue(&index_val);
 
                 Value* string_val = (Value*)AS_POINTER(*string_ptr_val);
-                const char* str = AS_STRING(*string_val) ? AS_STRING(*string_val) : "";
-                size_t len = strlen(str);
-
-                size_t char_offset = 0;
-                if (!vmResolveStringIndex(vm, pscal_index, len, &char_offset, false, NULL)) {
-                    return INTERPRET_RUNTIME_ERROR;
-                }
 
                 // VM 2.0 Phase 4j (Stage B): see the matching comment in
                 // GET_ELEMENT_ADDRESS.
                 valueEnsureUnique(string_val);
 
+                // Pin the character before releasing the base pointer.
                 Value popped_string_ptr = pop(vm);
+                bool pushed = vmPushStringCharAddress(vm, string_val, pscal_index, false);
                 freeValue(&popped_string_ptr);
-
-                push(vm, makePointer(&AS_STRING(*string_val)[char_offset], STRING_CHAR_PTR_SENTINEL));
+                if (!pushed) {
+                    return INTERPRET_RUNTIME_ERROR;
+                }
                 break;
             }
             // GET_GLOBAL_ADDRESS/GET_GLOBAL_ADDRESS16 (0x24/0x27) are
@@ -9232,27 +9383,13 @@ comparison_error_label:
                         // copyValueForStack retain-share.
                         valueEnsureUnique(base_val);
 
-                        size_t len = AS_STRING(*base_val) ? strlen(AS_STRING(*base_val)) : 0;
-                        size_t char_offset = 0;
-                        bool wants_length = false;
-                        if (!vmResolveStringIndex(vm,
-                                                  pscal_index,
-                                                  len,
-                                                  &char_offset,
-                                                  true,
-                                                  &wants_length)) {
-                            freeValue(&operand);
+                        // A pinned char pointer (makeStringCharPointer),
+                        // indexed by code point for a UnicodeString.
+                        bool pushed = vmPushStringCharAddress(vm, base_val, pscal_index, true);
+                        freeValue(&operand);
+                        if (!pushed) {
                             return INTERPRET_RUNTIME_ERROR;
                         }
-
-                        if (!frontendIsZeroBasedStrings() && wants_length) {
-                            push(vm, makePointer(base_val, STRING_LENGTH_SENTINEL));
-                            freeValue(&operand);
-                            break;
-                        }
-
-                        push(vm, makePointer(&AS_STRING(*base_val)[char_offset], STRING_CHAR_PTR_SENTINEL));
-                        freeValue(&operand);
                         break;
                     }
                 }
@@ -9546,7 +9683,9 @@ comparison_error_label:
                     Value* base_val = (Value*)AS_POINTER(operand);
                     if (base_val && isPascalStringType(VALUE_TYPE(*base_val))) {
                         const char* str = AS_STRING(*base_val) ? AS_STRING(*base_val) : "";
-                        size_t len = strlen(str);
+                        size_t byte_len = strlen(str);
+                        bool unicode = VALUE_TYPE(*base_val) == TYPE_UNICODE_STRING;
+                        size_t len = unicode ? utf8CodepointCount(str, byte_len) : byte_len;
 
                         if ((size_t)flat_offset >= len) {
                             unsigned long long display_index = vmDisplayIndexFromOffset(flat_offset);
@@ -9561,7 +9700,11 @@ comparison_error_label:
                         // in GET_ELEMENT_ADDRESS.
                         valueEnsureUnique(base_val);
 
-                        push(vm, makePointer(&AS_STRING(*base_val)[flat_offset], STRING_CHAR_PTR_SENTINEL));
+                        // A pinned char pointer, as in GET_ELEMENT_ADDRESS.
+                        size_t byte_offset = (unicode && len != byte_len)
+                                                 ? utf8ByteOffsetForCodepointIndex(AS_STRING(*base_val), byte_len, flat_offset)
+                                                 : (size_t)flat_offset;
+                        push(vm, makeStringCharPointer(base_val, flat_offset, unicode, &AS_STRING(*base_val)[byte_offset]));
                         freeValue(&operand);
                         break;
                     }
@@ -10166,9 +10309,21 @@ comparison_error_label:
 
                 if (PTR_BASE_TYPE_NODE(pointer_to_lvalue) == STRING_CHAR_PTR_SENTINEL ||
                     PTR_BASE_TYPE_NODE(pointer_to_lvalue) == SERIALIZED_CHAR_PTR_SENTINEL) {
-                    char* char_target_addr = (char*)AS_POINTER(pointer_to_lvalue);
+                    PointerObj* char_po = PSCAL_VALUE_PTR(pointer_to_lvalue, PointerObj);
+                    if (char_po && char_po->retained_string && char_po->string_index_is_codepoint) {
+                        // A UnicodeString character: re-encoded and spliced
+                        // in, since its UTF-8 length can change.
+                        bool stored = vmStoreUnicodeChar(vm, char_po, &value_to_set);
+                        freeValue(&value_to_set);
+                        freeValue(&pointer_to_lvalue);
+                        if (!stored) {
+                            return INTERPRET_RUNTIME_ERROR;
+                        }
+                        break;
+                    }
+                    char* char_target_addr = vmStringCharTarget(vm, &pointer_to_lvalue,
+                                                                "VM Error: Attempting to assign to a NULL character address.");
                     if (char_target_addr == NULL) {
-                        runtimeError(vm, "VM Error: Attempting to assign to a NULL character address.");
                         freeValue(&value_to_set);
                         freeValue(&pointer_to_lvalue);
                         return INTERPRET_RUNTIME_ERROR;
@@ -10621,13 +10776,23 @@ comparison_error_label:
                 if (PTR_BASE_TYPE_NODE(pointer_val) == STRING_CHAR_PTR_SENTINEL ||
                     PTR_BASE_TYPE_NODE(pointer_val) == SERIALIZED_CHAR_PTR_SENTINEL) {
                     // Special case: pointer into a string's character buffer.
-                    char* char_target_addr = (char*)AS_POINTER(pointer_val);
-                    if (char_target_addr == NULL) {
-                        runtimeError(vm, "VM Error: Attempting to dereference a NULL character address.");
-                        freeValue(&pointer_val);
-                        return INTERPRET_RUNTIME_ERROR;
+                    PointerObj* char_po = PSCAL_VALUE_PTR(pointer_val, PointerObj);
+                    if (char_po && char_po->retained_string && char_po->string_index_is_codepoint) {
+                        Value ch;
+                        if (!vmLoadUnicodeChar(vm, char_po, &ch)) {
+                            freeValue(&pointer_val);
+                            return INTERPRET_RUNTIME_ERROR;
+                        }
+                        push(vm, ch);
+                    } else {
+                        char* char_target_addr = vmStringCharTarget(vm, &pointer_val,
+                                                                    "VM Error: Attempting to dereference a NULL character address.");
+                        if (char_target_addr == NULL) {
+                            freeValue(&pointer_val);
+                            return INTERPRET_RUNTIME_ERROR;
+                        }
+                        push(vm, makeChar(*char_target_addr));
                     }
-                    push(vm, makeChar(*char_target_addr));
                 } else if (PTR_BASE_TYPE_NODE(pointer_val) == BYTE_ARRAY_PTR_SENTINEL) {
                     uint8_t* byte_target_addr = (uint8_t*)AS_POINTER(pointer_val);
                     if (byte_target_addr == NULL) {

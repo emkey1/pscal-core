@@ -378,7 +378,8 @@ Value makeNil(void);
 // GET_FIELD_ADDRESS/16/_KEEP/16, and the string-char-address sites.
 // Read-only value loads (LOAD_ELEMENT_VALUE, LOAD_FIELD_VALUE*) never take
 // such an address to begin with, so they never need to call this.
-// If `target`'s underlying object is shared (ObjHeader.refcount > 1),
+// If `target`'s underlying object is shared (ObjHeader.refcount > 1, not
+// counting character pointers pinning a string -- see StringObj.pins),
 // clones it via makeCopyOfValue so the caller-about-to-mutate has a
 // private copy; a no-op otherwise (unique already, or not a CoW-eligible
 // type). TYPE_ARRAY with is_dynamic==true and TYPE_FILE are permanent
@@ -418,6 +419,12 @@ Value makePointer(void* address, AST* base_type_node); // <<< ADD THIS PROTOTYPE
 // long as this pointer is, even across a concurrent SetLength() on the same
 // array. See PointerObj.retained_array's comment (core/types.h).
 Value makeRetainedArrayElementPointer(void* address, AST* base_type_node, struct ArrayObj* owner);
+// A STRING_CHAR_PTR_SENTINEL pointer to character `index` (a byte offset, or
+// a code point index when `index_is_codepoint`) of the string in
+// `*string_val`, at raw `address`. Retains and pins the string's StringObj
+// (see PointerObj.retained_string) so the character stays addressable for as
+// long as the pointer lives, whatever later happens to `*string_val`.
+Value makeStringCharPointer(Value* string_val, size_t index, bool index_is_codepoint, char* address);
 Value makeString(const char *val);
 Value makeStringLen(const char *val, size_t len);
 Value makeChar(int c);
