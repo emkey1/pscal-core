@@ -4739,6 +4739,22 @@ static pthread_mutex_t vm_term_mutex = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local int vm_raw_mode = 0;
 static _Thread_local int vm_alt_screen_depth = 0; // Track nested alternate screen buffers
 
+/* What the signal handlers put back, captured outside signal context. A
+ * handler may only make async-signal-safe calls (tcsetattr, write, sigaction,
+ * raise, _exit): the old one ran vmAtExitCleanup, which takes vm_term_mutex
+ * (a deadlock if the signal lands while it is held), fcloses the fx journal
+ * and calls getenv/fprintf. Set with vm_term_mutex held. */
+static struct termios g_vm_signal_termios;
+static volatile sig_atomic_t g_vm_signal_termios_valid = 0;
+
+static void vmNoteSignalTermios(void) {
+    if (!g_vm_signal_termios_valid) {
+        g_vm_signal_termios = vm_orig_termios;
+        atomic_signal_fence(memory_order_seq_cst);
+        g_vm_signal_termios_valid = 1;
+    }
+}
+
 typedef struct {
     char fg[32];
     char bg[32];
@@ -4779,9 +4795,19 @@ static pthread_key_t vm_thread_cleanup_key;
 static pthread_once_t vm_thread_cleanup_key_once = PTHREAD_ONCE_INIT;
 static pthread_once_t vm_restore_once = PTHREAD_ONCE_INIT;
 
+static void vmRestoreTerminal(void);
+
+/* A thread that set up the terminal handlers is exiting. It undoes raw mode
+ * it set itself (vm_raw_mode is per thread) and nothing else: this used to
+ * run the whole exit cleanup, so any worker thread finishing ended the
+ * process-wide fx record/replay session and took the terminal out of raw
+ * mode under the main thread. The process-level cleanup belongs to
+ * vmExitWithCleanup and the atexit handler. */
 static void vmThreadCleanup(void *unused) {
     (void)unused;
-    vmAtExitCleanup();
+    if (vm_raw_mode) {
+        vmRestoreTerminal();
+    }
 }
 
 static void vmCreateThreadKey(void) {
@@ -4908,6 +4934,7 @@ static void vmRestoreTerminal(void) {
     if (!vm_termios_saved) {
         if (vmTcgetattr(STDIN_FILENO, &vm_orig_termios) == 0) {
             vm_termios_saved = 1;
+            vmNoteSignalTermios();
         }
     }
 
@@ -5086,6 +5113,19 @@ static void vmAtExitCleanup(void) {
     }
 }
 
+/* Put the terminal back the way the program found it, from signal context:
+ * the saved termios and a visible cursor, nothing that is not
+ * async-signal-safe. */
+static void vmSignalRestoreTerminal(void) {
+    if (g_vm_signal_termios_valid) {
+        (void)tcsetattr(STDIN_FILENO, TCSANOW, &g_vm_signal_termios);
+    }
+    if (isatty(STDOUT_FILENO)) {
+        static const char show_cursor[] = "\x1B[?25h";
+        (void)!write(STDOUT_FILENO, show_cursor, sizeof(show_cursor) - 1);
+    }
+}
+
 // Signal handler to ensure terminal state is restored on interrupts.
 static void vmSignalHandler(int signum) {
     if (signum == SIGINT) {
@@ -5096,10 +5136,47 @@ static void vmSignalHandler(int signum) {
         }
         return;
     }
-    if (vm_raw_mode || vm_alt_screen_depth > 0)
-        vmAtExitCleanup();
+    vmSignalRestoreTerminal();
     _exit(128 + signum);
 }
+
+#if !defined(PSCAL_TARGET_IOS)
+/* A crash (SIGSEGV, SIGBUS, SIGABRT) is not turned into a plain exit any
+ * more: that hid it (exit status 139 with no core dump, and no report from
+ * a sanitizer whose handler this one had replaced). The terminal is restored
+ * and the signal goes on to whatever handled it before -- the default action
+ * or a sanitizer -- with its original details: a hardware fault re-faults on
+ * return, a sent signal is raised again. */
+static struct sigaction g_vm_prev_segv_action;
+static struct sigaction g_vm_prev_bus_action;
+static struct sigaction g_vm_prev_abrt_action;
+
+static void vmFatalSignalHandler(int signum, siginfo_t *info, void *context) {
+    (void)context;
+    vmSignalRestoreTerminal();
+    const struct sigaction *prev = (signum == SIGSEGV) ? &g_vm_prev_segv_action
+                                 : (signum == SIGBUS)  ? &g_vm_prev_bus_action
+                                                       : &g_vm_prev_abrt_action;
+    (void)sigaction(signum, prev, NULL);
+#if defined(__APPLE__)
+    /* Darwin fills in a SIGSEGV sent with kill() exactly like a fault
+     * (si_code SEGV_ACCERR, si_pid 0), so the two cannot be told apart.
+     * With the default action behind us, raising is right for both (a real
+     * fault's raised signal is delivered at the faulting instruction as this
+     * handler returns). A handler behind us (a sanitizer) needs the fault's
+     * own details, so a fault is left to re-fault into it; a signal sent
+     * from outside is then absorbed once. */
+    (void)info;
+    bool hardware_fault = (signum == SIGSEGV || signum == SIGBUS) &&
+                          prev->sa_handler != SIG_DFL && prev->sa_handler != SIG_IGN;
+#else
+    bool hardware_fault = (signum == SIGSEGV || signum == SIGBUS) && info && info->si_code > 0;
+#endif
+    if (!hardware_fault) {
+        (void)raise(signum);
+    }
+}
+#endif
 
 static void vmRegisterRestoreHandlers(void) {
     atexit(vmAtExitCleanup);
@@ -5111,8 +5188,17 @@ static void vmRegisterRestoreHandlers(void) {
 #if !defined(PSCAL_TARGET_IOS)
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGQUIT, &sa, NULL);
-    sigaction(SIGABRT, &sa, NULL);
-    sigaction(SIGSEGV, &sa, NULL);
+
+    struct sigaction fatal;
+    memset(&fatal, 0, sizeof(fatal));
+    fatal.sa_sigaction = vmFatalSignalHandler;
+    sigemptyset(&fatal.sa_mask);
+    // SA_ONSTACK: a stack overflow can only be handled on an alternate
+    // signal stack (a sanitizer installs one).
+    fatal.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    sigaction(SIGSEGV, &fatal, &g_vm_prev_segv_action);
+    sigaction(SIGBUS, &fatal, &g_vm_prev_bus_action);
+    sigaction(SIGABRT, &fatal, &g_vm_prev_abrt_action);
 #endif
 }
 
@@ -5124,6 +5210,7 @@ static void vmSetupTermHandlers(void) {
     if (!vm_termios_saved) {
         if (vmTcgetattr(STDIN_FILENO, &vm_orig_termios) == 0) {
             vm_termios_saved = 1;
+            vmNoteSignalTermios();
         }
     }
     pthread_mutex_unlock(&vm_term_mutex);
@@ -5469,6 +5556,7 @@ static void vmEnableRawMode(void) {
             return;
         }
         vm_termios_saved = 1;
+        vmNoteSignalTermios();
     }
     vmLogTermios("raw base", &vm_orig_termios);
 
