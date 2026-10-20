@@ -787,11 +787,20 @@ static bool verifyStackDepths(VCtx* ctx) {
     qsort(addrs, (size_t)addr_count, sizeof(AddrSym), cmpAddrSym);
 
     // Dedupe identical addresses (aliases resolving to the same target, a
-    // procedure at pc 0, a thread entry at a procedure) and drop any that are
-    // not an instruction start of this chunk (stale cross-chunk metadata).
+    // procedure at pc 0, a thread entry at a procedure) and drop any past the
+    // end of the code (stale cross-chunk metadata; the VM refuses a call
+    // there). An address inside the code must be an instruction start: the
+    // VM enters a routine wherever its symbol says (by name, by address, or
+    // through a closure or V-table that resolves to it), and dropping such a
+    // routine here left the bytes it starts on unverified.
     int n = 0;
     for (int i = 0; i < addr_count; i++) {
-        if (addrs[i].addr >= (uint32_t)chunk->count || !ctx->boundary[addrs[i].addr]) continue;
+        if (addrs[i].addr >= (uint32_t)chunk->count) continue;
+        if (!ctx->boundary[addrs[i].addr]) {
+            ok = vfail(ctx, "%s starts at pc %u, which is not an instruction boundary",
+                       entryName(&addrs[i]), addrs[i].addr);
+            goto done;
+        }
         if (n > 0 && addrs[n - 1].addr == addrs[i].addr) continue;
         addrs[n++] = addrs[i];
     }
