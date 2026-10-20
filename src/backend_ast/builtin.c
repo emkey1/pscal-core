@@ -10227,19 +10227,65 @@ Value vmBuiltinMstreamloadfromfile(VM* vm, int arg_count, Value* args) {
         return makeBoolean(0);
     }
 
-    fseek(f, 0, SEEK_END);
-    int size = (int)ftell(f);
-    rewind(f);
-
-    unsigned char* buffer = malloc(size + 1); // +1 for null terminator for safety
+    // Read to end of file rather than trusting ftell for the size: on a pipe
+    // or FIFO (MStreamLoadFromFile(ms, '/dev/stdin')) ftell is -1, which made
+    // this malloc(0) and then fread SIZE_MAX bytes into it. The file size,
+    // when there is one, only sizes the first allocation. MStream sizes are
+    // ints, so a file of 2 GiB or more is refused instead of truncated.
+    size_t capacity = 64 * 1024;
+    if (fseeko(f, 0, SEEK_END) == 0) {
+        off_t end = ftello(f);
+        if (end > 0 && end < (off_t)INT_MAX) {
+            capacity = (size_t)end + 1;
+        }
+        if (fseeko(f, 0, SEEK_SET) != 0) {
+            clearerr(f);
+        }
+    } else {
+        clearerr(f);
+    }
+    unsigned char* buffer = malloc(capacity);
+    size_t size = 0;
+    bool too_large = false;
+    while (buffer) {
+        if (size + 1 >= capacity) {
+            if (capacity >= (size_t)INT_MAX) {
+                too_large = true;
+                break;
+            }
+            size_t new_capacity = capacity * 2;
+            if (new_capacity > (size_t)INT_MAX) new_capacity = (size_t)INT_MAX;
+            unsigned char* grown = realloc(buffer, new_capacity);
+            if (!grown) {
+                free(buffer);
+                buffer = NULL;
+                break;
+            }
+            buffer = grown;
+            capacity = new_capacity;
+        }
+        size_t n = fread(buffer + size, 1, capacity - size - 1, f);
+        size += n;
+        if (n == 0 || feof(f)) {
+            break;
+        }
+        if (size + 1 >= capacity) {
+            // Filled exactly: check for end of file before growing.
+            int c = fgetc(f);
+            if (c == EOF) {
+                break;
+            }
+            ungetc(c, f);
+        }
+    }
     if (!buffer) {
         fclose(f);
         runtimeError(vm, "MStreamLoadFromFile: Memory allocation error for file buffer.");
         return makeBoolean(0);
     }
-    size_t read_bytes = fread(buffer, 1, size, f);
-    if (read_bytes != size) {
-        fprintf(stderr, "MStreamLoadFromFile: short read or read error.\n");
+    if (too_large || ferror(f)) {
+        fprintf(stderr, too_large ? "MStreamLoadFromFile: file is too large (2 GiB or more).\n"
+                                  : "MStreamLoadFromFile: short read or read error.\n");
         free(buffer);
         fclose(f);
         return makeBoolean(0);
@@ -10251,8 +10297,8 @@ Value vmBuiltinMstreamloadfromfile(VM* vm, int arg_count, Value* args) {
     if (ms->buffer) free(ms->buffer);
 
     ms->buffer = buffer;
-    ms->size = size;
-    ms->capacity = size + 1; // Capacity is now exactly what's needed + null
+    ms->size = (int)size;
+    ms->capacity = (int)capacity;
 
     return makeBoolean(1);
 }
@@ -11745,6 +11791,8 @@ Value vmBuiltinTaskCancel(VM* vm, int arg_count, Value* args) {
 // CALLING VM) straight through to vmChannelSend/Receive only so their
 // blocking wait loops can poll cancellation/interrupt state, not to
 // address the channel itself.
+#define VM_CHANNEL_MAX_CAPACITY (1LL << 24)
+
 Value vmBuiltinChannelCreate(VM* vm, int arg_count, Value* args) {
     if (!vm) {
         return makeNil();
@@ -11756,6 +11804,14 @@ Value vmBuiltinChannelCreate(VM* vm, int arg_count, Value* args) {
     long long capacity = asI64(args[0]);
     if (capacity < 1) {
         runtimeError(vm, "ChannelCreate requires capacity >= 1.");
+        return makeNil();
+    }
+    // The buffer is allocated and initialised up front, so an absurd
+    // capacity is refused here rather than exhausting memory (1e9 slots is
+    // 16 GB) or overflowing the size computation.
+    if (capacity > VM_CHANNEL_MAX_CAPACITY) {
+        runtimeError(vm, "ChannelCreate capacity %lld exceeds the maximum of %lld.",
+                     capacity, (long long)VM_CHANNEL_MAX_CAPACITY);
         return makeNil();
     }
     return makeChannel((size_t)capacity);

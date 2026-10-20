@@ -26,6 +26,7 @@
 #include <unistd.h>    // For STDOUT_FILENO
 #include <sys/stat.h>  // For stat
 #include <limits.h>    // For PATH_MAX
+#include <stdint.h>    // For SIZE_MAX
 #include <pthread.h>
 #ifdef __linux__
 #include <linux/limits.h>
@@ -775,7 +776,9 @@ ChannelObj *createChannelObj(size_t capacity) {
     pthread_mutex_init(&ch->lock, NULL);
     pthread_cond_init(&ch->notEmpty, NULL);
     pthread_cond_init(&ch->notFull, NULL);
-    ch->buf = malloc(sizeof(Value) * capacity);
+    // calloc checks capacity * sizeof(Value) for overflow; a capacity of
+    // 2^60 used to wrap to a tiny malloc that the loop below then overran.
+    ch->buf = (capacity <= SIZE_MAX / sizeof(Value)) ? calloc(capacity, sizeof(Value)) : NULL;
     if (!ch->buf) {
         fprintf(stderr, "Memory allocation error in createChannelObj\n");
         EXIT_FAILURE_HANDLER();
