@@ -6407,9 +6407,7 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, VmLineBuf *line) {
 }
 
 static void vmCommitLastIoError(int value) {
-    pthread_mutex_lock(&globals_mutex);
-    last_io_error = value;
-    pthread_mutex_unlock(&globals_mutex);
+    last_io_error = value; // thread-local; no lock needed
 }
 
 static bool vmBufferIsPureDsr(const char *buf, size_t len) {
@@ -7992,6 +7990,17 @@ Value vmBuiltinHigh(VM* vm, int arg_count, Value* args) {
     return makeInt(0);
 }
 
+static AST* gNewIntegerBaseNode = NULL;
+static pthread_once_t gNewIntegerBaseOnce = PTHREAD_ONCE_INIT;
+
+static void newIntegerBaseInit(void) {
+    Token* baseTok = newToken(TOKEN_IDENTIFIER, "integer", 0, 0);
+    AST* baseNode = newASTNode(AST_VARIABLE, baseTok);
+    setTypeAST(baseNode, TYPE_INT32);
+    freeToken(baseTok);
+    gNewIntegerBaseNode = baseNode;
+}
+
 Value vmBuiltinNew(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1 || VALUE_TYPE(args[0]) != TYPE_POINTER) {
         runtimeError(vm, "new() expects a single pointer variable argument.");
@@ -8052,26 +8061,28 @@ Value vmBuiltinNew(VM* vm, int arg_count, Value* args) {
     *(allocated_memory) = makeValueForType(baseVarType, actualBaseTypeDef, NULL);
     // (debug logging removed)
 
-    // Update the pointer variable that was passed by reference
-    SET_VALUE_TYPE(pointerVarValuePtr, TYPE_POINTER);
+    // Update the pointer variable that was passed by reference. It is
+    // already TYPE_POINTER (checked above), so it keeps its PointerObj: a
+    // SET_VALUE_TYPE here reset .bits to a nil placeholder, which orphaned
+    // that PointerObj -- and with it the base type -- so every new() leaked
+    // one and then fell into the "no base type" fallback below.
     pscalPointerEnsureObj(pointerVarValuePtr);
-    // SET_VALUE_TYPE just reset .bits to a nil-pointer placeholder (VM 2.0
-    // Phase 4i checkpoint 3b) -- but if this pointer variable already held
-    // a real PointerObj (the common case: Pascal pointer vars start out
-    // nil-but-wrappered via makeValueForType, so pscalPointerEnsureObj
-    // above is a no-op here), .bits is now wrongly out of sync with the
-    // wrapper that's actually there. Re-tag unconditionally; safe whether
-    // ensure just allocated fresh or found one already present.
-    pscalValueSetHeapPtrBits(pointerVarValuePtr, PSCAL_VALUE_PTR(*pointerVarValuePtr, PointerObj));
+    PointerObj* po = PSCAL_VALUE_PTR(*pointerVarValuePtr, PointerObj);
+    if (po->retained_array) {
+        // It no longer points into that array (see PointerObj.retained_array).
+        pthread_mutex_lock(&dynamic_array_refcount_mutex);
+        pscalObjRelease(&po->retained_array->header);
+        pthread_mutex_unlock(&dynamic_array_refcount_mutex);
+        po->retained_array = NULL;
+    }
+    po->extent = 0;
     AS_POINTER(*pointerVarValuePtr) = allocated_memory;
 
-    // Safety: if base type metadata is unknown, treat as integer for subsequent dereferences
+    // Safety: if base type metadata is unknown, treat as integer for subsequent
+    // dereferences. One shared node, built once: it was a fresh AST per call.
     if (!PTR_BASE_TYPE_NODE(*pointerVarValuePtr)) {
-        Token* baseTok = newToken(TOKEN_IDENTIFIER, "integer", 0, 0);
-        AST* baseNode = newASTNode(AST_VARIABLE, baseTok);
-        setTypeAST(baseNode, TYPE_INT32);
-        freeToken(baseTok);
-        PTR_BASE_TYPE_NODE(*pointerVarValuePtr) = baseNode;
+        pthread_once(&gNewIntegerBaseOnce, newIntegerBaseInit);
+        PTR_BASE_TYPE_NODE(*pointerVarValuePtr) = gNewIntegerBaseNode;
     }
     // (debug logging removed)
 
@@ -10174,6 +10185,21 @@ Value vmBuiltinDosGetfattr(VM* vm, int arg_count, Value* args) {
     return makeInt(attr);
 }
 
+/* Store a date/time component into a VAR argument. An integer variable keeps
+ * its own type: retyping each one to Word first (SET_VALUE_TYPE) dropped an
+ * Int64's heap box without freeing it and changed the variable's type. */
+static void dosStoreTimeField(Value* arg, long long value) {
+    Value* dst = (VALUE_TYPE(*arg) == TYPE_POINTER) ? (Value*)AS_POINTER(*arg) : NULL;
+    if (!dst) {
+        return;
+    }
+    if (!IS_INTLIKE(*dst)) {
+        freeValue(dst);
+        SET_VALUE_TYPE(dst, TYPE_WORD);
+    }
+    SET_INT_VALUE(dst, value);
+}
+
 Value vmBuiltinDosGetdate(VM* vm, int arg_count, Value* args) {
     if (arg_count != 4) {
         runtimeError(vm, "dosGetdate expects 4 var arguments.");
@@ -10189,14 +10215,10 @@ Value vmBuiltinDosGetdate(VM* vm, int arg_count, Value* args) {
         if (tmp) tm_info = *tmp; else memset(&tm_info, 0, sizeof(tm_info));
     }
 #endif
-    Value* year = (Value*)AS_POINTER(args[0]);
-    Value* month = (Value*)AS_POINTER(args[1]);
-    Value* day = (Value*)AS_POINTER(args[2]);
-    Value* dow = (Value*)AS_POINTER(args[3]);
-    if (year) { SET_VALUE_TYPE(year, TYPE_WORD); SET_INT_VALUE(year, tm_info.tm_year + 1900); }
-    if (month) { SET_VALUE_TYPE(month, TYPE_WORD); SET_INT_VALUE(month, tm_info.tm_mon + 1); }
-    if (day) { SET_VALUE_TYPE(day, TYPE_WORD); SET_INT_VALUE(day, tm_info.tm_mday); }
-    if (dow) { SET_VALUE_TYPE(dow, TYPE_WORD); SET_INT_VALUE(dow, tm_info.tm_wday); }
+    dosStoreTimeField(&args[0], tm_info.tm_year + 1900);
+    dosStoreTimeField(&args[1], tm_info.tm_mon + 1);
+    dosStoreTimeField(&args[2], tm_info.tm_mday);
+    dosStoreTimeField(&args[3], tm_info.tm_wday);
     return makeVoid();
 }
 
@@ -10216,14 +10238,10 @@ Value vmBuiltinDosGettime(VM* vm, int arg_count, Value* args) {
         if (tmp) tm_info = *tmp; else memset(&tm_info, 0, sizeof(tm_info));
     }
 #endif
-    Value* hour = (Value*)AS_POINTER(args[0]);
-    Value* min = (Value*)AS_POINTER(args[1]);
-    Value* sec = (Value*)AS_POINTER(args[2]);
-    Value* sec100 = (Value*)AS_POINTER(args[3]);
-    if (hour) { SET_VALUE_TYPE(hour, TYPE_WORD); SET_INT_VALUE(hour, tm_info.tm_hour); }
-    if (min) { SET_VALUE_TYPE(min, TYPE_WORD); SET_INT_VALUE(min, tm_info.tm_min); }
-    if (sec) { SET_VALUE_TYPE(sec, TYPE_WORD); SET_INT_VALUE(sec, tm_info.tm_sec); }
-    if (sec100) { SET_VALUE_TYPE(sec100, TYPE_WORD); SET_INT_VALUE(sec100, (int)(tv.tv_usec / 10000)); }
+    dosStoreTimeField(&args[0], tm_info.tm_hour);
+    dosStoreTimeField(&args[1], tm_info.tm_min);
+    dosStoreTimeField(&args[2], tm_info.tm_sec);
+    dosStoreTimeField(&args[3], (long long)(tv.tv_usec / 10000));
     return makeVoid();
 }
 
