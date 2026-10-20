@@ -5426,7 +5426,12 @@ typedef struct RuntimeVTableEntry {
     struct RuntimeVTableEntry* next;
 } RuntimeVTableEntry;
 
+// Interface method tables, one per "<class>|<interface>" pair, shared by
+// every VM in the process (worker threads box interfaces too), so the list
+// is only touched under runtimeVTablesMutex. An entry's table is never
+// changed once built; interface values point straight at it.
 static RuntimeVTableEntry* runtimeVTables = NULL;
+static pthread_mutex_t runtimeVTablesMutex = PTHREAD_MUTEX_INITIALIZER;
 
 static RuntimeVTableEntry* findRuntimeVTableEntry(const char* classNameLower) {
     for (RuntimeVTableEntry* entry = runtimeVTables; entry; entry = entry->next) {
@@ -5454,7 +5459,10 @@ static RuntimeVTableEntry* createRuntimeVTableEntry(const char* classNameLower) 
 }
 
 static void vmFreeRuntimeVTables(void) {
+    pthread_mutex_lock(&runtimeVTablesMutex);
     RuntimeVTableEntry* entry = runtimeVTables;
+    runtimeVTables = NULL;
+    pthread_mutex_unlock(&runtimeVTablesMutex);
     while (entry) {
         RuntimeVTableEntry* next = entry->next;
         free(entry->className);
@@ -5465,7 +5473,6 @@ static void vmFreeRuntimeVTables(void) {
         free(entry);
         entry = next;
     }
-    runtimeVTables = NULL;
 }
 
 static void vmCleanupGlobalCachesIfIdle(void) {
@@ -5582,20 +5589,126 @@ static bool collectRuntimeInterfaceMethods(AST* interfaceType,
     return true;
 }
 
-static bool ensureRuntimeInterfaceVTable(VM* vm,
-                                         const char* className,
-                                         AST* interfaceType,
-                                         Value* tableValue) {
-    if (!vm || !className || !interfaceType || !tableValue) {
+// Builds the method-address table of `className`'s implementation of
+// `interfaceType`, indexed by interface method slot.
+static bool buildRuntimeInterfaceVTable(const char* className,
+                                        const char* class_lower,
+                                        AST* interfaceType,
+                                        Value* out) {
+    int method_capacity = 0;
+    int method_count = 0;
+    int* addrs = NULL;
+
+    AST** methods = NULL;
+    int collected_count = 0;
+    int collected_capacity = 0;
+    if (!collectRuntimeInterfaceMethods(interfaceType,
+                                        &methods,
+                                        &collected_count,
+                                        &collected_capacity,
+                                        0)) {
+        free(methods);
         return false;
     }
 
-    if (VALUE_TYPE(*tableValue) == TYPE_ARRAY && AS_ARRAY(*tableValue)) {
-        return true;
+    for (int i = 0; i < collected_count; i++) {
+        AST* method = methods[i];
+        const char* method_name = (method && method->token) ? method->token->value : NULL;
+        if (!method_name) {
+            free(methods);
+            free(addrs);
+            return false;
+        }
+
+        int slot = method->i_val >= 0 ? method->i_val : i;
+        if (slot >= method_capacity) {
+            int new_capacity = method_capacity < 4 ? 4 : method_capacity * 2;
+            while (new_capacity <= slot) {
+                new_capacity *= 2;
+            }
+            int* resized = (int*)realloc(addrs, (size_t)new_capacity * sizeof(int));
+            if (!resized) {
+                free(methods);
+                free(addrs);
+                return false;
+            }
+            for (int j = method_capacity; j < new_capacity; j++) {
+                resized[j] = -1;
+            }
+            addrs = resized;
+            method_capacity = new_capacity;
+        }
+
+        char method_lower[MAX_SYMBOL_LENGTH];
+        strncpy(method_lower, method_name, sizeof(method_lower) - 1);
+        method_lower[sizeof(method_lower) - 1] = '\0';
+        toLowerString(method_lower);
+
+        char qualified[MAX_SYMBOL_LENGTH * 2 + 2];
+        snprintf(qualified, sizeof(qualified), "%s.%s", class_lower, method_lower);
+        Symbol* sym = lookupProcedure(qualified);
+        if (!sym) {
+            snprintf(qualified, sizeof(qualified), "%s.%s", className, method_name);
+            sym = lookupProcedure(qualified);
+        }
+        if (!sym) {
+            free(methods);
+            free(addrs);
+            return false;
+        }
+
+        Symbol* base = sym->is_alias ? sym->real_symbol : sym;
+        if (!base) {
+            free(methods);
+            free(addrs);
+            return false;
+        }
+
+        addrs[slot] = base->bytecode_address;
+        if (slot + 1 > method_count) {
+            method_count = slot + 1;
+        }
     }
 
-    if (!vm->procedureTable) {
+    free(methods);
+
+    if (method_count == 0) {
+        free(addrs);
         return false;
+    }
+
+    int lower = 0;
+    int upper = method_count - 1;
+    Value arr = makeArrayND(1, &lower, &upper, TYPE_INT32, NULL);
+    if (!AS_ARRAY(arr)) {
+        free(addrs);
+        return false;
+    }
+
+    for (int i = 0; i < method_count; i++) {
+        int addr = (i < method_capacity && addrs) ? addrs[i] : -1;
+        AS_ARRAY(arr)[i] = makeInt(addr >= 0 ? addr : 0);
+    }
+    free(addrs);
+    *out = arr;
+    return true;
+}
+
+// The interface method table for `className` implementing the interface
+// named `interfaceName`, built on first use and cached per (class,
+// interface) pair. The key must name the interface: the interface AST's own
+// token is the `interface` keyword for every Pascal interface, so a key
+// built from it gave all of a class's interfaces the table of whichever
+// was boxed first, and a call through the second dispatched to the wrong
+// method. The table lives in the cache only -- it is never written into
+// the receiver, whose single hidden __vtable field cannot hold one table
+// per interface. NULL if the table cannot be built.
+static Value* ensureRuntimeInterfaceVTable(VM* vm,
+                                           const char* className,
+                                           const char* interfaceName,
+                                           AST* interfaceType) {
+    if (!vm || !className || !interfaceName || !interfaceType || !vm->procedureTable) {
+        return NULL;
     }
 
     char class_lower[MAX_SYMBOL_LENGTH];
@@ -5604,158 +5717,44 @@ static bool ensureRuntimeInterfaceVTable(VM* vm,
     toLowerString(class_lower);
 
     char interface_lower[MAX_SYMBOL_LENGTH];
-    const char* interface_name = (interfaceType->token && interfaceType->token->value)
-                                     ? interfaceType->token->value
-                                     : "<anonymous_interface>";
-    strncpy(interface_lower, interface_name, sizeof(interface_lower) - 1);
+    strncpy(interface_lower, interfaceName, sizeof(interface_lower) - 1);
     interface_lower[sizeof(interface_lower) - 1] = '\0';
     toLowerString(interface_lower);
 
     char cache_key[(MAX_SYMBOL_LENGTH * 2) + 4];
     snprintf(cache_key, sizeof(cache_key), "%s|%s", class_lower, interface_lower);
 
+    pthread_mutex_lock(&runtimeVTablesMutex);
     RuntimeVTableEntry* entry = findRuntimeVTableEntry(cache_key);
-    bool need_build = true;
-    if (entry && entry->table && VALUE_TYPE(*entry->table) == TYPE_ARRAY && AS_ARRAY(*entry->table)) {
-        need_build = false;
-    }
-
-    int method_capacity = 0;
-    int method_count = 0;
-    int* addrs = NULL;
-
-    if (need_build) {
-        AST** methods = NULL;
-        int collected_count = 0;
-        int collected_capacity = 0;
-        if (!collectRuntimeInterfaceMethods(interfaceType,
-                                            &methods,
-                                            &collected_count,
-                                            &collected_capacity,
-                                            0)) {
-            free(methods);
-            return false;
+    if (!entry || !entry->table || VALUE_TYPE(*entry->table) != TYPE_ARRAY || !AS_ARRAY(*entry->table)) {
+        Value arr;
+        if (!buildRuntimeInterfaceVTable(className, class_lower, interfaceType, &arr)) {
+            pthread_mutex_unlock(&runtimeVTablesMutex);
+            return NULL;
         }
-
-        for (int i = 0; i < collected_count; i++) {
-            AST* method = methods[i];
-            const char* method_name = (method && method->token) ? method->token->value : NULL;
-            if (!method_name) {
-                free(methods);
-                free(addrs);
-                return false;
-            }
-
-            int slot = method->i_val >= 0 ? method->i_val : i;
-            if (slot >= method_capacity) {
-                int new_capacity = method_capacity < 4 ? 4 : method_capacity * 2;
-                while (new_capacity <= slot) {
-                    new_capacity *= 2;
-                }
-                int* resized = (int*)realloc(addrs, (size_t)new_capacity * sizeof(int));
-                if (!resized) {
-                    free(methods);
-                    free(addrs);
-                    return false;
-                }
-                for (int j = method_capacity; j < new_capacity; j++) {
-                    resized[j] = -1;
-                }
-                addrs = resized;
-                method_capacity = new_capacity;
-            }
-
-            char method_lower[MAX_SYMBOL_LENGTH];
-            strncpy(method_lower, method_name, sizeof(method_lower) - 1);
-            method_lower[sizeof(method_lower) - 1] = '\0';
-            toLowerString(method_lower);
-
-            char qualified[MAX_SYMBOL_LENGTH * 2 + 2];
-            snprintf(qualified, sizeof(qualified), "%s.%s", class_lower, method_lower);
-            Symbol* sym = lookupProcedure(qualified);
-            if (!sym) {
-                snprintf(qualified, sizeof(qualified), "%s.%s", className, method_name);
-                sym = lookupProcedure(qualified);
-            }
-            if (!sym) {
-                free(methods);
-                free(addrs);
-                return false;
-            }
-
-            Symbol* base = sym->is_alias ? sym->real_symbol : sym;
-            if (!base) {
-                free(methods);
-                free(addrs);
-                return false;
-            }
-
-            addrs[slot] = base->bytecode_address;
-            if (slot + 1 > method_count) {
-                method_count = slot + 1;
-            }
-        }
-
-        free(methods);
-
-        if (method_count == 0) {
-            free(addrs);
-            return false;
-        }
-
-        int lower = 0;
-        int upper = method_count - 1;
-        Value arr = makeArrayND(1, &lower, &upper, TYPE_INT32, NULL);
-        if (!AS_ARRAY(arr)) {
-            free(addrs);
-            return false;
-        }
-
-        for (int i = 0; i < method_count; i++) {
-            int addr = (i < method_capacity && addrs) ? addrs[i] : -1;
-            AS_ARRAY(arr)[i] = makeInt(addr >= 0 ? addr : 0);
-        }
-        free(addrs);
-
         if (!entry) {
             entry = createRuntimeVTableEntry(cache_key);
             if (!entry) {
                 freeValue(&arr);
-                return false;
+                pthread_mutex_unlock(&runtimeVTablesMutex);
+                return NULL;
             }
         }
-
         if (!entry->table) {
             entry->table = (Value*)malloc(sizeof(Value));
             if (!entry->table) {
                 freeValue(&arr);
-                return false;
+                pthread_mutex_unlock(&runtimeVTablesMutex);
+                return NULL;
             }
-            *(entry->table) = makeNil();
         } else {
             freeValue(entry->table);
         }
         *(entry->table) = arr;
     }
-
-    if (!entry) {
-        entry = findRuntimeVTableEntry(class_lower);
-    }
-    if (!entry || !entry->table) {
-        return false;
-    }
-
-    if (tableValue == entry->table) {
-        return true;
-    }
-
-    if (VALUE_TYPE(*tableValue) == TYPE_POINTER && AS_POINTER(*tableValue) == entry->table) {
-        return true;
-    }
-
-    freeValue(tableValue);
-    *tableValue = makePointer(entry->table, NULL);
-    return true;
+    Value* table = entry->table;
+    pthread_mutex_unlock(&runtimeVTablesMutex);
+    return table;
 }
 
 static Value vmHostBoxInterface(VM* vm) {
@@ -5788,37 +5787,13 @@ static Value vmHostBoxInterface(VM* vm) {
 
     AST* interfaceType = lookupType(AS_STRING(typeNameVal));
     if (!interfaceType) {
+        // Report before the frees: freeValue clears the name being printed.
+        runtimeError(vm, "VM Error: Unknown interface type '%s'.", AS_STRING(typeNameVal));
         freeValue(&classNameVal);
         freeValue(&typeNameVal);
         freeValue(&receiverVal);
         freeValue(&tablePtrVal);
-        runtimeError(vm, "VM Error: Unknown interface type '%s'.", AS_STRING(typeNameVal));
         return makeNil();
-    }
-
-    Value* tableSlotPtr = NULL;
-    Value* tableValuePtr = NULL;
-    if (VALUE_TYPE(tablePtrVal) == TYPE_POINTER && AS_POINTER(tablePtrVal)) {
-        tableSlotPtr = (Value*)AS_POINTER(tablePtrVal);
-        tableValuePtr = tableSlotPtr;
-        if (tableValuePtr && VALUE_TYPE(*tableValuePtr) == TYPE_POINTER && AS_POINTER(*tableValuePtr)) {
-            tableValuePtr = (Value*)AS_POINTER(*tableValuePtr);
-        }
-    }
-
-    if (!tableSlotPtr && VALUE_TYPE(receiverVal) == TYPE_POINTER && AS_POINTER(receiverVal)) {
-        bool invalid_type = false;
-        Value* existingRecord = resolveRecord(&receiverVal, &invalid_type);
-        if (!invalid_type && existingRecord && VALUE_TYPE(*existingRecord) == TYPE_RECORD) {
-            FieldValue* hiddenField = AS_RECORD(*existingRecord);
-            if (hiddenField) {
-                tableSlotPtr = fieldValueStorage(hiddenField);
-                tableValuePtr = tableSlotPtr;
-                if (tableValuePtr && VALUE_TYPE(*tableValuePtr) == TYPE_POINTER && AS_POINTER(*tableValuePtr)) {
-                    tableValuePtr = (Value*)AS_POINTER(*tableValuePtr);
-                }
-            }
-        }
     }
 
     if (VALUE_TYPE(receiverVal) != TYPE_POINTER) {
@@ -5832,6 +5807,7 @@ static Value vmHostBoxInterface(VM* vm) {
             return makeNil();
         }
         *clone = makeCopyOfValue(&receiverVal);
+        freeValue(&receiverVal);
         receiverVal = makePointer(clone, NULL);
         PTR_BASE_TYPE_NODE(receiverVal) = OWNED_POINTER_SENTINEL;
 
@@ -5845,26 +5821,11 @@ static Value vmHostBoxInterface(VM* vm) {
             runtimeError(vm, "VM Error: Unable to resolve cloned receiver for interface boxing.");
             return makeNil();
         }
-        FieldValue* hiddenField = AS_RECORD(*clonedRecord);
-        if (!hiddenField) {
-            freeValue(&classNameVal);
-            freeValue(&typeNameVal);
-            freeValue(&receiverVal);
-            freeValue(&tablePtrVal);
-            runtimeError(vm, "VM Error: Cloned receiver lacks vtable storage.");
-            return makeNil();
-        }
-        tableSlotPtr = fieldValueStorage(hiddenField);
-        tableValuePtr = tableSlotPtr;
-        if (tableValuePtr && VALUE_TYPE(*tableValuePtr) == TYPE_POINTER && AS_POINTER(*tableValuePtr)) {
-            tableValuePtr = (Value*)AS_POINTER(*tableValuePtr);
-        }
     }
 
-    const char* class_name_str = (VALUE_TYPE(classNameVal) == TYPE_STRING && AS_STRING(classNameVal))
-                                     ? AS_STRING(classNameVal)
-                                     : NULL;
-    if (!tableValuePtr || !ensureRuntimeInterfaceVTable(vm, class_name_str, interfaceType, tableValuePtr)) {
+    const char* class_name_str = AS_STRING(classNameVal);
+    Value* tableValuePtr = ensureRuntimeInterfaceVTable(vm, class_name_str, AS_STRING(typeNameVal), interfaceType);
+    if (!tableValuePtr) {
         runtimeError(vm, "VM Error: Unable to initialise interface table for class '%s'.",
                      class_name_str ? class_name_str : "<unknown>");
         freeValue(&classNameVal);
@@ -5873,20 +5834,6 @@ static Value vmHostBoxInterface(VM* vm) {
         freeValue(&tablePtrVal);
         return makeNil();
     }
-    Value* resolvedTablePtr = tableSlotPtr;
-    while (resolvedTablePtr && VALUE_TYPE(*resolvedTablePtr) == TYPE_POINTER) {
-        resolvedTablePtr = (Value*)AS_POINTER(*resolvedTablePtr);
-    }
-    if (!resolvedTablePtr || VALUE_TYPE(*resolvedTablePtr) != TYPE_ARRAY || !AS_ARRAY(*resolvedTablePtr)) {
-        runtimeError(vm, "VM Error: Resolved vtable storage for class '%s' is invalid.",
-                     class_name_str ? class_name_str : "<unknown>");
-        freeValue(&classNameVal);
-        freeValue(&typeNameVal);
-        freeValue(&receiverVal);
-        freeValue(&tablePtrVal);
-        return makeNil();
-    }
-    tableValuePtr = resolvedTablePtr;
 
     ClosureEnvPayload* payload = createClosureEnv(3, TYPE_INTERFACE);
     if (!payload) {
