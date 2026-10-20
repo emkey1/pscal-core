@@ -6210,6 +6210,57 @@ static Value vmHostWaitThread(VM* vm) {
     return makeInt(0);
 }
 
+// vsnprintf into a fresh heap buffer sized for the whole result (NULL if
+// out of memory). The caller frees it.
+static char* vmFormatAlloc(const char* format, ...) __attribute__((format(printf, 1, 2)));
+static char* vmFormatAlloc(const char* format, ...) {
+    va_list ap;
+    va_start(ap, format);
+    int needed = vsnprintf(NULL, 0, format, ap);
+    va_end(ap);
+    if (needed < 0) {
+        return NULL;
+    }
+    char* out = (char*)malloc((size_t)needed + 1);
+    if (!out) {
+        return NULL;
+    }
+    va_start(ap, format);
+    vsnprintf(out, (size_t)needed + 1, format, ap);
+    va_end(ap);
+    return out;
+}
+
+// Largest field width or precision vmHostPrintf accepts. Anything larger is
+// reported as an error instead of being silently dropped with its argument.
+#define VM_PRINTF_MAX_FIELD 65535
+
+// Reads a run of decimal digits at fmt[*j]; false if the number is above
+// VM_PRINTF_MAX_FIELD (the digits are consumed either way).
+static bool vmPrintfReadField(const char* fmt, size_t flen, size_t* j, int* out) {
+    int value = 0;
+    bool fits = true;
+    while (*j < flen && isdigit((unsigned char)fmt[*j])) {
+        if (fits) {
+            value = value * 10 + (fmt[*j] - '0');
+            if (value > VM_PRINTF_MAX_FIELD) {
+                fits = false;
+            }
+        }
+        (*j)++;
+    }
+    *out = value;
+    return fits;
+}
+
+// printf for the Pascal and Rea front ends. Each conversion is re-issued to
+// the C library from its parsed parts with an argument of exactly the type
+// that conversion expects: an integer is always passed as a 64-bit
+// (unsigned) long long under `ll`, after narrowing it to the width the
+// user's length modifier asks for (hh: 8 bits, h: 16, l/ll/j/z/t/L: 64, none:
+// the operand's own width, 32 or 64); a real is passed as a double, or as a
+// long double under `L`. Output goes straight to stdout, so no conversion
+// is cut short by a fixed buffer.
 static Value vmHostPrintf(VM* vm) {
     Value countVal = pop(vm);
     int arg_count = 0;
@@ -6233,161 +6284,120 @@ static Value vmHostPrintf(VM* vm) {
                 i++;
             } else if (arg_index < arg_count) {
                 size_t j = i + 1;
+                // Flags; a repeated flag means the same as one, so each is
+                // kept once.
                 char flags[8];
                 size_t flag_len = 0;
                 const char* flag_chars = "-+ #0'";
                 while (j < flen && strchr(flag_chars, fmt[j]) != NULL) {
-                    if (flag_len + 1 < sizeof(flags)) {
+                    if (!memchr(flags, fmt[j], flag_len)) {
                         flags[flag_len++] = fmt[j];
                     }
                     j++;
                 }
-                flags[flag_len] = '\0';
-                bool width_specified = false;
-                int width = 0;
-                while (j < flen && isdigit((unsigned char)fmt[j])) {
-                    width_specified = true;
-                    width = width * 10 + (fmt[j]-'0');
-                    j++;
+                bool fields_fit = true;
+                int width = -1;
+                if (j < flen && isdigit((unsigned char)fmt[j])) {
+                    fields_fit = vmPrintfReadField(fmt, flen, &j, &width);
                 }
                 int precision = -1;
                 if (j < flen && fmt[j] == '.') {
                     j++;
-                    precision = 0;
-                    while (j < flen && isdigit((unsigned char)fmt[j])) { precision = precision * 10 + (fmt[j]-'0'); j++; }
+                    if (!vmPrintfReadField(fmt, flen, &j, &precision)) {
+                        fields_fit = false;
+                    }
                 }
                 const char* length_mods = "hlLjzt";
                 size_t mod_start = j;
-                while (j < flen && strchr(length_mods, fmt[j]) != NULL) j++;
-                char lenmod[4] = {0};
-                size_t mod_len = (j > mod_start) ? (j - mod_start) : 0;
-                if (mod_len > 0) {
-                    if (mod_len > sizeof(lenmod) - 1) mod_len = sizeof(lenmod) - 1;
-                    memcpy(lenmod, fmt + mod_start, mod_len);
-                    lenmod[mod_len] = '\0';
+                bool mods_all_h = true;
+                bool mod_long_double = false;
+                while (j < flen && strchr(length_mods, fmt[j]) != NULL) {
+                    if (fmt[j] != 'h') mods_all_h = false;
+                    if (fmt[j] == 'L') mod_long_double = true;
+                    j++;
                 }
+                size_t mod_len = j - mod_start;
                 char spec = (j < flen) ? fmt[j] : '\0';
 
-                char fmtbuf[64];
-                char buf[DEFAULT_STRING_CAPACITY];
                 Value v = args[arg_index++];
-                size_t copy_len = (spec && spec != '\0') ? (j - i + 1) : 0;
-                if (copy_len >= sizeof(fmtbuf)) copy_len = sizeof(fmtbuf) - 1;
-                if (copy_len > 0) {
-                    memcpy(fmtbuf, fmt + i, copy_len);
-                    fmtbuf[copy_len] = '\0';
-                } else {
-                    fmtbuf[0] = '%';
-                    size_t pos = 1;
-                    if (flag_len > 0 && pos + flag_len < sizeof(fmtbuf)) {
-                        memcpy(&fmtbuf[pos], flags, flag_len);
-                        pos += flag_len;
-                    }
-                    if (width_specified) {
-                        int written = snprintf(&fmtbuf[pos], sizeof(fmtbuf) - pos, "%d", width);
-                        if (written > 0) {
-                            if ((size_t)written >= sizeof(fmtbuf) - pos) pos = sizeof(fmtbuf) - 1;
-                            else pos += (size_t)written;
-                        }
-                    }
-                    if (precision >= 0 && pos < sizeof(fmtbuf)) {
-                        fmtbuf[pos++] = '.';
-                        int written = snprintf(&fmtbuf[pos], sizeof(fmtbuf) - pos, "%d", precision);
-                        if (written > 0) {
-                            if ((size_t)written >= sizeof(fmtbuf) - pos) pos = sizeof(fmtbuf) - 1;
-                            else pos += (size_t)written;
-                        }
-                    }
-                    size_t lenmod_len = strlen(lenmod);
-                    if (lenmod_len > 0 && pos + lenmod_len < sizeof(fmtbuf)) {
-                        memcpy(&fmtbuf[pos], lenmod, lenmod_len);
-                        pos += lenmod_len;
-                    }
-                    if (pos < sizeof(fmtbuf)) {
-                        fmtbuf[pos++] = spec ? spec : ' ';
-                    }
-                    fmtbuf[pos < sizeof(fmtbuf) ? pos : (sizeof(fmtbuf) - 1)] = '\0';
+                if (!fields_fit) {
+                    size_t spec_len = (j < flen ? j + 1 : flen) - i;
+                    runtimeError(vm, "Runtime Error: printf field width or precision above %d in '%.*s%s'.",
+                                 VM_PRINTF_MAX_FIELD, (int)(spec_len > 40 ? 40 : spec_len), fmt + i,
+                                 spec_len > 40 ? "..." : "");
+                    freeValue(&v);
+                    break;
                 }
-                bool expects_wide_char = (lenmod[0] != '\0' && strpbrk(lenmod, "lL") != NULL);
+
+                // '%' + flags + width + '.' + precision + "ll" + spec + NUL
+                char conv[40];
+                size_t pos = 0;
+                conv[pos++] = '%';
+                memcpy(conv + pos, flags, flag_len);
+                pos += flag_len;
+                if (width >= 0) {
+                    pos += (size_t)snprintf(conv + pos, sizeof(conv) - pos, "%d", width);
+                }
+                if (precision >= 0 && spec != 'c') {
+                    pos += (size_t)snprintf(conv + pos, sizeof(conv) - pos, ".%d", precision);
+                }
+
                 switch (spec) {
                     case 'd': case 'i': case 'u': case 'o': case 'x': case 'X': {
-                        unsigned long long u = 0ULL; long long s = 0LL;
-                        if (isIntlikeType(VALUE_TYPE(v)) || VALUE_TYPE(v) == TYPE_BOOLEAN || VALUE_TYPE(v) == TYPE_CHAR) {
+                        long long s = 0;
+                        if (isIntlikeType(VALUE_TYPE(v))) {
                             s = AS_INTEGER(v);
-                            u = (unsigned long long)AS_INTEGER(v);
                         }
-                        bool is_unsigned = (spec=='u'||spec=='o'||spec=='x'||spec=='X');
-                        // Cast to the correct type expected by the format length modifier
-                        if (is_unsigned) {
-                            if (strcmp(lenmod, "ll") == 0) {
-                                unsigned long long val = (unsigned long long)u;
-                                snprintf(buf, sizeof(buf), fmtbuf, val);
-                            } else if (strcmp(lenmod, "l") == 0) {
-                                unsigned long val = (unsigned long)u;
-                                snprintf(buf, sizeof(buf), fmtbuf, val);
-                            } else if (strcmp(lenmod, "j") == 0) {
-                                uintmax_t val = (uintmax_t)u;
-                                snprintf(buf, sizeof(buf), fmtbuf, val);
-                            } else if (strcmp(lenmod, "z") == 0) {
-                                size_t val = (size_t)u;
-                                snprintf(buf, sizeof(buf), fmtbuf, val);
-                            } else {
-                                unsigned int val = (unsigned int)u; // includes h, hh, and default
-                                snprintf(buf, sizeof(buf), fmtbuf, val);
-                            }
+                        int bits;
+                        if (mod_len == 0) {
+                            bits = (VALUE_TYPE(v) == TYPE_INT64 || VALUE_TYPE(v) == TYPE_UINT64) ? 64 : 32;
+                        } else if (mods_all_h) {
+                            bits = (mod_len >= 2) ? 8 : 16;
                         } else {
-                            if (strcmp(lenmod, "ll") == 0) {
-                                long long val = (long long)s;
-                                snprintf(buf, sizeof(buf), fmtbuf, val);
-                            } else if (strcmp(lenmod, "l") == 0) {
-                                long val = (long)s;
-                                snprintf(buf, sizeof(buf), fmtbuf, val);
-                            } else if (strcmp(lenmod, "j") == 0) {
-                                intmax_t val = (intmax_t)s;
-                                snprintf(buf, sizeof(buf), fmtbuf, val);
-                            } else if (strcmp(lenmod, "t") == 0) {
-                                ptrdiff_t val = (ptrdiff_t)s;
-                                snprintf(buf, sizeof(buf), fmtbuf, val);
-                            } else {
-                                int val = (int)s; // includes h, hh, and default
-                                snprintf(buf, sizeof(buf), fmtbuf, val);
-                            }
+                            bits = 64;
                         }
-                        fputs(buf, stdout);
+                        conv[pos++] = 'l';
+                        conv[pos++] = 'l';
+                        conv[pos++] = spec;
+                        conv[pos] = '\0';
+                        if (spec == 'd' || spec == 'i') {
+                            if (bits == 8) s = (signed char)s;
+                            else if (bits == 16) s = (short)s;
+                            else if (bits == 32) s = (int32_t)s;
+                            fprintf(stdout, conv, s);
+                        } else {
+                            unsigned long long u = (unsigned long long)s;
+                            if (bits == 8) u &= 0xFFULL;
+                            else if (bits == 16) u &= 0xFFFFULL;
+                            else if (bits == 32) u &= 0xFFFFFFFFULL;
+                            fprintf(stdout, conv, u);
+                        }
                         break;
                     }
                     case 'f': case 'F': case 'e': case 'E': case 'g': case 'G': case 'a': case 'A': {
-                        long double rv = isRealType(VALUE_TYPE(v)) ? AS_REAL(v) : (long double)AS_INTEGER(v);
-                        // If 'L' modifier is present, pass a long double; otherwise pass double
-                        if (strcmp(lenmod, "L") == 0) {
-                            // Print directly with long double argument
-                            // Use a temporary buffer via vsnprintf-like call by delegating to snprintf
-                            // Note: snprintf supports %Lf on platforms where long double is distinct.
-                            // We still format into buf to keep existing behavior (collect into string before fputs)
-                            // Casting to long double explicitly for clarity.
-                            snprintf(buf, sizeof(buf), fmtbuf, (long double)rv);
-                        } else {
-                            snprintf(buf, sizeof(buf), fmtbuf, (double)rv);
+                        long double rv = 0.0L;
+                        if (isRealType(VALUE_TYPE(v))) {
+                            rv = AS_REAL(v);
+                        } else if (isIntlikeType(VALUE_TYPE(v))) {
+                            rv = asLd(v);
                         }
-                        fputs(buf, stdout);
+                        if (mod_long_double) {
+                            conv[pos++] = 'L';
+                            conv[pos++] = spec;
+                            conv[pos] = '\0';
+                            fprintf(stdout, conv, rv);
+                        } else {
+                            conv[pos++] = spec;
+                            conv[pos] = '\0';
+                            fprintf(stdout, conv, (double)rv);
+                        }
                         break;
                     }
                     case 'c': {
-                        char ch = (VALUE_TYPE(v) == TYPE_CHAR) ? AS_CHAR(v) : (char)AS_INTEGER(v);
-                        char safe_fmt[sizeof(fmtbuf)];
-                        const char* format = fmtbuf;
-                        if (expects_wide_char) {
-                            strncpy(safe_fmt, fmtbuf, sizeof(safe_fmt));
-                            safe_fmt[sizeof(safe_fmt) - 1] = '\0';
-                            char* mod_pos = strstr(safe_fmt, lenmod);
-                            if (mod_pos) {
-                                size_t remove_len = strlen(lenmod);
-                                memmove(mod_pos, mod_pos + remove_len, strlen(mod_pos + remove_len) + 1);
-                                format = safe_fmt;
-                            }
-                        }
-                        snprintf(buf, sizeof(buf), format, (unsigned int)ch);
-                        fputs(buf, stdout);
+                        char ch = (VALUE_TYPE(v) == TYPE_CHAR) ? (char)AS_CHAR(v) : (char)AS_INTEGER(v);
+                        conv[pos++] = 'c';
+                        conv[pos] = '\0';
+                        fprintf(stdout, conv, (int)(unsigned char)ch);
                         break;
                     }
                     case 's': {
@@ -6402,20 +6412,9 @@ static Value vmHostPrintf(VM* vm) {
                             encodeUtf8Codepoint((uint32_t)AS_CHAR(v), char_text);
                             sv = char_text;
                         }
-                        char safe_fmt[sizeof(fmtbuf)];
-                        const char* format = fmtbuf;
-                        if (expects_wide_char) {
-                            strncpy(safe_fmt, fmtbuf, sizeof(safe_fmt));
-                            safe_fmt[sizeof(safe_fmt) - 1] = '\0';
-                            char* mod_pos = strstr(safe_fmt, lenmod);
-                            if (mod_pos) {
-                                size_t remove_len = strlen(lenmod);
-                                memmove(mod_pos, mod_pos + remove_len, strlen(mod_pos + remove_len) + 1);
-                                format = safe_fmt;
-                            }
-                        }
-                        snprintf(buf, sizeof(buf), format, sv);
-                        fputs(buf, stdout);
+                        conv[pos++] = 's';
+                        conv[pos] = '\0';
+                        fprintf(stdout, conv, sv);
                         break;
                     }
                     default:
@@ -12845,23 +12844,24 @@ comparison_error_label:
 
                 Value raw_val = pop(vm);
 
-                char buf[DEFAULT_STRING_CAPACITY];
-                buf[0] = '\0';
+                // Sized for the whole field: `1e300:1:2` is over 300
+                // characters, and a string may be any length.
+                char* buf = NULL;
 
                 if (isRealType(VALUE_TYPE(raw_val))) {
                     long double rv = AS_REAL(raw_val);
                     int width_int = width;
                     if (precision >= 0) {
-                        snprintf(buf, sizeof(buf), "%*.*Lf", width_int, precision, rv);
+                        buf = vmFormatAlloc("%*.*Lf", width_int, precision, rv);
                     } else {
-                        snprintf(buf, sizeof(buf), "%*.*LE", width_int,
+                        buf = vmFormatAlloc("%*.*LE", width_int,
                                  (int)PASCAL_DEFAULT_FLOAT_PRECISION, rv);
                     }
                 } else if (VALUE_TYPE(raw_val) == TYPE_CHAR) {
-                    snprintf(buf, sizeof(buf), "%*c", width, AS_CHAR(raw_val));
+                    buf = vmFormatAlloc("%*c", width, AS_CHAR(raw_val));
                 } else if (VALUE_TYPE(raw_val) == TYPE_BOOLEAN) {
                     const char* bool_str = VAL_INT(raw_val) ? "TRUE" : "FALSE";
-                    snprintf(buf, sizeof(buf), "%*s", width, bool_str);
+                    buf = vmFormatAlloc("%*s", width, bool_str);
                 } else if (isIntlikeType(VALUE_TYPE(raw_val))) {
                     if (VALUE_TYPE(raw_val) == TYPE_UINT64 || VALUE_TYPE(raw_val) == TYPE_UINT32 ||
                         VALUE_TYPE(raw_val) == TYPE_UINT16 || VALUE_TYPE(raw_val) == TYPE_UINT8 ||
@@ -12870,25 +12870,29 @@ comparison_error_label:
                         if (VALUE_TYPE(raw_val) == TYPE_BYTE || VALUE_TYPE(raw_val) == TYPE_UINT8)   u &= 0xFFULL;
                         if (VALUE_TYPE(raw_val) == TYPE_WORD || VALUE_TYPE(raw_val) == TYPE_UINT16) u &= 0xFFFFULL;
                         if (VALUE_TYPE(raw_val) == TYPE_UINT32) u &= 0xFFFFFFFFULL;
-                        snprintf(buf, sizeof(buf), "%*llu", width, u);
+                        buf = vmFormatAlloc("%*llu", width, u);
                     } else {
                         long long s = VAL_INT(raw_val);
                         if (VALUE_TYPE(raw_val) == TYPE_INT8)  s = (int8_t)s;
                         if (VALUE_TYPE(raw_val) == TYPE_INT16) s = (int16_t)s;
-                        snprintf(buf, sizeof(buf), "%*lld", width, s);
+                        buf = vmFormatAlloc("%*lld", width, s);
                     }
                 } else if (VALUE_TYPE(raw_val) == TYPE_STRING) {
                     const char* source_str = AS_STRING(raw_val) ? AS_STRING(raw_val) : "";
                     size_t len = strlen(source_str);
                     int prec = (width > 0 && (size_t)width < len) ? width : (int)len;
-                    snprintf(buf, sizeof(buf), "%*.*s", width, prec, source_str);
+                    buf = vmFormatAlloc("%*.*s", width, prec, source_str);
                 } else {
-                    snprintf(buf, sizeof(buf), "%*s", width, "?");
+                    buf = vmFormatAlloc("%*s", width, "?");
                 }
 
                 freeValue(&raw_val);
+                if (!buf) {
+                    runtimeError(vm, "VM Error: Out of memory formatting a value for output.");
+                    return INTERPRET_RUNTIME_ERROR;
+                }
 
-                push(vm, makeString(buf));
+                push(vm, makeOwnedString(buf, strlen(buf)));
                 break;
             }
 
