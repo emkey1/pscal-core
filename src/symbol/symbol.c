@@ -1261,6 +1261,10 @@ static void updateSymbolInternal(Symbol *sym, const char *name, Value val) {
             if (!source_str) source_str = "";
 
             if (STRING_MAX_LENGTH(*sym->value) > 0) { // Target is a fixed-length string.
+                // Written in place: unshare the StringObj first, or every
+                // copy sharing it by reference count (a by-value parameter,
+                // `b := g`) changes too.
+                valueEnsureUnique(sym->value);
                 strncpy(AS_STRING(*sym->value), source_str, STRING_MAX_LENGTH(*sym->value));
                 AS_STRING(*sym->value)[STRING_MAX_LENGTH(*sym->value)] = '\0';
             } else { // Target is a dynamic string.

@@ -10277,13 +10277,16 @@ comparison_error_label:
                     }
 
                     // (Your existing logic for handling fixed-length strings, pointers, reals, etc. goes here)
+                    // Dynamic-string targets get a whole new Value installed
+                    // through replaceValueCell, never a free-then-rebuild of
+                    // the cell in place: another thread copying this cell
+                    // (copyValueForStack, under value_cell_mutex) could
+                    // otherwise retain the StringObj just freed here.
                     if (isPascalStringType(VALUE_TYPE(*target_lvalue_ptr)) && STRING_MAX_LENGTH(*target_lvalue_ptr) <= 0) {
                         if (VALUE_TYPE(value_to_set) == TYPE_CHAR || VALUE_TYPE(value_to_set) == TYPE_WIDECHAR) {
                             VarType destType = VALUE_TYPE(*target_lvalue_ptr) == TYPE_UNICODE_STRING
                                                    ? TYPE_UNICODE_STRING
                                                    : TYPE_STRING;
-                            freeValue(target_lvalue_ptr);
-                            pscalStringEnsureObj(target_lvalue_ptr); // freeValue left s_val NULL
                             char encoded[5] = {0};
                             size_t encoded_len = 0;
                             if (VALUE_TYPE(value_to_set) == TYPE_CHAR) {
@@ -10292,47 +10295,45 @@ comparison_error_label:
                             } else {
                                 encoded_len = encodeUtf8Codepoint((uint32_t)AS_CHAR(value_to_set), encoded);
                             }
-                            AS_STRING(*target_lvalue_ptr) = (char*)malloc(encoded_len + 1);
-                            if (!AS_STRING(*target_lvalue_ptr)) {
-                                runtimeError(vm, "VM Error: Malloc failed for CHAR/WIDECHAR to string assignment.");
-                            } else {
-                                memcpy(AS_STRING(*target_lvalue_ptr), encoded, encoded_len);
-                                AS_STRING(*target_lvalue_ptr)[encoded_len] = '\0';
-                            }
-                            {
-                                // SET_VALUE_TYPE resets .bits to a nil-pointer
-                                // placeholder (VM 2.0 Phase 4i checkpoint 3b) --
-                                // capture the StringObj stored above before that
-                                // happens so it can be re-tagged afterward, same
-                                // "re-tag after retype" fix checkpoint 2 needed
-                                // for TYPE_THREAD.
-                                StringObj *reset_s = PSCAL_VALUE_PTR(*target_lvalue_ptr, StringObj);
-                                SET_VALUE_TYPE(target_lvalue_ptr, destType);
-                                pscalValueSetHeapPtrBits(target_lvalue_ptr, reset_s);
-                            }
-                            STRING_MAX_LENGTH(*target_lvalue_ptr) = -1;
+                            Value replacement = (destType == TYPE_UNICODE_STRING)
+                                                    ? makeUnicodeStringLen(encoded, encoded_len)
+                                                    : makeStringLen(encoded, encoded_len);
+                            replaceValueCell(target_lvalue_ptr, replacement, NULL);
                         } else if (isPascalStringType(VALUE_TYPE(value_to_set)) && AS_STRING(value_to_set)) {
                             VarType destType = VALUE_TYPE(*target_lvalue_ptr);
-                            freeValue(target_lvalue_ptr);
-                            /* Optimization: steal the whole StringObj from the
-                             * temporary value on the stack (not just its
-                             * buffer) -- simpler than allocating a fresh
-                             * wrapper at the destination and copying the
-                             * buffer pointer into it, and avoids needing
-                             * pscalStringEnsureObj here at all. */
-                            StringObj *stolen_s = PSCAL_VALUE_PTR(value_to_set, StringObj);
-                            pscalValueSetHeapPtrBits(&value_to_set, NULL); /* Prevent double-free */
-                            SET_VALUE_TYPE(target_lvalue_ptr, destType);
-                            // Re-tag after the retype above stomped .bits back
-                            // to a nil-pointer placeholder -- see the sibling
-                            // comment a few lines up.
-                            pscalValueSetHeapPtrBits(target_lvalue_ptr, stolen_s);
-                            STRING_MAX_LENGTH(*target_lvalue_ptr) = -1;
+                            StringObj *src_s = PSCAL_VALUE_PTR(value_to_set, StringObj);
+                            Value replacement;
+                            if (src_s->max_length > 0) {
+                                /* A string[N] source's StringObj is still that
+                                 * variable's own fixed buffer (GET_* shares it
+                                 * by reference count). Taking it over would
+                                 * share the buffer with the target and strip
+                                 * its length cap, so copy the text into a
+                                 * fresh dynamic string instead. */
+                                replacement = (destType == TYPE_UNICODE_STRING)
+                                                  ? makeUnicodeString(AS_STRING(value_to_set))
+                                                  : makeString(AS_STRING(value_to_set));
+                            } else {
+                                /* Optimization: take over the temporary's
+                                 * whole (dynamic) StringObj reference rather
+                                 * than copying its buffer. */
+                                pscalValueSetHeapPtrBits(&value_to_set, NULL); /* Prevent double-free */
+                                replacement = makeVoid();
+                                SET_VALUE_TYPE(&replacement, destType);
+                                pscalValueSetHeapPtrBits(&replacement, src_s);
+                            }
+                            replaceValueCell(target_lvalue_ptr, replacement, NULL);
                         } else {
                             runtimeError(vm, "Type mismatch: Cannot assign this type to a dynamic string.");
                         }
                     }
                     else if (VALUE_TYPE(*target_lvalue_ptr) == TYPE_STRING && STRING_MAX_LENGTH(*target_lvalue_ptr) > 0) {
+                        // The fixed buffer is written in place (char
+                        // addresses into it stay valid), so first make sure
+                        // this variable is its only holder: GET_* shares a
+                        // StringObj by reference count, and a by-value
+                        // parameter or a copy would otherwise change too.
+                        valueEnsureUnique(target_lvalue_ptr);
                         if (isPascalStringType(VALUE_TYPE(value_to_set)) && AS_STRING(value_to_set)) {
                             strncpy(AS_STRING(*target_lvalue_ptr), AS_STRING(value_to_set), STRING_MAX_LENGTH(*target_lvalue_ptr));
                             AS_STRING(*target_lvalue_ptr)[STRING_MAX_LENGTH(*target_lvalue_ptr)] = '\0'; // Ensure null termination
@@ -10911,7 +10912,10 @@ comparison_error_label:
                     }
                     STRING_MAX_LENGTH(*target_slot) = -1;
                 } else if (VALUE_TYPE(*target_slot) == TYPE_STRING && STRING_MAX_LENGTH(*target_slot) > 0) {
-                    // Special case: Assignment to a fixed-length string.
+                    // Special case: Assignment to a fixed-length string. The
+                    // buffer is written in place, so unshare it first (see
+                    // SET_INDIRECT's fixed-length branch).
+                    valueEnsureUnique(target_slot);
                     const char* source_str = "";
                     char char_buf[2] = {0};
 
@@ -11047,6 +11051,7 @@ comparison_error_label:
                     // Preserve pointer metadata when assigning NIL.
                     AS_POINTER(*target_slot) = NULL;
                 } else if (VALUE_TYPE(*target_slot) == TYPE_STRING && STRING_MAX_LENGTH(*target_slot) > 0) {
+                    valueEnsureUnique(target_slot); // in-place write: unshare first
                     const char* source_str = "";
                     char char_buf[2] = {0};
                     if (isPascalStringType(VALUE_TYPE(value_from_stack)) && AS_STRING(value_from_stack)) {
