@@ -10097,7 +10097,8 @@ static void shellHelpPrintOverview(void) {
     printf("- Navigate the interface with familiar terminal controls when used in supporting environments.\n");
     printf("- Edit with vim or pico, transfer data via curl, scp, or sftp, and inspect the network with ping, host, or nslookup.\n");
     printf("- Extend the runtime with PSCAL packages and builtins compiled via the toolchain.\n\n");
-    printf("- Compiled scripts are cached in ~/.pscal/bc_cache; use --no-cache to force recompilation.\n\n");
+    printf("- Compiled scripts are cached in ~/.pscal/bc_cache; use --no-cache to force recompilation\n"
+           "  and --prune-cache to remove entries whose source file is gone.\n\n");
     printf("Documentation: %s/exsh_overview.md.\n", PSCAL_DOCS_DIR);
     printf("Support: Report issues on the GitHub PSCAL project tracker or Discord community channels.\n\n");
     printf("Type 'help -l' for a list of functions, or 'help <function>' for help on a specific shell function.\n");

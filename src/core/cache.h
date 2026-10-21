@@ -36,6 +36,13 @@ const char* pscalCacheLastLoadError(void);
 // Build the canonical path for the cache file corresponding to a source path.
 // Caller is responsible for freeing the returned string.
 char* buildCachePath(const char* source_path, const char* compiler_id);
+// The frontends' --prune-cache: removes every entry in $HOME/.pscal/bc_cache
+// whose recorded source file no longer exists, for every compiler and every
+// container format up to this build's, and judges nothing else. Entries it
+// cannot check are kept. Prints a summary to `out` (with `verbose`, one line
+// per entry removed or kept unchecked). Returns an exit status: 0, or 1 when
+// the directory could not be read or an entry could not be removed.
+int pruneBytecodeCache(FILE* out, bool verbose);
 
 // Rebuild constructor aliases in procedure tables so fresh-compile and
 // cache-loaded execution paths share identical callable symbol aliases.

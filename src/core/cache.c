@@ -17,6 +17,7 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <fcntl.h>
+#include <dirent.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -3288,4 +3289,201 @@ bool saveBytecodeToFile(const char* file_path, const char* source_path, const By
     fclose(f);
     if (!ok) unlink(file_path);  // as saveBytecodeToCache: no truncated file left behind
     return ok;
+}
+
+/* ---- pruneBytecodeCache: one rule, stated in full ----
+ *
+ * An entry is removed when the source file its META section records no
+ * longer exists. Nothing else is judged -- not age, size, or whether a path
+ * looks temporary -- so `ls` on the recorded path explains every removal.
+ * What the rule cannot settle is kept and counted: files that do not read
+ * as an entry, entries recording no absolute path, and sources stat() cannot
+ * answer for (a permission error, an unreachable mount). Only an explicit
+ * --prune-cache runs this; no load or save ever does. */
+
+/* The source path an entry's META section records (malloc'd), or NULL with
+ * *why saying what the file is instead. Unlike psb3Load this reads every
+ * container format up to this build's: META has been framed the same way
+ * since PSB3's first format, and entries older builds left behind are
+ * exactly the ones a prune has to judge. A newer format's META is not this
+ * build's to interpret, so those are left alone. Reads the header, the
+ * section directory and META only, never the chunk. */
+static char* cacheEntrySourcePath(const char* entry_path, const char** why) {
+    FILE* f = fopen(entry_path, "rb");
+    if (!f) {
+        *why = "cannot be opened";
+        return NULL;
+    }
+    char* result = NULL;
+    uint8_t* body = NULL;
+    *why = "is not a PSB3 cache entry";
+    do {
+        struct stat st;
+        uint8_t header[16];
+        if (fstat(fileno(f), &st) != 0 || fread(header, 1, sizeof(header), f) != sizeof(header)) break;
+        Cursor c;
+        curInit(&c, header, sizeof(header));
+        uint32_t magic = curU32LE(&c);
+        uint16_t format_ver = curU16LE(&c);
+        (void)curU16LE(&c); /* vm_ver */
+        (void)curU32LE(&c); /* flags */
+        uint32_t section_count = curU32LE(&c);
+        if (magic != PSB3_MAGIC || format_ver == 0 || section_count > 64) break;
+        if (format_ver > PSB3_FORMAT_VERSION) {
+            *why = "was written by a newer build";
+            break;
+        }
+        uint8_t directory[64 * 12];
+        size_t directory_size = (size_t)section_count * 12;
+        if (fread(directory, 1, directory_size, f) != directory_size) break;
+        curInit(&c, directory, directory_size);
+        bool found = false;
+        uint32_t meta_offset = 0, meta_length = 0;
+        for (uint32_t i = 0; i < section_count; ++i) {
+            uint32_t id = curU32LE(&c);
+            uint32_t offset = curU32LE(&c);
+            uint32_t length = curU32LE(&c);
+            if (id == PSB3_SEC_META && !found) {
+                found = true;
+                meta_offset = offset;
+                meta_length = length;
+            }
+        }
+        *why = "has no readable META section";
+        if (!found || meta_length < 17 || meta_length > (1u << 20) ||
+            (uint64_t)meta_offset + meta_length > (uint64_t)st.st_size) {
+            break;
+        }
+        body = (uint8_t*)malloc(meta_length);
+        if (!body || fseek(f, (long)meta_offset, SEEK_SET) != 0 ||
+            fread(body, 1, meta_length, f) != meta_length) {
+            break;
+        }
+        curInit(&c, body, meta_length);
+        (void)curU64LE(&c); /* source hash */
+        (void)curU64LE(&c); /* combined hash */
+        size_t path_len = 0;
+        char* path = curLenPrefixedString(&c, &path_len);
+        if (!path || c.error || strlen(path) != path_len) {
+            free(path);
+            break;
+        }
+        result = path;
+        *why = NULL;
+    } while (0);
+    free(body);
+    fclose(f);
+    return result;
+}
+
+int pruneBytecodeCache(FILE* out, bool verbose) {
+    const char* home = getenv("HOME");
+    if (!home || !home[0]) {
+        fprintf(stderr, "Cannot prune the bytecode cache: HOME is not set.\n");
+        return 1;
+    }
+    size_t dir_len = strlen(home) + 1 + strlen(CACHE_ROOT) + 1 + strlen(CACHE_DIR) + 1;
+    char* dir = (char*)malloc(dir_len);
+    if (!dir) {
+        fprintf(stderr, "Cannot prune the bytecode cache: out of memory.\n");
+        return 1;
+    }
+    snprintf(dir, dir_len, "%s/%s/%s", home, CACHE_ROOT, CACHE_DIR);
+
+    DIR* d = opendir(dir);
+    if (!d) {
+        int err = errno;
+        if (err == ENOENT) {
+            fprintf(out, "No bytecode cache at %s; nothing to prune.\n", dir);
+            free(dir);
+            return 0;
+        }
+        fprintf(stderr, "Cannot read the bytecode cache %s: %s\n", dir, strerror(err));
+        free(dir);
+        return 1;
+    }
+    /* Every name first, then the removals: whether readdir() still returns
+     * the remaining names while the directory is being unlinked from is
+     * unspecified, and some filesystems skip some. */
+    char** names = NULL;
+    size_t name_count = 0, name_cap = 0;
+    bool out_of_memory = false;
+    struct dirent* de;
+    while ((de = readdir(d)) != NULL) {
+        size_t len = strlen(de->d_name);
+        if (len <= 3 || strcmp(de->d_name + len - 3, ".bc") != 0) continue;
+        if (name_count == name_cap) {
+            size_t new_cap = name_cap ? name_cap * 2 : 256;
+            char** grown = (char**)realloc(names, new_cap * sizeof(char*));
+            if (!grown) {
+                out_of_memory = true;
+                break;
+            }
+            names = grown;
+            name_cap = new_cap;
+        }
+        if (!(names[name_count] = strdup(de->d_name))) {
+            out_of_memory = true;
+            break;
+        }
+        name_count++;
+    }
+    closedir(d);
+
+    size_t entries = 0, removed = 0, unsettled = 0, failed = 0;
+    for (size_t i = 0; i < name_count && !out_of_memory; ++i) {
+        size_t entry_len = strlen(dir) + 1 + strlen(names[i]) + 1;
+        char* entry = (char*)malloc(entry_len);
+        if (!entry) {
+            out_of_memory = true;
+            break;
+        }
+        snprintf(entry, entry_len, "%s/%s", dir, names[i]);
+        struct stat st;
+        // Gone since the listing, or not a plain file: not an entry.
+        if (lstat(entry, &st) != 0 || !S_ISREG(st.st_mode)) {
+            free(entry);
+            continue;
+        }
+        entries++;
+        const char* why = NULL;
+        char* source = cacheEntrySourcePath(entry, &why);
+        struct stat source_stat;
+        if (!source) {
+            unsettled++;
+            if (verbose) fprintf(out, "kept %s: it %s\n", entry, why);
+        } else if (source[0] != '/') {
+            unsettled++;
+            if (verbose) fprintf(out, "kept %s: it records no absolute source path ('%s')\n", entry, source);
+        } else if (stat(source, &source_stat) == 0) {
+            // The source exists: the rule does not apply.
+        } else if (errno != ENOENT && errno != ENOTDIR) {
+            unsettled++;
+            if (verbose) fprintf(out, "kept %s: cannot check its source %s: %s\n", entry, source, strerror(errno));
+        } else if (unlink(entry) == 0) {
+            removed++;
+            if (verbose) fprintf(out, "removed %s: its source %s no longer exists\n", entry, source);
+        } else if (errno != ENOENT) {
+            failed++;
+            fprintf(stderr, "Cannot remove %s: %s\n", entry, strerror(errno));
+        }
+        free(source);
+        free(entry);
+    }
+    for (size_t i = 0; i < name_count; ++i) free(names[i]);
+    free(names);
+
+    if (out_of_memory) {
+        fprintf(stderr, "Cannot finish pruning the bytecode cache %s: out of memory.\n", dir);
+        free(dir);
+        return 1;
+    }
+    fprintf(out, "Removed %zu of %zu bytecode cache entries in %s: their source files no longer exist.\n",
+            removed, entries, dir);
+    if (unsettled) {
+        fprintf(out, "Kept %zu entries whose source could not be checked%s.\n", unsettled,
+                verbose ? "" : " (--verbose lists them)");
+    }
+    free(dir);
+    return failed ? 1 : 0;
 }
