@@ -1639,7 +1639,7 @@ static _Thread_local DIR* dos_dir = NULL; // Used by dosFindfirst/findnext
 
 /* Random number seeding.
  *
- * rand_seed is per-thread, which is what keeps rand_r thread-safe -- but a
+ * rand_seed is per-thread, which is what keeps the draws thread-safe -- but a
  * worker thread that never seeds itself starts from the same constant as every
  * other worker and draws an IDENTICAL stream. That made every `par` branch
  * produce the same "random" numbers, so a parallel sampler silently computed
@@ -1670,7 +1670,7 @@ static atomic_uint gRandBaseSeed = 1u;
 static atomic_uint gRandThreadCounter = 0u;
 
 /* splitmix32-style avalanche: adjacent indices must not yield adjacent seeds,
- * or rand_r's early outputs stay visibly correlated between branches. */
+ * or the generator's early outputs stay visibly correlated between branches. */
 static unsigned int randMixSeed(unsigned int base, unsigned int index) {
     unsigned int x = base + index * 0x9E3779B9u;
     x ^= x >> 16;
@@ -2919,6 +2919,47 @@ bool getVmBuiltinMappingCanonical(const char *canonical_name, VmBuiltinMapping *
     }
     pthread_mutex_unlock(&builtin_registry_mutex);
     return found;
+}
+
+#define MAX_BUILTIN_NAME_ALIASES 4
+static struct {
+    int frontendKind;
+    BuiltinNameAliasFn resolver;
+} gBuiltinNameAliases[MAX_BUILTIN_NAME_ALIASES];
+static size_t gBuiltinNameAliasCount = 0;
+
+void registerBuiltinNameAlias(int frontendKind, BuiltinNameAliasFn resolver) {
+    if (!resolver) {
+        return;
+    }
+    for (size_t i = 0; i < gBuiltinNameAliasCount; ++i) {
+        if (gBuiltinNameAliases[i].frontendKind == frontendKind &&
+            gBuiltinNameAliases[i].resolver == resolver) {
+            return;
+        }
+    }
+    if (gBuiltinNameAliasCount < MAX_BUILTIN_NAME_ALIASES) {
+        gBuiltinNameAliases[gBuiltinNameAliasCount].frontendKind = frontendKind;
+        gBuiltinNameAliases[gBuiltinNameAliasCount].resolver = resolver;
+        gBuiltinNameAliasCount++;
+    }
+}
+
+const char* resolveBuiltinNameAlias(const char* name) {
+    if (!name) {
+        return NULL;
+    }
+    int kind = (int)frontendGetKind();
+    for (size_t i = 0; i < gBuiltinNameAliasCount; ++i) {
+        if (gBuiltinNameAliases[i].frontendKind != kind) {
+            continue;
+        }
+        const char* engine = gBuiltinNameAliases[i].resolver(name);
+        if (engine && *engine) {
+            return engine;
+        }
+    }
+    return NULL;
 }
 
 int getVmBuiltinID(const char *name) {
@@ -9774,7 +9815,28 @@ Value vmBuiltinRandomize(VM* vm, int arg_count, Value* args) {
     return makeVoid();
 }
 
-/* A uniformly distributed integer in [0, n), n >= 1. One rand_r draw covers
+/* One draw in [0, PSCAL_RAND_MAX]. This is the Park-Miller "minimal standard"
+ * generator macOS's rand_r uses (FreeBSD's do_rand on a 64-bit context), so
+ * a run without Randomize prints what it printed on macOS on every host.
+ * libc rand_r differs (glibc's is another generator, and Windows' RAND_MAX
+ * is 32767), so an unseeded program printed different numbers on Linux. */
+#define PSCAL_RAND_MAX 0x7fffffff
+static unsigned int pscalRandDraw(unsigned int *ctx) {
+    int64_t v = (int64_t)*ctx;
+    if (v == 0) {
+        v = 123459876;
+    }
+    int64_t hi = v / 127773;
+    int64_t lo = v % 127773;
+    int64_t x = 16807 * lo - 2836 * hi;
+    if (x < 0) {
+        x += 0x7fffffff;
+    }
+    *ctx = (unsigned int)x;
+    return (unsigned int)(x % ((int64_t)PSCAL_RAND_MAX + 1));
+}
+
+/* A uniformly distributed integer in [0, n), n >= 1. One draw covers
  * RAND_MAX + 1 values; draws from the incomplete block at its top are
  * rejected, so every result is equally likely (plain `% n` favoured the low
  * values). For the usual small n that rejection almost never happens, so a
@@ -9782,18 +9844,18 @@ Value vmBuiltinRandomize(VM* vm, int arg_count, Value* args) {
  * beyond one draw's range takes 64 bits from several draws (Random(n) could
  * never return 2^31 or more). */
 static unsigned long long randUniformBelow(unsigned long long n) {
-    const unsigned long long draw_range = (unsigned long long)RAND_MAX + 1ULL;
+    const unsigned long long draw_range = (unsigned long long)PSCAL_RAND_MAX + 1ULL;
     if (n <= draw_range) {
         unsigned long long limit = draw_range - (draw_range % n);
         for (;;) {
-            unsigned long long r = (unsigned long long)rand_r(&rand_seed);
+            unsigned long long r = (unsigned long long)pscalRandDraw(&rand_seed);
             if (r < limit) {
                 return r % n;
             }
         }
     }
     int bits_per_draw = 0;
-    for (unsigned long long m = (unsigned long long)RAND_MAX; m; m >>= 1) {
+    for (unsigned long long m = (unsigned long long)PSCAL_RAND_MAX; m; m >>= 1) {
         bits_per_draw++;
     }
     // 2^64 mod n: draws below it belong to the incomplete top block.
@@ -9801,7 +9863,7 @@ static unsigned long long randUniformBelow(unsigned long long n) {
     for (;;) {
         unsigned long long r = 0;
         for (int bits = 0; bits < 64; bits += bits_per_draw) {
-            r = (r << bits_per_draw) | (unsigned long long)rand_r(&rand_seed);
+            r = (r << bits_per_draw) | (unsigned long long)pscalRandDraw(&rand_seed);
         }
         if (r >= threshold) {
             return r % n;
@@ -9812,7 +9874,7 @@ static unsigned long long randUniformBelow(unsigned long long n) {
 Value vmBuiltinRandom(VM* vm, int arg_count, Value* args) {
     if (arg_count == 0) {
         randEnsureSeeded();
-        return makeReal((double)rand_r(&rand_seed) / ((double)RAND_MAX + 1.0));
+        return makeReal((double)pscalRandDraw(&rand_seed) / ((double)PSCAL_RAND_MAX + 1.0));
     }
     if (arg_count == 1 && IS_INTLIKE(args[0])) {
         long long n = AS_INTEGER(args[0]);
@@ -11373,7 +11435,13 @@ static Value threadSpawnOrSubmitCommon(VM* vm, int arg_count, Value* args, bool 
             runtimeError(vm, "%s requires a builtin name or id.", opName);
             return makeInt(-1);
         }
-        builtin_id = getVmBuiltinID(source_name);
+        /* The front end's own spelling first (Aether's "dns_lookup" names
+         * the engine's "dnslookup"), then the engine name as written. */
+        const char* engine_name = resolveBuiltinNameAlias(source_name);
+        builtin_id = engine_name ? getVmBuiltinID(engine_name) : -1;
+        if (builtin_id < 0) {
+            builtin_id = getVmBuiltinID(source_name);
+        }
         builtin_name = getVmBuiltinNameById(builtin_id);
     } else if (IS_INTLIKE(target)) {
         builtin_id = (int)asI64(target);

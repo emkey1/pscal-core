@@ -6,6 +6,7 @@
 #include <limits.h>
 #include <curl/curl.h>
 #include <pthread.h>
+#include <sys/stat.h>
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
@@ -817,12 +818,43 @@ static size_t headerAccumCallback(char *buffer, size_t size, size_t nitems, void
 static HttpSession g_http_sessions[MAX_HTTP_SESSIONS];
 static unsigned int g_http_session_gen = 0;
 
+// One lock per session slot. The program's thread is not the only one that
+// touches a session: http_await may run on a task worker, and two task
+// workers may each run a synchronous request on one session. Every builtin
+// that takes a session id holds its slot's lock for the whole call (see the
+// wrappers at the end of this file), and so do httpAllocSession and the
+// await path that applies an async result to the session. A synchronous
+// request holds it across its transfer: requests on one session (one curl
+// easy handle) run one at a time, which libcurl requires anyway.
+static pthread_mutex_t g_http_session_locks[MAX_HTTP_SESSIONS];
+static pthread_once_t g_http_session_locks_once = PTHREAD_ONCE_INIT;
+
+static void httpSessionLocksInit(void) {
+    for (int i = 0; i < MAX_HTTP_SESSIONS; i++) {
+        pthread_mutex_init(&g_http_session_locks[i], NULL);
+    }
+}
+
+// Locks session slot `id` and returns it, or returns -1 (nothing locked) for
+// an id outside the table.
+static int httpSessionLock(int id) {
+    if (id < 0 || id >= MAX_HTTP_SESSIONS) return -1;
+    pthread_once(&g_http_session_locks_once, httpSessionLocksInit);
+    pthread_mutex_lock(&g_http_session_locks[id]);
+    return id;
+}
+
+static void httpSessionUnlock(int locked) {
+    if (locked >= 0) pthread_mutex_unlock(&g_http_session_locks[locked]);
+}
+
 static int httpAllocSession(void) {
     for (int i = 0; i < MAX_HTTP_SESSIONS; i++) {
+    httpSessionLock(i);
     if (!g_http_sessions[i].active) {
         memset(&g_http_sessions[i], 0, sizeof(HttpSession));
         g_http_sessions[i].curl = curl_easy_init();
-        if (!g_http_sessions[i].curl) return -1;
+        if (!g_http_sessions[i].curl) { httpSessionUnlock(i); return -1; }
         g_http_sessions[i].timeout_ms = 15000; // default 15s
         g_http_sessions[i].follow_redirects = 1;
         g_http_sessions[i].user_agent = strdup("PscalInterpreter/1.0");
@@ -835,8 +867,10 @@ static int httpAllocSession(void) {
         g_http_sessions[i].max_recv_speed = 0;
         g_http_sessions[i].max_send_speed = 0;
         g_http_sessions[i].gen = __atomic_add_fetch(&g_http_session_gen, 1, __ATOMIC_RELAXED);
+        httpSessionUnlock(i);
         return i;
     }
+    httpSessionUnlock(i);
     }
     return -1;
 }
@@ -890,7 +924,7 @@ Value vmBuiltinHttpSession(VM* vm, int arg_count, Value* args) {
 }
 
 // httpClose(session): void
-Value vmBuiltinHttpClose(VM* vm, int arg_count, Value* args) {
+static Value httpCloseUnlocked(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1 || !IS_INTLIKE(args[0])) {
         runtimeError(vm, "httpClose expects 1 integer session id.");
         return makeVoid();
@@ -901,7 +935,7 @@ Value vmBuiltinHttpClose(VM* vm, int arg_count, Value* args) {
 }
 
 // httpSetHeader(session, name, value): void
-Value vmBuiltinHttpSetHeader(VM* vm, int arg_count, Value* args) {
+static Value httpSetHeaderUnlocked(VM* vm, int arg_count, Value* args) {
     if (arg_count != 3 || !IS_INTLIKE(args[0]) ||
         !isPascalStringType(VALUE_TYPE(args[1])) || !isPascalStringType(VALUE_TYPE(args[2]))) {
         runtimeError(vm, "httpSetHeader expects (session:int, name:string, value:string).");
@@ -919,7 +953,7 @@ Value vmBuiltinHttpSetHeader(VM* vm, int arg_count, Value* args) {
 }
 
 // httpClearHeaders(session): void
-Value vmBuiltinHttpClearHeaders(VM* vm, int arg_count, Value* args) {
+static Value httpClearHeadersUnlocked(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1 || !IS_INTLIKE(args[0])) {
         runtimeError(vm, "httpClearHeaders expects 1 integer session id.");
         return makeVoid();
@@ -931,7 +965,7 @@ Value vmBuiltinHttpClearHeaders(VM* vm, int arg_count, Value* args) {
 }
 
 // httpSetOption(session, key, value): void (value can be int or string)
-Value vmBuiltinHttpSetOption(VM* vm, int arg_count, Value* args) {
+static Value httpSetOptionUnlocked(VM* vm, int arg_count, Value* args) {
     if (arg_count != 3 || !IS_INTLIKE(args[0]) || !isPascalStringType(VALUE_TYPE(args[1]))) {
         runtimeError(vm, "httpSetOption expects (session:int, key:string, value:int|string).");
         return makeVoid();
@@ -1037,7 +1071,7 @@ Value vmBuiltinHttpSetOption(VM* vm, int arg_count, Value* args) {
 }
 
 // httpRequest(session, method, url, bodyStrOrMStreamOrNil, outMStream): Integer (status)
-Value vmBuiltinHttpRequest(VM* vm, int arg_count, Value* args) {
+static Value httpRequestUnlocked(VM* vm, int arg_count, Value* args) {
     if (arg_count != 5 || !IS_INTLIKE(args[0]) ||
         !isPascalStringType(VALUE_TYPE(args[1])) || !isPascalStringType(VALUE_TYPE(args[2]))) {
         runtimeError(vm, "httpRequest expects (session:int, method:string, url:string, body:string|mstream|nil, out:mstream).");
@@ -1478,7 +1512,7 @@ Value vmBuiltinHttpRequest(VM* vm, int arg_count, Value* args) {
 }
 
 // httpRequestToFile(session, method, url, bodyStrOrMStreamOrNil, outFilename): Integer (status)
-Value vmBuiltinHttpRequestToFile(VM* vm, int arg_count, Value* args) {
+static Value httpRequestToFileUnlocked(VM* vm, int arg_count, Value* args) {
     if (arg_count != 5 || !IS_INTLIKE(args[0]) ||
         !isPascalStringType(VALUE_TYPE(args[1])) || !isPascalStringType(VALUE_TYPE(args[2]))) {
         runtimeError(vm, "httpRequestToFile expects (session:int, method:string, url:string, body:string|mstream|nil, out:string).");
@@ -1969,6 +2003,11 @@ Value vmBuiltinSocketCreate(VM* vm, int arg_count, Value* args) {
 #ifdef _WIN32
     ensure_winsock();
 #endif
+    /* 0 is TCP and 1 is UDP; any other type used to make a TCP socket. */
+    if (type != 0 && type != 1) {
+        setSocketError(EINVAL);
+        return makeInt(-1);
+    }
     int socktype = (type == 1) ? SOCK_DGRAM : SOCK_STREAM;
     int proto = (type == 1) ? IPPROTO_UDP : IPPROTO_TCP;
     int s = (int)socket(family, socktype, proto);
@@ -2654,6 +2693,7 @@ typedef struct HttpAsyncJob_s {
     pthread_t th;
     int session;
     unsigned int session_gen; // the session's gen at submission time
+    bool session_valid;       // the session id was open at submission time
     char* method;
     char* url;
     char* body;
@@ -2905,8 +2945,10 @@ static void httpAsyncWork(VM* threadVm, void* user_data) {
     job->threadVm = threadVm; // so xferInfoCallback/progressCallback (which
                                // only receive `job` as clientp) can call
                                // vmTaskReportProgress
-    HttpSession* s = httpGet(job->session);
-    if (!s) {
+    // The job carries its own copy of the session's options, taken at
+    // submission, and never touches the session: closing the session while
+    // the request runs no longer decides, by timing, whether it fails.
+    if (!job->session_valid) {
         job->status = -1;
         job->error = strdup("invalid session");
         httpAsyncFinish(threadVm, job);
@@ -2937,6 +2979,13 @@ static void httpAsyncWork(VM* threadVm, void* user_data) {
             job->error = strdup("cannot open local file");
             httpAsyncFinish(threadVm, job);
         return;
+        }
+        // A regular file's size is the expected total, as Content-Length is
+        // for a network transfer (http_get_async_total read 0 here before).
+        struct stat in_st;
+        if (fstat(fileno(in), &in_st) == 0 && S_ISREG(in_st.st_mode)) {
+            job->dl_total = (long long)in_st.st_size;
+            vmTaskReportProgress(threadVm, 0, job->dl_total);
         }
         size_t total = 0; unsigned char buf[8192]; size_t n;
         while (1) {
@@ -3328,7 +3377,7 @@ static void httpAsyncWork(VM* threadVm, void* user_data) {
 }
 
 // HttpRequestAsync(session, method, url, bodyStrOrMStreamOrNil): Integer (async id)
-Value vmBuiltinHttpRequestAsync(VM* vm, int arg_count, Value* args) {
+static Value httpRequestAsyncUnlocked(VM* vm, int arg_count, Value* args) {
     if (arg_count != 4 || !IS_INTLIKE(args[0]) ||
         !isPascalStringType(VALUE_TYPE(args[1])) || !isPascalStringType(VALUE_TYPE(args[2]))) {
         runtimeError(vm, "httpRequestAsync expects (session:int, method:string, url:string, body:string|mstream|nil).");
@@ -3354,6 +3403,7 @@ Value vmBuiltinHttpRequestAsync(VM* vm, int arg_count, Value* args) {
     // Snapshot session options for thread safety
     HttpSession* s = httpGet(job->session);
     if (s) {
+        job->session_valid = true;
         job->session_gen = s->gen;
         job->timeout_ms = s->timeout_ms; job->follow_redirects = s->follow_redirects;
         job->verify_peer = s->verify_peer; job->verify_host = s->verify_host; job->force_http2 = s->force_http2;
@@ -3411,7 +3461,7 @@ Value vmBuiltinHttpRequestAsync(VM* vm, int arg_count, Value* args) {
 }
 
 // HttpRequestAsyncToFile(session, method, url, bodyStrOrMStreamOrNil, outPath): Integer (async id)
-Value vmBuiltinHttpRequestAsyncToFile(VM* vm, int arg_count, Value* args) {
+static Value httpRequestAsyncToFileUnlocked(VM* vm, int arg_count, Value* args) {
     if (arg_count != 5 || !IS_INTLIKE(args[0]) ||
         !isPascalStringType(VALUE_TYPE(args[1])) || !isPascalStringType(VALUE_TYPE(args[2]))) {
         runtimeError(vm, "httpRequestAsyncToFile expects (session:int, method:string, url:string, body:string|mstream|nil, out:string).");
@@ -3443,6 +3493,7 @@ Value vmBuiltinHttpRequestAsyncToFile(VM* vm, int arg_count, Value* args) {
     // Snapshot session options for thread safety
     HttpSession* s = httpGet(job->session);
     if (s) {
+        job->session_valid = true;
         job->session_gen = s->gen;
         job->timeout_ms = s->timeout_ms; job->follow_redirects = s->follow_redirects;
         job->verify_peer = s->verify_peer; job->verify_host = s->verify_host; job->force_http2 = s->force_http2;
@@ -3528,8 +3579,9 @@ static int httpTaskAwaitAndExtract(VM* vm, TaskObj* t, Value* outMstream) {
     // closed and its slot reused, since the request started.
     Value* sessionField = httpFindRecordField(result, "session");
     Value* genField = httpFindRecordField(result, "session_gen");
-    HttpSession* s = (sessionField && IS_INTLIKE(*sessionField))
-                         ? httpGet((int)AS_INTEGER(*sessionField)) : NULL;
+    int locked = (sessionField && IS_INTLIKE(*sessionField))
+                     ? httpSessionLock((int)AS_INTEGER(*sessionField)) : -1;
+    HttpSession* s = locked >= 0 ? httpGet(locked) : NULL;
     if (s && genField && IS_INTLIKE(*genField) &&
         s->gen == (unsigned int)AS_INTEGER(*genField)) {
         Value* headersField = httpFindRecordField(result, "headers");
@@ -3546,6 +3598,7 @@ static int httpTaskAwaitAndExtract(VM* vm, TaskObj* t, Value* outMstream) {
             s->last_error_msg = strdup(AS_STRING(*msgField));
         }
     }
+    httpSessionUnlock(locked);
     Value* bodyField = httpFindRecordField(result, "body");
     if (bodyField && VALUE_TYPE(*bodyField) == TYPE_MEMORYSTREAM &&
         AS_MSTREAM(*bodyField) && AS_MSTREAM(*bodyField)->buffer) {
@@ -3661,7 +3714,7 @@ Value vmBuiltinHttpGetAsyncTotal(VM* vm, int arg_count, Value* args) {
 }
 
 // HttpLastError(session): String
-Value vmBuiltinHttpLastError(VM* vm, int arg_count, Value* args) {
+static Value httpLastErrorUnlocked(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1 || !IS_INTLIKE(args[0])) {
         runtimeError(vm, "httpLastError expects 1 integer session id.");
         return makeString("");
@@ -3673,7 +3726,7 @@ Value vmBuiltinHttpLastError(VM* vm, int arg_count, Value* args) {
 }
 
 // HttpGetLastHeaders(session): String
-Value vmBuiltinHttpGetLastHeaders(VM* vm, int arg_count, Value* args) {
+static Value httpGetLastHeadersUnlocked(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1 || !IS_INTLIKE(args[0])) {
         runtimeError(vm, "httpGetLastHeaders expects 1 integer session id.");
         return makeString("");
@@ -3685,7 +3738,7 @@ Value vmBuiltinHttpGetLastHeaders(VM* vm, int arg_count, Value* args) {
 }
 
 // HttpErrorCode(session): Integer (0=none; 1=generic; 2=io; 3=timeout; 4=ssl; 5=resolve; 6=connect)
-Value vmBuiltinHttpErrorCode(VM* vm, int arg_count, Value* args) {
+static Value httpErrorCodeUnlocked(VM* vm, int arg_count, Value* args) {
     if (arg_count != 1 || !IS_INTLIKE(args[0])) {
         runtimeError(vm, "httpErrorCode expects 1 integer session id.");
         return makeInt(-1);
@@ -3696,7 +3749,7 @@ Value vmBuiltinHttpErrorCode(VM* vm, int arg_count, Value* args) {
 }
 
 // HttpGetHeader(session, name): String (value from last response headers; empty if not found)
-Value vmBuiltinHttpGetHeader(VM* vm, int arg_count, Value* args) {
+static Value httpGetHeaderUnlocked(VM* vm, int arg_count, Value* args) {
     if (arg_count != 2 || !IS_INTLIKE(args[0]) || !isPascalStringType(VALUE_TYPE(args[1]))) {
         runtimeError(vm, "httpGetHeader expects (session:int, name:string).");
         return makeString("");
@@ -3795,3 +3848,29 @@ Value vmBuiltinJsonGet(VM* vm, int arg_count, Value* args) {
     memcpy(out, p, len); out[len] = '\0';
     Value s = makeString(out); free(out); return s;
 }
+
+
+// The session builtins, each holding its session's lock for the whole call
+// (see g_http_session_locks). runtimeError only records the error, so every
+// path through the unlocked bodies returns here.
+#define HTTP_SESSION_LOCKED_BUILTIN(name, body)                         \
+    Value name(VM* vm, int arg_count, Value* args) {                    \
+        int locked = (arg_count >= 1 && IS_INTLIKE(args[0]))            \
+                         ? httpSessionLock((int)AS_INTEGER(args[0]))   \
+                         : -1;                                          \
+        Value result = body(vm, arg_count, args);                       \
+        httpSessionUnlock(locked);                                      \
+        return result;                                                  \
+    }
+HTTP_SESSION_LOCKED_BUILTIN(vmBuiltinHttpClose, httpCloseUnlocked)
+HTTP_SESSION_LOCKED_BUILTIN(vmBuiltinHttpSetHeader, httpSetHeaderUnlocked)
+HTTP_SESSION_LOCKED_BUILTIN(vmBuiltinHttpClearHeaders, httpClearHeadersUnlocked)
+HTTP_SESSION_LOCKED_BUILTIN(vmBuiltinHttpSetOption, httpSetOptionUnlocked)
+HTTP_SESSION_LOCKED_BUILTIN(vmBuiltinHttpRequest, httpRequestUnlocked)
+HTTP_SESSION_LOCKED_BUILTIN(vmBuiltinHttpRequestToFile, httpRequestToFileUnlocked)
+HTTP_SESSION_LOCKED_BUILTIN(vmBuiltinHttpRequestAsync, httpRequestAsyncUnlocked)
+HTTP_SESSION_LOCKED_BUILTIN(vmBuiltinHttpRequestAsyncToFile, httpRequestAsyncToFileUnlocked)
+HTTP_SESSION_LOCKED_BUILTIN(vmBuiltinHttpLastError, httpLastErrorUnlocked)
+HTTP_SESSION_LOCKED_BUILTIN(vmBuiltinHttpGetLastHeaders, httpGetLastHeadersUnlocked)
+HTTP_SESSION_LOCKED_BUILTIN(vmBuiltinHttpErrorCode, httpErrorCodeUnlocked)
+HTTP_SESSION_LOCKED_BUILTIN(vmBuiltinHttpGetHeader, httpGetHeaderUnlocked)

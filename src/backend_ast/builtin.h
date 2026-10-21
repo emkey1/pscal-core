@@ -41,6 +41,20 @@ BuiltinRoutineType getVmBuiltinTypeById(int id);
 bool getVmBuiltinMapping(const char* name, VmBuiltinMapping* out_mapping, int* out_id);
 bool getVmBuiltinMappingCanonical(const char* canonical_name, VmBuiltinMapping* out_mapping, int* out_id);
 int getVmBuiltinID(const char* name);
+
+/* Builtin names that arrive at run time, as data: task_spawn/task_queue
+ * targets and has_builtin's function name. A front end whose programs spell
+ * builtins differently from the engine (Aether's snake_case surface over the
+ * engine's builtins) registers how its names map, so those builtins accept
+ * the names its programs are written with ("dns_lookup", not only the
+ * engine's "dnslookup"). A resolver returns the engine name for `name`, or
+ * NULL when it has no alias for it. Resolvers apply only while `kind` is the
+ * running front end; register them at startup, before any thread runs. */
+typedef const char* (*BuiltinNameAliasFn)(const char* name);
+void registerBuiltinNameAlias(int frontendKind, BuiltinNameAliasFn resolver);
+/* The engine name the running front end's resolvers map `name` to, or NULL
+ * when none of them has an alias for it. */
+const char* resolveBuiltinNameAlias(const char* name);
 void registerVmBuiltin(const char *vm_name, VmBuiltinFn handler,
                        BuiltinRoutineType type, const char *display_name,
                        EffectMask effect_mask);

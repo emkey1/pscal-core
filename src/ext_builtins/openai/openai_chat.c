@@ -1,5 +1,9 @@
 #include "backend_ast/builtin.h"
 #include "core/utils.h"
+#include "common/frontend_kind.h"
+#ifdef ENABLE_EXT_BUILTIN_YYJSON
+#include "third_party/yyjson/yyjson.h"
+#endif
 #include <curl/curl.h>
 #include <ctype.h>
 #include <limits.h>
@@ -175,6 +179,67 @@ static char *openaiBuildRequestBody(const char *model,
     return body;
 }
 
+/* Aether documents ai_chat's third parameter as `system: Text`, but the
+ * engine spliced it into the request object as extra JSON fields, so a
+ * system prompt made the request invalid JSON. Under Aether the argument is
+ * still spliced when it is JSON object fields (an object, or its members,
+ * as every request that worked before passed it); anything else is a system
+ * prompt. */
+static bool openaiOptionsAreJsonFields(const char *options) {
+    const char *start = NULL;
+    size_t len = 0;
+    if (!openaiExtractOptionsSlice(options, &start, &len)) {
+        return true; /* empty: no options either way */
+    }
+#ifdef ENABLE_EXT_BUILTIN_YYJSON
+    char *wrapped = malloc(len + 3);
+    if (!wrapped) {
+        return true;
+    }
+    wrapped[0] = '{';
+    memcpy(wrapped + 1, start, len);
+    wrapped[len + 1] = '}';
+    wrapped[len + 2] = '\0';
+    yyjson_doc *doc = yyjson_read(wrapped, len + 2, 0);
+    bool fields = doc && yyjson_is_obj(yyjson_doc_get_root(doc));
+    if (doc) yyjson_doc_free(doc);
+    free(wrapped);
+    return fields;
+#else
+    (void)len;
+    const char *p = options;
+    while (*p && isspace((unsigned char)*p)) p++;
+    return *p == '{' || *p == '"';
+#endif
+}
+
+/* `messages` (a JSON array) with a system message first. */
+static char *openaiPrependSystemMessage(const char *messages, const char *system_prompt) {
+    char *escaped = openaiJsonEscape(system_prompt);
+    if (!escaped) {
+        return NULL;
+    }
+    const char *rest = messages ? messages : "";
+    while (*rest && isspace((unsigned char)*rest)) rest++;
+    bool array = *rest == '[';
+    if (array) {
+        rest++;
+        while (*rest && isspace((unsigned char)*rest)) rest++;
+    }
+    bool empty = !array || *rest == ']' || *rest == '\0';
+    if (!array) {
+        rest = "]";
+    }
+    size_t total = strlen(escaped) + strlen(rest) + 48;
+    char *out = malloc(total);
+    if (out) {
+        snprintf(out, total, "[{\"role\":\"system\",\"content\":\"%s\"}%s%s",
+                 escaped, empty ? "" : ",", (empty && array && *rest != ']') ? "]" : rest);
+    }
+    free(escaped);
+    return out;
+}
+
 static char *openaiBuildUrl(const char *base_url) {
     const char *path = "/chat/completions";
     if (!base_url || !*base_url) {
@@ -235,7 +300,18 @@ static Value vmBuiltinOpenAIChatCompletions(struct VM_s *vm, int arg_count,
         return makeString("");
     }
 
+    char *messages_with_system = NULL;
+    if (frontendIsAether() && options_json && !openaiOptionsAreJsonFields(options_json)) {
+        messages_with_system = openaiPrependSystemMessage(messages_json, options_json);
+        if (!messages_with_system) {
+            runtimeError(vm, "OpenAIChatCompletions failed to allocate request body.");
+            return makeString("");
+        }
+        messages_json = messages_with_system;
+        options_json = NULL;
+    }
     char *body = openaiBuildRequestBody(model, messages_json, options_json);
+    free(messages_with_system);
     if (!body) {
         runtimeError(vm, "OpenAIChatCompletions failed to allocate request body.");
         return makeString("");

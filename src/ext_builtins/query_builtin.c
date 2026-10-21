@@ -1,4 +1,5 @@
 #include "backend_ast/builtin.h"
+#include "common/frontend_kind.h"
 #include "core/utils.h"
 #include "ext_builtins/registry.h"
 #include <ctype.h>
@@ -48,7 +49,7 @@ static const AetherBuiltinMeta kAetherBuiltinMeta[] = {
      "Release a TOON document handle.", "toon", true},
     {"toon_key", "YyjsonGetKey", "function", "ToonNode",
      "toon_key(node: ToonNode, key: Text) -> ToonNode",
-     "Read an object child node by key.", "toon", false},
+     "Read an object child node by key; a missing key gives a missing node (every toon_is_* false, toon_type \"\").", "toon", false},
     {"toon_key_or", NULL, "function", "ToonNode",
      "toon_key_or(node: ToonNode, key: Text, fallback: ToonNode) -> ToonNode",
      "Read an object child node by key with a node fallback.", "toon", false},
@@ -138,7 +139,7 @@ static const AetherBuiltinMeta kAetherBuiltinMeta[] = {
      "Compact alias over length(...). Prefer length(...) in generated code unless brevity matters.", "collection", false},
     {"task_spawn", "thread_spawn_named", "function", "Int",
      "task_spawn(target: Text, name: Text, arg) -> Int",
-     "Spawn an allow-listed worker builtin and return a task handle.", "task", true},
+     "Spawn an allow-listed worker builtin, named as Aether spells it (\"sleep\", \"dns_lookup\"), and return a task handle.", "task", true},
     {"task_queue", "thread_pool_submit", "function", "Int",
      "task_queue(target: Text, name: Text, arg) -> Int",
      "Queue an allow-listed worker builtin and return a task handle.", "task", true},
@@ -148,9 +149,9 @@ static const AetherBuiltinMeta kAetherBuiltinMeta[] = {
     {"task_lookup", "thread_lookup", "function", "Int",
      "task_lookup(name: Text) -> Int",
      "Look up a named queued worker handle.", "task", true},
-    {"task_status", "thread_get_status", "function", "Int",
-     "task_status(handle: Int, consume: Bool = false) -> Int",
-     "Read a task success/status flag from the worker runtime.", "task", true},
+    {"task_status", "thread_get_status", "function", "Bool",
+     "task_status(handle: Int, consume: Bool = false) -> Bool",
+     "True when the finished task succeeded; readable once it has finished.", "task", true},
     {"task_result", "thread_get_result", "function", "Int",
      "task_result(handle: Int, consume: Bool = false) -> Int",
      "Read a task result payload from the worker runtime.", "task", true},
@@ -162,7 +163,7 @@ static const AetherBuiltinMeta kAetherBuiltinMeta[] = {
      "Worker-pool status encoded as JSON text.", "task", true},
     {"ai_chat", "openaichatcompletions", "function", "Text",
      "ai_chat(model: Text, messages: Text, system: Text = \"\", apiKey: Text = \"\", endpoint: Text = \"\") -> Text",
-     "Call the configured AI chat/completions backend; effectful and runtime-dependent.", "ai", true},
+     "Call the configured AI chat/completions backend; `system` goes first as a system message (JSON object fields there are merged into the request instead). Effectful and runtime-dependent.", "ai", true},
     {"has_toon", NULL, "function", "Bool", "has_toon() -> Bool",
      "Capability probe for the yyjson/TOON backend.", "capability", false},
     {"has_ai", NULL, "function", "Bool", "has_ai() -> Bool",
@@ -172,10 +173,10 @@ static const AetherBuiltinMeta kAetherBuiltinMeta[] = {
      "The compiler's version as `aether --version` prints it after \"Version:\": the language version and the release label, e.g. \"2026-10-20-13 (1.0-beta3)\".", "capability", false},
     {"has_builtin", "hasextbuiltin", "function", "Bool",
      "has_builtin(category: Text, function: Text) -> Bool",
-     "Capability probe for extended builtin categories/functions.", "capability", false},
+     "Can this builtin be called? Takes Aether names (\"sqlite_open\"); a core builtin matches whatever the category.", "capability", false},
     {"builtins_json", "aetherbuiltinsjson", "function", "Text",
      "builtins_json(detail: Bool = false) -> Text",
-     "Structured JSON list of Aether-visible builtins. detail=true adds usage metadata.", "capability", false},
+     "JSON array with one object per Aether-visible builtin (name, kind, category, ...). detail=true adds usage metadata.", "capability", false},
     {"builtin_info", "aetherbuiltininfo", "function", "Text",
      "builtin_info(name: Text) -> Text",
      "Structured JSON metadata for one Aether-visible builtin.", "capability", false},
@@ -397,7 +398,7 @@ static const AetherBuiltinMeta kAetherBuiltinMeta[] = {
      "Set a request header on a session.", "network", true, "vm_builtin"},
     {"http_request", "httprequest", "function", "Int",
      "http_request(session: Int, method: Text, url: Text, body: Text, out: MStream) -> Int",
-     "Perform a request; writes the response body into out, returns the HTTP status.", "network", true, "vm_builtin"},
+     "Perform a request; writes the response body into out, returns the HTTP status, or -(error class) on a transport error (see http_error_code).", "network", true, "vm_builtin"},
     {"http_error_code", "httperrorcode", "function", "Int",
      "http_error_code(session: Int) -> Int",
      "Transport-level error code for the last request on a session.", "network", true, "vm_builtin"},
@@ -490,7 +491,7 @@ static const AetherBuiltinMeta kAetherBuiltinMeta[] = {
     /* Filesystem mutation (effectful). */
     {"mkdir", NULL, "function", "Int",
      "mkdir(path: Text) -> Int",
-     "Create a directory; returns 0 on success or an errno.", "filesystem", true, "vm_builtin"},
+     "Create a directory; returns 0 on success (a directory that already exists counts) or an errno.", "filesystem", true, "vm_builtin"},
     {"rmdir", NULL, "function", "Int",
      "rmdir(path: Text) -> Int",
      "Remove an empty directory; returns 0 on success or an errno.", "filesystem", true, "vm_builtin"},
@@ -503,10 +504,10 @@ static const AetherBuiltinMeta kAetherBuiltinMeta[] = {
      "Close a database handle.", "sqlite", true, "vm_builtin"},
     {"sqlite_exec", "sqliteexec", "function", "Int",
      "sqlite_exec(db: Int, sql: Text) -> Int",
-     "Execute SQL with no result rows; returns a status code.", "sqlite", true, "vm_builtin"},
+     "Execute SQL with no result rows; returns 0. A SQL error stops the program with SQLite's message.", "sqlite", true, "vm_builtin"},
     {"sqlite_prepare", "sqliteprepare", "function", "Int",
      "sqlite_prepare(db: Int, sql: Text) -> Int",
-     "Compile a statement; returns a stmt handle.", "sqlite", true, "vm_builtin"},
+     "Compile a statement; returns a stmt handle. A SQL error stops the program with SQLite's message.", "sqlite", true, "vm_builtin"},
     {"sqlite_finalize", "sqlitefinalize", "function", "Int",
      "sqlite_finalize(stmt: Int) -> Int",
      "Release a prepared statement.", "sqlite", true, "vm_builtin"},
@@ -551,7 +552,7 @@ static const AetherBuiltinMeta kAetherBuiltinMeta[] = {
      "Clear all bound parameters on a statement.", "sqlite", true, "vm_builtin"},
     {"sqlite_errmsg", "sqliteerrmsg", "function", "Text",
      "sqlite_errmsg(db: Int) -> Text",
-     "Most recent error message for a database.", "sqlite", true, "vm_builtin"},
+     "Most recent error message for a database (after a failed sqlite_step).", "sqlite", true, "vm_builtin"},
     {"sqlite_last_insert_rowid", "sqlitelastinsertrowid", "function", "Int",
      "sqlite_last_insert_rowid(db: Int) -> Int",
      "Rowid of the most recent insert.", "sqlite", true, "vm_builtin"},
@@ -937,6 +938,32 @@ static Value vmBuiltinHasExtBuiltin(struct VM_s *vm, int arg_count,
   if (extBuiltinHasFunction(category, func)) {
     return makeBoolean(1);
   }
+  /* The front end's own spelling of a builtin (Aether's "file_exists",
+   * "sqlite_open", "println"). Only the engine names were found before, so
+   * the documented Aether names all answered false while the run-together
+   * engine spellings D72 removed from the language answered true. */
+  const char *engine = resolveBuiltinNameAlias(func);
+  if (engine) {
+    if (extBuiltinHasFunction(category, engine) || getVmBuiltinID(engine) >= 0) {
+      return makeBoolean(1);
+    }
+    /* println and print compile to the writeln/write statements, which are
+     * not engine functions. */
+    if (strcasecmp(engine, "writeln") == 0 || strcasecmp(engine, "write") == 0) {
+      return makeBoolean(1);
+    }
+    /* An alias whose engine builtin this build lacks (sqlite_open in a build
+     * without SQLite): not callable. */
+    return makeBoolean(0);
+  }
+  if (frontendIsAether()) {
+    /* Builtins the Aether front end implements itself (has_toon,
+     * aether_version): documented with no engine function behind them. */
+    const AetherBuiltinMeta *meta = findAetherBuiltinMeta(func);
+    if (meta && !meta->backend_name && !meta->source) {
+      return makeBoolean(1);
+    }
+  }
   /* Fall back to the core VM registry.
    *
    * Searching only the extended registry made this probe *inverted* for core
@@ -1140,7 +1167,17 @@ static Value vmBuiltinExtBuiltinGroupFunctionName(struct VM_s *vm,
   return makeString(name);
 }
 
+/* The documented Aether names (the table above) as engine names, for the
+ * builtins that take a builtin name at run time (resolveBuiltinNameAlias).
+ * The Aether front end registers its own alias table too; this one also
+ * covers a cached program run by a bare VM. */
+static const char *aetherMetaBackendName(const char *name) {
+  const AetherBuiltinMeta *meta = findAetherBuiltinMeta(name);
+  return meta ? meta->backend_name : NULL;
+}
+
 void registerExtBuiltinQueryBuiltins(void) {
+  registerBuiltinNameAlias(FRONTEND_KIND_AETHER, aetherMetaBackendName);
   registerVmBuiltin("hasextbuiltin", vmBuiltinHasExtBuiltin,
                     BUILTIN_TYPE_FUNCTION, "HasExtBuiltin", FX_PURE);
   registerVmBuiltin("extbuiltincategorycount",

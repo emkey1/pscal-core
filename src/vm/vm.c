@@ -2975,6 +2975,9 @@ static void vmThreadInitSlot(Thread* thread) {
     atomic_store(&thread->paused, false);
     atomic_store(&thread->cancelRequested, false);
     atomic_store(&thread->killRequested, false);
+    thread->finishedProgressNow = 0;
+    thread->finishedProgressTotal = 0;
+    thread->finishedProgressGeneration = 0;
     vmThreadResetResult(thread);
 }
 
@@ -3238,6 +3241,11 @@ static bool vmThreadAwaitRelease(Thread* thread, VM* owner) {
     // (vmThreadJobQueuePop no longer retires a worker on cancel, but a stale
     // flag would still cancel the slot's next job before it started).
     atomic_store(&thread->cancelRequested, false);
+    // Keep the finished job's progress readable once the slot is reset (see
+    // finishedProgressNow in vm.h).
+    thread->finishedProgressNow = atomic_load(&thread->nativeProgressNow);
+    thread->finishedProgressTotal = atomic_load(&thread->nativeProgressTotal);
+    thread->finishedProgressGeneration = thread->jobGeneration;
     if (exitLoop) {
         pthread_mutex_lock(&thread->resultMutex);
         thread->awaitingReuse = false;
@@ -3959,16 +3967,6 @@ static bool vmThreadGenerationMatchesLocked(const Thread* thread, uint32_t gener
     return generation == 0 || thread->jobGeneration == generation;
 }
 
-static bool vmThreadGenerationMatches(Thread* thread, uint32_t generation) {
-    if (generation == 0) {
-        return true;
-    }
-    pthread_mutex_lock(&thread->stateMutex);
-    bool matches = thread->jobGeneration == generation;
-    pthread_mutex_unlock(&thread->stateMutex);
-    return matches;
-}
-
 // VM 2.0 Phase 5a checkpoint 5a-i: non-blocking "has this task's job
 // completed" poll for TaskDone -- reads the slot's finished state under
 // resultMutex so builtin.c never has to reach into Thread's fields directly.
@@ -3976,18 +3974,26 @@ static bool vmThreadGenerationMatches(Thread* thread, uint32_t generation) {
 // (awaited, or released by a cancel, and possibly replaced by a later job)
 // reports done: there is nothing left to wait for. Before, a cancelled task
 // that had been released reported "not done" forever.
+//
+// A job that has been asked to stop (cancel or kill) is done too, from the
+// moment of the request: its result is never delivered (the slot is
+// released as soon as the job returns), so there is nothing to wait for
+// either. Before, the answer depended on whether the worker had noticed
+// the request yet. The wildcard generation 0 (an Aether Int task id) gets
+// the same answers as a real generation: an empty slot is done. It used to
+// skip the slot check, so a cancelled request polled by Int id stayed "not
+// done" forever once its slot was released.
 bool vmTaskIsDone(VM* vm, int threadId, uint32_t generation) {
     Thread* thread = vmThreadSlot(vmThreadPool(vm), threadId);
     if (!thread || !thread->syncInitialized || !thread->stateSyncInitialized) {
         return false;
     }
-    if (generation != 0) {
-        pthread_mutex_lock(&thread->stateMutex);
-        bool current = thread->currentJob != NULL && thread->jobGeneration == generation;
-        pthread_mutex_unlock(&thread->stateMutex);
-        if (!current) {
-            return true;
-        }
+    pthread_mutex_lock(&thread->stateMutex);
+    bool current = thread->currentJob != NULL && vmThreadGenerationMatchesLocked(thread, generation);
+    bool stopping = current && (atomic_load(&thread->cancelRequested) || atomic_load(&thread->killRequested));
+    pthread_mutex_unlock(&thread->stateMutex);
+    if (!current || stopping) {
+        return true;
     }
     if (!atomic_load(&thread->inPool)) {
         return false;
@@ -4070,14 +4076,36 @@ void vmTaskReportProgress(VM* threadVm, long long now, long long total) {
     atomic_store(&threadVm->owningThread->nativeProgressTotal, total);
 }
 
+// Reads the job's progress counters: the live ones while the job holds its
+// slot, the ones it finished with once it has been released (awaited or
+// cancelled). Both are read under stateMutex, which the slot's release and
+// next pickup hold while they reset and replace them, so a poll never sees
+// a half-reset pair. Before, a poll after http_await raced the worker's
+// slot reset: progress 7 with total 0, or 0/0.
 bool vmTaskGetProgress(VM* vm, int threadId, uint32_t generation, long long* outNow, long long* outTotal) {
     Thread* thread = vmThreadSlot(vmThreadPool(vm), threadId);
-    if (!thread || !atomic_load(&thread->inPool) || !vmThreadGenerationMatches(thread, generation)) {
+    if (!thread || !thread->stateSyncInitialized) {
         return false;
     }
-    if (outNow) *outNow = atomic_load(&thread->nativeProgressNow);
-    if (outTotal) *outTotal = atomic_load(&thread->nativeProgressTotal);
-    return true;
+    bool found = false;
+    long long now = 0, total = 0;
+    pthread_mutex_lock(&thread->stateMutex);
+    if (thread->currentJob && vmThreadGenerationMatchesLocked(thread, generation)) {
+        now = atomic_load(&thread->nativeProgressNow);
+        total = atomic_load(&thread->nativeProgressTotal);
+        found = true;
+    } else if (thread->finishedProgressGeneration != 0 &&
+               (generation == 0 || generation == thread->finishedProgressGeneration)) {
+        now = thread->finishedProgressNow;
+        total = thread->finishedProgressTotal;
+        found = true;
+    }
+    pthread_mutex_unlock(&thread->stateMutex);
+    if (found) {
+        if (outNow) *outNow = now;
+        if (outTotal) *outTotal = total;
+    }
+    return found;
 }
 
 bool vmThreadStopRequested(const VM* threadVm) {

@@ -299,6 +299,14 @@ typedef struct {
     atomic_llong nativeProgressNow;   // vmTaskReportProgress / vmTaskGetProgress
     atomic_llong nativeProgressTotal; // (0 total means "unknown", matching
                                        // HTTP's existing dl_total convention)
+    // The counters the slot's last released job ended with, and that job's
+    // generation (0: none yet). vmThreadAwaitRelease records them, under
+    // stateMutex, in the same section that resets the live counters, so a
+    // progress poll after the job was awaited or cancelled reads its final
+    // values instead of a reset slot. Guarded by stateMutex.
+    long long finishedProgressNow;
+    long long finishedProgressTotal;
+    uint32_t finishedProgressGeneration;
 } Thread;
 
 typedef void (*VMThreadCallback)(struct VM_s* threadVm, void* user_data);
