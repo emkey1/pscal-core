@@ -6051,6 +6051,42 @@ static int vmRecentInstructionStart(VM* vm, int error_offset) {
     return error_offset;
 }
 
+/* Aether codes the VM's math errors. Sixteen call sites (the arithmetic
+ * opcodes, abs/sqr/sum and the math extension builtins) raise these five fixed
+ * messages, which printed with no code and no hint ("Runtime Error: Integer
+ * overflow."), while every other Aether failure names one. Matching the exact
+ * text here codes them all, and any later site that reuses a message, without
+ * touching the other front ends' wording. */
+static const struct {
+    const char *plain;
+    const char *coded;
+} kAetherMathErrors[] = {
+    {"Runtime Error: Integer division by zero.",
+     "[AETH-RUNTIME-DIV-ZERO] Integer division by zero (`div`).\n"
+     "hint: check the divisor first, e.g. `if b != 0 { q = a div b; }`."},
+    {"Runtime Error: Division by zero (integer).",
+     "[AETH-RUNTIME-DIV-ZERO] Division by zero (`/`).\n"
+     "hint: check the divisor first, e.g. `if b != 0 { x = a / b; }`."},
+    {"Runtime Error: Division by zero.",
+     "[AETH-RUNTIME-DIV-ZERO] Division by zero (`/`).\n"
+     "hint: check the divisor first, e.g. `if b != 0 { x = a / b; }`."},
+    {"Runtime Error: Modulo by zero.",
+     "[AETH-RUNTIME-DIV-ZERO] Modulo by zero (`%`).\n"
+     "hint: check the divisor first, e.g. `if b != 0 { r = a % b; }`."},
+    {"Runtime Error: Integer overflow.",
+     "[AETH-RUNTIME-INT-OVERFLOW] Integer overflow: the result is outside Int's 64-bit range.\n"
+     "hint: check the operands before the operation, or compute in Real when values get that large."},
+};
+
+static void aetherCodeMathError(char *message, size_t size) {
+    for (size_t i = 0; i < sizeof(kAetherMathErrors) / sizeof(kAetherMathErrors[0]); i++) {
+        if (strcmp(message, kAetherMathErrors[i].plain) == 0) {
+            snprintf(message, size, "%s", kAetherMathErrors[i].coded);
+            return;
+        }
+    }
+}
+
 void runtimeError(VM* vm, const char* format, ...) {
     if (vm) {
         vm->abort_requested = true;
@@ -6082,6 +6118,7 @@ void runtimeError(VM* vm, const char* format, ...) {
     va_start(args, format);
     vsnprintf(message, sizeof(message), format, args);
     va_end(args);
+    if (frontendIsAether()) aetherCodeMathError(message, sizeof(message));
 
     size_t instruction_offset = 0;
     int error_line = 0;
