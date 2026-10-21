@@ -2962,6 +2962,44 @@ const char* resolveBuiltinNameAlias(const char* name) {
     return NULL;
 }
 
+#define MAX_BUILTIN_NAME_REJECTERS 4
+static struct {
+    int frontendKind;
+    BuiltinNameRejectedFn rejected;
+} gBuiltinNameRejecters[MAX_BUILTIN_NAME_REJECTERS];
+static size_t gBuiltinNameRejecterCount = 0;
+
+void registerBuiltinNameRejected(int frontendKind, BuiltinNameRejectedFn rejected) {
+    if (!rejected) {
+        return;
+    }
+    for (size_t i = 0; i < gBuiltinNameRejecterCount; ++i) {
+        if (gBuiltinNameRejecters[i].frontendKind == frontendKind &&
+            gBuiltinNameRejecters[i].rejected == rejected) {
+            return;
+        }
+    }
+    if (gBuiltinNameRejecterCount < MAX_BUILTIN_NAME_REJECTERS) {
+        gBuiltinNameRejecters[gBuiltinNameRejecterCount].frontendKind = frontendKind;
+        gBuiltinNameRejecters[gBuiltinNameRejecterCount].rejected = rejected;
+        gBuiltinNameRejecterCount++;
+    }
+}
+
+bool builtinNameRejectedByFrontend(const char* name) {
+    if (!name) {
+        return false;
+    }
+    int kind = (int)frontendGetKind();
+    for (size_t i = 0; i < gBuiltinNameRejecterCount; ++i) {
+        if (gBuiltinNameRejecters[i].frontendKind == kind &&
+            gBuiltinNameRejecters[i].rejected(name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int getVmBuiltinID(const char *name) {
     if (!name) {
         return -1;

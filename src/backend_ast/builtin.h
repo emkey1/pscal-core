@@ -55,6 +55,16 @@ void registerBuiltinNameAlias(int frontendKind, BuiltinNameAliasFn resolver);
 /* The engine name the running front end's resolvers map `name` to, or NULL
  * when none of them has an alias for it. */
 const char* resolveBuiltinNameAlias(const char* name);
+/* Engine builtin names a front end's programs may not call by that spelling
+ * (Aether's Pascal-era and run-together engine names, D55/D72: `copy`,
+ * `fileexists`, `sqliteopen`). The builtin listings (builtins_json,
+ * builtin_info) leave them out, so they list only what the compiler accepts.
+ * A predicate returns true for a rejected name; like the alias resolvers it
+ * applies only while `kind` is the running front end. */
+typedef bool (*BuiltinNameRejectedFn)(const char* name);
+void registerBuiltinNameRejected(int frontendKind, BuiltinNameRejectedFn rejected);
+/* True when one of the running front end's predicates rejects `name`. */
+bool builtinNameRejectedByFrontend(const char* name);
 void registerVmBuiltin(const char *vm_name, VmBuiltinFn handler,
                        BuiltinRoutineType type, const char *display_name,
                        EffectMask effect_mask);

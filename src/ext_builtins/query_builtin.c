@@ -152,9 +152,23 @@ static const AetherBuiltinMeta kAetherBuiltinMeta[] = {
     {"task_status", "thread_get_status", "function", "Bool",
      "task_status(handle: Int, consume: Bool = false) -> Bool",
      "True when the finished task succeeded; readable once it has finished.", "task", true},
-    {"task_result", "thread_get_result", "function", "Int",
-     "task_result(handle: Int, consume: Bool = false) -> Int",
-     "Read a task result payload from the worker runtime.", "task", true},
+    /* No fixed type: the payload is whatever the target builtin returned, so
+     * Aether's type checker leaves the call untyped (types.c). */
+    {"task_result", "thread_get_result", "function", "T",
+     "task_result(handle: Int, consume: Bool = false) -> T (the target's result: Text for \"dns_lookup\")",
+     "The target builtin's own result, of the type that builtin returns (Text for \"dns_lookup\"; nothing for a procedure such as \"sleep\"): bind it with that type. A run-time error while the task is still running.", "task", true},
+    {"task_set_name", "thread_set_name", "function", "Bool",
+     "task_set_name(handle: Int, name: Text) -> Bool",
+     "Rename a task, so task_lookup finds it by the new name; true when it was renamed.", "task", true},
+    {"task_pause", "thread_pause", "function", "Bool",
+     "task_pause(handle: Int) -> Bool",
+     "Pause a running task; true on success.", "task", true},
+    {"task_resume", "thread_resume", "function", "Bool",
+     "task_resume(handle: Int) -> Bool",
+     "Resume a paused task; true on success.", "task", true},
+    {"task_cancel", "thread_cancel", "function", "Bool",
+     "task_cancel(handle: Int) -> Bool",
+     "Ask a task to stop; true when the request reached it. Join it with task_wait afterwards.", "task", true},
     {"task_stats", "thread_stats", "function", "Array",
      "task_stats() -> Array",
      "Worker-pool state records with no Aether type: count them with length(task_stats()); read their fields through task_stats_json().", "task", true},
@@ -196,6 +210,9 @@ static const AetherBuiltinMeta kAetherBuiltinMeta[] = {
     {"trim", NULL, "function", "Text",
      "trim(s: Text) -> Text",
      "Strip leading and trailing whitespace.", "strings", false, "vm_builtin"},
+    {"int_to_text", "IntToStr", "function", "Text",
+     "int_to_text(n: Int) -> Text",
+     "n in decimal, with a leading - when negative.", "conversion", false, "vm_builtin"},
     {"real_to_text", "realtostr", "function", "Text",
      "real_to_text(value: Real) -> Text",
      "Real to Text with 6 decimals.", "conversion", false, "vm_builtin"},
@@ -814,9 +831,20 @@ static bool appendVmBuiltinObject(JsonText *json,
     category = "core";
   }
 
+  /* Since D70 an Aether program writes a camelCase engine name (apiSend) in
+   * lower case; the registered spelling itself is SCOPE-001. */
+  char lowered[128];
+  const char *shown = name;
+  if (frontendIsAether() && strlen(name) < sizeof(lowered)) {
+    size_t n = 0;
+    for (; name[n]; ++n) lowered[n] = (char)tolower((unsigned char)name[n]);
+    lowered[n] = '\0';
+    shown = lowered;
+  }
+
   if (!jsonTextAppend(json, "{")) return false;
   if (!jsonTextAppend(json, "\"name\":")) return false;
-  if (!jsonTextAppendEscaped(json, name)) return false;
+  if (!jsonTextAppendEscaped(json, shown)) return false;
   if (!jsonTextAppend(json, ",\"source\":\"vm_builtin\"")) return false;
   if (!jsonTextAppend(json, ",\"kind\":")) return false;
   if (!jsonTextAppendEscaped(json, builtinTypeName(type))) return false;
@@ -830,11 +858,22 @@ static bool appendVmBuiltinObject(JsonText *json,
   }
   if (detailed) {
     char usage[256];
-    snprintf(usage, sizeof(usage), "%s(...)", name);
+    snprintf(usage, sizeof(usage), "%s(...)", shown);
     if (!jsonTextAppend(json, ",\"usage\":")) return false;
     if (!jsonTextAppendEscaped(json, usage)) return false;
   }
   return jsonTextAppend(json, "}");
+}
+
+/* Under Aether the listings name only what a program can call as spelled: no
+ * engine name the front end rejects (copy, fileexists, sqliteopen: D55, D72),
+ * and none with no handler in this build (the SDL placeholders of a build
+ * without SDL). Both used to be listed as Aether-visible and were SCOPE-001. */
+static bool vmBuiltinHiddenFromAether(int id, const char *name) {
+  if (!frontendIsAether()) {
+    return false;
+  }
+  return !getVmBuiltinHandlerById(id) || builtinNameRejectedByFrontend(name);
 }
 
 static bool appendAetherBuiltinsJson(JsonText *json, bool detailed) {
@@ -852,7 +891,7 @@ static bool appendAetherBuiltinsJson(JsonText *json, bool detailed) {
   size_t builtin_count = getVmBuiltinCount();
   for (size_t i = 0; i < builtin_count; ++i) {
     const char *name = getVmBuiltinNameById((int)i);
-    if (!name || !*name) {
+    if (!name || !*name || vmBuiltinHiddenFromAether((int)i, name)) {
       continue;
     }
     if (!first && !jsonTextAppend(json, ",")) return false;
@@ -908,7 +947,7 @@ static Value vmBuiltinAetherBuiltinInfo(struct VM_s *vm, int arg_count,
     }
   } else {
     int id = getVmBuiltinID(name);
-    if (id < 0) {
+    if (id < 0 || vmBuiltinHiddenFromAether(id, name)) {
       jsonTextFree(&json);
       return makeString("null");
     }
