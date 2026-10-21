@@ -2,6 +2,7 @@
 #include "common/frontend_kind.h"
 #include "core/utils.h"
 #include "ext_builtins/registry.h"
+#include "vm/vm_fx_policy.h"
 #include <ctype.h>
 #include <stdbool.h>
 #include <stdarg.h>
@@ -997,6 +998,22 @@ static Value vmBuiltinAetherBuiltinInfo(struct VM_s *vm, int arg_count,
   return result;
 }
 
+/* has_builtin's yes. Under Aether "can I call this?" (the guides' wording)
+ * includes this run's --deny (D80): a builtin the policy refuses answers false,
+ * because calling it would stop the program with AETH-RUNTIME-DENIED. It used
+ * to answer true and the documented guard, `if has_builtin(...) { call }`,
+ * then died in the call. `engine` is the registered name whose effect mask
+ * the dispatch gate checks; halt and exit are never refused. */
+static Value hasBuiltinAnswer(const char *engine) {
+  if (frontendIsAether() && engine) {
+    EffectMask mask = pscalBuiltinNameEffectMaskLive(engine);
+    if ((mask & pscalFxEffectiveDeniedMask()) && !pscalFxBuiltinIsDenyExempt(engine)) {
+      return makeBoolean(0);
+    }
+  }
+  return makeBoolean(1);
+}
+
 static Value vmBuiltinHasExtBuiltin(struct VM_s *vm, int arg_count,
                                     Value *args) {
   if (arg_count != 2) {
@@ -1010,7 +1027,7 @@ static Value vmBuiltinHasExtBuiltin(struct VM_s *vm, int arg_count,
   const char *category = AS_STRING(args[0]);
   const char *func = AS_STRING(args[1]);
   if (extBuiltinHasFunction(category, func)) {
-    return makeBoolean(1);
+    return hasBuiltinAnswer(func);
   }
   /* The front end's own spelling of a builtin (Aether's "file_exists",
    * "sqlite_open", "println"). Only the engine names were found before, so
@@ -1019,12 +1036,12 @@ static Value vmBuiltinHasExtBuiltin(struct VM_s *vm, int arg_count,
   const char *engine = resolveBuiltinNameAlias(func);
   if (engine) {
     if (extBuiltinHasFunction(category, engine) || getVmBuiltinID(engine) >= 0) {
-      return makeBoolean(1);
+      return hasBuiltinAnswer(engine);
     }
     /* println and print compile to the writeln/write statements, which are
      * not engine functions. */
     if (strcasecmp(engine, "writeln") == 0 || strcasecmp(engine, "write") == 0) {
-      return makeBoolean(1);
+      return hasBuiltinAnswer(engine);
     }
     /* An alias whose engine builtin this build lacks (sqlite_open in a build
      * without SQLite): not callable. */
@@ -1037,7 +1054,8 @@ static Value vmBuiltinHasExtBuiltin(struct VM_s *vm, int arg_count,
     if (meta && !meta->backend_name && !meta->source) {
       /* try_sqlite_exec/try_sqlite_prepare run on an SQLite engine builtin. */
       if (strncasecmp(func, "try_sqlite_", 11) == 0) {
-        return makeBoolean(getVmBuiltinID("aether_try_sqlite_exec") >= 0);
+        return getVmBuiltinID("aether_try_sqlite_exec") >= 0
+                   ? hasBuiltinAnswer("aether_try_sqlite_exec") : makeBoolean(0);
       }
       return makeBoolean(1);
     }
@@ -1056,7 +1074,7 @@ static Value vmBuiltinHasExtBuiltin(struct VM_s *vm, int arg_count,
    * has_builtin("anything", "socketcreate") true, which is the honest reading --
    * the function is the question, and the category only ever narrowed the
    * extended registry. */
-  return makeBoolean(getVmBuiltinID(func) >= 0);
+  return getVmBuiltinID(func) >= 0 ? hasBuiltinAnswer(func) : makeBoolean(0);
 }
 
 static size_t countFunctionsAcrossGroups(const char *category) {
