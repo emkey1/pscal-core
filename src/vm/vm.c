@@ -9294,7 +9294,7 @@ void vmReportFxDenied(VM* vm, const char* builtin_name, EffectMask fx_mask, Effe
     }
     static const struct { EffectMask bit; const char *flag; const char *what; const char *hint; } kClasses[] = {
         {FX_NET, "net", "network access", NULL},
-        {FX_PROC, "proc", "starting tasks and threads",
+        {FX_PROC, "proc", "using tasks and threads",
          "\nhint: to run your own functions in parallel, use `par { f(a); g(b); }`."},
         {FX_IO, "io", "input and output", NULL},
         {FX_CLOCK, "clock", "reading the clock and sleeping", NULL},
