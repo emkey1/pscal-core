@@ -767,6 +767,35 @@ static bool findExtBuiltinCategoryForFunction(const char *func,
   return false;
 }
 
+/* Equal ignoring case and underscores: the dispatch table knows
+ * `threadpoolsubmit` where the listing says `thread_pool_submit`. */
+static bool builtinNamesMatch(const char *a, const char *b) {
+  for (;;) {
+    while (*a == '_') a++;
+    while (*b == '_') b++;
+    if (!*a || !*b) return *a == *b;
+    if (tolower((unsigned char)*a) != tolower((unsigned char)*b)) return false;
+    a++;
+    b++;
+  }
+}
+
+/* The Aether spelling of an engine builtin (`thread_spawn_named` ->
+ * `task_spawn`), so a run-time message names what the program wrote; NULL
+ * when the listing has no Aether entry for it. The first entry wins. */
+const char *pscalAetherNameForBuiltin(const char *backend_name) {
+  if (!backend_name) {
+    return NULL;
+  }
+  for (size_t i = 0; i < sizeof(kAetherBuiltinMeta) / sizeof(kAetherBuiltinMeta[0]); ++i) {
+    const AetherBuiltinMeta *meta = &kAetherBuiltinMeta[i];
+    if (meta->backend_name && builtinNamesMatch(meta->backend_name, backend_name)) {
+      return meta->aether_name;
+    }
+  }
+  return NULL;
+}
+
 static const AetherBuiltinMeta *findAetherBuiltinMeta(const char *name) {
   if (!name) {
     return NULL;

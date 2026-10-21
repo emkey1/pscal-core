@@ -51,6 +51,8 @@ void pscalFxEndSession(void);
 bool pscalFxBuiltinIsJournalExempt(const char *canonical_name);
 /* halt and exit: ending the program is never denied by --deny. */
 bool pscalFxBuiltinIsDenyExempt(const char *canonical_name);
+/* The Aether spelling of an engine builtin, or NULL (ext_builtins/query_builtin.c). */
+const char *pscalAetherNameForBuiltin(const char *backend_name);
 
 /* Called from vm.c right after a live handler call for an effectful builtin
  * (mask != FX_PURE) when recording is active. Journals the call in order:

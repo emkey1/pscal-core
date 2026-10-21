@@ -575,6 +575,8 @@ Symbol* vmFindClassMethod(VM* vm, const char* className, uint16_t methodIndex);
 
 // printf-style: the compiler checks every call's arguments against its format.
 void runtimeError(VM* vm, const char* format, ...) __attribute__((format(printf, 2, 3)));
+/* A --deny refusal of `builtin_name` (vm.c); Aether names it as the program spells it. */
+void vmReportFxDenied(VM* vm, const char* builtin_name, uint32_t fx_mask, uint32_t denied);
 void runtimeWarning(VM* vm, const char* format, ...) __attribute__((format(printf, 2, 3)));
 void vmDumpStackInfo(VM* vm);
 void vmDumpStackInfoDetailed(VM* vm, const char* context_message);

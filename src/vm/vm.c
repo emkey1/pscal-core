@@ -9280,6 +9280,41 @@ static BuiltinRoutineType vmBuiltinTypeCached(int builtin_id, const char* fallba
     return fallback_name ? getBuiltinType(fallback_name) : BUILTIN_TYPE_NONE;
 }
 
+/* The --deny refusal, from the dispatch gate below and from the thread-job
+ * check in builtin.c. Aether names the builtin as the program spells it and the
+ * denied class in words: the shared line named the engine's alias
+ * (`thread_spawn_named` for `task_spawn`) and hex effect masks, and an agent
+ * reading it took a sandbox refusal for a compiler bug. "denied by --deny"
+ * stays in both forms: the benchmark's sandbox probe looks for it. */
+void vmReportFxDenied(VM* vm, const char* builtin_name, EffectMask fx_mask, EffectMask denied) {
+    if (!frontendIsAether()) {
+        runtimeError(vm, "VM Error: builtin '%s' denied by --deny/PSCAL_VM_DENY policy (effect mask 0x%x intersects denied 0x%x).",
+                     builtin_name ? builtin_name : "?", (unsigned)fx_mask, (unsigned)denied);
+        return;
+    }
+    static const struct { EffectMask bit; const char *flag; const char *what; const char *hint; } kClasses[] = {
+        {FX_NET, "net", "network access", NULL},
+        {FX_PROC, "proc", "starting tasks and threads",
+         "\nhint: to run your own functions in parallel, use `par { f(a); g(b); }`."},
+        {FX_IO, "io", "input and output", NULL},
+        {FX_CLOCK, "clock", "reading the clock and sleeping", NULL},
+        {FX_RANDOM, "random", "random numbers", NULL},
+        {FX_EXT, "ext", "native plugins", NULL},
+    };
+    const char *flag = "?", *what = "it", *hint = NULL;
+    for (size_t i = 0; i < sizeof(kClasses) / sizeof(kClasses[0]); i++) {
+        if (fx_mask & denied & kClasses[i].bit) {
+            flag = kClasses[i].flag;
+            what = kClasses[i].what;
+            hint = kClasses[i].hint;
+            break;
+        }
+    }
+    const char *shown = pscalAetherNameForBuiltin(builtin_name);
+    runtimeError(vm, "[AETH-RUNTIME-DENIED] %s is denied by --deny %s in this run: %s is not allowed.%s",
+                 shown ? shown : (builtin_name ? builtin_name : "?"), flag, what, hint ? hint : "");
+}
+
 /* VM 2.0 Phase 6 (Docs/pscal_vm2_plan.md §6.3): shared enforce/replay gate for
  * both builtin-call opcodes (CALL_BUILTIN_PROC and CALL_BUILTIN), called
  * right before the handler would otherwise run. pscalFxPolicyActive() is a
@@ -9307,8 +9342,7 @@ static InterpretResult vmApplyFxPolicy(VM* vm, int effective_id, const char* eff
 
     EffectMask denied = pscalFxEffectiveDeniedMask();
     if ((denied & fx_mask) && !pscalFxBuiltinIsDenyExempt(getVmBuiltinNameById(effective_id))) {
-        runtimeError(vm, "VM Error: builtin '%s' denied by --deny/PSCAL_VM_DENY policy (effect mask 0x%x intersects denied 0x%x).",
-                     effective_name ? effective_name : "?", (unsigned)fx_mask, (unsigned)denied);
+        vmReportFxDenied(vm, effective_name, fx_mask, denied);
         return INTERPRET_RUNTIME_ERROR;
     }
 
