@@ -11479,7 +11479,7 @@ static Value threadSpawnOrSubmitCommon(VM* vm, int arg_count, Value* args, bool 
      * httprequest handed to a thread as surely as a direct call. */
     EffectMask target_mask = getVmBuiltinEffectMaskById(builtin_id);
     EffectMask denied_mask = pscalFxEffectiveDeniedMask();
-    if (target_mask & denied_mask) {
+    if ((target_mask & denied_mask) && !pscalFxBuiltinIsDenyExempt(builtin_name)) {
         runtimeError(vm, "VM Error: builtin '%s' denied by --deny/PSCAL_VM_DENY policy (effect mask 0x%x intersects denied 0x%x).",
                      builtin_name, (unsigned)target_mask, (unsigned)denied_mask);
         return makeInt(-1);

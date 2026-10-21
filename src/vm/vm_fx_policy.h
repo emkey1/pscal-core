@@ -49,6 +49,8 @@ void pscalFxEndSession(void);
  * race on accept/connect. Takes the canonical (dispatch-table) name and
  * matches the 13 socket builtins exactly. */
 bool pscalFxBuiltinIsJournalExempt(const char *canonical_name);
+/* halt and exit: ending the program is never denied by --deny. */
+bool pscalFxBuiltinIsDenyExempt(const char *canonical_name);
 
 /* Called from vm.c right after a live handler call for an effectful builtin
  * (mask != FX_PURE) when recording is active. Journals the call in order:

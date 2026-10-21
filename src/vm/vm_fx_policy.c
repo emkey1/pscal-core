@@ -160,6 +160,22 @@ bool pscalFxBuiltinIsJournalExempt(const char *canonical_name) {
     return false;
 }
 
+/* Ending the program is not something --deny withholds: a program can always
+ * end by returning, so denying halt/exit (proc-class) under --deny proc only
+ * turned a correct exit status into a runtime error and exit 1. Aether's
+ * `fn main() -> Int` exits through halt, and so do its failed contract and
+ * slice guards, which then reported the denial instead of the broken contract.
+ * Spawning processes and threads stays denied. Exact names, as above. */
+static const char *const kFxDenyExemptNames[] = { "halt", "exit" };
+
+bool pscalFxBuiltinIsDenyExempt(const char *canonical_name) {
+    if (!canonical_name) return false;
+    for (size_t i = 0; i < sizeof(kFxDenyExemptNames) / sizeof(kFxDenyExemptNames[0]); ++i) {
+        if (strcasecmp(kFxDenyExemptNames[i], canonical_name) == 0) return true;
+    }
+    return false;
+}
+
 void pscalFxEndSession(void) {
     pthread_mutex_lock(&g_fx_journal_mutex);
     if (g_fx_record_file) { fclose(g_fx_record_file); g_fx_record_file = NULL; }

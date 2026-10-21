@@ -9265,7 +9265,7 @@ static InterpretResult vmApplyFxPolicy(VM* vm, int effective_id, const char* eff
     if (fx_mask == FX_PURE) return INTERPRET_OK;
 
     EffectMask denied = pscalFxEffectiveDeniedMask();
-    if (denied & fx_mask) {
+    if ((denied & fx_mask) && !pscalFxBuiltinIsDenyExempt(getVmBuiltinNameById(effective_id))) {
         runtimeError(vm, "VM Error: builtin '%s' denied by --deny/PSCAL_VM_DENY policy (effect mask 0x%x intersects denied 0x%x).",
                      effective_name ? effective_name : "?", (unsigned)fx_mask, (unsigned)denied);
         return INTERPRET_RUNTIME_ERROR;
