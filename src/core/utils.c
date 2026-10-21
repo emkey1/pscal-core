@@ -5414,18 +5414,32 @@ static ObjHeader *valueCowHeader(const Value *target, uint32_t *out_pins) {
 void valueEnsureUnique(Value *target) {
     if (!target) return;
 
-    // Nothing to clone when the payload is not CoW-eligible or this cell
-    // holds its only owning reference -- the common case, so skip the
-    // global lock for it. The lock never covered the caller's mutation that
-    // follows (that happens after unlock), only the decision to clone.
-    // Character pointers into a string (`pins`) keep it alive without
-    // owning its text; only another Value sharing it forces the clone.
-    uint32_t pins = 0;
-    ObjHeader *hdr = valueCowHeader(target, &pins);
-    if (!hdr || atomic_load_explicit(&hdr->refcount, memory_order_acquire) <= 1u + pins) {
-        return;
+    // Only payloads that can be shared copy-on-write need anything. A cell's
+    // type does not change while another thread clones it, so this test
+    // needs no lock.
+    switch (target->type) {
+        case TYPE_STRING:
+        case TYPE_UNICODE_STRING:
+        case TYPE_SET:
+        case TYPE_RECORD:
+        case TYPE_ENUM:
+        case TYPE_MAP:
+        case TYPE_ARRAY:
+            break;
+        default:
+            return;
     }
 
+    // The uniqueness test itself must run under the lock, not only the
+    // clone. Another thread may be cloning this same cell right now
+    // (makeCopyOfValue, freeValue, install). Tested without the lock, the
+    // old payload can read as unshared in that window -- the other thread
+    // has already dropped the cell's reference to it -- so the caller
+    // writes into it while it is about to be released: a heap
+    // use-after-free in GET_FIELD_ADDRESS/SET_INDIRECT
+    // (Tests/vm_stack_growth_stress/mt_static_cow_race.pas). An unlocked
+    // refcount-1 shortcut here (pscal-core 1183157) caused exactly that.
+    //
     // Serializes against vm.c's copyValueForStack() (the cheap retain-share
     // copy this function's clone-on-write exists to protect against) and
     // against a second concurrent valueEnsureUnique() call racing to clone
@@ -5433,9 +5447,12 @@ void valueEnsureUnique(Value *target) {
     // independently decide "still shared, clone it", then stomp on each
     // other's install/release (confirmed as a real heap-corruption crash
     // under a multithreaded stress test before this lock was added).
+    // Character pointers into a string (`pins`) keep it alive without
+    // owning its text; only another Value sharing it forces the clone.
     pthread_mutex_lock(&value_cell_mutex);
 
-    hdr = valueCowHeader(target, &pins);
+    uint32_t pins = 0;
+    ObjHeader *hdr = valueCowHeader(target, &pins);
     if (hdr && atomic_load_explicit(&hdr->refcount, memory_order_acquire) > 1u + pins) {
         Value fresh = makeCopyOfValue(target);
         freeValue(target);
