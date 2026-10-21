@@ -1965,6 +1965,7 @@ typedef struct {
 } ThreadStartArgs;
 
 static bool vmThreadCaptureUpvaluesForJob(VM* vm, ThreadJob* job);
+static bool vmBindUpvaluesThrough(Value** out, const CallFrame* from, const Symbol* proc);
 static void vmThreadJobDestroy(ThreadJob* job);
 static void vmComputeDeadline(struct timespec* out, long millis);
 static void vmReleaseHeldMutexes(VM* vm);
@@ -2405,20 +2406,75 @@ static ClosureCell* vmFindCaptureCell(VM* vm, const Value* target) {
     return NULL;
 }
 
+// The VM, among those that spawned this worker's job (directly or not),
+// whose stack holds `target`, when this VM reached it through a slot of a
+// closure it runs that is still open (that VM has not closed it, so the
+// frame is live). NULL otherwise.
+static VM* vmForeignCaptureHolder(VM* vm, const Value* target) {
+    if (!vm->spawnerVm) {
+        return NULL;
+    }
+    bool open = false;
+    for (int fi = vm->frameCount - 1; fi >= 0 && !open; --fi) {
+        ClosureEnvPayload* env = vm->frames[fi].closureEnv;
+        if (!env) {
+            continue;
+        }
+        for (uint16_t i = 0; i < env->slot_count && !open; ++i) {
+            open = (!env->cells || !env->cells[i]) &&
+                   __atomic_load_n(&env->slots[i], __ATOMIC_ACQUIRE) == target;
+        }
+    }
+    if (!open) {
+        return NULL;
+    }
+    int hops = 0;
+    for (VM* v = vm->spawnerVm; v && v != vm && hops < 64; v = v->spawnerVm, ++hops) {
+        if (vmStackHolds(v, target)) {
+            return v;
+        }
+    }
+    return NULL;
+}
+
+// The VMs whose stacks a closure env being built points into.
+typedef struct {
+    VM* vms[8];
+    int count;
+} VmCaptureHolders;
+
+static void vmNoteCaptureHolder(VmCaptureHolders* holders, VM* holder) {
+    if (!holder) {
+        return;
+    }
+    for (int i = 0; i < holders->count; ++i) {
+        if (holders->vms[i] == holder) {
+            return;
+        }
+    }
+    if (holders->count < (int)(sizeof(holders->vms) / sizeof(holders->vms[0]))) {
+        holders->vms[holders->count++] = holder;
+    }
+}
+
 // Binds slot `index` of a closure env being built to `target`: a slot of
-// this VM's stack (returns true; register the env afterwards), the cell of
-// an enclosing closure, or anything else (a var parameter's referent off
-// the stack), which is used as is.
-static bool vmBindCapturedSlot(VM* vm, ClosureEnvPayload* env, uint16_t index, Value* target) {
+// this VM's stack, or of the stack of a VM that spawned this one's job
+// (noted in `holders`: register the env with them afterwards,
+// vmRegisterCaptureHolders), the cell of an enclosing closure, or anything
+// else (a var parameter's referent off the stack), which is used as is.
+static void vmBindCapturedSlot(VM* vm, ClosureEnvPayload* env, uint16_t index, Value* target,
+                               VmCaptureHolders* holders) {
     env->slots[index] = target;
     if (vmStackHolds(vm, target)) {
-        return true;
+        vmNoteCaptureHolder(holders, vm);
+        return;
     }
     ClosureCell* cell = vmFindCaptureCell(vm, target);
     if (cell) {
         closureEnvBindCell(env, index, cell);
+        return;
     }
-    return false;
+    vmNoteCaptureHolder(holders, vmForeignCaptureHolder(vm, target));
 }
 
 static Value* vmOpenCaptureHigh(const VM* vm, const ClosureEnvPayload* env) {
@@ -2478,6 +2534,60 @@ static void vmRegisterOpenCapture(VM* vm, ClosureEnvPayload* env) {
     }
 }
 
+// Hands `env` to `holder`, another thread's VM whose stack it points into,
+// to be closed with that VM's own captures.
+static void vmPostForeignCapture(VM* holder, ClosureEnvPayload* env) {
+    pthread_mutex_lock(&holder->foreignCaptureLock);
+    if (holder->foreignCaptureCount == holder->foreignCaptureCapacity) {
+        int cap = holder->foreignCaptureCapacity ? holder->foreignCaptureCapacity * 2 : 8;
+        ClosureEnvPayload** grown = (ClosureEnvPayload**)realloc(holder->foreignCaptures,
+                                                                 (size_t)cap * sizeof(ClosureEnvPayload*));
+        if (!grown) {
+            pthread_mutex_unlock(&holder->foreignCaptureLock);
+            fprintf(stderr, "Fatal VM Error: Out of memory tracking closure captures.\n");
+            EXIT_FAILURE_HANDLER();
+        }
+        holder->foreignCaptures = grown;
+        holder->foreignCaptureCapacity = cap;
+    }
+    retainClosureEnv(env);
+    holder->foreignCaptures[holder->foreignCaptureCount++] = env;
+    atomic_store_explicit(&holder->foreignCapturePending, true, memory_order_relaxed);
+    pthread_mutex_unlock(&holder->foreignCaptureLock);
+}
+
+static void vmAdoptForeignCaptures(VM* vm) {
+    pthread_mutex_lock(&vm->foreignCaptureLock);
+    ClosureEnvPayload** posted = vm->foreignCaptures;
+    int count = vm->foreignCaptureCount;
+    vm->foreignCaptures = NULL;
+    vm->foreignCaptureCount = 0;
+    vm->foreignCaptureCapacity = 0;
+    atomic_store_explicit(&vm->foreignCapturePending, false, memory_order_relaxed);
+    pthread_mutex_unlock(&vm->foreignCaptureLock);
+    for (int i = 0; i < count; ++i) {
+        vmRegisterOpenCapture(vm, posted[i]);
+        releaseClosureEnv(posted[i]);
+    }
+    free(posted);
+}
+
+static void vmRegisterCaptureHolders(VM* vm, ClosureEnvPayload* env, const VmCaptureHolders* holders) {
+    for (int i = 0; i < holders->count; ++i) {
+        if (holders->vms[i] == vm) {
+            vmRegisterOpenCapture(vm, env);
+        } else {
+            vmPostForeignCapture(holders->vms[i], env);
+        }
+    }
+}
+
+// The flag only says to look: the posted envs are read under the lock.
+static inline bool vmCapturesToClose(VM* vm) {
+    return vm->openCaptureCount > 0 ||
+           atomic_load_explicit(&vm->foreignCapturePending, memory_order_relaxed);
+}
+
 typedef struct {
     Value* slot;
     ClosureCell* cell;
@@ -2486,6 +2596,9 @@ typedef struct {
 // Closes every registered capture of a stack slot at or above `base`, which
 // is about to be released.
 static void vmCloseCaptures(VM* vm, Value* base) {
+    if (atomic_load_explicit(&vm->foreignCapturePending, memory_order_relaxed)) {
+        vmAdoptForeignCaptures(vm);
+    }
     if (vm->openCaptureCount == 0 || vm->openCaptureHigh < base) {
         return;
     }
@@ -2597,15 +2710,38 @@ static bool vmThreadCaptureUpvaluesForJob(VM* vm, ThreadJob* job) {
         return false;
     }
 
+    // The frame found may belong to a routine nested in the enclosing one
+    // (a sibling spawning it): its slots are not the enclosing routine's,
+    // so the variables come through its upvalues, as for a call, or, from
+    // bytecode that lacks those captures, the nearest frame of the
+    // enclosing routine itself.
+    Value* through[256];
+    bool use_through = proc_symbol->enclosing && parent_frame->function_symbol != proc_symbol->enclosing;
+    if (use_through && !vmBindUpvaluesThrough(through, parent_frame, proc_symbol)) {
+        use_through = false;
+        parent_frame = NULL;
+        for (int fi = vm->frameCount - 1; fi >= 0 && !parent_frame; --fi) {
+            if (vm->frames[fi].function_symbol == proc_symbol->enclosing) {
+                parent_frame = &vm->frames[fi];
+            }
+        }
+        if (!parent_frame) {
+            runtimeError(vm, "VM Error: Cannot spawn nested procedure '%s' without active parent frame.", proc_name);
+            return false;
+        }
+    }
+
     // The thread runs the routine as a closure over the parent's variables,
     // registered like any other so that they survive the parent's return.
     ClosureEnvPayload* env = createClosureEnv((uint16_t)proc_symbol->upvalue_count, TYPE_CLOSURE);
     env->symbol = proc_symbol;
-    bool open = false;
+    VmCaptureHolders holders = {{NULL}, 0};
 
     for (int i = 0; i < proc_symbol->upvalue_count; ++i) {
         Value* slot_ptr = NULL;
-        if (proc_symbol->upvalues[i].isLocal) {
+        if (use_through) {
+            slot_ptr = through[i];
+        } else if (proc_symbol->upvalues[i].isLocal) {
             uint8_t slot_index = proc_symbol->upvalues[i].index;
             if (parent_frame->slots && slot_index < parent_frame->slotCount) {
                 slot_ptr = parent_frame->slots + slot_index;
@@ -2623,14 +2759,10 @@ static bool vmThreadCaptureUpvaluesForJob(VM* vm, ThreadJob* job) {
             return false;
         }
 
-        if (vmBindCapturedSlot(vm, env, (uint16_t)i, slot_ptr)) {
-            open = true;
-        }
+        vmBindCapturedSlot(vm, env, (uint16_t)i, slot_ptr, &holders);
     }
 
-    if (open) {
-        vmRegisterOpenCapture(vm, env);
-    }
+    vmRegisterCaptureHolders(vm, env, &holders);
     job->closureEnv = env;  // the job takes createClosureEnv's reference
     return true;
 }
@@ -2695,6 +2827,7 @@ static bool vmThreadPrepareWorkerVm(Thread* thread, VM* owner, ThreadJob* job, i
     thread->vm->trace_executed = 0;
     thread->vm->owningThread = thread;
     thread->vm->threadId = threadId;
+    thread->vm->spawnerVm = sourceVm != thread->vm ? sourceVm : NULL;
     return true;
 }
 
@@ -6613,7 +6746,7 @@ static Value vmHostCreateClosure(VM* vm) {
 
     ClosureEnvPayload* env = createClosureEnv((uint16_t)capture_count, TYPE_CLOSURE);
     env->symbol = proc_symbol;
-    bool open = false;
+    VmCaptureHolders holders = {{NULL}, 0};
 
     for (int i = capture_count - 1; i >= 0; --i) {
         Value captured = pop(vm);
@@ -6630,15 +6763,13 @@ static Value vmHostCreateClosure(VM* vm) {
             ClosureCell* cell = closureCellCreate(makeCopyOfValue(target));
             closureEnvBindCell(env, (uint16_t)i, cell);
             closureCellRelease(cell);
-        } else if (vmBindCapturedSlot(vm, env, (uint16_t)i, target)) {
-            open = true;
+        } else {
+            vmBindCapturedSlot(vm, env, (uint16_t)i, target, &holders);
         }
         freeValue(&captured);
     }
 
-    if (open) {
-        vmRegisterOpenCapture(vm, env);
-    }
+    vmRegisterCaptureHolders(vm, env, &holders);
     Value closure = makeClosure(entry, proc_symbol, env);
     releaseClosureEnv(env);
     return closure;
@@ -7953,6 +8084,12 @@ void initVM(VM* vm) { // As in all.txt, with frameCount
     vm->openCaptureCount = 0;
     vm->openCaptureCapacity = 0;
     vm->openCaptureHigh = NULL;
+    pthread_mutex_init(&vm->foreignCaptureLock, NULL);
+    vm->foreignCaptures = NULL;
+    vm->foreignCaptureCount = 0;
+    vm->foreignCaptureCapacity = 0;
+    atomic_init(&vm->foreignCapturePending, false);
+    vm->spawnerVm = NULL;
 
     vm->frames = NULL;
     vm->frameCapacity = 0;
@@ -8129,6 +8266,16 @@ void freeVM(VM* vm) {
     free(vm->openCaptures);
     vm->openCaptures = NULL;
     vm->openCaptureCapacity = 0;
+    // Workers are joined by now; whatever they posted after this VM's last
+    // close points at storage that is gone.
+    for (int i = 0; i < vm->foreignCaptureCount; ++i) {
+        releaseClosureEnv(vm->foreignCaptures[i]);
+    }
+    free(vm->foreignCaptures);
+    vm->foreignCaptures = NULL;
+    vm->foreignCaptureCount = 0;
+    vm->foreignCaptureCapacity = 0;
+    pthread_mutex_destroy(&vm->foreignCaptureLock);
     if (vm->frames) {
         free(vm->frames);
         vm->frames = NULL;
@@ -8186,6 +8333,99 @@ static bool vmBindCallUpvalues(VM* vm, CallFrame* frame, const CallFrame* parent
         return false;
     }
     return true;
+}
+
+#define VM_LEXICAL_PATH_MAX 64
+
+// Binds into out[] the upvalues of `proc` through `from`, a frame of a
+// routine nested (at any depth) in proc's enclosing routine E: the routine
+// itself, a sibling, a routine nested in one, or a closure of any of these,
+// whose own enclosing routine may have returned. A descriptor of `proc`
+// names a slot or upvalue of E; the routines from `from`'s up to E's child
+// capture it one level at a time (the compiler makes every caller of a
+// nested routine capture what that routine does), so it is matched down
+// that chain to one of from's upvalues. False when the chain lacks one,
+// which bytecode from an older compiler can.
+static bool vmBindUpvaluesThrough(Value** out, const CallFrame* from, const Symbol* proc) {
+    const Symbol* path[VM_LEXICAL_PATH_MAX];
+    int depth = 0;
+    const Symbol* s = from->function_symbol;
+    for (; s && s != proc->enclosing; s = s->enclosing) {
+        if (depth == VM_LEXICAL_PATH_MAX) {
+            return false;
+        }
+        path[depth++] = s;
+    }
+    if (!s || depth == 0 || !from->upvalues) {
+        return false;
+    }
+    for (int i = 0; i < proc->upvalue_count; i++) {
+        bool isLocal = proc->upvalues[i].isLocal;
+        int index = proc->upvalues[i].index;
+        for (int level = depth - 1; level >= 0; --level) {
+            const Symbol* p = path[level];
+            // A routine calling itself, or a sibling capturing the same
+            // variables first, lines up position for position.
+            int at = -1;
+            if (i < p->upvalue_count && p->upvalues[i].isLocal == isLocal &&
+                p->upvalues[i].index == index) {
+                at = i;
+            }
+            for (int j = 0; at < 0 && j < p->upvalue_count; j++) {
+                if (p->upvalues[j].isLocal == isLocal && p->upvalues[j].index == index) {
+                    at = j;
+                }
+            }
+            if (at < 0) {
+                return false;
+            }
+            isLocal = false;
+            index = at;
+        }
+        if (index >= from->upvalue_count) {
+            return false;
+        }
+        out[i] = from->upvalues[index];
+    }
+    return true;
+}
+
+// Binds the upvalues of `proc`, called without a closure env, into the new
+// top frame. From its enclosing routine (or, for a routine without one, any
+// caller), they are that frame's slots and upvalues; from deeper inside the
+// enclosing routine, they come through the caller's upvalues
+// (vmBindUpvaluesThrough), which reach the instance of the enclosing routine
+// the caller belongs to even when that frame is gone or another instance of
+// it runs above. Only when that fails does the nearest frame of the
+// enclosing routine on the stack stand in. On failure this reports a
+// runtime error and frees frame->upvalues; the caller pops the frame.
+static bool vmBindNestedCallUpvalues(VM* vm, CallFrame* frame, const Symbol* proc_symbol) {
+    frame->upvalues = malloc(sizeof(Value*) * proc_symbol->upvalue_count);
+    frame->owns_upvalues = true;
+    CallFrame* caller = vm->frameCount >= 2 ? &vm->frames[vm->frameCount - 2] : NULL;
+    CallFrame* parent_frame = NULL;
+    if (!proc_symbol->enclosing || (caller && caller->function_symbol == proc_symbol->enclosing)) {
+        parent_frame = caller;
+    } else {
+        if (caller && frame->upvalues && vmBindUpvaluesThrough(frame->upvalues, caller, proc_symbol)) {
+            return true;
+        }
+        for (int fi = vm->frameCount - 2; fi >= 0; fi--) {
+            if (vm->frames[fi].function_symbol == proc_symbol->enclosing) {
+                parent_frame = &vm->frames[fi];
+                break;
+            }
+        }
+    }
+    if (!parent_frame) {
+        free(frame->upvalues);
+        frame->upvalues = NULL;
+        frame->owns_upvalues = false;
+        runtimeError(vm, "VM Error: Enclosing frame not found for '%s'.",
+                     proc_symbol->name ? proc_symbol->name : "<anonymous>");
+        return false;
+    }
+    return vmBindCallUpvalues(vm, frame, parent_frame, proc_symbol);
 }
 
 // Unwind the current call frame. If there are no more frames, the VM should halt.
@@ -8249,7 +8489,7 @@ static InterpretResult returnFromCall(VM* vm, bool* halted) {
         }
     }
 
-    if (vm->openCaptureCount > 0) {
+    if (vmCapturesToClose(vm)) {
         vmCloseCaptures(vm, currentFrame->slots);
     }
     for (Value* slot = currentFrame->slots; slot < vm->stackTop; slot++) {
@@ -13810,32 +14050,7 @@ comparison_error_label:
                 frame->vtable = NULL;
 
                 if (proc_symbol->upvalue_count > 0) {
-                    frame->upvalues = malloc(sizeof(Value*) * proc_symbol->upvalue_count);
-                    frame->owns_upvalues = true;
-                    CallFrame* parent_frame = NULL;
-                    if (proc_symbol->enclosing) {
-                        for (int fi = vm->frameCount - 2; fi >= 0; fi--) {
-                            if (vm->frames[fi].function_symbol == proc_symbol->enclosing) {
-                                parent_frame = &vm->frames[fi];
-                                break;
-                            }
-                        }
-                    } else if (vm->frameCount >= 2) {
-                        parent_frame = &vm->frames[vm->frameCount - 2];
-                    }
-
-                    if (!parent_frame) {
-                        if (frame->owns_upvalues && frame->upvalues) {
-                            free(frame->upvalues);
-                            frame->upvalues = NULL;
-                            frame->owns_upvalues = false;
-                        }
-                        runtimeError(vm, "VM Error: Enclosing frame not found for '%s'.", proc_symbol->name);
-                        vm->frameCount--;
-                        return INTERPRET_RUNTIME_ERROR;
-                    }
-
-                    if (!vmBindCallUpvalues(vm, frame, parent_frame, proc_symbol)) {
+                    if (!vmBindNestedCallUpvalues(vm, frame, proc_symbol)) {
                         vm->frameCount--;
                         return INTERPRET_RUNTIME_ERROR;
                     }
@@ -13911,32 +14126,7 @@ comparison_error_label:
                 frame->vtable = NULL;
 
                 if (proc_symbol->upvalue_count > 0) {
-                    frame->upvalues = malloc(sizeof(Value*) * proc_symbol->upvalue_count);
-                    frame->owns_upvalues = true;
-                    CallFrame* parent_frame = NULL;
-                    if (proc_symbol->enclosing) {
-                        for (int fi = vm->frameCount - 2; fi >= 0; fi--) {
-                            if (vm->frames[fi].function_symbol == proc_symbol->enclosing) {
-                                parent_frame = &vm->frames[fi];
-                                break;
-                            }
-                        }
-                    } else if (vm->frameCount >= 2) {
-                        parent_frame = &vm->frames[vm->frameCount - 2];
-                    }
-
-                    if (!parent_frame) {
-                        if (frame->owns_upvalues && frame->upvalues) {
-                            free(frame->upvalues);
-                            frame->upvalues = NULL;
-                            frame->owns_upvalues = false;
-                        }
-                        runtimeError(vm, "VM Error: Enclosing frame not found for '%s'.", proc_symbol->name);
-                        vm->frameCount--;
-                        return INTERPRET_RUNTIME_ERROR;
-                    }
-
-                    if (!vmBindCallUpvalues(vm, frame, parent_frame, proc_symbol)) {
+                    if (!vmBindNestedCallUpvalues(vm, frame, proc_symbol)) {
                         vm->frameCount--;
                         return INTERPRET_RUNTIME_ERROR;
                     }
@@ -14052,35 +14242,7 @@ comparison_error_label:
                     frame->closureEnv = captured_env;
                     frame->upvalues = captured_env->slots;
                 } else if (proc_symbol->upvalue_count > 0) {
-                    frame->upvalues = malloc(sizeof(Value*) * proc_symbol->upvalue_count);
-                    frame->owns_upvalues = true;
-                    CallFrame* parent_frame = NULL;
-                    if (proc_symbol->enclosing) {
-                        for (int fi = vm->frameCount - 2; fi >= 0; fi--) {
-                            if (vm->frames[fi].function_symbol == proc_symbol->enclosing) {
-                                parent_frame = &vm->frames[fi];
-                                break;
-                            }
-                        }
-                    } else if (vm->frameCount >= 2) {
-                        parent_frame = &vm->frames[vm->frameCount - 2];
-                    }
-
-                    if (!parent_frame) {
-                        if (frame->owns_upvalues && frame->upvalues) {
-                            free(frame->upvalues);
-                            frame->upvalues = NULL;
-                            frame->owns_upvalues = false;
-                        }
-                        if (captured_env) {
-                            releaseClosureEnv(captured_env);
-                        }
-                        runtimeError(vm, "VM Error: Enclosing frame not found for '%s'.", proc_symbol->name);
-                        vm->frameCount--;
-                        return INTERPRET_RUNTIME_ERROR;
-                    }
-
-                    if (!vmBindCallUpvalues(vm, frame, parent_frame, proc_symbol)) {
+                    if (!vmBindNestedCallUpvalues(vm, frame, proc_symbol)) {
                         vm->frameCount--;
                         return INTERPRET_RUNTIME_ERROR;
                     }
@@ -14224,28 +14386,7 @@ comparison_error_label:
                 frame->discard_result_on_return = false;
 
                 if (method_symbol->upvalue_count > 0) {
-                    frame->upvalues = malloc(sizeof(Value*) * method_symbol->upvalue_count);
-                    frame->owns_upvalues = true;
-                    CallFrame* parent_frame = NULL;
-                    if (method_symbol->enclosing) {
-                        for (int fi = vm->frameCount - 2; fi >= 0; fi--) {
-                            if (vm->frames[fi].function_symbol == method_symbol->enclosing) {
-                                parent_frame = &vm->frames[fi];
-                                break;
-                            }
-                        }
-                    } else if (vm->frameCount >= 2) {
-                        parent_frame = &vm->frames[vm->frameCount - 2];
-                    }
-                    if (!parent_frame) {
-                        free(frame->upvalues);
-                        frame->upvalues = NULL;
-                        frame->owns_upvalues = false;
-                        runtimeError(vm, "VM Error: Enclosing frame not found for '%s'.", method_symbol->name);
-                        vm->frameCount--;
-                        return INTERPRET_RUNTIME_ERROR;
-                    }
-                    if (!vmBindCallUpvalues(vm, frame, parent_frame, method_symbol)) {
+                    if (!vmBindNestedCallUpvalues(vm, frame, method_symbol)) {
                         vm->frameCount--;
                         return INTERPRET_RUNTIME_ERROR;
                     }
@@ -14362,33 +14503,7 @@ comparison_error_label:
                     frame->closureEnv = captured_env;
                     frame->upvalues = captured_env->slots;
                 } else if (proc_symbol->upvalue_count > 0) {
-                    frame->upvalues = malloc(sizeof(Value*) * proc_symbol->upvalue_count);
-                    frame->owns_upvalues = true;
-                    CallFrame* parent_frame = NULL;
-                    if (proc_symbol->enclosing) {
-                        for (int fi = vm->frameCount - 2; fi >= 0; fi--) {
-                            if (vm->frames[fi].function_symbol == proc_symbol->enclosing) {
-                                parent_frame = &vm->frames[fi];
-                                break;
-                            }
-                        }
-                    } else if (vm->frameCount >= 2) {
-                        parent_frame = &vm->frames[vm->frameCount - 2];
-                    }
-                    if (!parent_frame) {
-                        if (frame->owns_upvalues && frame->upvalues) {
-                            free(frame->upvalues);
-                            frame->upvalues = NULL;
-                            frame->owns_upvalues = false;
-                        }
-                        if (captured_env) {
-                            releaseClosureEnv(captured_env);
-                        }
-                        runtimeError(vm, "VM Error: Enclosing frame not found for '%s'.", proc_symbol->name);
-                        vm->frameCount--;
-                        return INTERPRET_RUNTIME_ERROR;
-                    }
-                    if (!vmBindCallUpvalues(vm, frame, parent_frame, proc_symbol)) {
+                    if (!vmBindNestedCallUpvalues(vm, frame, proc_symbol)) {
                         vm->frameCount--;
                         return INTERPRET_RUNTIME_ERROR;
                     }

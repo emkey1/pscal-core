@@ -357,6 +357,17 @@ typedef struct VM_s {
     int openCaptureCount;
     int openCaptureCapacity;
     Value* openCaptureHigh;
+    // Closure envs that worker threads built over this VM's stack slots
+    // (reached through the closure a worker runs), handed over by
+    // vmPostForeignCapture and adopted into openCaptures by this VM's own
+    // thread before it next closes captures.
+    pthread_mutex_t foreignCaptureLock;
+    struct ClosureEnvPayload** foreignCaptures;
+    int foreignCaptureCount;
+    int foreignCaptureCapacity;
+    atomic_bool foreignCapturePending;
+    // The VM that spawned the job this worker VM runs; NULL on the main VM.
+    struct VM_s* spawnerVm;
 
     HashTable* vmGlobalSymbols;      // VM's own symbol table for runtime global variable storage
     HashTable* vmConstGlobalSymbols; // Separate table for constant globals (read-only, no mutex)

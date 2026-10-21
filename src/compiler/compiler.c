@@ -431,6 +431,251 @@ static int* inline_routine_exit_jumps = NULL;
 static int inline_routine_exit_count = 0;
 static int inline_routine_exit_capacity = 0;
 
+static int addUpvalue(FunctionCompilerState* fc, uint8_t index, bool isLocal, bool is_ref, bool source_is_ref);
+
+/* Captures for nested routines reached from below their enclosing routine.
+ *
+ * A nested routine reaches its enclosing routine's variables through upvalues
+ * bound at each call. Called from that routine, they come from its frame.
+ * Called from deeper inside it (by a sibling, by itself, by a routine nested
+ * in either, or by a closure of any of these that outlived the enclosing
+ * frame), the VM binds them through the caller's own upvalues
+ * (vmBindNestedCallUpvalues, vm.c). So such a caller, and every routine
+ * between it and the enclosing routine, captures each variable the callee
+ * captures; a closure literal taken there captures through the same chain.
+ *
+ * A callee whose body comes later (forward, mutual recursion, a routine
+ * nested in the callee calling it) knows its captures only once that body is
+ * compiled, so each such call is recorded, and a routine whose list grows
+ * after its body was compiled passes the growth on to its recorded callers.
+ * A list a closure literal has been emitted from cannot grow (the literal
+ * pushed one address per upvalue); a call that would need it to falls back
+ * on the VM's search for the enclosing routine's frame. All of this is
+ * within one top-level routine, and is dropped when that one is compiled. */
+typedef struct {
+    Symbol* caller;
+    Symbol* callee;
+} NestedCallCapture;
+
+#define NESTED_CAPTURE_PATH_MAX 64
+#define NESTED_CAPTURE_LIST_MAX 255  // Symbol.upvalue_count is a uint8_t
+
+static NestedCallCapture* nested_call_captures = NULL;
+static int nested_call_capture_count = 0;
+static int nested_call_capture_capacity = 0;
+static Symbol** fixed_capture_lists = NULL;  // routines a closure literal was emitted for
+static int fixed_capture_list_count = 0;
+static int fixed_capture_list_capacity = 0;
+static Symbol** grown_capture_lists = NULL;  // compiled routines whose list grew, to pass on
+static int grown_capture_list_count = 0;
+static int grown_capture_list_capacity = 0;
+
+static bool appendCaptureSymbol(Symbol*** list, int* count, int* capacity, Symbol* sym) {
+    for (int i = 0; i < *count; i++) {
+        if ((*list)[i] == sym) {
+            return true;
+        }
+    }
+    if (*count == *capacity) {
+        int cap = *capacity ? *capacity * 2 : 8;
+        Symbol** grown = (Symbol**)realloc(*list, sizeof(Symbol*) * (size_t)cap);
+        if (!grown) {
+            fprintf(stderr, "Compiler error: Out of memory tracking nested routine captures.\n");
+            compiler_had_error = true;
+            return false;
+        }
+        *list = grown;
+        *capacity = cap;
+    }
+    (*list)[(*count)++] = sym;
+    return true;
+}
+
+static void resetNestedCallCaptures(void) {
+    free(nested_call_captures);
+    nested_call_captures = NULL;
+    nested_call_capture_count = 0;
+    nested_call_capture_capacity = 0;
+    free(fixed_capture_lists);
+    fixed_capture_lists = NULL;
+    fixed_capture_list_count = 0;
+    fixed_capture_list_capacity = 0;
+    free(grown_capture_lists);
+    grown_capture_lists = NULL;
+    grown_capture_list_count = 0;
+    grown_capture_list_capacity = 0;
+}
+
+// The compiler state of `sym` while its body is being compiled; its symbol
+// gets the capture list only at the end of the body.
+static FunctionCompilerState* liveFunctionCompilerFor(const Symbol* sym) {
+    for (FunctionCompilerState* fc = current_function_compiler; fc; fc = fc->enclosing) {
+        if (fc->function_symbol == sym) {
+            return fc;
+        }
+    }
+    return NULL;
+}
+
+static bool captureListIsFixed(const Symbol* sym) {
+    for (int i = 0; i < fixed_capture_list_count; i++) {
+        if (fixed_capture_lists[i] == sym) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int findCapture(const Symbol* sym, bool isLocal, uint8_t index) {
+    FunctionCompilerState* fc = liveFunctionCompilerFor(sym);
+    int count = fc ? fc->upvalue_count : sym->upvalue_count;
+    for (int i = 0; i < count; i++) {
+        bool up_local = fc ? fc->upvalues[i].isLocal : sym->upvalues[i].isLocal;
+        uint8_t up_index = fc ? fc->upvalues[i].index : sym->upvalues[i].index;
+        if (up_local == isLocal && up_index == index) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+// Adds (isLocal, index) to the capture list of `sym`; -1 when it cannot grow.
+static int addCapture(Symbol* sym, bool isLocal, uint8_t index, bool source_is_ref) {
+    FunctionCompilerState* fc = liveFunctionCompilerFor(sym);
+    if (fc) {
+        if (fc->upvalue_count >= NESTED_CAPTURE_LIST_MAX) {
+            return -1;
+        }
+        return addUpvalue(fc, index, isLocal, false, source_is_ref);
+    }
+    if (sym->upvalue_count >= NESTED_CAPTURE_LIST_MAX || captureListIsFixed(sym)) {
+        return -1;
+    }
+    int at = sym->upvalue_count++;
+    sym->upvalues[at].index = index;
+    sym->upvalues[at].isLocal = isLocal;
+    sym->upvalues[at].is_ref = false;
+    sym->upvalues[at].source_is_ref = source_is_ref;
+    appendCaptureSymbol(&grown_capture_lists, &grown_capture_list_count, &grown_capture_list_capacity, sym);
+    return at;
+}
+
+// Fills path[] with `routine` and its enclosing routines up to, not including,
+// `home`. Returns their number: 0 when routine is home, -1 when home does not
+// enclose it.
+static int lexicalPathTo(Symbol* routine, const Symbol* home, Symbol** path) {
+    int depth = 0;
+    for (Symbol* s = routine; s; s = s->enclosing) {
+        if (s == home) {
+            return depth;
+        }
+        if (depth == NESTED_CAPTURE_PATH_MAX) {
+            return -1;
+        }
+        path[depth++] = s;
+    }
+    return -1;
+}
+
+// The position in path[0]'s capture list of the variable that a routine nested
+// directly in `home` captures as (isLocal, index), where path[] is from
+// lexicalPathTo(path[0], home). Adds it to each routine on the way that lacks
+// it; -1 when one of them cannot take it.
+static int captureThroughPath(Symbol* const* path, int depth, bool isLocal, uint8_t index, bool source_is_ref) {
+    for (int level = depth - 1; level >= 0; --level) {
+        int at = findCapture(path[level], isLocal, index);
+        if (at < 0) {
+            at = addCapture(path[level], isLocal, index, source_is_ref);
+        }
+        if (at < 0) {
+            return -1;
+        }
+        isLocal = false;
+        index = (uint8_t)at;
+    }
+    return index;
+}
+
+static void captureCalleeVariables(Symbol* caller, Symbol* callee) {
+    Symbol* path[NESTED_CAPTURE_PATH_MAX];
+    int depth = lexicalPathTo(caller, callee->enclosing, path);
+    if (depth <= 0) {
+        return;
+    }
+    FunctionCompilerState* live = liveFunctionCompilerFor(callee);
+    int count = live ? live->upvalue_count : callee->upvalue_count;
+    for (int i = 0; i < count; i++) {
+        bool isLocal = live ? live->upvalues[i].isLocal : callee->upvalues[i].isLocal;
+        uint8_t index = live ? live->upvalues[i].index : callee->upvalues[i].index;
+        bool source_is_ref = live ? live->upvalues[i].source_is_ref : callee->upvalues[i].source_is_ref;
+        if (captureThroughPath(path, depth, isLocal, index, source_is_ref) < 0) {
+            return;
+        }
+    }
+}
+
+static void passOnCaptureGrowth(void) {
+    while (grown_capture_list_count > 0) {
+        Symbol* grown = grown_capture_lists[--grown_capture_list_count];
+        for (int i = 0; i < nested_call_capture_count; i++) {
+            if (nested_call_captures[i].callee == grown) {
+                captureCalleeVariables(nested_call_captures[i].caller, grown);
+            }
+        }
+    }
+}
+
+// A call or spawn of `callee` compiled in the current routine.
+static void captureForNestedCall(Symbol* callee) {
+    if (callee && callee->is_alias && callee->real_symbol) {
+        callee = callee->real_symbol;
+    }
+    FunctionCompilerState* fc = current_function_compiler;
+    if (!callee || !fc || !fc->function_symbol || !fc->enclosing || inline_routine_active) {
+        return;
+    }
+    Symbol* caller = fc->function_symbol;
+    Symbol* path[NESTED_CAPTURE_PATH_MAX];
+    // A forward-declared routine learns its enclosing routine with its body:
+    // record the call, and let captureListCompiled() settle it then.
+    bool pending = !callee->enclosing && !callee->is_body_compiled;
+    if (!pending && (!callee->enclosing || lexicalPathTo(caller, callee->enclosing, path) <= 0)) {
+        return;
+    }
+    bool recorded = false;
+    for (int i = 0; i < nested_call_capture_count && !recorded; i++) {
+        recorded = nested_call_captures[i].caller == caller && nested_call_captures[i].callee == callee;
+    }
+    if (!recorded) {
+        if (nested_call_capture_count == nested_call_capture_capacity) {
+            int cap = nested_call_capture_capacity ? nested_call_capture_capacity * 2 : 8;
+            NestedCallCapture* grown = (NestedCallCapture*)realloc(nested_call_captures,
+                                                                   sizeof(NestedCallCapture) * (size_t)cap);
+            if (!grown) {
+                fprintf(stderr, "Compiler error: Out of memory tracking nested routine captures.\n");
+                compiler_had_error = true;
+                return;
+            }
+            nested_call_captures = grown;
+            nested_call_capture_capacity = cap;
+        }
+        nested_call_captures[nested_call_capture_count].caller = caller;
+        nested_call_captures[nested_call_capture_count].callee = callee;
+        nested_call_capture_count++;
+    }
+    captureCalleeVariables(caller, callee);
+    passOnCaptureGrowth();
+}
+
+// The body of `sym` has been compiled and its symbol holds its capture list.
+static void captureListCompiled(Symbol* sym) {
+    if (inline_routine_active) {
+        return;
+    }
+    appendCaptureSymbol(&grown_capture_lists, &grown_capture_list_count, &grown_capture_list_capacity, sym);
+    passOnCaptureGrowth();
+}
+
 static int addStringConstant(BytecodeChunk* chunk, const char* str);
 static int addIntConstant(BytecodeChunk* chunk, long long intValue);
 static void noteLocalSlotUse(FunctionCompilerState* fc, int slot);
@@ -1532,17 +1777,40 @@ static bool emitClosureLiteral(Symbol *psym, BytecodeChunk *chunk, int line) {
         return false;
     }
 
+    // Taken below the routine's enclosing routine (in a sibling, or in a
+    // routine nested in one), the literal reaches the enclosing routine's
+    // variables through the current routine's upvalues: its own locals are
+    // not the ones the descriptors name.
+    Symbol* path[NESTED_CAPTURE_PATH_MAX];
+    int depth = 0;
+    if (capture_count > 0 && psym->enclosing && current_function_compiler->function_symbol &&
+        !inline_routine_active) {
+        depth = lexicalPathTo(current_function_compiler->function_symbol, psym->enclosing, path);
+        if (depth < 0) {
+            depth = 0;
+        }
+    }
+    appendCaptureSymbol(&fixed_capture_lists, &fixed_capture_list_count, &fixed_capture_list_capacity, psym);
+
     for (int i = 0; i < capture_count; i++) {
         uint8_t slot_index = psym->upvalues[i].index;
         bool isLocal = psym->upvalues[i].isLocal;
         bool source_is_ref = psym->upvalues[i].source_is_ref;
 
-        if (isLocal) {
-            if (source_is_ref) {
-                writeBytecodeChunk(chunk, GET_LOCAL, line);
-            } else {
-                writeBytecodeChunk(chunk, GET_LOCAL_ADDRESS, line);
+        if (depth > 0) {
+            int via = captureThroughPath(path, depth, isLocal, slot_index, source_is_ref);
+            if (via < 0) {
+                fprintf(stderr, "L%d: Compiler error: Too many upvalues in function.\n", line);
+                compiler_had_error = true;
+                return false;
             }
+            writeBytecodeChunk(chunk, GET_UPVALUE_ADDRESS, line);
+            writeBytecodeChunk(chunk, (uint8_t)via, line);
+        } else if (isLocal) {
+            // The slot itself, also for a VAR parameter: the routine's code
+            // reads such an upvalue as the slot holding the reference, as a
+            // direct call binds it.
+            writeBytecodeChunk(chunk, GET_LOCAL_ADDRESS, line);
             writeBytecodeChunk(chunk, slot_index, line);
         } else {
             writeBytecodeChunk(chunk, GET_UPVALUE_ADDRESS, line);
@@ -6943,6 +7211,9 @@ static bool emitDirectStoreForVariable(AST* lvalue, BytecodeChunk* chunk, int li
 
         int upvalue_slot = resolveUpvalue(current_function_compiler, varName);
         if (upvalue_slot != -1) {
+            if (current_function_compiler->upvalues[upvalue_slot].source_is_ref) {
+                return false;
+            }
             writeBytecodeChunk(chunk, SET_UPVALUE, line);
             writeBytecodeChunk(chunk, (uint8_t)upvalue_slot, line);
             return true;
@@ -7425,6 +7696,7 @@ bool compileASTToBytecode(AST* rootNode, BytecodeChunk* outputChunk) {
     compilerGlobalCount = 0;
     compiler_had_error = false;
     current_function_compiler = NULL;
+    resetNestedCallCaptures();
     compiler_defined_myself_global = false;
     compiler_myself_global_name_idx = -1;
     postpone_global_initializers = false;
@@ -7505,6 +7777,7 @@ bool compileModuleAST(AST* rootNode, BytecodeChunk* outputChunk) {
     compilerGlobalCount = 0;
     compiler_had_error = false;
     current_function_compiler = NULL;
+    resetNestedCallCaptures();
     int saved_myself_flag = compiler_defined_myself_global;
     int saved_myself_idx = compiler_myself_global_name_idx;
     compiler_defined_myself_global = true;
@@ -7568,6 +7841,7 @@ bool compileModuleAST(AST* rootNode, BytecodeChunk* outputChunk) {
 }
 
 void compilerResetState(void) {
+    resetNestedCallCaptures();
     current_compilation_unit_name = NULL;
     gCurrentProgramRoot = NULL;
     current_class_const_table = NULL;
@@ -8697,6 +8971,12 @@ static void compileDefinedFunction(AST* func_decl_node, BytecodeChunk* chunk, in
     current_class_record_type = saved_class_record_type;
     current_function_compiler = fc.enclosing;
     restoreLocalEnv(&env_snap);
+    if (proc_symbol) {
+        captureListCompiled(proc_symbol);
+    }
+    if (!outer_fc) {
+        resetNestedCallCaptures();
+    }
 }
 
 static void compileInlineRoutine(Symbol* proc_symbol, AST* call_node, BytecodeChunk* chunk, int line, bool push_result) {
@@ -10745,6 +11025,7 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                     }
                 }
             } else if (proc_symbol) { // If a symbol was found (either defined or forward-declared)
+                captureForNestedCall(proc_symbol);
                 int nameIndex = addStringConstant(chunk, calleeName);
                 writeBytecodeChunk(chunk, CALL_USER_PROC, line);
                 emitShort(chunk, (uint16_t)nameIndex, line);
@@ -11216,6 +11497,9 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
             if (!proc_symbol && calleeName) {
                 proc_symbol = lookupProcedure(calleeName);
             }
+            // A nested target spawned by name binds its upvalues through the
+            // spawning routine (vmThreadCaptureUpvaluesForJob).
+            captureForNestedCall(proc_symbol);
             if (!proc_symbol || !proc_symbol->is_defined || !proc_symbol->is_body_compiled) {
                 // Forward reference: the target's bytecode address isn't
                 // known yet (its body compiles later in the program). Emit
@@ -11366,6 +11650,12 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                     if (upvalue_slot != -1) {
                         writeBytecodeChunk(chunk, GET_UPVALUE, line);
                         writeBytecodeChunk(chunk, (uint8_t)upvalue_slot, line);
+                        // A captured VAR parameter holds the referent's
+                        // address, read through as for a by-ref local.
+                        if (current_function_compiler->upvalues[upvalue_slot].source_is_ref &&
+                            node->var_type != TYPE_ARRAY) {
+                            writeBytecodeChunk(chunk, GET_INDIRECT, line);
+                        }
                     } else {
                         // Check if it's a compile-time constant first.
                         Value* const_val_ptr = findCompilerConstant(varName);
@@ -12428,6 +12718,7 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                         for (uint8_t i = 0; i < call_arg_count; ++i) writeBytecodeChunk(chunk, POP, line);
                         emitConstant(chunk, addNilConstant(chunk), line);
                     } else {
+                        captureForNestedCall(func_symbol);
                         int nameIndex = addStringConstant(chunk, functionName);
                         writeBytecodeChunk(chunk, CALL_USER_PROC, line);
                         emitShort(chunk, (uint16_t)nameIndex, line);
