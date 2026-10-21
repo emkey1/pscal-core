@@ -175,8 +175,12 @@ const char* bytecodeDisplayNameForPath(const char* path) {
         }
     }
 
-    while (*trimmed == '/' || *trimmed == '\\') {
-        ++trimmed;
+    // Only the separators after a trimmed Tests prefix: an absolute path with
+    // no Tests component keeps its leading "/".
+    if (trimmed != path) {
+        while (*trimmed == '/' || *trimmed == '\\') {
+            ++trimmed;
+        }
     }
 
     if (*trimmed == '\0') {

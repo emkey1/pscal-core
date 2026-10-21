@@ -6088,9 +6088,13 @@ void runtimeError(VM* vm, const char* format, ...) {
     bool have_runtime_location = false;
     if (vm) {
         computeRuntimeLocation(vm, &instruction_offset, &error_line);
+        // The path exactly as the frontend was given it, as its compile-time
+        // diagnostics print it. bytecodeDisplayNameForPath shortens test paths
+        // for disassembly goldens; here it turned "/tmp/p.aether" into
+        // "tmp/p.aether" and ".../Tests/sub/p.aether" into "sub/p.aether".
         if (vm->chunk && vm->chunk->source_path && error_line > 0) {
             fprintf(stderr, "%s:%d: %s\n",
-                    bytecodeDisplayNameForPath(vm->chunk->source_path),
+                    vm->chunk->source_path,
                     error_line,
                     message);
         } else {
