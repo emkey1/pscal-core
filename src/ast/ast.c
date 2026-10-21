@@ -1952,7 +1952,9 @@ VarType getBuiltinReturnType(const char* name) {
     }
     if (strcasecmp(name, "aether_index_of") == 0 || strcasecmp(name, "aether_count") == 0 ||
         strcasecmp(name, "aether_clock_ms") == 0 || strcasecmp(name, "aether_mstream_length") == 0 ||
-        strcasecmp(name, "aetherparseintvalue") == 0) {
+        strcasecmp(name, "aetherparseintvalue") == 0 ||
+        strcasecmp(name, "aether_try_sqlite_exec") == 0 ||
+        strcasecmp(name, "aether_try_sqlite_prepare") == 0) {
         return TYPE_INT64;
     }
     if (strcasecmp(name, "aether_round_to") == 0 || strcasecmp(name, "aetherparserealvalue") == 0) {

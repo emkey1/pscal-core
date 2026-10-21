@@ -521,10 +521,16 @@ static const AetherBuiltinMeta kAetherBuiltinMeta[] = {
      "Close a database handle.", "sqlite", true, "vm_builtin"},
     {"sqlite_exec", "sqliteexec", "function", "Int",
      "sqlite_exec(db: Int, sql: Text) -> Int",
-     "Execute SQL with no result rows; returns 0. A SQL error stops the program with SQLite's message.", "sqlite", true, "vm_builtin"},
+     "Execute SQL with no result rows; returns 0. A SQL error stops the program with SQLite's message (try_sqlite_exec reports it instead).", "sqlite", true, "vm_builtin"},
     {"sqlite_prepare", "sqliteprepare", "function", "Int",
      "sqlite_prepare(db: Int, sql: Text) -> Int",
-     "Compile a statement; returns a stmt handle. A SQL error stops the program with SQLite's message.", "sqlite", true, "vm_builtin"},
+     "Compile a statement; returns a stmt handle. A SQL error stops the program with SQLite's message (try_sqlite_prepare reports it instead).", "sqlite", true, "vm_builtin"},
+    {"try_sqlite_exec", NULL, "function", "(Int, Bool)",
+     "try_sqlite_exec(db: Int, sql: Text) -> (Int, Bool)",
+     "(rc, ok): SQLite's result code and rc == 0; a SQL error never stops the program, and sqlite_errmsg(db) reads its message.", "sqlite", true},
+    {"try_sqlite_prepare", NULL, "function", "(Int, Bool)",
+     "try_sqlite_prepare(db: Int, sql: Text) -> (Int, Bool)",
+     "(stmt, ok): a statement handle, or -1 and ok false when the SQL does not compile; sqlite_errmsg(db) reads why.", "sqlite", true},
     {"sqlite_finalize", "sqlitefinalize", "function", "Int",
      "sqlite_finalize(stmt: Int) -> Int",
      "Release a prepared statement.", "sqlite", true, "vm_builtin"},
@@ -569,7 +575,7 @@ static const AetherBuiltinMeta kAetherBuiltinMeta[] = {
      "Clear all bound parameters on a statement.", "sqlite", true, "vm_builtin"},
     {"sqlite_errmsg", "sqliteerrmsg", "function", "Text",
      "sqlite_errmsg(db: Int) -> Text",
-     "Most recent error message for a database (after a failed sqlite_step).", "sqlite", true, "vm_builtin"},
+     "Most recent error message for a database (after a failed sqlite_step, try_sqlite_exec or try_sqlite_prepare).", "sqlite", true, "vm_builtin"},
     {"sqlite_last_insert_rowid", "sqlitelastinsertrowid", "function", "Int",
      "sqlite_last_insert_rowid(db: Int) -> Int",
      "Rowid of the most recent insert.", "sqlite", true, "vm_builtin"},
@@ -1000,6 +1006,10 @@ static Value vmBuiltinHasExtBuiltin(struct VM_s *vm, int arg_count,
      * aether_version): documented with no engine function behind them. */
     const AetherBuiltinMeta *meta = findAetherBuiltinMeta(func);
     if (meta && !meta->backend_name && !meta->source) {
+      /* try_sqlite_exec/try_sqlite_prepare run on an SQLite engine builtin. */
+      if (strncasecmp(func, "try_sqlite_", 11) == 0) {
+        return makeBoolean(getVmBuiltinID("aether_try_sqlite_exec") >= 0);
+      }
       return makeBoolean(1);
     }
   }

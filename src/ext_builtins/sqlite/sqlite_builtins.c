@@ -189,7 +189,14 @@ static Value vmSqliteClose(struct VM_s *vm, int arg_count, Value *args) {
     return makeInt(rc);
 }
 
-static Value vmSqliteExec(struct VM_s *vm, int arg_count, Value *args) {
+/* sqlite_exec and sqlite_prepare stop the program on a SQL error (a syntax
+ * error, a missing table). Aether's try_sqlite_exec / try_sqlite_prepare
+ * (the prelude fns over aether_try_sqlite_exec / aether_try_sqlite_prepare)
+ * take the `checked` path instead: a SQL error, or a database handle that is
+ * not open, is reported through the result and never stops the program;
+ * sqlite_errmsg(db) then reads SQLite's message. Wrong argument types stay
+ * run-time errors either way (Aether rejects them at compile time). */
+static Value sqliteExecCommon(struct VM_s *vm, int arg_count, Value *args, bool checked) {
     if (arg_count != 2) {
         runtimeError(vm, "SqliteExec expects (db_handle:int, sql:string).");
         return makeInt(-1);
@@ -201,6 +208,7 @@ static Value vmSqliteExec(struct VM_s *vm, int arg_count, Value *args) {
     int handle = (int)asI64(args[0]);
     const char *sql = AS_STRING(args[1]);
     if (!sql) {
+        if (checked) return makeInt(SQLITE_MISUSE);
         runtimeError(vm, "SqliteExec received NIL SQL string.");
         return makeInt(-1);
     }
@@ -209,6 +217,7 @@ static Value vmSqliteExec(struct VM_s *vm, int arg_count, Value *args) {
     SqliteHandleEntry *entry = sqliteLookupHandleLocked(handle);
     if (!entry || entry->kind != SQLITE_HANDLE_DB || !entry->db) {
         pthread_mutex_unlock(&sqliteHandleMutex);
+        if (checked) return makeInt(SQLITE_MISUSE);
         runtimeError(vm, "SqliteExec received invalid database handle %d.", handle);
         return makeInt(-1);
     }
@@ -217,7 +226,7 @@ static Value vmSqliteExec(struct VM_s *vm, int arg_count, Value *args) {
 
     char *err_msg = NULL;
     int rc = sqlite3_exec(db, sql, NULL, NULL, &err_msg);
-    if (rc != SQLITE_OK) {
+    if (rc != SQLITE_OK && !checked) {
         runtimeError(vm, "SqliteExec failed (%d): %s", rc, err_msg ? err_msg : "unknown");
     }
     if (err_msg) {
@@ -226,7 +235,16 @@ static Value vmSqliteExec(struct VM_s *vm, int arg_count, Value *args) {
     return makeInt(rc);
 }
 
-static Value vmSqlitePrepare(struct VM_s *vm, int arg_count, Value *args) {
+static Value vmSqliteExec(struct VM_s *vm, int arg_count, Value *args) {
+    return sqliteExecCommon(vm, arg_count, args, false);
+}
+
+/* aether_try_sqlite_exec(db, sql) -> Int: SQLite's result code, 0 on success. */
+static Value vmSqliteTryExec(struct VM_s *vm, int arg_count, Value *args) {
+    return sqliteExecCommon(vm, arg_count, args, true);
+}
+
+static Value sqlitePrepareCommon(struct VM_s *vm, int arg_count, Value *args, bool checked) {
     if (arg_count != 2) {
         runtimeError(vm, "SqlitePrepare expects (db_handle:int, sql:string).");
         return makeInt(-1);
@@ -238,6 +256,7 @@ static Value vmSqlitePrepare(struct VM_s *vm, int arg_count, Value *args) {
     int handle = (int)asI64(args[0]);
     const char *sql = AS_STRING(args[1]);
     if (!sql) {
+        if (checked) return makeInt(-1);
         runtimeError(vm, "SqlitePrepare received NIL SQL string.");
         return makeInt(-1);
     }
@@ -246,6 +265,7 @@ static Value vmSqlitePrepare(struct VM_s *vm, int arg_count, Value *args) {
     SqliteHandleEntry *entry = sqliteLookupHandleLocked(handle);
     if (!entry || entry->kind != SQLITE_HANDLE_DB || !entry->db) {
         pthread_mutex_unlock(&sqliteHandleMutex);
+        if (checked) return makeInt(-1);
         runtimeError(vm, "SqlitePrepare received invalid database handle %d.", handle);
         return makeInt(-1);
     }
@@ -257,9 +277,10 @@ static Value vmSqlitePrepare(struct VM_s *vm, int arg_count, Value *args) {
         result_handle = sqliteAllocStmtHandleLocked(stmt, handle);
         if (result_handle < 0) {
             sqlite3_finalize(stmt);
-            runtimeError(vm, "SqlitePrepare: unable to allocate statement handle.");
+            if (!checked) runtimeError(vm, "SqlitePrepare: unable to allocate statement handle.");
         }
-    } else {
+    } else if (!checked) {
+        /* Also text with no statement in it (rc 0, no stmt). */
         runtimeError(vm, "SqlitePrepare failed (%d): %s", rc, sqlite3_errmsg(db));
     }
     pthread_mutex_unlock(&sqliteHandleMutex);
@@ -268,6 +289,16 @@ static Value vmSqlitePrepare(struct VM_s *vm, int arg_count, Value *args) {
         return makeInt(-1);
     }
     return makeInt(result_handle);
+}
+
+static Value vmSqlitePrepare(struct VM_s *vm, int arg_count, Value *args) {
+    return sqlitePrepareCommon(vm, arg_count, args, false);
+}
+
+/* aether_try_sqlite_prepare(db, sql) -> Int: a statement handle, or -1 when
+ * the SQL does not compile (or the database handle is not open). */
+static Value vmSqliteTryPrepare(struct VM_s *vm, int arg_count, Value *args) {
+    return sqlitePrepareCommon(vm, arg_count, args, true);
 }
 
 static Value vmSqliteFinalize(struct VM_s *vm, int arg_count, Value *args) {
@@ -693,4 +724,8 @@ void registerSqliteBuiltins(void) {
     registerSqliteFunction("connection", "SqliteErrMsg", "sqliteerrmsg", vmSqliteErrMsg);
     registerSqliteFunction("connection", "SqliteLastInsertRowId", "sqlitelastinsertrowid", vmSqliteLastInsertRowId);
     registerSqliteFunction("connection", "SqliteChanges", "sqlitechanges", vmSqliteChanges);
+    /* Aether-private engine names, outside the sqlite category (no other
+     * front end sees them): the bodies of try_sqlite_exec / try_sqlite_prepare. */
+    registerVmBuiltin("aether_try_sqlite_exec", vmSqliteTryExec, BUILTIN_TYPE_FUNCTION, NULL, FX_IO);
+    registerVmBuiltin("aether_try_sqlite_prepare", vmSqliteTryPrepare, BUILTIN_TYPE_FUNCTION, NULL, FX_IO);
 }
