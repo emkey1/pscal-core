@@ -6087,6 +6087,47 @@ static void aetherCodeMathError(char *message, size_t size) {
     }
 }
 
+/* The task builtins' refusals spoke of the engine's threads and of "join",
+ * where Aether has tasks and task_wait, and carried no code. Aether rewrites
+ * them by shape, keeping the task number. Other front ends keep the wording. */
+static void aetherCodeTaskError(char *message, size_t size) {
+    int id = 0;
+    char expect[128];
+    if (sscanf(message, "Thread %d ", &id) != 1) {
+        return;
+    }
+    snprintf(expect, sizeof(expect), "Thread %d is still running; join it before querying status.", id);
+    if (strcmp(message, expect) == 0) {
+        snprintf(message, size,
+                 "[AETH-RUNTIME-TASK-RUNNING] task_status: task %d is still running.\n"
+                 "hint: wait for it with `task_wait(t)` first; task_status reads a finished task.", id);
+        return;
+    }
+    snprintf(expect, sizeof(expect), "Thread %d is still running; join it before retrieving the result.", id);
+    if (strcmp(message, expect) == 0) {
+        snprintf(message, size,
+                 "[AETH-RUNTIME-TASK-RUNNING] task_result: task %d is still running.\n"
+                 "hint: wait for it with `task_wait(t)` first, then read its result.", id);
+        return;
+    }
+    snprintf(expect, sizeof(expect), "Thread %d has no stored status.", id);
+    if (strcmp(message, expect) == 0) {
+        snprintf(message, size,
+                 "[AETH-RUNTIME-TASK-NO-STATUS] task_status: task %d has no status to read: "
+                 "task_wait already took it, or the handle is not a task.\n"
+                 "hint: read task_status(t) before task_wait(t), or use task_wait's return value "
+                 "(0 = success).", id);
+        return;
+    }
+    snprintf(expect, sizeof(expect), "Thread %d has no stored result.", id);
+    if (strcmp(message, expect) == 0) {
+        snprintf(message, size,
+                 "[AETH-RUNTIME-TASK-NO-RESULT] task_result: task %d has no result to read: "
+                 "it was already taken (consume = true), or the handle is not a task.\n"
+                 "hint: read a task's result once and keep it in a variable.", id);
+    }
+}
+
 void runtimeError(VM* vm, const char* format, ...) {
     if (vm) {
         vm->abort_requested = true;
@@ -6118,7 +6159,10 @@ void runtimeError(VM* vm, const char* format, ...) {
     va_start(args, format);
     vsnprintf(message, sizeof(message), format, args);
     va_end(args);
-    if (frontendIsAether()) aetherCodeMathError(message, sizeof(message));
+    if (frontendIsAether()) {
+        aetherCodeMathError(message, sizeof(message));
+        aetherCodeTaskError(message, sizeof(message));
+    }
 
     size_t instruction_offset = 0;
     int error_line = 0;
