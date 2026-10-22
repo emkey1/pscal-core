@@ -11623,6 +11623,21 @@ Value vmBuiltinThreadPoolSubmit(VM* vm, int arg_count, Value* args) {
     return threadSpawnOrSubmitCommon(vm, arg_count, args, true, "ThreadPoolSubmit");
 }
 
+/* Aether: a task whose target returns nothing (`sleep`) has no result, and
+ * the VOID placeholder its slot holds used to escape. Bound to a variable it
+ * failed with the uncoded "Type mismatch: Cannot assign VOID to string.", and
+ * printed it showed `<VOID_TYPE>` and the program carried on (D81). */
+static Value threadResultForFrontend(VM* vm, Value result) {
+    if (frontendIsAether() && VALUE_TYPE(result) == TYPE_VOID) {
+        runtimeError(vm, "[AETH-RUNTIME-TASK-NO-RESULT] task_result: this task's target returns nothing, "
+                         "so there is no result to read.\n"
+                         "hint: wait for it with `task_wait(t)`; only a target that returns a value, "
+                         "such as `dns_lookup`, has a result.");
+        return makeNil();
+    }
+    return result;
+}
+
 Value vmBuiltinThreadGetResult(VM* vm, int arg_count, Value* args) {
     if (!vm) {
         return makeNil();
@@ -11663,7 +11678,7 @@ Value vmBuiltinThreadGetResult(VM* vm, int arg_count, Value* args) {
     bool status = false;
     Value result = makeNil();
     if (thread_vm && vmThreadTakeResult(thread_vm, thread_id, &result, true, &status, consume_status)) {
-        return result;
+        return threadResultForFrontend(vm, result);
     }
 
     if (thread_vm && thread_vm != vm) {
@@ -11674,7 +11689,7 @@ Value vmBuiltinThreadGetResult(VM* vm, int arg_count, Value* args) {
             return makeNil();
         }
         if (vmThreadTakeResult(vm, thread_id, &result, true, &status, consume_status)) {
-            return result;
+            return threadResultForFrontend(vm, result);
         }
     }
 

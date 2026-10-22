@@ -157,7 +157,7 @@ static const AetherBuiltinMeta kAetherBuiltinMeta[] = {
      * Aether's type checker leaves the call untyped (types.c). */
     {"task_result", "thread_get_result", "function", "T",
      "task_result(handle: Int, consume: Bool = false) -> T (the target's result: Text for \"dns_lookup\")",
-     "The target builtin's own result, of the type that builtin returns (Text for \"dns_lookup\"; nothing for a procedure such as \"sleep\"): bind it with that type. A run-time error while the task is still running.", "task", true},
+     "The target builtin's own result, of the type that builtin returns (Text for \"dns_lookup\"): bind it with that type. A target that returns nothing (\"sleep\") has no result, and reading it is the run-time error AETH-RUNTIME-TASK-NO-RESULT; wait with task_wait. A run-time error while the task is still running.", "task", true},
     {"task_set_name", "thread_set_name", "function", "Bool",
      "task_set_name(handle: Int, name: Text) -> Bool",
      "Rename a task, so task_lookup finds it by the new name; true when it was renamed.", "task", true},
