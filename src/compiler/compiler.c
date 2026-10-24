@@ -6061,7 +6061,10 @@ Value evaluateCompileTimeValue(AST* node) {
                         Value arg = evaluateCompileTimeValue(node->children[0]);
                         if (VALUE_TYPE(arg) == TYPE_INTEGER) {
                             long long code = VAL_INT(arg);
-                            if (code >= 0 && code <= PASCAL_CHAR_MAX) {
+                            // Aether's chr is a Unicode code point (vmBuiltinChr):
+                            // fold only the ASCII range to a byte char.
+                            long long foldMax = frontendIsAether() ? 127 : PASCAL_CHAR_MAX;
+                            if (code >= 0 && code <= foldMax) {
                                 Value result = makeChar((int)code);
                                 freeValue(&arg);
                                 return result;
@@ -8757,12 +8760,12 @@ static void compileDefinedFunction(AST* func_decl_node, BytecodeChunk* chunk, in
         return_value_slot = fc.local_count - 1;
         emitRoutineResultSlotInit(func_decl_node->right, return_value_slot, chunk, line);
 
-        // The `result` return-value alias is a Pascal surface feature that
-        // Aether's `ret` lowering also targets. For clike/rea/shell,
-        // `result` is an ordinary identifier; registering the alias local
-        // would silently shadow a user global of that name inside every
-        // value-returning function.
-        if (frontendIsPascal() || frontendIsAether()) {
+        // The `result` return-value alias is a Pascal surface feature. For
+        // every other front end `result` is an ordinary identifier;
+        // registering the alias local would silently shadow a user global or
+        // parameter of that name inside every value-returning function.
+        // Aether's @post lowering stages into its own temp (D84).
+        if (frontendIsPascal()) {
             addLocal(&fc, "result", line, false);
         }
     }
@@ -9143,8 +9146,8 @@ static void compileInlineRoutine(Symbol* proc_symbol, AST* call_node, BytecodeCh
                           decl->right,
                           true);
         // Same frontend gate as the non-inline path: `result` is only a
-        // return-value alias for Pascal/Aether surfaces.
-        if (frontendIsPascal() || frontendIsAether()) {
+        // return-value alias for the Pascal surface.
+        if (frontendIsPascal()) {
             insertLocalSymbol("result",
                               decl->right ? decl->right->var_type : TYPE_UNKNOWN,
                               decl->right,

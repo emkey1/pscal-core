@@ -5,6 +5,7 @@
 #include "core/globals.h"
 #include "symbol/symbol.h"
 #include "backend_ast/builtin.h"
+#include "common/frontend_kind.h"
 #include <string.h>
 
 bool isNodeInTypeTable(AST* nodeToFind) {
@@ -800,8 +801,9 @@ AST* findDeclarationInScope(const char* varName, AST* currentScopeNode, AST* ref
     }
 
     if (currentScopeNode->type == AST_FUNCTION_DECL) {
+        // Pascal's implicit `result`; under Aether it is an ordinary name (D84).
         if (strcasecmp(currentScopeNode->token->value, varName) == 0 ||
-            strcasecmp("result", varName) == 0) {
+            (strcasecmp("result", varName) == 0 && !frontendIsAether())) {
             return currentScopeNode;
         }
     }
@@ -1302,7 +1304,8 @@ void annotateTypes(AST *node, AST *currentScopeNode, AST *globalProgramNode) {
 resolved_field: ;
                     }
                 }
-                if (strcasecmp(varName, "result") == 0 && childScopeNode && childScopeNode->type == AST_FUNCTION_DECL) {
+                if (strcasecmp(varName, "result") == 0 && !frontendIsAether() &&
+                    childScopeNode && childScopeNode->type == AST_FUNCTION_DECL) {
                     if (childScopeNode->right) node->var_type = childScopeNode->right->var_type;
                     else node->var_type = TYPE_VOID;
                 }

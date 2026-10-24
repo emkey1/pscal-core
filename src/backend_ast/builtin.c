@@ -3060,7 +3060,10 @@ Value vmBuiltinChr(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "Chr argument out of range (0-0x10FFFF).");
         return makeChar('\0');
     }
-    if (code <= PASCAL_CHAR_MAX) {
+    // Under Aether, Text is Unicode and chr(n) is code point n: 128..255 are
+    // wide chars too (é for 233), so ord(chr(n)) == n. A byte char there
+    // printed through CP437 (chr(233) was Θ) and did not equal "é".
+    if (code <= (frontendIsAether() ? 127 : PASCAL_CHAR_MAX)) {
         return makeChar((int)code);
     }
     return makeWideChar((int)code);
