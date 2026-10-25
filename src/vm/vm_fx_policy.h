@@ -53,6 +53,11 @@ bool pscalFxBuiltinIsJournalExempt(const char *canonical_name);
 bool pscalFxBuiltinIsDenyExempt(const char *canonical_name);
 /* The Aether spelling of an engine builtin, or NULL (ext_builtins/query_builtin.c). */
 const char *pscalAetherNameForBuiltin(const char *backend_name);
+/* Every name an Aether program can call, as builtins_json lists it (the
+ * Aether entries, then the visible engine builtins): fn(name, signature or
+ * NULL, ctx) once per entry. For the front end's close-spelling hint. */
+void pscalAetherForEachBuiltinName(void (*fn)(const char *name, const char *signature, void *ctx),
+                                   void *ctx);
 
 /* Called from vm.c right after a live handler call for an effectful builtin
  * (mask != FX_PURE) when recording is active. Journals the call in order:

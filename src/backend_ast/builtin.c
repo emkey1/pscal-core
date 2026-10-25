@@ -3057,7 +3057,13 @@ Value vmBuiltinChr(VM* vm, int arg_count, Value* args) {
     }
     long long code = AS_INTEGER(args[0]);
     if (code < 0 || code > UNICODE_MAX) {
-        runtimeError(vm, "Chr argument out of range (0-0x10FFFF).");
+        if (frontendIsAether()) {
+            runtimeError(vm, "[AETH-RUNTIME-CHR-RANGE] chr(%lld): not a Unicode code point; chr "
+                             "takes 0 to 1114111 (0x10FFFF).\nhint: check the code first, e.g. "
+                             "`if n >= 0 && n <= 1114111 { ... }`.", code);
+        } else {
+            runtimeError(vm, "Chr argument out of range (0-0x10FFFF).");
+        }
         return makeChar('\0');
     }
     // Under Aether, Text is Unicode and chr(n) is code point n: 128..255 are

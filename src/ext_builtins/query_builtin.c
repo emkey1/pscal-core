@@ -912,6 +912,24 @@ static bool vmBuiltinHiddenFromAether(int id, const char *name) {
   return !getVmBuiltinHandlerById(id) || builtinNameRejectedByFrontend(name);
 }
 
+void pscalAetherForEachBuiltinName(void (*fn)(const char *name, const char *signature, void *ctx),
+                                   void *ctx) {
+  if (!fn) {
+    return;
+  }
+  for (size_t i = 0; i < sizeof(kAetherBuiltinMeta) / sizeof(kAetherBuiltinMeta[0]); ++i) {
+    fn(kAetherBuiltinMeta[i].aether_name, kAetherBuiltinMeta[i].signature, ctx);
+  }
+  size_t builtin_count = getVmBuiltinCount();
+  for (size_t i = 0; i < builtin_count; ++i) {
+    const char *name = getVmBuiltinNameById((int)i);
+    if (!name || !*name || vmBuiltinHiddenFromAether((int)i, name)) {
+      continue;
+    }
+    fn(name, NULL, ctx);
+  }
+}
+
 static bool appendAetherBuiltinsJson(JsonText *json, bool detailed) {
   bool first = true;
   if (!jsonTextAppend(json, "[")) {
