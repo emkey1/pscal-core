@@ -6090,6 +6090,34 @@ static void aetherCodeMathError(char *message, size_t size) {
 /* The task builtins' refusals spoke of the engine's threads and of "join",
  * where Aether has tasks and task_wait, and carried no code. Aether rewrites
  * them by shape, keeping the task number. Other front ends keep the wording. */
+/* An engine builtin's name at the head of its own error ("ThreadStatsJson
+ * expects no arguments.", "SqliteOpen failed (14): ...") is replaced by the
+ * Aether name a program writes (task_stats_json, sqlite_open). Coded messages
+ * and words with no Aether spelling are left as they are. */
+static void aetherRenameEngineBuiltin(char *message, size_t size) {
+    if (!message || message[0] == '[') {
+        return;
+    }
+    size_t n = 0;
+    while (message[n] && (isalnum((unsigned char)message[n]) || message[n] == '_')) {
+        n++;
+    }
+    if (n == 0 || n >= 64 || message[n] != ' ') {
+        return;
+    }
+    char word[64];
+    memcpy(word, message, n);
+    word[n] = '\0';
+    /* `length` is listed first under its alias string_len; programs write len. */
+    const char *aether = strcasecmp(word, "length") == 0 ? "len" : pscalAetherNameForBuiltin(word);
+    if (!aether || strcmp(aether, word) == 0) {
+        return;
+    }
+    char renamed[1024];
+    snprintf(renamed, sizeof(renamed), "%s%s", aether, message + n);
+    snprintf(message, size, "%s", renamed);
+}
+
 static void aetherCodeTaskError(char *message, size_t size) {
     int id = 0;
     char expect[128];
@@ -6162,6 +6190,7 @@ void runtimeError(VM* vm, const char* format, ...) {
     if (frontendIsAether()) {
         aetherCodeMathError(message, sizeof(message));
         aetherCodeTaskError(message, sizeof(message));
+        aetherRenameEngineBuiltin(message, sizeof(message));
     }
 
     size_t instruction_offset = 0;
