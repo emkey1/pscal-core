@@ -6056,7 +6056,8 @@ static int vmRecentInstructionStart(VM* vm, int error_offset) {
  * messages, which printed with no code and no hint ("Runtime Error: Integer
  * overflow."), while every other Aether failure names one. Matching the exact
  * text here codes them all, and any later site that reuses a message, without
- * touching the other front ends' wording. */
+ * touching the other front ends' wording. The two SHL/SHR sites' negative
+ * count joined them later. */
 static const struct {
     const char *plain;
     const char *coded;
@@ -6076,6 +6077,9 @@ static const struct {
     {"Runtime Error: Integer overflow.",
      "[AETH-RUNTIME-INT-OVERFLOW] Integer overflow: the result is outside Int's 64-bit range.\n"
      "hint: check the operands before the operation, or compute in Real when values get that large."},
+    {"Runtime Error: Shift amount cannot be negative.",
+     "[AETH-RUNTIME-SHIFT-NEGATIVE] Shift amount cannot be negative (`<<`, `>>`).\n"
+     "hint: check the count first, e.g. `if k >= 0 { x = a << k; }`; shift the other way with the opposite operator."},
 };
 
 static void aetherCodeMathError(char *message, size_t size) {
