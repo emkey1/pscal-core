@@ -151,8 +151,8 @@ static const AetherBuiltinMeta kAetherBuiltinMeta[] = {
      "task_lookup(name: Text) -> Int",
      "Look up a named queued worker handle.", "task", true},
     {"task_status", "thread_get_status", "function", "Bool",
-     "task_status(handle: Int, consume: Bool = false) -> Bool",
-     "True when the finished task succeeded; readable once it has finished.", "task", true},
+     "task_status(handle: Int, drop_result: Bool = false) -> Bool",
+     "True when the finished task succeeded. Reading it takes the status: read it once, after the task has finished and before task_wait; a second read is the run-time error AETH-RUNTIME-TASK-NO-STATUS. drop_result: true also discards the task's result.", "task", true},
     /* No fixed type: the payload is whatever the target builtin returned, so
      * Aether's type checker leaves the call untyped (types.c). */
     {"task_result", "thread_get_result", "function", "T",

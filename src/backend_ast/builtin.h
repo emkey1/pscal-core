@@ -75,6 +75,12 @@ void registerVmBuiltin(const char *vm_name, VmBuiltinFn handler,
  * metadata (builtins_json / builtin_info). Case-insensitive. */
 bool pscalBuiltinNameIsEffectful(const char *name);
 
+/* What a task_spawn / task_queue target name is: 1 a builtin that may run on a
+ * worker thread, 0 a builtin that may not, -1 no builtin. Resolves the front
+ * end's spelling first, as the spawn does (Aether's "dns_lookup" is the
+ * engine's "dnslookup"). For the Aether front end's compile-time check. */
+int pscalTaskTargetKind(const char *name);
+
 /* VM 2.0 Phase 6: effect-class mask for the --deny sandbox and record/replay
  * (Docs/pscal_vm2_plan.md §6.3). Covers every builtin regardless of how it was
  * registered: core dispatch-table entries are classified by name (seeded from

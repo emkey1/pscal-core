@@ -11476,8 +11476,13 @@ static Value threadSpawnOrSubmitCommon(VM* vm, int arg_count, Value* args, bool 
     Value target = args[0];
     int builtin_id = -1;
     const char* builtin_name = NULL;
+    const char* source_name = NULL;
+    /* Aether names the target as the program wrote it and lists what a task
+     * can run; the engine's lines named the engine (ThreadSpawnBuiltin,
+     * aether_read_file) and had no code. */
+    const char* aether_op = poolSubmit ? "task_queue" : "task_spawn";
     if (isPascalStringType(VALUE_TYPE(target)) || VALUE_TYPE(target) == TYPE_POINTER) {
-        const char* source_name = builtinValueToCString(&target);
+        source_name = builtinValueToCString(&target);
         if (!source_name || !*source_name) {
             runtimeError(vm, "%s requires a builtin name or id.", opName);
             return makeInt(-1);
@@ -11499,9 +11504,26 @@ static Value threadSpawnOrSubmitCommon(VM* vm, int arg_count, Value* args, bool 
     }
 
     if (builtin_id < 0 || !builtin_name) {
+        if (frontendIsAether()) {
+            runtimeError(vm, "[AETH-RUNTIME-TASK-TARGET] %s: '%s' is not a builtin: a task runs "
+                             "sleep, dns_lookup or an http_* builtin, by name.\n"
+                             "hint: to run your own function concurrently, call it inside "
+                             "`par { ... }`.",
+                         aether_op, source_name ? source_name : "?");
+            return makeInt(-1);
+        }
         runtimeError(vm, "%s received an unknown builtin identifier.", opName);
         return makeInt(-1);
     }
+        if (!threadBuiltinIsAllowlisted(builtin_id) && frontendIsAether()) {
+            const char* shown = source_name ? source_name : builtin_name;
+            runtimeError(vm, "[AETH-RUNTIME-TASK-TARGET] %s: '%s' cannot run as a task: a task runs "
+                             "sleep, dns_lookup or an http_* builtin.\n"
+                             "hint: call %s directly, or run your own code concurrently in "
+                             "`par { ... }`.",
+                         aether_op, shown, shown);
+            return makeInt(-1);
+        }
         if (!threadBuiltinIsAllowlisted(builtin_id)) {
             runtimeError(vm, "Builtin '%s' is not approved for threaded execution.", builtin_name);
             if (shellRuntimeSetLastStatusSticky) {
@@ -12430,6 +12452,21 @@ static void initThreadBuiltinAllowlist(void) {
             gThreadBuiltinAllowlist[id] = true;
         }
     }
+}
+
+int pscalTaskTargetKind(const char *name) {
+    if (!name || !*name) {
+        return -1;
+    }
+    const char *engine_name = resolveBuiltinNameAlias(name);
+    int id = engine_name ? getVmBuiltinID(engine_name) : -1;
+    if (id < 0) {
+        id = getVmBuiltinID(name);
+    }
+    if (id < 0 || !getVmBuiltinNameById(id)) {
+        return -1;
+    }
+    return threadBuiltinIsAllowlisted(id) ? 1 : 0;
 }
 
 static bool threadBuiltinIsAllowlisted(int id) {

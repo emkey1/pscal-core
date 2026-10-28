@@ -6145,10 +6145,11 @@ static void aetherCodeTaskError(char *message, size_t size) {
     snprintf(expect, sizeof(expect), "Thread %d has no stored status.", id);
     if (strcmp(message, expect) == 0) {
         snprintf(message, size,
-                 "[AETH-RUNTIME-TASK-NO-STATUS] task_status: task %d has no status to read: "
-                 "task_wait already took it, or the handle is not a task.\n"
-                 "hint: read task_status(t) before task_wait(t), or use task_wait's return value "
-                 "(0 = success).", id);
+                 "[AETH-RUNTIME-TASK-NO-STATUS] task_status: task %d has no status to read: reading "
+                 "it takes the status, and an earlier task_status, task_wait or task_result(t, true) "
+                 "took it, or the handle is not a task.\n"
+                 "hint: read task_status(t) once, before task_wait(t), and keep it in a variable; or "
+                 "use task_wait's return value (0 = success).", id);
         return;
     }
     snprintf(expect, sizeof(expect), "Thread %d has no stored result.", id);
