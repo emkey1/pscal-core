@@ -6544,6 +6544,27 @@ static void compileCallArgumentRValue(AST* node, BytecodeChunk* chunk, int curre
     }
 }
 
+// A bare `[]` handed to a typed slot -- a parameter, a function's return value
+// -- takes that slot's element type, as a declaration's initializer and an
+// assignment's right-hand side already do. Built untyped (TYPE_UNKNOWN), the
+// array kept no element type, and every later SetLength on it (Aether lowers
+// `xs + [v]` to one) rebuilt each slot through makeValueForType, printing
+// "unhandled type 0 (UNKNOWN_VAR_TYPE)" once per slot: a recursive search
+// that passed `[]` down printed it thousands of times.
+static bool isEmptyArrayLiteral(AST* node) {
+    return node && node->type == AST_ARRAY_LITERAL && node->child_count == 0;
+}
+
+static void compileCallArgumentRValueForParam(AST* node, AST* param_type_hint,
+                                              BytecodeChunk* chunk, int current_line_approx) {
+    if (param_type_hint && isEmptyArrayLiteral(node)) {
+        emitEmptyArrayLiteralForType(param_type_hint, chunk,
+                                     getLine(node) > 0 ? getLine(node) : current_line_approx);
+        return;
+    }
+    compileCallArgumentRValue(node, chunk, current_line_approx);
+}
+
 static bool isFormatOpenArrayCall(const char* calleeName, AST* node, int receiver_offset) {
     if (!calleeName || !node || strcasecmp(calleeName, "format") != 0) {
         return false;
@@ -9288,13 +9309,17 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
         case AST_RETURN: {
             if (inline_routine_active) {
                 if (node->left) {
-                    compileRValue(node->left, chunk, getLine(node->left));
                     AST* func_decl = (current_function_compiler && current_function_compiler->function_symbol)
                                          ? current_function_compiler->function_symbol->type_def
                                          : NULL;
                     AST* return_type = NULL;
                     if (func_decl && func_decl->type == AST_FUNCTION_DECL) {
                         return_type = func_decl->right;
+                    }
+                    if (return_type && isEmptyArrayLiteral(node->left)) {
+                        emitEmptyArrayLiteralForType(return_type, chunk, getLine(node->left));
+                    } else {
+                        compileRValue(node->left, chunk, getLine(node->left));
                     }
                     maybeAutoBoxInterfaceForType(return_type, node->left, chunk, getLine(node->left), true, false);
                     if (inline_routine_result_slot != -1) {
@@ -9312,13 +9337,17 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                 break;
             }
             if (node->left) {
-                compileRValue(node->left, chunk, getLine(node->left));
                 AST* func_decl = (current_function_compiler && current_function_compiler->function_symbol)
                                      ? current_function_compiler->function_symbol->type_def
                                      : NULL;
                 AST* return_type = NULL;
                 if (func_decl && func_decl->type == AST_FUNCTION_DECL) {
                     return_type = func_decl->right;
+                }
+                if (return_type && isEmptyArrayLiteral(node->left)) {
+                    emitEmptyArrayLiteralForType(return_type, chunk, getLine(node->left));
+                } else {
+                    compileRValue(node->left, chunk, getLine(node->left));
                 }
                 maybeAutoBoxInterfaceForType(return_type, node->left, chunk, getLine(node->left), true, false);
             }
@@ -10832,7 +10861,7 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                         }
                         compileLValue(arg_node, chunk, getLine(arg_node));
                     } else {
-                        compileCallArgumentRValue(arg_node, chunk, getLine(arg_node));
+                        compileCallArgumentRValueForParam(arg_node, param_type_hint, chunk, getLine(arg_node));
                         maybeAutoBoxInterfaceForType(param_type_hint, arg_node, chunk, getLine(arg_node), true, false);
                     }
                     writeBytecodeChunk(chunk, SWAP, line);
@@ -10948,7 +10977,7 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                     if (is_var_param) {
                         compileLValue(arg_node, chunk, getLine(arg_node));
                     } else {
-                        compileCallArgumentRValue(arg_node, chunk, getLine(arg_node));
+                        compileCallArgumentRValueForParam(arg_node, param_type_hint, chunk, getLine(arg_node));
                         maybeAutoBoxInterfaceForType(param_type_hint, arg_node, chunk, getLine(arg_node), true, false);
                     }
                 }
@@ -12420,7 +12449,7 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                     if (is_var_param) {
                         compileLValue(arg_node, chunk, getLine(arg_node));
                     } else {
-                        compileCallArgumentRValue(arg_node, chunk, getLine(arg_node));
+                        compileCallArgumentRValueForParam(arg_node, param_type_hint, chunk, getLine(arg_node));
                         maybeAutoBoxInterfaceForType(param_type_hint, arg_node, chunk, getLine(arg_node), true, false);
                     }
                     writeBytecodeChunk(chunk, SWAP, line);
@@ -12572,7 +12601,7 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                             }
                             compileLValue(arg_node, chunk, getLine(arg_node));
                         } else {
-                            compileCallArgumentRValue(arg_node, chunk, getLine(arg_node));
+                            compileCallArgumentRValueForParam(arg_node, param_type_hint, chunk, getLine(arg_node));
                             maybeAutoBoxInterfaceForType(param_type_hint, arg_node, chunk, getLine(arg_node), true, false);
                         }
                     }

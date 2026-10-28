@@ -3915,6 +3915,22 @@ static int flatOffsetFromBounds(int dims, const int* lower, const int* upper, co
     return offset;
 }
 
+// A slot SetLength adds to an array. An Aether array made from a bare `[]` the
+// compiler could not type (an empty row of a nested literal, an `if` branch)
+// has no element type; its grown slots are written by the append/concat
+// lowering at once, so build them as makeValueForType would (a zeroed
+// TYPE_UNKNOWN cell) without its "unhandled type 0 (UNKNOWN_VAR_TYPE)"
+// warning, an engine internal the program cannot act on.
+static Value setLengthSlotValue(VarType element_type, AST* element_type_def) {
+    if (element_type == TYPE_UNKNOWN && frontendIsAether()) {
+        Value v;
+        memset(&v, 0, sizeof(Value));
+        v.type = TYPE_UNKNOWN;
+        return v;
+    }
+    return makeValueForType(element_type, element_type_def, NULL);
+}
+
 static bool resizeDynamicArrayValue(VM* vm,
                                     Value* array_value,
                                     int dimension_count,
@@ -4122,7 +4138,7 @@ static bool resizeDynamicArrayValue(VM* vm,
                     if (grown) {
                         old->elements = grown;
                         for (size_t i = old_capacity; i < new_capacity; ++i) {
-                            old->elements[i] = makeValueForType(element_type, element_type_def, NULL);
+                            old->elements[i] = setLengthSlotValue(element_type, element_type_def);
                         }
                         old->capacity = (int)new_capacity;
                     } else {
@@ -4189,7 +4205,7 @@ static bool resizeDynamicArrayValue(VM* vm,
             }
 
             for (size_t i = 0; i < new_total; ++i) {
-                new_elements[i] = makeValueForType(element_type, element_type_def, NULL);
+                new_elements[i] = setLengthSlotValue(element_type, element_type_def);
             }
         }
 
