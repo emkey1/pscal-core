@@ -1,0 +1,10 @@
+pscal-core
+Copyright 2025-2026 Mike Miller
+
+This product includes third-party software under its own license:
+
+- yyjson, Copyright (c) 2020 YaoYuan, under the MIT License
+  (src/third_party/yyjson/LICENSE).
+- nextvi, Copyright (C) 2015-2019 Ali Gholami Rudi and
+  Copyright (C) 2020-2025 Kyryl Melekhin, under an ISC-style license
+  (third-party/nextvi/LICENSE).

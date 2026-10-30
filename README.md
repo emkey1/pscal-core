@@ -54,3 +54,8 @@ VM and runtime reference lives in [`docs/`](docs/):
 
 This repository was extracted from the PSCAL monorepo (emkey1/pscal) with full
 per-file history preserved.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE); see [NOTICE](NOTICE)
+for copyright and third-party notices.
