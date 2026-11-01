@@ -8275,10 +8275,23 @@ void vprocIsolationLeave(VProcIsolationDomain domain) {
     pthread_mutex_unlock(&lock->mu);
 }
 
+/* A stdio stream's descriptor is a host fd, not a slot in the vproc table, so a
+ * shim given fileno(fp) as it stands answers EBADF, or worse, uses whichever
+ * slot has that number. vprocFilenoShim marks the fd so the shims use it as a
+ * host fd. */
+#define VPROC_HOST_FD_TAG 0x40000000
+
+static inline bool vprocFdIsTaggedHost(int fd) {
+    return fd >= 0 && (fd & VPROC_HOST_FD_TAG) != 0;
+}
+
 int vprocTranslateFd(VProc *vp, int fd) {
     if (!vp || fd < 0) {
         errno = EBADF;
         return -1;
+    }
+    if (vprocFdIsTaggedHost(fd)) {
+        return fd & ~VPROC_HOST_FD_TAG;
     }
     if (!vprocRegistryContainsValidated(vp)) {
         errno = EBADF;
@@ -12989,6 +13002,9 @@ static int vprocResolveFdForShim(VProc *vp, int fd, int allow_real, struct pscal
     if (out_pscal) {
         *out_pscal = NULL;
     }
+    if (vprocFdIsTaggedHost(fd)) {
+        return fd & ~VPROC_HOST_FD_TAG;
+    }
     if (!vp) {
         return allow_real ? fd : -1;
     }
@@ -13025,6 +13041,26 @@ static int vprocResolveFdForShim(VProc *vp, int fd, int allow_real, struct pscal
 static int shimTranslate(int fd, int allow_real) {
     VProc *vp = vprocForThread();
     return vprocResolveFdForShim(vp, fd, allow_real, NULL);
+}
+
+int vprocFilenoShim(FILE *stream) {
+    int fd = (fileno)(stream);
+    /* The standard streams' numbers are slots already, and with no vproc the
+     * shims pass every fd straight to the host. */
+    if (fd < 0 || stream == stdin || stream == stdout || stream == stderr || !vprocForThread()) {
+        return fd;
+    }
+    return fd | VPROC_HOST_FD_TAG;
+}
+
+int vprocFtruncateShim(int fd, off_t length) {
+    int host = shimTranslate(fd, 1);
+    return host < 0 ? -1 : ftruncate(host, length);
+}
+
+int vprocFutimensShim(int fd, const struct timespec times[2]) {
+    int host = shimTranslate(fd, 1);
+    return host < 0 ? -1 : futimens(host, times);
 }
 
 static int vprocSetCompatErrno(int err) {

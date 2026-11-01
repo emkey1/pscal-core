@@ -244,6 +244,7 @@ static inline void pscalPerror(const char *label) {
 #undef fputs
 #undef puts
 #undef fputc
+#undef putc
 #undef putchar
 #undef fwrite
 #undef perror
@@ -255,6 +256,7 @@ static inline void pscalPerror(const char *label) {
 #define fputs(s, stream) pscalFputs((s), (stream))
 #define puts(s) pscalPuts((s))
 #define fputc(c, stream) pscalFputc((c), (stream))
+#define putc(c, stream) pscalFputc((c), (stream))
 #define putchar(c) pscalPutchar((c))
 #define fwrite(ptr, size, nmemb, stream) pscalFwrite((ptr), (size), (nmemb), (stream))
 #define perror(label) pscalPerror((label))

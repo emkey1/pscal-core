@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -140,6 +141,12 @@ int vprocHostPthreadCreate(pthread_t *thread,
                            void *arg);
 /* Adopt an existing host fd into the vproc table, returning the vproc-local fd. */
 int vprocAdoptHostFd(VProc *vp, int host_fd);
+/* fileno() whose result the read, fstat, lseek and dup shims accept. The stream
+ * keeps owning the descriptor: close it with fclose(), not close(). */
+int vprocFilenoShim(FILE *stream);
+/* ftruncate and futimens on a vproc fd. */
+int vprocFtruncateShim(int fd, off_t length);
+int vprocFutimensShim(int fd, const struct timespec times[2]);
 /* Inherit the current vproc into new threads created via pthread_create shim. */
 int vprocPthreadCreateShim(pthread_t *thread,
                            const pthread_attr_t *attr,
