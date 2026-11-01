@@ -1,5 +1,6 @@
 /* Auto-generated include: word expansion and substitution logic. Included from shell.c. */
 #if defined(PSCAL_TARGET_IOS)
+#include "smallclue/smallclue.h"
 #undef stdin
 #undef stdout
 #undef stderr
@@ -563,6 +564,16 @@ static char *shellExpandParameter(const char *input,
 
         const char *cursor = inner;
         size_t name_len = 0;
+        if (isdigit((unsigned char)*inner)) {
+            /* ${1}: the identifier rule below refuses a leading digit. */
+            while (cursor < closing && isdigit((unsigned char)*cursor)) {
+                cursor++;
+            }
+            if (cursor == closing) {
+                return shellLookupParameterValue(inner, inner_len);
+            }
+            return NULL;
+        }
         if (!consumeShellIdentifier(inner, (size_t)(closing - inner), &name_len, false)) {
             return NULL;
         }
@@ -2737,6 +2748,15 @@ static bool shellInvokeBuiltin(VM *vm, ShellCommand *cmd) {
     if (!is_runtime_builtin) {
         return false;
     }
+#if defined(PSCAL_TARGET_IOS)
+    /* The VM's math and file routines of these names take values, not a command
+     * line (`ln -s a b` called ln(x)). As commands they mean the applets. */
+    if ((strcasecmp(lookup, "ln") == 0 || strcasecmp(lookup, "mkdir") == 0 ||
+         strcasecmp(lookup, "rmdir") == 0 || strcasecmp(lookup, "reset") == 0) &&
+        smallclueFindApplet(lookup) != NULL) {
+        return false;
+    }
+#endif
     VmBuiltinFn handler = getVmBuiltinHandler(lookup);
     if (!handler && canonical && canonical != name) {
         handler = getVmBuiltinHandler(name);

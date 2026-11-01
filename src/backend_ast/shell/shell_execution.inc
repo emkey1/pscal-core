@@ -4358,6 +4358,16 @@ cleanup:
     return status;
 }
 
+/* A foreground stage's parent is whichever vproc will wait for it. wait only
+ * matches its own children, and inside a nested exsh or a script that is not the
+ * session shell: the wait failed at once and the next command ran alongside this
+ * stage. */
+static int shellStageParentPid(int shell_pid) {
+    VProc *waiter = vprocCurrent();
+    int waiter_pid = waiter ? vprocPid(waiter) : -1;
+    return waiter_pid > 0 ? waiter_pid : shell_pid;
+}
+
 static int shellPipelineRunStage(VM *vm,
                                  ShellPipelineContext *ctx,
                                  ShellCommand *cmd,
@@ -4474,7 +4484,7 @@ static int shellPipelineRunStage(VM *vm,
     }
     int shell_pid = vprocGetShellSelfPid();
     if (shell_pid > 0) {
-        vprocSetParent(vprocPid(vp), shell_pid);
+        vprocSetParent(vprocPid(vp), shellStageParentPid(shell_pid));
         int shell_sid = vprocGetSid(shell_pid);
         if (shell_sid > 0) {
             vprocSetSid(vprocPid(vp), shell_sid);
@@ -4901,7 +4911,7 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
 
         int shell_pid = vprocGetShellSelfPid();
         if (shell_pid > 0 && stage_pid > 0) {
-            (void)vprocSetParent((int)stage_pid, shell_pid);
+            (void)vprocSetParent((int)stage_pid, shellStageParentPid(shell_pid));
             int shell_sid = vprocGetSid(shell_pid);
             if (shell_sid > 0) {
                 (void)vprocSetSid((int)stage_pid, shell_sid);
