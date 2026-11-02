@@ -8139,7 +8139,7 @@ static void shellCommandPrintVerbose(const char *name, const ShellCommandResult 
     }
     switch (result->kind) {
         case SHELL_COMMAND_RESULT_ALIAS:
-            printf("%s is aliased to '%s'\n", name, result->detail ? result->detail : "");
+            printf("%s is aliased to `%s'\n", name, result->detail ? result->detail : "");
             break;
         case SHELL_COMMAND_RESULT_KEYWORD:
             printf("%s is a shell keyword\n", name);
@@ -9186,6 +9186,7 @@ Value vmBuiltinShellType(VM *vm, int arg_count, Value *args) {
     bool print_type = false;
     bool print_path = false;
     bool use_default_path = false;
+    bool skip_functions = false;
     int first_name = arg_count;
 
     for (int i = 0; i < arg_count; ++i) {
@@ -9207,6 +9208,9 @@ Value vmBuiltinShellType(VM *vm, int arg_count, Value *args) {
                         case 'a':
                             list_all = true;
                             break;
+                        case 'f':
+                            skip_functions = true;
+                            break;
                         case 't':
                             print_type = true;
                             break;
@@ -9218,8 +9222,9 @@ Value vmBuiltinShellType(VM *vm, int arg_count, Value *args) {
                             use_default_path = true;
                             break;
                         default:
-                            runtimeError(vm, "type: unsupported option '-%c'", *opt);
-                            shellUpdateStatus(1);
+                            shellReportRecoverableError(vm, true, "type: -%c: invalid option", *opt);
+                            shellReportRecoverableError(vm, false, "type: usage: type [-afptP] name [name ...]");
+                            shellUpdateStatus(2);
                             return makeVoid();
                     }
                 }
@@ -9236,8 +9241,7 @@ Value vmBuiltinShellType(VM *vm, int arg_count, Value *args) {
     }
 
     if (first_name == arg_count) {
-        runtimeError(vm, "type: expected name");
-        shellUpdateStatus(1);
+        shellUpdateStatus(0);
         return makeVoid();
     }
 
@@ -9255,10 +9259,22 @@ Value vmBuiltinShellType(VM *vm, int arg_count, Value *args) {
             return makeVoid();
         }
 
+        if (skip_functions) {
+            size_t kept = 0;
+            for (size_t j = 0; j < count; ++j) {
+                if (results[j].kind == SHELL_COMMAND_RESULT_FUNCTION) {
+                    free(results[j].detail);
+                    continue;
+                }
+                results[kept++] = results[j];
+            }
+            count = kept;
+        }
+
         if (count == 0) {
             overall_ok = false;
             if (descriptive) {
-                runtimeError(vm, "type: %s: not found", name);
+                shellReportRecoverableError(vm, true, "type: %s: not found", name);
             }
             shellUpdateStatus(1);
             shellCommandFreeResults(results, count);
@@ -10279,9 +10295,10 @@ static const ShellHelpTopic kShellHelpTopics[] = {
     {
         "alias",
         "Define or display shell aliases.",
-        "alias [name=value ...]",
-        "Without arguments prints the stored alias definitions as "
-        "alias name='value'. Each NAME=VALUE argument updates or creates an alias.",
+        "alias [-p] [name[=value] ...]",
+        "Without arguments, or with -p, prints the stored alias definitions as "
+        "alias name='value'. Each NAME=VALUE argument updates or creates an alias, and "
+        "each NAME prints that one, or fails if there is none.",
         NULL,
         0
     },
@@ -10708,11 +10725,11 @@ static const ShellHelpTopic kShellHelpTopics[] = {
     {
         "type",
         "Describe how the shell interprets names.",
-        "type [-a] [-p|-P] [-t] name ...",
+        "type [-af] [-p|-P] [-t] name ...",
         "Without options prints the first match for each NAME. -t prints only the"
         " classification (alias, function, builtin, or file). -p prints the first"
-        " executable path, -P forces the default PATH, and -a includes every"
-        " result discovered during lookup.",
+        " executable path, -P forces the default PATH, -a includes every"
+        " result discovered during lookup, and -f leaves out functions.",
         NULL,
         0
     },
@@ -10936,15 +10953,78 @@ Value vmBuiltinShellHelp(VM *vm, int arg_count, Value *args) {
     return makeVoid();
 }
 
-Value vmBuiltinShellAlias(VM *vm, int arg_count, Value *args) {
-    if (arg_count == 0) {
-        for (size_t i = 0; i < gShellAliasCount; ++i) {
-            printf("alias %s='%s'\n", gShellAliases[i].name, gShellAliases[i].value);
+/* In a form that can be read back. */
+static void shellPrintAlias(const ShellAlias *alias) {
+    printf("alias %s%s='", alias->name[0] == '-' ? "-- " : "", alias->name);
+    const char *rest = alias->value ? alias->value : "";
+    const char *quote;
+    while ((quote = strchr(rest, '\'')) != NULL) {
+        printf("%.*s'\\''", (int)(quote - rest), rest);
+        rest = quote + 1;
+    }
+    printf("%s'\n", rest);
+}
+
+static int shellCompareAliasNames(const void *lhs, const void *rhs) {
+    const ShellAlias *left = *(const ShellAlias *const *)lhs;
+    const ShellAlias *right = *(const ShellAlias *const *)rhs;
+    return strcmp(left->name, right->name);
+}
+
+static void shellPrintAllAliases(void) {
+    size_t count = gShellAliasCount;
+    if (count == 0) {
+        return;
+    }
+    const ShellAlias **sorted = (const ShellAlias **)malloc(count * sizeof(*sorted));
+    if (sorted) {
+        for (size_t i = 0; i < count; ++i) {
+            sorted[i] = &gShellAliases[i];
         }
+        qsort(sorted, count, sizeof(*sorted), shellCompareAliasNames);
+        for (size_t i = 0; i < count; ++i) {
+            shellPrintAlias(sorted[i]);
+        }
+        free(sorted);
+    } else {
+        for (size_t i = 0; i < count; ++i) {
+            shellPrintAlias(&gShellAliases[i]);
+        }
+    }
+}
+
+Value vmBuiltinShellAlias(VM *vm, int arg_count, Value *args) {
+    bool list_all = false;
+    int first_name = 0;
+    for (; first_name < arg_count; ++first_name) {
+        if (VALUE_TYPE(args[first_name]) != TYPE_STRING || !AS_STRING(args[first_name])) {
+            break;
+        }
+        const char *arg = AS_STRING(args[first_name]);
+        if (strcmp(arg, "--") == 0) {
+            first_name++;
+            break;
+        }
+        if (arg[0] != '-' || arg[1] == '\0') {
+            break;
+        }
+        for (const char *opt = arg + 1; *opt; ++opt) {
+            if (*opt != 'p') {
+                shellReportRecoverableError(vm, true, "alias: -%c: invalid option", *opt);
+                shellReportRecoverableError(vm, false, "alias: usage: alias [-p] [name[=value] ... ]");
+                shellUpdateStatus(2);
+                return makeVoid();
+            }
+        }
+        list_all = true;
+    }
+    if (list_all || first_name >= arg_count) {
+        shellPrintAllAliases();
         shellUpdateStatus(0);
         return makeVoid();
     }
-    for (int i = 0; i < arg_count; ++i) {
+    bool ok = true;
+    for (int i = first_name; i < arg_count; ++i) {
         if (VALUE_TYPE(args[i]) != TYPE_STRING || !AS_STRING(args[i])) {
             runtimeError(vm, "alias: expected name=value");
             shellUpdateStatus(1);
@@ -10953,9 +11033,15 @@ Value vmBuiltinShellAlias(VM *vm, int arg_count, Value *args) {
         const char *assignment = AS_STRING(args[i]);
         const char *eq = strchr(assignment, '=');
         if (!eq || eq == assignment) {
-            runtimeError(vm, "alias: invalid assignment '%s'", assignment);
-            shellUpdateStatus(1);
-            return makeVoid();
+            /* Not a definition, so a question: print this one if there is one. */
+            const ShellAlias *found = shellFindAlias(assignment);
+            if (found) {
+                shellPrintAlias(found);
+            } else {
+                shellReportRecoverableError(vm, true, "alias: %s: not found", assignment);
+                ok = false;
+            }
+            continue;
         }
         size_t name_len = (size_t)(eq - assignment);
         char *name = strndup(assignment, name_len);
@@ -10973,7 +11059,7 @@ Value vmBuiltinShellAlias(VM *vm, int arg_count, Value *args) {
         }
         free(name);
     }
-    shellUpdateStatus(0);
+    shellUpdateStatus(ok ? 0 : 1);
     return makeVoid();
 }
 
