@@ -2623,6 +2623,9 @@ typedef struct {
      * meaningful host-fd equivalent, so restoring only the host side leaves
      * the vproc pointing at the redirection target. -1 when unused. */
     int vproc_saved_fd;
+    /* iOS, above stdio: the slot is the whole descriptor. Nothing of the host's
+     * was saved, and an entry that was closed before goes back to closed. */
+    bool slot_only;
 } ShellExecRedirBackup;
 
 static void shellRestoreExecRedirections(ShellExecRedirBackup *backups, size_t count);

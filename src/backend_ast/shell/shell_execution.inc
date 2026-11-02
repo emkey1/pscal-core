@@ -3344,13 +3344,18 @@ static bool shellEnsureExecRedirBackup(int target_fd,
     backup.was_closed = false;
     backup.use_vproc = false;
     backup.vproc_saved_fd = -1;
+    backup.slot_only = false;
 #if defined(PSCAL_TARGET_IOS)
     /* shellDupOntoTarget() rewrites the fd table of whatever vproc is current,
      * so snapshot that entry against the same vproc -- not `active_vp` below,
      * which is deliberately blanked for in-process pipeline stages. */
     VProc *vp_mutated = vprocCurrent();
     if (vp_mutated) {
-        backup.vproc_saved_fd = vprocDup(vp_mutated, target_fd);
+        backup.vproc_saved_fd = vprocDupAbove(vp_mutated, target_fd, 10);
+        backup.slot_only = target_fd > STDERR_FILENO;
+    }
+    if (backup.slot_only) {
+        goto store_backup;
     }
     VProc *active_vp = vp_mutated;
     bool want_vproc_restore = gShellSkipHostStdio;
@@ -3364,7 +3369,9 @@ static bool shellEnsureExecRedirBackup(int target_fd,
     VProc *active_vp = NULL;
     (void)active_vp;
 #endif
-    int min_fd = target_fd + 1;
+    /* A saved copy stays clear of the numbers a script can name, as bash's does at 10:
+     * `2>/dev/null >&3` must not find a saved stderr in descriptor 3. */
+    int min_fd = (target_fd + 1 > 10) ? target_fd + 1 : 10;
     if (avoid_fd >= 0 && avoid_fd >= min_fd) {
         min_fd = avoid_fd + 1;
     }
@@ -3456,6 +3463,9 @@ static bool shellEnsureExecRedirBackup(int target_fd,
     } else {
         return false;
     }
+#if defined(PSCAL_TARGET_IOS)
+store_backup:
+#endif
     if (*count >= *capacity) {
         size_t new_capacity = (*capacity == 0) ? 4 : (*capacity * 2);
         ShellExecRedirBackup *resized =
@@ -3504,10 +3514,20 @@ static bool shellDupOntoTarget(VProc *vp, int src_fd, int target_fd, bool dbg, c
         !gShellBackgroundWorkerActive) {
         skip_host_dup = false;
     }
+    /* Only stdio has a host side to keep in step. Above it the number means the slot, and
+     * the host's descriptor of that number is someone else's, such as the Go runtime's
+     * kqueue: dup2 onto it ends the whole app. */
+    if (vp && target_fd > STDERR_FILENO) {
+        skip_host_dup = true;
+    }
     if (vp) {
         int translated = vprocTranslateFd(vp, src_fd);
         if (translated >= 0) {
             host_src = translated;
+        } else if (src_fd > STDERR_FILENO) {
+            /* The number names a slot, and that slot has no host side. The host's
+             * descriptor of that number is not this one: `>&7` must not write into it. */
+            host_src = -1;
         }
     }
 #endif
@@ -3518,6 +3538,10 @@ static bool shellDupOntoTarget(VProc *vp, int src_fd, int target_fd, bool dbg, c
         if (dbg) {
             fprintf(stderr, "[redir] vprocDup2 %d->%d rc=%d host_src=%d (%s)\n",
                     src_fd, target_fd, vrc, host_src, label ? label : "");
+        }
+        if (vrc < 0 && host_src < 0 && src_fd > STDERR_FILENO) {
+            errno = EBADF;
+            return false;
         }
         if (vrc < 0 && skip_host_dup) {
             int restore_rc = -1;
@@ -3631,6 +3655,8 @@ static void shellRestoreExecRedirections(ShellExecRedirBackup *backups, size_t c
                 (void)vprocClose(active_vp, backup->vproc_saved_fd);
             }
             backup->vproc_saved_fd = -1;
+        } else if (backup->slot_only && active_vp) {
+            (void)vprocClose(active_vp, backup->target_fd);
         }
 #endif
         if (touched) {
@@ -3789,6 +3815,11 @@ static bool shellApplyExecRedirections(const ShellCommand *cmd,
 #endif
                     vprocHostClose(fd);
                 }
+#if defined(PSCAL_TARGET_IOS)
+                else if (vp_current) {
+                    vprocMarkFdInherited(vp_current, target_fd);
+                }
+#endif
                 if (target_fd == STDOUT_FILENO) {
                     stdout_redirected = true;
                 }
@@ -5496,6 +5527,13 @@ static bool shellExecuteExecBuiltin(VM *vm, ShellCommand *cmd) {
             return true;
         }
         shellFreeExecRedirBackups(backups, backup_count);
+#if defined(PSCAL_TARGET_IOS)
+        for (size_t i = 0; i < cmd->redir_count; ++i) {
+            if (cmd->redirs[i].fd > STDERR_FILENO) {
+                vprocShellFdFollow(cmd->redirs[i].fd);
+            }
+        }
+#endif
         shellUpdateStatus(0);
         return true;
     }

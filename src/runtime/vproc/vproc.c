@@ -1992,6 +1992,7 @@ typedef struct {
     int host_fd;
     struct pscal_fd *pscal_fd;
     VProcFdKind kind;
+    bool inherit; /* Above stdio: asked for by a redirection, so what this vproc starts gets it. */
 } VProcFdEntry;
 
 typedef struct {
@@ -6429,6 +6430,7 @@ static bool vprocEnsureFdCapacityLocked(VProc *vp, size_t needed) {
         resized[i].host_fd = -1;
         resized[i].pscal_fd = NULL;
         resized[i].kind = VPROC_FD_NONE;
+        resized[i].inherit = false;
     }
     vp->entries = resized;
     vp->capacity = new_cap;
@@ -6489,6 +6491,7 @@ static int vprocInsertLocked(VProc *vp, int host_fd) {
     vp->entries[slot].host_fd = host_fd;
     vp->entries[slot].pscal_fd = NULL;
     vp->entries[slot].kind = VPROC_FD_HOST;
+    vp->entries[slot].inherit = false;
     vprocResourceTrackLocked(vp, host_fd, VPROC_RESOURCE_GENERIC);
     return slot;
 }
@@ -6523,6 +6526,7 @@ static int vprocInsertPscalFd(VProc *vp, struct pscal_fd *fd) {
         vp->entries[slot].host_fd = -1;
         vp->entries[slot].pscal_fd = retained;
         vp->entries[slot].kind = VPROC_FD_PSCAL;
+        vp->entries[slot].inherit = false;
     }
     pthread_mutex_unlock(&vp->mu);
     if (slot < 0) {
@@ -7596,6 +7600,68 @@ VProcOptions vprocDefaultOptions(void) {
     return opts;
 }
 
+/* A slot in `to` becomes a copy of the slot in `from`, or closes if that one is closed. */
+static void vprocCopyFdEntry(VProc *from, VProc *to, int fd) {
+    struct pscal_fd *pscal = NULL;
+    int host = -1;
+    pthread_mutex_lock(&from->mu);
+    if ((size_t)fd < from->capacity) {
+        if (from->entries[fd].kind == VPROC_FD_PSCAL) {
+            pscal = pscal_fd_retain(from->entries[fd].pscal_fd);
+        } else if (from->entries[fd].kind == VPROC_FD_HOST) {
+            host = vprocCloneFd(from->entries[fd].host_fd);
+        }
+    }
+    pthread_mutex_unlock(&from->mu);
+    (void)vprocClose(to, fd);
+    if (!pscal && host < 0) {
+        return;
+    }
+    pthread_mutex_lock(&to->mu);
+    if ((size_t)fd < to->capacity || vprocEnsureFdCapacityLocked(to, (size_t)fd + 1)) {
+        to->entries[fd].host_fd = host;
+        to->entries[fd].pscal_fd = pscal;
+        to->entries[fd].kind = pscal ? VPROC_FD_PSCAL : VPROC_FD_HOST;
+        to->entries[fd].inherit = true;
+    } else if (pscal) {
+        pscal_fd_close(pscal);
+    } else {
+        vprocHostCloseRaw(host);
+    }
+    pthread_mutex_unlock(&to->mu);
+}
+
+/* What a redirection put above stdio, as `exec 3> f` or `cmd 3> f`, reaches what this vproc
+ * starts, as across a fork. The slots it opens for its own use stay its own. */
+static void vprocInheritFds(VProc *vp, VProc *from) {
+    if (!from) {
+        return;
+    }
+    int fds[32];
+    size_t count = 0;
+    pthread_mutex_lock(&from->mu);
+    for (size_t fd = STDERR_FILENO + 1; fd < from->capacity && count < sizeof(fds) / sizeof(fds[0]); ++fd) {
+        if (from->entries[fd].inherit && from->entries[fd].kind != VPROC_FD_NONE) {
+            fds[count++] = (int)fd;
+        }
+    }
+    pthread_mutex_unlock(&from->mu);
+    for (size_t i = 0; i < count; ++i) {
+        vprocCopyFdEntry(from, vp, fds[i]);
+    }
+}
+
+void vprocMarkFdInherited(VProc *vp, int fd) {
+    if (!vp || fd <= STDERR_FILENO) {
+        return;
+    }
+    pthread_mutex_lock(&vp->mu);
+    if ((size_t)fd < vp->capacity) {
+        vp->entries[fd].inherit = true;
+    }
+    pthread_mutex_unlock(&vp->mu);
+}
+
 VProc *vprocCreate(const VProcOptions *opts) {
     VProcOptions local = opts ? *opts : vprocDefaultOptions();
     if (gNextSyntheticPid == 0) {
@@ -7805,6 +7871,7 @@ VProc *vprocCreate(const VProcOptions *opts) {
         }
     }
 #endif
+    vprocInheritFds(vp, active);
     vprocRegistryAdd(vp);
     return vp;
 }
@@ -8522,6 +8589,46 @@ int vprocDup(VProc *vp, int fd) {
     return vprocInsert(vp, cloned);
 }
 
+/* As vprocDup, at `min` or above. The shell's own saved copies stay clear of the low numbers
+ * a script can name, as bash's do: `2>/dev/null >&3` must not find a saved stderr in slot 3. */
+int vprocDupAbove(VProc *vp, int fd, int min) {
+    struct pscal_fd *pscal = vprocGetPscalFd(vp, fd);
+    int host = -1;
+    if (!pscal) {
+        host = vprocTranslateFd(vp, fd);
+        if (host < 0) {
+            return -1;
+        }
+        host = vprocCloneFd(host);
+        if (host < 0) {
+            return -1;
+        }
+    }
+    pthread_mutex_lock(&vp->mu);
+    int slot = min;
+    while ((size_t)slot < vp->capacity && vp->entries[slot].kind != VPROC_FD_NONE) {
+        ++slot;
+    }
+    if ((size_t)slot >= vp->capacity && !vprocEnsureFdCapacityLocked(vp, (size_t)slot + 1)) {
+        pthread_mutex_unlock(&vp->mu);
+        if (pscal) {
+            pscal_fd_close(pscal);
+        } else {
+            vprocHostCloseRaw(host);
+        }
+        return -1;
+    }
+    vp->entries[slot].host_fd = host;
+    vp->entries[slot].pscal_fd = pscal;
+    vp->entries[slot].kind = pscal ? VPROC_FD_PSCAL : VPROC_FD_HOST;
+    vp->entries[slot].inherit = false;
+    if (!pscal) {
+        vprocResourceTrackLocked(vp, host, VPROC_RESOURCE_GENERIC);
+    }
+    pthread_mutex_unlock(&vp->mu);
+    return slot;
+}
+
 int vprocDup2(VProc *vp, int fd, int target) {
     if (!vp || target < 0) {
         errno = EBADF;
@@ -8559,6 +8666,7 @@ int vprocDup2(VProc *vp, int fd, int target) {
         vp->entries[target].host_fd = -1;
         vp->entries[target].pscal_fd = pscal_fd;
         vp->entries[target].kind = VPROC_FD_PSCAL;
+        vp->entries[target].inherit = target > STDERR_FILENO;
         pthread_mutex_unlock(&vp->mu);
         return target;
     }
@@ -8599,6 +8707,7 @@ int vprocDup2(VProc *vp, int fd, int target) {
     vp->entries[target].host_fd = cloned;
     vp->entries[target].pscal_fd = NULL;
     vp->entries[target].kind = VPROC_FD_HOST;
+    vp->entries[target].inherit = target > STDERR_FILENO;
 #if defined(PSCAL_TARGET_IOS)
     if (target == STDIN_FILENO) {
         vp->stdin_host_fd = cloned;
@@ -8696,6 +8805,7 @@ int vprocClose(VProc *vp, int fd) {
     vp->entries[fd].host_fd = -1;
     vp->entries[fd].pscal_fd = NULL;
     vp->entries[fd].kind = VPROC_FD_NONE;
+    vp->entries[fd].inherit = false;
     pthread_mutex_unlock(&vp->mu);
     if (kind == VPROC_FD_PSCAL && pscal_fd) {
         int rc = pscal_fd_close(pscal_fd);
@@ -14140,6 +14250,24 @@ static void vprocCwdFollowOwner(VProc *owner) {
             vprocSetVirtualCwd(vp, cwd);
         }
         vp = (depth > 0) ? gVProcStack[--depth] : NULL;
+    }
+}
+
+/* `exec 3> f` in a sourced file is the shell's, as its cd is: the slot goes down the same
+ * stack, or it would close with the vproc the file ran under. */
+void vprocShellFdFollow(int fd) {
+    VProc *from = vprocForThread();
+    VProc *owner = vprocResolveShellVprocForPathOps();
+    if (!from || from == owner) {
+        return;
+    }
+    VProc *vp = from;
+    size_t depth = gVProcStackDepth;
+    while (vp != owner && depth > 0) {
+        vp = gVProcStack[--depth];
+        if (vp && vprocRegistryContains(vp)) {
+            vprocCopyFdEntry(from, vp, fd);
+        }
     }
 }
 

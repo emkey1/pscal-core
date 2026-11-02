@@ -93,6 +93,9 @@ struct pscal_fd *vprocGetPscalFd(VProc *vp, int fd);
 int vprocCreateInprocPipe(struct pscal_fd **out_read, struct pscal_fd **out_write);
 int vprocDup(VProc *vp, int fd);
 int vprocDup2(VProc *vp, int fd, int target);
+int vprocDupAbove(VProc *vp, int fd, int min);
+void vprocMarkFdInherited(VProc *vp, int fd);
+void vprocShellFdFollow(int fd);
 /* Sync vproc table entry to a host fd already duplicated onto target_fd. */
 int vprocRestoreHostFd(VProc *vp, int target_fd, int host_src);
 int vprocClose(VProc *vp, int fd);
@@ -504,6 +507,8 @@ static inline size_t vprocSnapshot(VProcSnapshot *out, size_t capacity) { (void)
 static inline int vprocTranslateFd(VProc *vp, int fd) { (void)vp; (void)fd; return -1; }
 static inline struct pscal_fd *vprocGetPscalFd(VProc *vp, int fd) { (void)vp; (void)fd; return NULL; }
 static inline int vprocDup(VProc *vp, int fd) { (void)vp; (void)fd; return -1; }
+static inline void vprocMarkFdInherited(VProc *vp, int fd) { (void)vp; (void)fd; }
+static inline void vprocShellFdFollow(int fd) { (void)fd; }
 static inline int vprocDup2(VProc *vp, int fd, int target) { (void)vp; (void)fd; (void)target; return -1; }
 static inline int vprocRestoreHostFd(VProc *vp, int target_fd, int host_src) {
     (void)vp;
