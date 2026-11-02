@@ -393,6 +393,7 @@ bool shellRuntimeShouldDeferExit(struct VM_s* vm);
 bool shellRuntimeMaybeRequestPendingExit(struct VM_s* vm);
 const volatile bool *shellRuntimePendingExitFlag(void);
 void shellRuntimeSetInteractive(bool interactive);
+void shellRuntimeNoteIgnoredSignals(void);
 bool shellRuntimeIsInteractive(void);
 void shellRuntimeSetExitOnSignal(bool enabled);
 bool shellRuntimeExitOnSignal(void);

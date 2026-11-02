@@ -1,6 +1,8 @@
 /* Auto-generated include: command assembly helpers and metadata parsing. Included from shell.c. */
 #include "common/env_snapshot.h"
 #include "shell/runner.h"
+#include <stdatomic.h>
+#include <sys/utsname.h>
 #include <stdlib.h>
 #include <string.h>
 #if defined(PSCAL_TARGET_IOS)
@@ -469,6 +471,58 @@ static void shellCommandSubstitutionAbandon(void *arg) {
     __atomic_store_n(&ctx->command_done, true, __ATOMIC_RELEASE);
 }
 
+/* A pipe holds only so much, and nothing reads it until this returns. A bigger body
+ * goes in an unlinked file. Returns a descriptor to read it from, or -1. */
+static int shellOpenHereBody(const char *body, size_t length, bool append_newline) {
+    size_t total = length + (append_newline ? 1 : 0);
+    if (total <= 4096) {
+        int pipefd[2];
+        if (pipe(pipefd) != 0) {
+            return -1;
+        }
+        ssize_t written = length > 0 ? write(pipefd[1], body, length) : 0;
+        if (written == (ssize_t)length && append_newline) {
+            written = write(pipefd[1], "\n", 1);
+        }
+        close(pipefd[1]);
+        if (written < 0) {
+            close(pipefd[0]);
+            return -1;
+        }
+        return pipefd[0];
+    }
+    const char *dir = shellSafeGetenv("TMPDIR");
+    char path[PATH_MAX];
+    static atomic_uint counter;
+    snprintf(path, sizeof(path), "%s/.exsh-here-%d-%u", (dir && *dir) ? dir : "/tmp", (int)getpid(),
+             atomic_fetch_add(&counter, 1));
+    int fd = open(path, O_RDWR | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) {
+        return -1;
+    }
+    unlink(path);
+    const char *cursor = body;
+    size_t remaining = length;
+    while (remaining > 0) {
+        ssize_t written = write(fd, cursor, remaining);
+        if (written < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            close(fd);
+            return -1;
+        }
+        cursor += written;
+        remaining -= (size_t)written;
+    }
+    if (append_newline && write(fd, "\n", 1) != 1) {
+        close(fd);
+        return -1;
+    }
+    lseek(fd, 0, SEEK_SET);
+    return fd;
+}
+
 static char *shellRunCommandSubstitution(const char *command) {
     const char *source = command ? command : "";
     ShellScalarCacheEntry *cached_entry = NULL;
@@ -510,6 +564,8 @@ static char *shellRunCommandSubstitution(const char *command) {
     PscalEnvSnapshot env_snapshot = {0};
     bool runtime_state_overridden = false;
     bool saved_exit_requested = gShellExitRequested;
+    bool saved_expansion_failed = gShellExpansionFailed;
+    bool saved_return_pending = gShellReturnPending;
     bool saved_break_requested = gShellRuntime.break_requested;
     int saved_break_levels = gShellRuntime.break_requested_levels;
     bool saved_continue_requested = gShellRuntime.continue_requested;
@@ -727,6 +783,7 @@ static char *shellRunCommandSubstitution(const char *command) {
         (void)pscalEnvSnapshotTake(&env_snapshot);
         ShellCwdScope cwd_scope;
         shellCwdScopeEnter(&cwd_scope);
+        opts.first_line = gShellCurrentCommandLine;
         status = shellRunSource(source, "<command-substitution>", &opts, &exit_requested);
         shellCwdScopeLeave(&cwd_scope);
     }
@@ -741,6 +798,9 @@ static char *shellRunCommandSubstitution(const char *command) {
     gShellRuntime.local_scope_active = previous_local_scope_flag;
     gShellRuntime.pipeline_subshell_active = previous_pipeline_flag;
     if (runtime_state_overridden) {
+        /* ${x:?} in there ended that shell, not this one. */
+        gShellExpansionFailed = saved_expansion_failed;
+        gShellReturnPending = saved_return_pending;
         gShellExitRequested = saved_exit_requested;
         gShellRuntime.break_requested = saved_break_requested;
         gShellRuntime.break_requested_levels = saved_break_levels;
@@ -956,6 +1016,20 @@ static ShellCompiledFunction *shellFindCompiledFunction(const char *name) {
     return compiled;
 }
 
+/* The body stays allocated: another shell session may still be running it. */
+static void shellRemoveFunction(const char *name) {
+    pthread_mutex_lock(&gShellFunctionTableMutex);
+    ShellFunctionEntry *entry = shellFindFunctionEntryUnlocked(name);
+    if (entry) {
+        free(entry->name);
+        free(entry->parameter_metadata);
+        size_t index = (size_t)(entry - gShellFunctions);
+        memmove(entry, entry + 1, (gShellFunctionCount - index - 1) * sizeof(ShellFunctionEntry));
+        gShellFunctionCount--;
+    }
+    pthread_mutex_unlock(&gShellFunctionTableMutex);
+}
+
 static bool shellStoreFunction(const char *name, const char *param_meta, ShellCompiledFunction *compiled) {
     if (!name || !compiled) {
         return false;
@@ -1037,57 +1111,6 @@ static void shellRewriteDoubleBracketTest(ShellCommand *cmd) {
 
     if (cmd->argv) {
         cmd->argv[cmd->argc] = NULL;
-    }
-
-    if (cmd->redirs && cmd->redir_count > 0) {
-        for (size_t i = 0; i < cmd->redir_count; ++i) {
-            ShellRedirection *redir = &cmd->redirs[i];
-            if (!redir) {
-                continue;
-            }
-
-            const char *op = NULL;
-            if (redir->kind == SHELL_RUNTIME_REDIR_OPEN) {
-                int mode = redir->flags & O_ACCMODE;
-                if (mode == O_RDONLY) {
-                    op = "<";
-                } else if (mode == O_WRONLY || mode == O_RDWR) {
-                    op = (redir->flags & O_APPEND) ? ">>" : ">";
-                }
-            }
-
-            if (!op) {
-                continue;
-            }
-
-            char *op_copy = strdup(op);
-            if (op_copy) {
-                shellCommandAppendArgOwned(cmd, op_copy);
-            }
-
-            char *target = NULL;
-            if (redir->path) {
-                target = redir->path;
-                redir->path = NULL;
-            }
-            if (!target) {
-                target = strdup("");
-            }
-            if (target) {
-                shellCommandAppendArgOwned(cmd, target);
-            }
-
-            free(redir->here_doc);
-            redir->here_doc = NULL;
-            free(redir->here_string_literal);
-            redir->here_string_literal = NULL;
-            free(redir->here_string);
-            redir->here_string = NULL;
-        }
-
-        free(cmd->redirs);
-        cmd->redirs = NULL;
-        cmd->redir_count = 0;
     }
 
     char *replacement = strdup("__shell_double_bracket");
@@ -1284,11 +1307,17 @@ static bool shellApplyAssignmentsPermanently(const ShellCommand *cmd,
             continue;
         }
         bool set_ok;
+        char *attributed = entry->is_array_literal ? NULL : shellApplyVariableAttributes(effective_name, value);
+        const char *assigned = attributed ? attributed : value;
         if (is_element) {
-            set_ok = shellArrayRegistrySetElement(effective_name, subscript_text, value);
+            set_ok = shellArrayRegistrySetElement(effective_name, subscript_text, assigned);
+        } else if (!entry->is_array_literal && shellArrayRegistryIndexedExists(effective_name)) {
+            /* a=(x y); a=z sets the first element and keeps the rest. */
+            set_ok = shellArrayRegistrySetElement(effective_name, "0", assigned);
         } else {
-            set_ok = shellSetTrackedVariable(effective_name, value, entry->is_array_literal);
+            set_ok = shellSetTrackedVariable(effective_name, assigned, entry->is_array_literal);
         }
+        free(attributed);
         free(base_name);
         free(subscript_text);
         if (!set_ok) {
@@ -1424,11 +1453,14 @@ static bool shellApplyAssignmentsTemporary(const ShellCommand *cmd,
             }
         }
         bool set_ok;
+        char *attributed = entry->is_array_literal ? NULL : shellApplyVariableAttributes(backups[i].name, value);
+        const char *assigned = attributed ? attributed : value;
         if (is_element) {
-            set_ok = shellArrayRegistrySetElement(backups[i].name, subscript_text, value);
+            set_ok = shellArrayRegistrySetElement(backups[i].name, subscript_text, assigned);
         } else {
-            set_ok = shellSetTrackedVariable(backups[i].name, value, entry->is_array_literal);
+            set_ok = shellSetTrackedVariable(backups[i].name, assigned, entry->is_array_literal);
         }
+        free(attributed);
         free(subscript_text);
         if (!set_ok) {
             if (out_failed_assignment) {
@@ -1469,7 +1501,8 @@ static bool shellWordShouldGlob(uint8_t flags, const char *text) {
             ++cursor;
             continue;
         }
-        if (*cursor == '*' || *cursor == '?' || *cursor == '[') {
+        if (*cursor == '*' || *cursor == '?' || *cursor == '[' ||
+            ((*cursor == '@' || *cursor == '+' || *cursor == '!') && cursor[1] == '(')) {
             return true;
         }
     }
@@ -1633,6 +1666,14 @@ static bool shellQuotedMapAppendRepeated(bool track,
     return true;
 }
 
+static const char *shellCurrentIfs(void) {
+    ShellLocalVariable *local = shellLocalScopeFind("IFS");
+    if (local) {
+        return local->value ? local->value : "";
+    }
+    return shellSafeGetenv("IFS");
+}
+
 static bool shellSplitExpandedWord(const char *expanded, uint8_t word_flags,
                                    const bool *quoted_map, size_t quoted_len,
                                    bool array_zero,
@@ -1655,12 +1696,19 @@ static bool shellSplitExpandedWord(const char *expanded, uint8_t word_flags,
         return true;
     }
     if (strchr(expanded, SHELL_ARRAY_ELEMENT_SEP)) {
+        /* Each element of "$@" or "${a[@]}" ends a field. Whether the text in that
+         * field is split further depends on how it was quoted, a piece at a time:
+         * x"$@"y. An element that is empty stays only when it was quoted. */
         ShellStringArray fields = (ShellStringArray){0};
         const char *segment = expanded;
         bool base_quoted = (word_flags & (SHELL_WORD_FLAG_SINGLE_QUOTED | SHELL_WORD_FLAG_DOUBLE_QUOTED)) != 0;
+        bool have_map = quoted_map && quoted_len == length;
         while (1) {
             const char *next = strchr(segment, SHELL_ARRAY_ELEMENT_SEP);
             size_t seg_len = next ? (size_t)(next - segment) : strlen(segment);
+            size_t seg_offset = (size_t)(segment - expanded);
+            bool sep_quoted = base_quoted || (have_map && next && quoted_map[(size_t)(next - expanded)]) ||
+                              (have_map && !next && seg_offset > 0 && quoted_map[seg_offset - 1]);
             char *copy = (char *)malloc(seg_len + 1);
             if (!copy) {
                 shellStringArrayFree(&fields);
@@ -1670,7 +1718,7 @@ static bool shellSplitExpandedWord(const char *expanded, uint8_t word_flags,
                 memcpy(copy, segment, seg_len);
             }
             copy[seg_len] = '\0';
-            if (base_quoted) {
+            if (base_quoted || (seg_len == 0 && sep_quoted)) {
                 if (!shellStringArrayAppend(&fields, copy)) {
                     free(copy);
                     shellStringArrayFree(&fields);
@@ -1679,7 +1727,8 @@ static bool shellSplitExpandedWord(const char *expanded, uint8_t word_flags,
             } else {
                 char **sub_fields = NULL;
                 size_t sub_count = 0;
-                if (!shellSplitExpandedWord(copy, 0, NULL, 0, false, &sub_fields, &sub_count)) {
+                if (!shellSplitExpandedWord(copy, 0, have_map ? quoted_map + seg_offset : NULL, have_map ? seg_len : 0,
+                                            false, &sub_fields, &sub_count)) {
                     free(copy);
                     shellStringArrayFree(&fields);
                     return false;
@@ -1707,7 +1756,7 @@ static bool shellSplitExpandedWord(const char *expanded, uint8_t word_flags,
         return true;
     }
     bool use_map = quoted_map && quoted_len == length;
-    const char *ifs = shellSafeGetenv("IFS");
+    const char *ifs = shellCurrentIfs();
     if (!ifs) {
         ifs = " \t\n";
     }
@@ -1850,14 +1899,8 @@ static bool shellSplitExpandedWord(const char *expanded, uint8_t word_flags,
         }
     }
 
-    if (last_non_wh_delim) {
-        char *empty = strdup("");
-        if (!empty || !shellStringArrayAppend(&fields, empty)) {
-            free(empty);
-            shellStringArrayFree(&fields);
-            return false;
-        }
-    }
+    /* A delimiter at the end closes the last field and opens no other: a,b, is two. */
+    (void)last_non_wh_delim;
 
     if (fields.count == 0) {
         free(fields.items);
@@ -2519,6 +2562,56 @@ static char *shellJoinPositionalParameters(bool array_style, size_t *out_count) 
                                             separator);
 }
 
+#define SHELL_BASH_COMPAT_VERSION "5.2.0(1)-exsh"
+
+/* What bash has set by the time a script starts, for the names nothing else has set. */
+static char *shellDefaultVariableValue(const char *name) {
+    if (strcmp(name, "IFS") == 0) {
+        return gShellIfsUnset ? NULL : strdup(" \t\n");
+    }
+    /* Scripts ask before they use what bash has. This much of it is here. */
+    if (strcmp(name, "BASH_VERSION") == 0) {
+        return strdup(SHELL_BASH_COMPAT_VERSION);
+    }
+    struct utsname info;
+    if (strcmp(name, "HOSTNAME") == 0) {
+        char host[256];
+        if (gethostname(host, sizeof(host)) == 0) {
+            host[sizeof(host) - 1] = '\0';
+            return strdup(host);
+        }
+        return NULL;
+    }
+    if ((strcmp(name, "OSTYPE") == 0 || strcmp(name, "HOSTTYPE") == 0 || strcmp(name, "MACHTYPE") == 0) &&
+        uname(&info) == 0) {
+        char system[80];
+        size_t i = 0;
+        for (; info.sysname[i] && i + 1 < sizeof(system); ++i) {
+            system[i] = (char)tolower((unsigned char)info.sysname[i]);
+        }
+        system[i] = '\0';
+        char ostype[128];
+#if defined(__linux__)
+        snprintf(ostype, sizeof(ostype), "%s-gnu", system);
+#else
+        int major = atoi(info.release);
+        snprintf(ostype, sizeof(ostype), "%s%d", system, major);
+#endif
+        if (strcmp(name, "OSTYPE") == 0) {
+            return strdup(ostype);
+        }
+        if (strcmp(name, "HOSTTYPE") == 0) {
+            return strdup(info.machine);
+        }
+        char machine[256];
+        snprintf(machine, sizeof(machine), "%s-unknown-%s", info.machine, ostype);
+        return strdup(machine);
+    }
+    return NULL;
+}
+
+static void shellRefreshSpecialArray(const char *name, size_t len);
+
 static char *shellLookupParameterValueInternal(const char *name,
                                                size_t len,
                                                bool *out_is_set) {
@@ -2533,6 +2626,11 @@ static char *shellLookupParameterValueInternal(const char *name,
     }
     if (len == 1) {
         switch (name[0]) {
+            case '_':
+                if (out_is_set) {
+                    *out_is_set = gShellLastWord != NULL;
+                }
+                return strdup(gShellLastWord ? gShellLastWord : "");
             case '?': {
                 char buffer[32];
                 snprintf(buffer, sizeof(buffer), "%d", gShellRuntime.last_status);
@@ -2585,6 +2683,42 @@ static char *shellLookupParameterValueInternal(const char *name,
         }
     }
 
+    /* The variables the shell itself keeps up to date. */
+    {
+        long long computed = 0;
+        bool have_computed = false;
+        if (len == 6 && strncmp(name, "LINENO", 6) == 0) {
+            computed = gShellCurrentCommandLine;
+            have_computed = true;
+        } else if (len == 7 && strncmp(name, "SECONDS", 7) == 0) {
+            if (gShellSecondsBase == 0) {
+                gShellSecondsBase = time(NULL);
+            }
+            computed = (long long)(time(NULL) - gShellSecondsBase);
+            have_computed = true;
+        } else if (len == 4 && strncmp(name, "PPID", 4) == 0) {
+            computed = (long long)getppid();
+            have_computed = true;
+        } else if (len == 3 && strncmp(name, "UID", 3) == 0) {
+            computed = (long long)getuid();
+            have_computed = true;
+        } else if (len == 4 && strncmp(name, "EUID", 4) == 0) {
+            computed = (long long)geteuid();
+            have_computed = true;
+        } else if (len == 7 && strncmp(name, "BASHPID", 7) == 0) {
+            computed = (long long)getpid();
+            have_computed = true;
+        }
+        if (have_computed) {
+            char buffer[32];
+            snprintf(buffer, sizeof(buffer), "%lld", computed);
+            if (out_is_set) {
+                *out_is_set = true;
+            }
+            return strdup(buffer);
+        }
+    }
+
     if (len == 6 && strncmp(name, "RANDOM", 6) == 0) {
         unsigned int value = shellRandomNextValue();
         char buffer[16];
@@ -2603,7 +2737,11 @@ static char *shellLookupParameterValueInternal(const char *name,
         }
     }
     if (numeric) {
-        long index = strtol(name, NULL, 10);
+        char digits[32];
+        size_t digit_count = len < sizeof(digits) ? len : sizeof(digits) - 1;
+        memcpy(digits, name, digit_count);
+        digits[digit_count] = '\0';
+        long index = strtol(digits, NULL, 10);
         bool have_value = (index >= 1 && index <= gParamCount && gParamValues);
         const char *value = "";
         if (have_value) {
@@ -2621,10 +2759,13 @@ static char *shellLookupParameterValueInternal(const char *name,
     }
     memcpy(key, name, len);
     key[len] = '\0';
+    if (key[0] == 'F' || key[0] == 'B' || key[0] == 'P') {
+        shellRefreshSpecialArray(key, len);
+    }
     const ShellArrayVariable *array_var = shellArrayRegistryFindConst(key);
     if (array_var) {
         if (out_is_set) {
-            *out_is_set = true;
+            *out_is_set = array_var->count > 0;
         }
         const char *first = (array_var->count > 0 && array_var->values)
                                 ? (array_var->values[0] ? array_var->values[0] : "")
@@ -2643,6 +2784,16 @@ static char *shellLookupParameterValueInternal(const char *name,
         return local_value ? local_value : strdup("");
     }
     const char *env = shellSafeGetenv(key);
+    if (!env) {
+        char *fallback = shellDefaultVariableValue(key);
+        if (fallback) {
+            if (out_is_set) {
+                *out_is_set = true;
+            }
+            free(key);
+            return fallback;
+        }
+    }
     if (out_is_set) {
         *out_is_set = (env != NULL);
     }
@@ -3062,23 +3213,37 @@ static bool shellParseArrayLiteral(const char *value,
     if (!value) {
         return true;
     }
+    /* Keyed if the first element has the form, outside any quotes. */
     bool looks_associative = false;
-    for (const char *cursor = value; *cursor; ++cursor) {
-        if (*cursor == '[') {
-            const char *closing = strchr(cursor + 1, ']');
-            if (!closing) {
-                break;
-            }
-            const char *after = closing + 1;
-            while (*after && isspace((unsigned char)*after)) {
-                after++;
-            }
-            if (*after == '=') {
-                looks_associative = true;
-                break;
-            }
-            cursor = closing;
+    const char *first = value;
+    while (*first && isspace((unsigned char)*first)) {
+        first++;
+    }
+    if (*first == '(') {
+        first++;
+        while (*first && isspace((unsigned char)*first)) {
+            first++;
         }
+    }
+    if (*first == '[') {
+        size_t rest = strlen(first);
+        size_t k = 1;
+        while (k < rest && first[k] != ']') {
+            size_t stop = k + 1;
+            if (first[k] == '"') {
+                stop = shellScanDoubleQuoted(first, rest, k + 1);
+            } else if (first[k] == '\'') {
+                stop = shellScanSingleQuoted(first, rest, k + 1);
+            } else if (first[k] == '\\') {
+                stop = k + 2;
+            }
+            if (stop == SHELL_SCAN_UNTERMINATED) {
+                k = rest;
+                break;
+            }
+            k = stop;
+        }
+        looks_associative = k < rest && k + 1 < rest && first[k + 1] == '=';
     }
     if (looks_associative) {
         char **keys = NULL;
@@ -3220,13 +3385,93 @@ static void shellArrayRegistryAssignFromText(const char *name, const char *value
         shellArrayRegistryRemove(name);
         return;
     }
+    const ShellArrayVariable *before = shellArrayRegistryFindConst(name);
+    bool declared_associative = before && before->kind == SHELL_ARRAY_KIND_ASSOCIATIVE && !before->sparse;
     if (!shellArrayRegistryStore(name, items, keys, count, kind)) {
         shellArrayRegistryRemove(name);
+    } else if (kind == SHELL_ARRAY_KIND_ASSOCIATIVE && !declared_associative && keys) {
+        bool numeric = true;
+        for (size_t i = 0; i < count && numeric; ++i) {
+            numeric = shellSubscriptIsNumeric(keys[i]);
+        }
+        ShellArrayVariable *stored = shellArrayRegistryFindMutable(name);
+        if (stored) {
+            stored->sparse = numeric;
+            if (numeric) {
+                shellArraySortSparse(stored);
+            }
+        }
     }
     shellFreeArrayValues(items, count);
     if (keys) {
         shellFreeArrayValues(keys, count);
     }
+}
+
+/* From a plain list to keys, for an array whose indices are about to have gaps. */
+static bool shellArrayMakeSparse(ShellArrayVariable *var) {
+    char **keys = (char **)calloc(var->count ? var->count : 1, sizeof(char *));
+    if (!keys) {
+        return false;
+    }
+    for (size_t i = 0; i < var->count; ++i) {
+        char buffer[32];
+        snprintf(buffer, sizeof(buffer), "%zu", i);
+        keys[i] = strdup(buffer);
+    }
+    var->keys = keys;
+    var->kind = SHELL_ARRAY_KIND_ASSOCIATIVE;
+    var->sparse = true;
+    return true;
+}
+
+/* Index order, as ${a[@]} gives them. */
+static void shellArraySortSparse(ShellArrayVariable *var) {
+    for (size_t i = 1; i < var->count; ++i) {
+        char *key = var->keys[i];
+        char *value = var->values[i];
+        unsigned long long index = strtoull(key, NULL, 10);
+        size_t j = i;
+        while (j > 0 && strtoull(var->keys[j - 1], NULL, 10) > index) {
+            var->keys[j] = var->keys[j - 1];
+            var->values[j] = var->values[j - 1];
+            j--;
+        }
+        var->keys[j] = key;
+        var->values[j] = value;
+    }
+}
+
+/* unset 'a[1]': the other elements keep their indices, so the array turns keyed. */
+static void shellArrayRegistryUnsetElement(const char *name, const char *subscript) {
+    ShellArrayVariable *var = shellArrayRegistryFindMutable(name);
+    if (!var) {
+        return;
+    }
+    size_t victim = var->count;
+    if (var->kind == SHELL_ARRAY_KIND_ASSOCIATIVE && var->keys) {
+        for (size_t i = 0; i < var->count; ++i) {
+            if (var->keys[i] && strcmp(var->keys[i], subscript) == 0) {
+                victim = i;
+                break;
+            }
+        }
+    } else {
+        victim = (size_t)strtoull(subscript, NULL, 10);
+    }
+    if (victim >= var->count) {
+        return;
+    }
+    if (var->kind == SHELL_ARRAY_KIND_INDEXED && !shellArrayMakeSparse(var)) {
+        return;
+    }
+    free(var->values[victim]);
+    free(var->keys[victim]);
+    for (size_t i = victim + 1; i < var->count; ++i) {
+        var->values[i - 1] = var->values[i];
+        var->keys[i - 1] = var->keys[i];
+    }
+    var->count--;
 }
 
 static bool shellArrayRegistryInitializeAssociative(const char *name) {
@@ -3407,18 +3652,20 @@ static bool shellArrayRegistrySetElement(const char *name,
     sub_copy[sub_len] = '\0';
 
     ShellArrayVariable *var = shellArrayRegistryFindMutable(name);
+    /* Only declare -A makes a keyed array: elsewhere a subscript is arithmetic. */
+    if ((!var || var->kind == SHELL_ARRAY_KIND_INDEXED || var->sparse) && !shellSubscriptIsNumeric(sub_copy)) {
+        char *key = shellParamSubscriptKey(name, strlen(name), sub_copy, sub_len);
+        free(sub_copy);
+        if (!key) {
+            return false;
+        }
+        sub_copy = key;
+    }
     ShellArrayKind target_kind;
     if (var) {
         target_kind = var->kind;
     } else {
-        target_kind = shellSubscriptIsNumeric(sub_copy) ? SHELL_ARRAY_KIND_INDEXED
-                                                        : SHELL_ARRAY_KIND_ASSOCIATIVE;
-        if (target_kind == SHELL_ARRAY_KIND_ASSOCIATIVE &&
-            !shellAssociativeArraysSupported()) {
-            free(sub_copy);
-            errno = EINVAL;
-            return false;
-        }
+        target_kind = SHELL_ARRAY_KIND_INDEXED;
         if (!shellArrayRegistryEnsureCapacity(gShellArrayVarCount + 1)) {
             free(sub_copy);
             return false;
@@ -3434,6 +3681,7 @@ static bool shellArrayRegistrySetElement(const char *name,
         var->keys = NULL;
         var->count = 0;
         var->kind = target_kind;
+        var->sparse = false;
     }
 
     if (var->kind == SHELL_ARRAY_KIND_ASSOCIATIVE && target_kind != SHELL_ARRAY_KIND_ASSOCIATIVE) {
@@ -3443,6 +3691,13 @@ static bool shellArrayRegistrySetElement(const char *name,
     if (var->kind == SHELL_ARRAY_KIND_INDEXED && target_kind != SHELL_ARRAY_KIND_INDEXED) {
         free(sub_copy);
         return false;
+    }
+    /* a[5]=x past the end leaves a gap. */
+    if (var->kind == SHELL_ARRAY_KIND_INDEXED && strtoull(sub_copy, NULL, 10) > var->count) {
+        if (!shellArrayMakeSparse(var)) {
+            free(sub_copy);
+            return false;
+        }
     }
 
     bool ok = true;
@@ -3493,11 +3748,15 @@ static bool shellArrayRegistrySetElement(const char *name,
             var->values[index] = dup_value;
             free(decoded_key);
         }
+        if (var->sparse) {
+            shellArraySortSparse(var);
+        }
     } else {
         char *endptr = NULL;
         long parsed = strtol(sub_copy, &endptr, 10);
+        bool valid = endptr && *endptr == '\0' && parsed >= 0;
         free(sub_copy);
-        if (!endptr || *endptr != '\0' || parsed < 0) {
+        if (!valid) {
             return false;
         }
         size_t index = (size_t)parsed;
@@ -3583,10 +3842,18 @@ static bool shellSetTrackedVariable(const char *name, const char *value, bool is
         return false;
     }
     const char *text = value ? value : "";
+    bool is_new = shellSafeGetenv(name) == NULL;
     if (setenv(name, text, 1) != 0) {
         return false;
     }
+    if (is_new) {
+        shellExportNoteNewVariable(name);
+    }
+    if (gShellRuntime.allexport_enabled) {
+        shellExportMarkExported(name);
+    }
     if (is_array_literal) {
+        shellExportMarkUnexported(name);
         const char *current = shellSafeGetenv(name);
         shellArrayRegistryAssignFromText(name, current);
     } else {
@@ -3603,6 +3870,10 @@ static void shellUnsetTrackedVariable(const char *name) {
         return;
     }
     unsetenv(name);
+    if (strcmp(name, "IFS") == 0) {
+        gShellIfsUnset = true;
+    }
+    shellExportForget(name);
     shellArrayRegistryRemove(name);
 }
 
@@ -3779,6 +4050,55 @@ static bool shellDirectoryStackUpdateEnvironment(const char *old_cwd, const char
     return true;
 }
 
+static PSCAL_THREAD_LOCAL bool gShellCdPhysical = false;
+
+#if !defined(PSCAL_TARGET_IOS)
+static bool shellPathIsCurrentDirectory(const char *path) {
+    struct stat a;
+    struct stat b;
+    return stat(path, &a) == 0 && stat(".", &b) == 0 && a.st_dev == b.st_dev && a.st_ino == b.st_ino;
+}
+
+/* Bash follows the path as written, so /tmp stays /tmp where that is a link and `..`
+ * goes back up the way it came. base is the logical directory a relative target starts from. */
+static bool shellLogicalPath(const char *base, const char *target, char *out, size_t out_size) {
+    char joined[PATH_MAX * 2];
+    if (target[0] == '/') {
+        snprintf(joined, sizeof(joined), "%s", target);
+    } else {
+        snprintf(joined, sizeof(joined), "%s/%s", base, target);
+    }
+    size_t length = 0;
+    out[length++] = '/';
+    char *save = NULL;
+    for (char *part = strtok_r(joined, "/", &save); part; part = strtok_r(NULL, "/", &save)) {
+        if (strcmp(part, ".") == 0) {
+            continue;
+        }
+        if (strcmp(part, "..") == 0) {
+            while (length > 1 && out[length - 1] != '/') {
+                length--;
+            }
+            if (length > 1) {
+                length--;
+            }
+            continue;
+        }
+        size_t n = strlen(part);
+        if (length + n + 2 >= out_size) {
+            return false;
+        }
+        if (length > 1) {
+            out[length++] = '/';
+        }
+        memcpy(out + length, part, n);
+        length += n;
+    }
+    out[length] = '\0';
+    return true;
+}
+#endif
+
 static bool shellDirectoryStackChdir(VM *vm,
                                      const char *builtin,
                                      const char *target,
@@ -3795,7 +4115,25 @@ static bool shellDirectoryStackChdir(VM *vm,
         shellUpdateStatus(1);
         return false;
     }
-    if (SHELL_CHDIR(target) != 0) {
+#if !defined(PSCAL_TARGET_IOS)
+    /* The directory we are in, as $PWD names it if that still holds. */
+    char logical_base[PATH_MAX];
+    const char *pwd = shellSafeGetenv("PWD");
+    if (pwd && pwd[0] == '/' && strlen(pwd) < sizeof(logical_base) && shellPathIsCurrentDirectory(pwd)) {
+        snprintf(logical_base, sizeof(logical_base), "%s", pwd);
+    } else {
+        snprintf(logical_base, sizeof(logical_base), "%s", old_cwd);
+    }
+#endif
+#if !defined(PSCAL_TARGET_IOS)
+    /* `cd ..` from a link goes back the way it came, so the logical path goes first. */
+    char logical[PATH_MAX];
+    bool have_logical = !gShellCdPhysical && shellLogicalPath(logical_base, target, logical, sizeof(logical));
+    bool went_logical = have_logical && SHELL_CHDIR(logical) == 0;
+#else
+    bool went_logical = false;
+#endif
+    if (!went_logical && SHELL_CHDIR(target) != 0) {
 #if defined(PSCAL_TARGET_IOS)
         char logBuf[PATH_MAX + 64];
         snprintf(logBuf, sizeof(logBuf), "[exsh] chdir failed target=%s errno=%d", target ? target : "(null)", errno);
@@ -3812,6 +4150,14 @@ static bool shellDirectoryStackChdir(VM *vm,
         (void)SHELL_CHDIR(old_cwd);
         return false;
     }
+#if !defined(PSCAL_TARGET_IOS)
+    if (went_logical) {
+        snprintf(new_cwd, sizeof(new_cwd), "%s", logical);
+    }
+    if (logical_base[0]) {
+        snprintf(old_cwd, sizeof(old_cwd), "%s", logical_base);
+    }
+#endif
     char *new_copy = strdup(new_cwd);
     if (!new_copy) {
         shellDirectoryStackReportError(vm, builtin, "out of memory");

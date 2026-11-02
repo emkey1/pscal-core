@@ -490,6 +490,15 @@ int pscalPathVirtualized_glob(const char *pattern,
                 final_path = stripped + cwd_len + 1;
             } else if (strcmp(stripped, cwd) == 0) {
                 final_path = ".";
+            } else {
+                /* `.*` matches `..` too, and expanding the path resolved it. */
+                const char *cut = strrchr(cwd, '/');
+                size_t parent_len = cut ? (size_t)(cut - cwd) : 0;
+                if (parent_len == 0 ? strcmp(stripped, "/") == 0
+                                    : (strlen(stripped) == parent_len &&
+                                       strncmp(stripped, cwd, parent_len) == 0)) {
+                    final_path = "..";
+                }
             }
             if (!final_path || final_path[0] == '\0') {
                 final_path = ".";

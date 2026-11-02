@@ -547,7 +547,8 @@ static int shellTryRunScriptFallback(VM *vm, const ShellCommand *cmd) {
     opts.quiet = true;
     opts.exit_on_signal = shellRuntimeExitOnSignal();
     opts.suppress_warnings = true;
-    const char *frontend_path = shellRuntimeGetArg0();
+    /* Setting $0 below frees what this returns. */
+    char *frontend_path = shellRuntimeGetArg0() ? strdup(shellRuntimeGetArg0()) : NULL;
     opts.frontend_path = frontend_path ? frontend_path : "exsh";
 
     shellRuntimeSetArg0(cmd->argv[0]);
@@ -559,6 +560,7 @@ static int shellTryRunScriptFallback(VM *vm, const ShellCommand *cmd) {
     shellCwdScopeLeave(&cwd_scope);
     free(source);
     shellRuntimeSetArg0(frontend_path);
+    free(frontend_path);
 
     if (replaced_params) {
         if (gShellPositionalOwned) {
@@ -651,6 +653,98 @@ static void shellPatchCombinedRedirectTokens(ShellCommand *cmd) {
     }
 }
 
+/* In the child, about to exec: what bash would have left out goes, and what is set for
+ * this command only is in, which also covers a prefix on a local. */
+static void shellEnvironmentForChild(const ShellCommand *cmd) {
+    for (size_t i = 0; i < gShellUnexported.count; ++i) {
+        unsetenv(gShellUnexported.names[i]);
+    }
+    /* Arrays are never exported. */
+    for (size_t i = 0; i < gShellArrayVarCount; ++i) {
+        if (gShellArrayVars[i].name) {
+            unsetenv(gShellArrayVars[i].name);
+        }
+    }
+    for (size_t i = 0; cmd && i < cmd->assignment_count; ++i) {
+        const char *text = cmd->assignments[i].text;
+        const char *eq = text ? strchr(text, '=') : NULL;
+        if (eq && !cmd->assignments[i].is_array_literal) {
+            char *name = strndup(text, (size_t)(eq - text));
+            if (name) {
+                if (!strchr(name, '[')) {
+                    char *attributed = shellApplyVariableAttributes(name, eq + 1);
+                    setenv(name, attributed ? attributed : eq + 1, 1);
+                    free(attributed);
+                }
+                free(name);
+            }
+        }
+    }
+}
+
+/* set -x: a word needs quotes if the shell would read anything into it. */
+static void shellTraceWord(const char *word) {
+    bool plain = *word != '\0';
+    for (const char *cursor = word; *cursor && plain; ++cursor) {
+        unsigned char c = (unsigned char)*cursor;
+        plain = isalnum(c) || strchr("_@%+=:,./-", c) || c >= 0x80;
+    }
+    if (plain) {
+        fputs(word, stderr);
+        return;
+    }
+    fputc('\'', stderr);
+    for (const char *cursor = word; *cursor; ++cursor) {
+        if (*cursor == '\'') {
+            fputs("'\\''", stderr);
+        } else {
+            fputc(*cursor, stderr);
+        }
+    }
+    fputc('\'', stderr);
+}
+
+static void shellTraceCommand(const ShellCommand *cmd) {
+    bool is_set = false;
+    char *prompt = shellLookupParameterValueInternal("PS4", 3, &is_set);
+    fputs((is_set && prompt) ? prompt : "+ ", stderr);
+    free(prompt);
+    bool first = true;
+    for (size_t i = 0; i < cmd->assignment_count; ++i) {
+        const char *text = cmd->assignments[i].text;
+        const char *eq = text ? strchr(text, '=') : NULL;
+        if (!first) {
+            fputc(' ', stderr);
+        }
+        first = false;
+        if (eq) {
+            fwrite(text, 1, (size_t)(eq - text) + 1, stderr);
+            if (cmd->assignments[i].is_array_literal) {
+                fputs(eq + 1, stderr);
+            } else if (*(eq + 1)) {
+                shellTraceWord(eq + 1);
+            }
+        }
+    }
+    bool double_bracket = cmd->argc > 0 && cmd->argv[0] && strcmp(cmd->argv[0], "__shell_double_bracket") == 0;
+    for (size_t i = 0; i < cmd->argc; ++i) {
+        if (!first) {
+            fputc(' ', stderr);
+        }
+        first = false;
+        if (i == 0 && double_bracket) {
+            fputs("[[", stderr);
+        } else {
+            shellTraceWord(cmd->argv[i] ? cmd->argv[i] : "");
+        }
+    }
+    if (double_bracket) {
+        fputs(" ]]", stderr);
+    }
+    fputc('\n', stderr);
+    fflush(stderr);
+}
+
 static void shellHashRecordExecution(const char *name);
 static bool shellBuildCommand(VM *vm, int arg_count, Value *args, ShellCommand *out_cmd) {
     if (!out_cmd) {
@@ -668,6 +762,10 @@ static bool shellBuildCommand(VM *vm, int arg_count, Value *args, ShellCommand *
         return false;
     }
     shellParseMetadata(AS_STRING(meta), out_cmd);
+    if (out_cmd->line > 0) {
+        gShellCurrentCommandLine = out_cmd->line;
+    }
+    gShellExpansionFailed = false;
     bool saw_command_word = false;
     unsigned long substitutions_before = gShellRuntime.command_substitutions_run;
     if (redir_dbg) {
@@ -695,6 +793,11 @@ static bool shellBuildCommand(VM *vm, int arg_count, Value *args, ShellCommand *
                 shellFreeCommand(out_cmd);
                 return false;
             }
+        }
+        if (gShellExpansionFailed) {
+            /* Reported already, and the command does not run. */
+            shellFreeCommand(out_cmd);
+            return false;
         }
     }
     out_cmd->ran_command_substitution = gShellRuntime.command_substitutions_run != substitutions_before;
@@ -941,6 +1044,60 @@ static bool shellExpandAliasOnce(ShellCommand *cmd, const char *value) {
     return ok;
 }
 
+static bool shellAliasTextNeedsParsing(const char *value) {
+    bool in_single = false;
+    bool in_double = false;
+    for (const char *cursor = value; *cursor; ++cursor) {
+        char c = *cursor;
+        if (c == '\\' && !in_single && cursor[1]) {
+            cursor++;
+        } else if (c == '\'' && !in_double) {
+            in_single = !in_single;
+        } else if (c == '"' && !in_single) {
+            in_double = !in_double;
+        } else if (!in_single && (c == '$' || c == '`')) {
+            return true;
+        } else if (!in_single && !in_double && strchr(";|&<>()\n", c)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The command becomes an eval of the alias's text and its other words, quoted. It stays
+ * one command: a pipeline stage still gets its pipes, and its redirections still apply. */
+static bool shellRewriteAliasAsEval(ShellCommand *cmd, const char *value) {
+    char *script = NULL;
+    size_t length = 0;
+    size_t capacity = 0;
+    shellBufferAppendString(&script, &length, &capacity, value);
+    for (size_t i = 1; i < cmd->argc; ++i) {
+        shellBufferAppendString(&script, &length, &capacity, " '");
+        for (const char *cursor = cmd->argv[i] ? cmd->argv[i] : ""; *cursor; ++cursor) {
+            if (*cursor == '\'') {
+                shellBufferAppendString(&script, &length, &capacity, "'\\''");
+            } else {
+                shellBufferAppendChar(&script, &length, &capacity, *cursor);
+            }
+        }
+        shellBufferAppendChar(&script, &length, &capacity, '\'');
+    }
+    char *word = strdup("eval");
+    if (!script || !word) {
+        free(script);
+        free(word);
+        return false;
+    }
+    for (size_t i = 0; i < cmd->argc; ++i) {
+        free(cmd->argv[i]);
+    }
+    cmd->argv[0] = word;
+    cmd->argv[1] = script;
+    cmd->argv[2] = NULL;
+    cmd->argc = 2;
+    return true;
+}
+
 static bool shellExpandAliasesIfNeeded(VM *vm, ShellCommand *cmd) {
     if (!cmd || cmd->argc == 0 || cmd->ignore_functions) {
         return true;
@@ -970,6 +1127,17 @@ static bool shellExpandAliasesIfNeeded(VM *vm, ShellCommand *cmd) {
         ShellAlias *alias = shellFindAlias(name);
         if (!alias || !alias->value) {
             break;
+        }
+        if (shellAliasTextNeedsParsing(alias->value)) {
+            /* Splitting into words cannot carry `;`, `|` or `>`. */
+            if (cmd->argc < 2) {
+                char **grown = (char **)realloc(cmd->argv, sizeof(char *) * 3);
+                if (!grown) {
+                    return false;
+                }
+                cmd->argv = grown;
+            }
+            return shellRewriteAliasAsEval(cmd, alias->value);
         }
         if (!shellExpandAliasOnce(cmd, alias->value)) {
             if (vm) {
@@ -1090,30 +1258,31 @@ static int shellSpawnProcess(VM *vm,
                 break;
             }
             case SHELL_RUNTIME_REDIR_HEREDOC: {
-                int pipefd[2];
-                if (pipe(pipefd) != 0) {
+                const char *body = redir->here_doc ? redir->here_doc : "";
+                size_t body_length = redir->here_doc_length ? redir->here_doc_length : strlen(body);
+                op.type = SHELL_REDIR_OP_HEREDOC;
+                op.source_fd = shellOpenHereBody(body, body_length, false);
+                if (op.source_fd < 0) {
                     prep_error = errno;
                     goto spawn_cleanup;
                 }
-                op.type = SHELL_REDIR_OP_HEREDOC;
-                op.source_fd = pipefd[0];
-                op.write_fd = pipefd[1];
-                op.here_body = redir->here_doc ? redir->here_doc : "";
-                op.here_length = redir->here_doc_length;
+                op.write_fd = -1;
+                op.here_body = body;
+                op.here_length = body_length;
                 op.append_newline = false;
                 break;
             }
             case SHELL_RUNTIME_REDIR_HERE_STRING: {
-                int pipefd[2];
-                if (pipe(pipefd) != 0) {
+                op.type = SHELL_REDIR_OP_HERE_STRING;
+                const char *body = redir->here_string ? redir->here_string
+                                                      : (redir->here_string_literal ? redir->here_string_literal : "");
+                size_t body_length = redir->here_string_length ? redir->here_string_length : strlen(body);
+                op.source_fd = shellOpenHereBody(body, body_length, true);
+                if (op.source_fd < 0) {
                     prep_error = errno;
                     goto spawn_cleanup;
                 }
-                op.type = SHELL_REDIR_OP_HERE_STRING;
-                op.source_fd = pipefd[0];
-                op.write_fd = pipefd[1];
-                const char *body = redir->here_string ? redir->here_string
-                                                      : (redir->here_string_literal ? redir->here_string_literal : "");
+                op.write_fd = -1;
                 op.here_body = body;
                 op.here_length = redir->here_string_length;
                 if (op.here_length == 0 && body) {
@@ -1280,6 +1449,7 @@ static int shellSpawnProcess(VM *vm,
             }
 #endif
             int err = 0;
+            shellEnvironmentForChild(cmd);
 #if defined(PSCAL_TARGET_IOS)
             char exec_path[PATH_MAX];
             const char *resolved_exec = cmd->argv[0];
@@ -1296,7 +1466,12 @@ static int shellSpawnProcess(VM *vm,
             execvp(cmd->argv[0], cmd->argv);
             err = errno;
 #endif
+#if defined(PSCAL_TARGET_IOS)
             int script_status = shellTryRunScriptFallback(vm ? vm : gShellCurrentVm, cmd);
+#else
+            /* A file without execute permission is an error, not a script to read. */
+            int script_status = err == ENOEXEC ? shellTryRunScriptFallback(vm ? vm : gShellCurrentVm, cmd) : -1;
+#endif
             if (script_status >= 0) {
                 _exit(script_status);
             }
@@ -3177,7 +3352,12 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd) {
             int combined = 0;
             for (size_t i = 0; i < ctx->stage_count; ++i) {
                 combined = shellPipelineNextStatus(combined, ctx->stage_status[i]);
+                if (i < SHELL_PIPESTATUS_MAX) {
+                    gShellPipeStatus[i] = ctx->stage_status[i];
+                }
             }
+            gShellPipeStatusCount = ctx->stage_count < SHELL_PIPESTATUS_MAX ? ctx->stage_count : SHELL_PIPESTATUS_MAX;
+            gShellPipeStatusFresh = true;
             if (gShellRuntime.pipefail_enabled) {
                 final_status = combined;
             }
@@ -3260,8 +3440,13 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd) {
             } else {
                 final_status = shellPipelineNextStatus(final_status, wait_res.status_mapped);
                 ctx->pids[i] = -1;
+                if (i < SHELL_PIPESTATUS_MAX) {
+                    gShellPipeStatus[i] = wait_res.status_mapped;
+                    gShellPipeStatusCount = i + 1;
+                }
             }
         }
+        gShellPipeStatusFresh = ctx->launched > 0;
 
         if (job_control) {
             shellJobControlRestoreForeground();
@@ -3863,96 +4048,53 @@ static bool shellApplyExecRedirections(const ShellCommand *cmd,
                 break;
             }
             case SHELL_RUNTIME_REDIR_HEREDOC: {
-                int pipefd[2];
-                if (pipe(pipefd) != 0) {
-                    int err = errno;
-                    shellRedirectionFailed("here-document", err);
-                    goto redir_error;
-                }
                 const char *body = redir->here_doc ? redir->here_doc : "";
-                size_t remaining = redir->here_doc_length;
-                if (remaining == 0) {
-                    remaining = strlen(body);
-                }
-                const char *cursor = body;
-                while (remaining > 0) {
-                    ssize_t written = write(pipefd[1], cursor, remaining);
-                    if (written < 0) {
-                        if (errno == EINTR) {
-                            continue;
-                        }
-                        int err = errno;
-                        shellRedirectionFailed("here-document", err);
-                        close(pipefd[0]);
-                        close(pipefd[1]);
-                        goto redir_error;
-                    }
-                    cursor += written;
-                    remaining -= (size_t)written;
-                }
-                close(pipefd[1]);
-                if (dup2(pipefd[0], target_fd) < 0) {
-                    int err = errno;
-                    shellRedirectionFailed("here-document", err);
-                    close(pipefd[0]);
+                int body_fd = shellOpenHereBody(body, redir->here_doc_length ? redir->here_doc_length : strlen(body), false);
+                if (body_fd < 0) {
+                    shellRedirectionFailed("here-document", errno);
                     goto redir_error;
                 }
+                if (body_fd != target_fd && dup2(body_fd, target_fd) < 0) {
+                    int err = errno;
+                    shellRedirectionFailed("here-document", err);
+                    close(body_fd);
+                    goto redir_error;
+                }
+#if defined(PSCAL_TARGET_IOS)
+                if (vp_current) {
+                    vprocMarkFdInherited(vp_current, target_fd);
+                }
+#endif
                 shellResetStandardStream(target_fd);
-                close(pipefd[0]);
+                if (body_fd != target_fd) {
+                    close(body_fd);
+                }
                 break;
             }
             case SHELL_RUNTIME_REDIR_HERE_STRING: {
-                int pipefd[2];
-                if (pipe(pipefd) != 0) {
-                    int err = errno;
-                    shellRedirectionFailed("here-string", err);
-                    goto redir_error;
-                }
                 const char *body = redir->here_string ? redir->here_string
                                                        : (redir->here_string_literal ? redir->here_string_literal : "");
-                size_t remaining = redir->here_string_length;
-                if (remaining == 0 && body) {
-                    remaining = strlen(body);
-                }
-                const char *cursor = body;
-                while (remaining > 0) {
-                    ssize_t written = write(pipefd[1], cursor, remaining);
-                    if (written < 0) {
-                        if (errno == EINTR) {
-                            continue;
-                        }
-                        int err = errno;
-                        shellRedirectionFailed("here-string", err);
-                        close(pipefd[0]);
-                        close(pipefd[1]);
-                        goto redir_error;
-                    }
-                    cursor += written;
-                    remaining -= (size_t)written;
-                }
-                while (true) {
-                    ssize_t written = write(pipefd[1], "\n", 1);
-                    if (written < 0) {
-                        if (errno == EINTR) {
-                            continue;
-                        }
-                        int err = errno;
-                        shellRedirectionFailed("here-string", err);
-                        close(pipefd[0]);
-                        close(pipefd[1]);
-                        goto redir_error;
-                    }
-                    break;
-                }
-                close(pipefd[1]);
-                if (dup2(pipefd[0], target_fd) < 0) {
-                    int err = errno;
-                    shellRedirectionFailed("here-string", err);
-                    close(pipefd[0]);
+                int body_fd = shellOpenHereBody(body, redir->here_string_length ? redir->here_string_length : strlen(body),
+                                                true);
+                if (body_fd < 0) {
+                    shellRedirectionFailed("here-string", errno);
                     goto redir_error;
                 }
+                if (body_fd != target_fd && dup2(body_fd, target_fd) < 0) {
+                    int err = errno;
+                    shellRedirectionFailed("here-string", err);
+                    close(body_fd);
+                    goto redir_error;
+                }
+#if defined(PSCAL_TARGET_IOS)
+                if (vp_current) {
+                    vprocMarkFdInherited(vp_current, target_fd);
+                }
+#endif
                 shellResetStandardStream(target_fd);
-                close(pipefd[0]);
+                if (body_fd != target_fd) {
+                    close(body_fd);
+                }
                 break;
             }
             default:
@@ -4265,7 +4407,16 @@ static int shellRunBuiltinInProcess(VM *vm,
         fprintf(stderr, "[run-builtin] begin lookup for %s\n",
                 (cmd && cmd->argv && cmd->argv[0]) ? cmd->argv[0] : "<nil>");
     }
+    /* What was applied above stays applied. The builtin would open each file again, and
+     * under set -C the second open finds the file the first one made. */
+    size_t applied_redir_count = cmd ? cmd->redir_count : 0;
+    if (applied_redirs) {
+        cmd->redir_count = 0;
+    }
     bool builtin_ran = shellInvokeBuiltin(vm, cmd);
+    if (cmd) {
+        cmd->redir_count = applied_redir_count;
+    }
 #if defined(PSCAL_TARGET_IOS)
     if (!builtin_ran) {
         builtin_ran = shellDispatchIOSFrontendBuiltin(vm, cmd);
@@ -4615,6 +4766,12 @@ static int shellPipelineRunStage(VM *vm,
     bool adopt_failed = false;
 
     bool pipeline_in_process = ctx && ctx->in_process;
+#if defined(PSCAL_TARGET_IOS)
+    /* The last stage runs right here, on the shell's thread. */
+    if (ctx && ctx->stage_count > 1 && cmd && !cmd->body_state && shellStageRunsShellCode(cmd)) {
+        cmd->body_state = shellBodyStateCapture();
+    }
+#endif
     if (pipe_dbg) {
         fprintf(stderr,
                 "[pipe-stage] begin stage=%zu cmd=%s head=%d tail=%d in_proc=%d\n",
@@ -5190,6 +5347,9 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
             shellAbortPipeline();
             return false;
         }
+        if (ctx->stage_count > 1 && shellStageRunsShellCode(cloned)) {
+            cloned->body_state = shellBodyStateCapture();
+        }
         worker->vm = vm;
         worker->cmd = cloned;
         worker->vp = vp;
@@ -5385,6 +5545,9 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
             ? PSCALRuntimeGetCurrentRuntimeContext()
             : NULL;
         tctx->link = shellThreadLinkCapture();
+        if (ctx->stage_count > 1 && shellStageRunsShellCode(cloned)) {
+            cloned->body_state = shellBodyStateCapture();
+        }
 #endif
         if (async_tail) {
             ShellPipelineContext *ctx_clone = shellCloneSingleStagePipelineContext(ctx);
@@ -5553,6 +5716,7 @@ static bool shellExecuteExecBuiltin(VM *vm, ShellCommand *cmd) {
         return true;
     }
 
+    shellEnvironmentForChild(cmd);
 #if defined(PSCAL_TARGET_IOS)
     char exec_path[PATH_MAX];
     const char *resolved_exec = argv[0];
@@ -5596,6 +5760,9 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
         shellFreeCommand(cmd);
         shellScalarCacheInvalidate();
         return makeVoid();
+    }
+    if (gShellRuntime.xtrace_enabled) {
+        shellTraceCommand(cmd);
     }
     if (!shellExpandAliasesIfNeeded(vm, cmd)) {
         shellUpdateStatus(1);

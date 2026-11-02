@@ -3,6 +3,11 @@
 #include "core/utils.h"
 #include "shell/word_encoding.h"
 #include "shell/quote_markers.h"
+#include "shell/word_scan.h"
+#include <dirent.h>
+#include <pwd.h>
+#include <poll.h>
+#include <time.h>
 #include "shell/function.h"
 #include "shell/builtins.h"
 #include "shell/runner.h"
@@ -457,6 +462,9 @@ typedef struct {
     char **keys;
     size_t count;
     ShellArrayKind kind;
+    /* Keyed only because its indices have gaps: a=([5]=x), unset 'a[1]'. Subscripts are
+     * still arithmetic. */
+    bool sparse;
 } ShellArrayVariable;
 
 typedef struct {
@@ -484,6 +492,11 @@ typedef struct ShellTrapEntry {
     ShellTrapAction action;
     char *command;
 } ShellTrapEntry;
+
+static PSCAL_THREAD_LOCAL ShellTrapEntry gShellErrTrap;
+static PSCAL_THREAD_LOCAL ShellTrapEntry gShellDebugTrap;
+static PSCAL_THREAD_LOCAL ShellTrapEntry gShellReturnTrap;
+static PSCAL_THREAD_LOCAL int gShellReturnTrapDepth = 0;
 
 typedef struct ShellJob {
     pid_t pgid;
@@ -569,6 +582,13 @@ typedef struct ShellRuntimeState {
     ShellJobControlCaps job_control_caps;
     bool errexit_enabled;
     bool pipefail_enabled;
+    bool nounset_enabled;
+    bool noglob_enabled;
+    bool noclobber_enabled;
+    bool xtrace_enabled;
+    bool verbose_enabled;
+    bool braceexpand_disabled;
+    bool allexport_enabled;
     bool errexit_pending;
     bool errexit_defer_active;
     bool trap_enabled;
@@ -620,6 +640,9 @@ typedef struct ShellRuntimeState {
     pid_t last_removed_job_pgid;
     int last_removed_job_status;
     bool last_removed_job_valid;
+    /* Jobs that ended with nobody waiting on them, oldest first, for wait -n. */
+    int finished_job_statuses[64];
+    size_t finished_job_count;
     ShellJobControlContext job_control_ctx;
     ShellArrayVariable *array_vars;
     size_t array_var_count;
@@ -657,7 +680,6 @@ static void shellSetContext(ShellRuntimeState *ctx);
 #define gShellArrayVars (SC()->array_vars)
 #define gShellArrayVarCount (SC()->array_var_count)
 #define gShellArrayVarCapacity (SC()->array_var_capacity)
-#define gShellAssociativeArraySupport (SC()->associative_array_support)
 #define gShellBindInteractiveStatus (SC()->bind_interactive_status)
 #define gShellReadonlyVars (SC()->readonly_vars)
 #define gShellReadonlyVarCount (SC()->readonly_var_count)
@@ -680,6 +702,7 @@ static const char *kShellCommandDefaultPath =
 
 typedef enum {
     SHELL_COMMAND_RESULT_ALIAS,
+    SHELL_COMMAND_RESULT_KEYWORD,
     SHELL_COMMAND_RESULT_FUNCTION,
     SHELL_COMMAND_RESULT_BUILTIN,
     SHELL_COMMAND_RESULT_APPLET,
@@ -961,40 +984,7 @@ static const char *shellResolveBashPath(void) {
 }
 
 static bool shellAssociativeArraysSupported(void) {
-    if (gShellAssociativeArraySupport != -1) {
-        return gShellAssociativeArraySupport == 1;
-    }
-
-    int override_value = shellParseEnvBool(shellSafeGetenv("PSCALSHELL_ASSOC_ARRAYS"));
-    if (override_value == 0 || override_value == 1) {
-        gShellAssociativeArraySupport = override_value ? 1 : 0;
-        return gShellAssociativeArraySupport == 1;
-    }
-
-    const char *bash_path = shellResolveBashPath();
-    pid_t pid = fork();
-    if (pid < 0) {
-        gShellAssociativeArraySupport = 0;
-        return false;
-    }
-    if (pid == 0) {
-        execl(bash_path,
-              bash_path,
-              "--noprofile",
-              "--norc",
-              "-c",
-              "declare -A __exsh_assoc_probe=([__exsh_key__]=value) >/dev/null 2>/dev/null",
-              (char *)NULL);
-        _exit(127);
-    }
-    int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
-        gShellAssociativeArraySupport = 0;
-        return false;
-    }
-    bool supported = WIFEXITED(status) && WEXITSTATUS(status) == 0;
-    gShellAssociativeArraySupport = supported ? 1 : 0;
-    return supported;
+    return shellParseEnvBool(shellSafeGetenv("PSCALSHELL_ASSOC_ARRAYS")) != 0;
 }
 
 static bool shellBindRequiresInteractive(void) {
@@ -1113,6 +1103,10 @@ static bool shellParseReturnStatus(const char *text, int *out_status);
 static bool shellArithmeticParseValueString(const char *text, long long *out_value);
 static char *shellEvaluateArithmetic(const char *expr, bool *out_error);
 static void shellMarkArithmeticError(void);
+static const char *shellCurrentIfs(void);
+static bool shellArrayRegistryIndexedExists(const char *name);
+static char *shellParamSubscriptKey(const char *name, size_t name_len, const char *subscript, size_t subscript_len);
+static void shellArraySortSparse(ShellArrayVariable *var);
 
 static PSCAL_THREAD_LOCAL bool gShellPositionalOwned = false;
 
@@ -1141,7 +1135,7 @@ static ShellOptionEntry gShellOptionTable[] = {
     {"dirspell", false},
     {"dotglob", false},
     {"execfail", false},
-    {"expand_aliases", true},
+    {"expand_aliases", false},
     {"extdebug", false},
     {"extglob", false},
     {"extquote", true},
@@ -1184,6 +1178,7 @@ static const size_t gShellOptionCount = sizeof(gShellOptionTable) / sizeof(gShel
 #endif
 
 static bool shellShoptOptionEnabled(const char *name);
+static ShellOptionEntry *shellShoptFindOption(const char *name);
 
 typedef struct {
     char *name;
@@ -1256,74 +1251,169 @@ typedef enum {
 static int shellPatternMatchEx(const char *pattern, const char *text, ShellPatternFlags flags);
 static int shellPatternMatch(const char *pattern, const char *text);
 static int shellExpandGlobPattern(const char *pattern, char ***out_matches, size_t *out_count);
+static const char *shellExtglobFind(const char *pattern);
+
+static int shellCompareGlobMatches(const void *a, const void *b) {
+    return strcmp(*(char *const *)a, *(char *const *)b);
+}
+
+/* An extended pattern in the last part of a path: read the directory and test each name. */
+static int shellExpandExtglob(const char *pattern, char ***out_matches, size_t *out_count) {
+    const char *slash = strrchr(pattern, '/');
+    const char *base = slash ? slash + 1 : pattern;
+    size_t dir_len = slash ? (size_t)(slash - pattern) + 1 : 0;
+    char *dir_name = strndup(pattern, dir_len);
+    if (!dir_name) {
+        return GLOB_NOSPACE;
+    }
+    DIR *dir = opendir(dir_len ? dir_name : ".");
+    if (!dir) {
+        free(dir_name);
+        return GLOB_NOMATCH;
+    }
+    bool hidden_too = base[0] == '.' || shellShoptOptionEnabled("dotglob");
+    ShellPatternFlags flags = shellShoptOptionEnabled("nocaseglob") ? SHELL_PATTERN_NOCASE : SHELL_PATTERN_NONE;
+    char **matches = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        const char *name = entry->d_name;
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0 || (name[0] == '.' && !hidden_too)) {
+            continue;
+        }
+        if (shellPatternMatchEx(base, name, flags) != 0) {
+            continue;
+        }
+        if (count == capacity) {
+            capacity = capacity ? capacity * 2 : 16;
+            char **grown = (char **)realloc(matches, capacity * sizeof(char *));
+            if (!grown) {
+                break;
+            }
+            matches = grown;
+        }
+        size_t n = strlen(name);
+        char *path = (char *)malloc(dir_len + n + 1);
+        if (!path) {
+            break;
+        }
+        memcpy(path, dir_name, dir_len);
+        memcpy(path + dir_len, name, n + 1);
+        matches[count++] = path;
+    }
+    closedir(dir);
+    free(dir_name);
+    if (count == 0) {
+        free(matches);
+        return GLOB_NOMATCH;
+    }
+    qsort(matches, count, sizeof(char *), shellCompareGlobMatches);
+    *out_matches = matches;
+    *out_count = count;
+    return 0;
+}
+
+/* shellExpandGlobPattern and what shopt adds to it. A hidden name only matches a pattern
+ * that starts with a dot, so dotglob asks again with one and merges the two. */
+static int shellExpandGlobWithOptions(const char *pattern, char ***out_matches, size_t *out_count) {
+    *out_matches = NULL;
+    *out_count = 0;
+    if (shellExtglobFind(pattern)) {
+        return shellExpandExtglob(pattern, out_matches, out_count);
+    }
+    int status = shellExpandGlobPattern(pattern, out_matches, out_count);
+    if (!shellShoptOptionEnabled("dotglob")) {
+        return status;
+    }
+    const char *slash = strrchr(pattern, '/');
+    const char *base = slash ? slash + 1 : pattern;
+    if (base[0] == '.') {
+        return status;
+    }
+    size_t dir_len = (size_t)(base - pattern);
+    size_t n = strlen(pattern);
+    char *hidden_pattern = (char *)malloc(n + 2);
+    if (!hidden_pattern) {
+        return status;
+    }
+    memcpy(hidden_pattern, pattern, dir_len);
+    hidden_pattern[dir_len] = '.';
+    memcpy(hidden_pattern + dir_len + 1, base, n - dir_len + 1);
+    char **hidden = NULL;
+    size_t hidden_count = 0;
+    int hidden_status = shellExpandGlobPattern(hidden_pattern, &hidden, &hidden_count);
+    free(hidden_pattern);
+    if (hidden_status != 0) {
+        return status;
+    }
+    size_t count = *out_count;
+    char **merged = (char **)realloc(*out_matches, (count + hidden_count) * sizeof(char *));
+    if (!merged) {
+        return status;
+    }
+    for (size_t i = 0; i < hidden_count; ++i) {
+        const char *name = strrchr(hidden[i], '/');
+        name = name ? name + 1 : hidden[i];
+        if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) {
+            free(hidden[i]);
+        } else {
+            merged[count++] = hidden[i];
+        }
+    }
+    free(hidden);
+    if (count == 0) {
+        free(merged);
+        *out_matches = NULL;
+        return GLOB_NOMATCH;
+    }
+    qsort(merged, count, sizeof(char *), shellCompareGlobMatches);
+    *out_matches = merged;
+    *out_count = count;
+    return 0;
+}
+
+static bool shellIsCharBoundary(const char *text, size_t index) {
+    return ((unsigned char)text[index] & 0xC0) != 0x80;
+}
 
 static char *shellRemovePatternPrefix(const char *value, const char *pattern, bool longest) {
     if (!value) {
         return strdup("");
     }
-    if (!pattern) {
+    if (!pattern || !*pattern) {
         return strdup(value);
     }
-    size_t value_len = strlen(value);
+    size_t len = strlen(value);
+    char *work = strdup(value);
+    if (!work) {
+        return NULL;
+    }
+    /* A pattern ending in a plain character can only end at one, which saves matching
+     * against all of a long value. */
     size_t pattern_len = strlen(pattern);
-    if (pattern_len == 0) {
-        return strdup(value);
-    }
-    bool utf8_value = value_len > 0 && isValidUtf8Bytes(value, value_len);
-    size_t logical_len = utf8_value ? utf8CodepointCount(value, value_len) : value_len;
-    size_t match_len = SIZE_MAX;
-    if (longest) {
-        for (size_t len = logical_len; ; --len) {
-            size_t prefix_len = utf8_value
-                ? utf8ByteOffsetForCodepointIndex(value, value_len, len)
-                : len;
-            char *prefix = (char *)malloc(prefix_len + 1);
-            if (!prefix) {
-                return NULL;
-            }
-            if (prefix_len > 0) {
-                memcpy(prefix, value, prefix_len);
-            }
-            prefix[prefix_len] = '\0';
-            int rc = shellPatternMatch(pattern, prefix);
-            free(prefix);
+    char last = pattern[pattern_len - 1];
+    bool last_literal = !strchr("*?[]\\", last);
+    size_t cut = longest ? len : 0;
+    size_t match = SIZE_MAX;
+    while (true) {
+        if ((cut == len || shellIsCharBoundary(work, cut)) && (!last_literal || (cut > 0 && value[cut - 1] == last))) {
+            char saved = work[cut];
+            work[cut] = '\0';
+            int rc = shellPatternMatch(pattern, work);
+            work[cut] = saved;
             if (rc == 0) {
-                match_len = prefix_len;
-                break;
-            }
-            if (len == 0) {
+                match = cut;
                 break;
             }
         }
-    } else {
-        for (size_t len = 0; len <= logical_len; ++len) {
-            size_t prefix_len = utf8_value
-                ? utf8ByteOffsetForCodepointIndex(value, value_len, len)
-                : len;
-            char *prefix = (char *)malloc(prefix_len + 1);
-            if (!prefix) {
-                return NULL;
-            }
-            if (prefix_len > 0) {
-                memcpy(prefix, value, prefix_len);
-            }
-            prefix[prefix_len] = '\0';
-            int rc = shellPatternMatch(pattern, prefix);
-            free(prefix);
-            if (rc == 0) {
-                match_len = prefix_len;
-                break;
-            }
+        if (longest ? cut == 0 : cut == len) {
+            break;
         }
+        cut += longest ? (size_t)-1 : 1;
     }
-    if (match_len == SIZE_MAX) {
-        return strdup(value);
-    }
-    if (match_len >= value_len) {
-        return strdup("");
-    }
-    const char *remainder = value + match_len;
-    return strdup(remainder);
+    free(work);
+    return strdup(match == SIZE_MAX ? value : value + match);
 }
 
 static bool shellUtf8GlobConsumeToken(const char *pattern,
@@ -1698,7 +1788,7 @@ static int shellUtf8GlobMatchInternal(const char *pattern, const char *text, She
                 }
                 uint32_t text_cp = 0;
                 size_t text_advance = 0;
-                if (!decodeUtf8Codepoint(cursor, strlen(cursor), &text_cp, &text_advance)) {
+                if (!decodeUtf8Codepoint(cursor, strnlen(cursor, 4), &text_cp, &text_advance)) {
                     return -1;
                 }
                 cursor += text_advance;
@@ -1710,7 +1800,7 @@ static int shellUtf8GlobMatchInternal(const char *pattern, const char *text, She
         }
         uint32_t text_cp = 0;
         size_t text_advance = 0;
-        if (!decodeUtf8Codepoint(text, strlen(text), &text_cp, &text_advance)) {
+        if (!decodeUtf8Codepoint(text, strnlen(text, 4), &text_cp, &text_advance)) {
             return -1;
         }
         if (bracket) {
@@ -1731,9 +1821,161 @@ static int shellUtf8GlobMatchInternal(const char *pattern, const char *text, She
     return (!text || *text == '\0') ? 1 : 0;
 }
 
+/* The opening of an extended pattern at or after this point, or NULL: @( ?( *( +( !( */
+static const char *shellExtglobFind(const char *pattern) {
+    bool in_bracket = false;
+    for (const char *p = pattern; *p; ++p) {
+        if (*p == '\\' && p[1]) {
+            ++p;
+        } else if (in_bracket) {
+            in_bracket = *p != ']';
+        } else if (*p == '[') {
+            in_bracket = true;
+        } else if (strchr("@?*+!", *p) && p[1] == '(') {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+static const char *shellExtglobClose(const char *open) {
+    int depth = 0;
+    for (const char *p = open; *p; ++p) {
+        if (*p == '\\' && p[1]) {
+            ++p;
+        } else if (*p == '(') {
+            depth++;
+        } else if (*p == ')' && --depth == 0) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+static int shellPatternMatchEx(const char *pattern, const char *text, ShellPatternFlags flags);
+
+/* Whether one of the | alternatives in [start, end) matches all of text. */
+static bool shellExtglobAnyAlternative(const char *start, const char *end, const char *text, ShellPatternFlags flags) {
+    const char *piece = start;
+    int depth = 0;
+    for (const char *p = start; p <= end; ++p) {
+        bool done = p == end;
+        if (!done && *p == '\\' && p + 1 < end) {
+            ++p;
+            continue;
+        }
+        if (!done && *p == '(') {
+            depth++;
+        } else if (!done && *p == ')') {
+            depth--;
+        }
+        if (done || (*p == '|' && depth == 0)) {
+            size_t n = (size_t)(p - piece);
+            char *alternative = strndup(piece, n);
+            if (!alternative) {
+                return false;
+            }
+            bool matched = shellPatternMatchEx(alternative, text, flags) == 0;
+            free(alternative);
+            if (matched) {
+                return true;
+            }
+            piece = p + 1;
+        }
+    }
+    return false;
+}
+
+/* op(alternatives)rest against text from here on. times is how many repeats so far. */
+static bool shellExtglobMatchFrom(char op, const char *alt_start, const char *alt_end, const char *rest, char *work,
+                                  size_t pos, size_t len, ShellPatternFlags flags, int times);
+
+static bool shellExtglobRepeat(char op, const char *alt_start, const char *alt_end, const char *rest, char *work,
+                               size_t pos, size_t len, ShellPatternFlags flags, int times) {
+    bool may_stop = op == '*' || (op == '+' && times > 0) || (op == '?' );
+    if (may_stop && shellPatternMatchEx(rest, work + pos, flags) == 0) {
+        return true;
+    }
+    if (op == '?' && times > 0) {
+        return false;
+    }
+    for (size_t end = pos + 1; end <= len; ++end) {
+        char saved = work[end];
+        work[end] = '\0';
+        bool matched = shellExtglobAnyAlternative(alt_start, alt_end, work + pos, flags);
+        work[end] = saved;
+        if (matched && shellExtglobRepeat(op, alt_start, alt_end, rest, work, end, len, flags, times + 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool shellExtglobMatchFrom(char op, const char *alt_start, const char *alt_end, const char *rest, char *work,
+                                  size_t pos, size_t len, ShellPatternFlags flags, int times) {
+    if (op == '@') {
+        for (size_t end = pos; end <= len; ++end) {
+            char saved = work[end];
+            work[end] = '\0';
+            bool matched = shellExtglobAnyAlternative(alt_start, alt_end, work + pos, flags);
+            work[end] = saved;
+            if (matched && shellPatternMatchEx(rest, work + end, flags) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+    if (op == '!') {
+        for (size_t end = pos; end <= len; ++end) {
+            char saved = work[end];
+            work[end] = '\0';
+            bool matched = shellExtglobAnyAlternative(alt_start, alt_end, work + pos, flags);
+            work[end] = saved;
+            if (!matched && shellPatternMatchEx(rest, work + end, flags) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+    return shellExtglobRepeat(op, alt_start, alt_end, rest, work, pos, len, flags, times);
+}
+
+/* prefix op(alternatives) rest: try every place the prefix could end. */
+static int shellExtglobMatch(const char *pattern, const char *open, const char *text, ShellPatternFlags flags) {
+    const char *close = shellExtglobClose(open + 1);
+    if (!close) {
+        return FNM_NOMATCH;
+    }
+    char *prefix = strndup(pattern, (size_t)(open - pattern));
+    char *work = strdup(text);
+    if (!prefix || !work) {
+        free(prefix);
+        free(work);
+        return FNM_NOMATCH;
+    }
+    size_t len = strlen(work);
+    bool matched = false;
+    for (size_t pos = 0; pos <= len && !matched; ++pos) {
+        char saved = work[pos];
+        work[pos] = '\0';
+        bool prefix_ok = shellPatternMatchEx(prefix, work, flags) == 0;
+        work[pos] = saved;
+        if (prefix_ok) {
+            matched = shellExtglobMatchFrom(*open, open + 2, close, close + 1, work, pos, len, flags, 0);
+        }
+    }
+    free(prefix);
+    free(work);
+    return matched ? 0 : FNM_NOMATCH;
+}
+
 static int shellPatternMatchEx(const char *pattern, const char *text, ShellPatternFlags flags) {
     if (!pattern || !text) {
         return FNM_NOMATCH;
+    }
+    const char *extglob = shellExtglobFind(pattern);
+    if (extglob) {
+        return shellExtglobMatch(pattern, extglob, text, flags);
     }
     size_t text_len = strlen(text);
     size_t pattern_len = strlen(pattern);
@@ -2079,122 +2321,29 @@ static char *shellRemovePatternSuffix(const char *value, const char *pattern, bo
     if (!value) {
         return strdup("");
     }
-    if (!pattern) {
+    if (!pattern || !*pattern) {
         return strdup(value);
     }
-    size_t value_len = strlen(value);
-    size_t pattern_len = strlen(pattern);
-    if (pattern_len == 0) {
-        return strdup(value);
-    }
-    bool utf8_value = value_len > 0 && isValidUtf8Bytes(value, value_len);
-    size_t logical_len = utf8_value ? utf8CodepointCount(value, value_len) : value_len;
-    size_t match_len = SIZE_MAX;
-    if (longest) {
-        for (size_t len = logical_len; ; --len) {
-            size_t suffix_len = utf8_value
-                ? (value_len - utf8ByteOffsetForCodepointIndex(value, value_len, logical_len - len))
-                : len;
-            size_t offset = value_len - suffix_len;
-            const char *suffix = value + offset;
-            if (shellPatternMatch(pattern, suffix) == 0) {
-                match_len = suffix_len;
-                break;
-            }
-            if (len == 0) {
-                break;
-            }
-        }
-    } else {
-        for (size_t len = 0; len <= logical_len; ++len) {
-            size_t suffix_len = utf8_value
-                ? (value_len - utf8ByteOffsetForCodepointIndex(value, value_len, logical_len - len))
-                : len;
-            size_t offset = value_len - suffix_len;
-            const char *suffix = value + offset;
-            if (shellPatternMatch(pattern, suffix) == 0) {
-                match_len = suffix_len;
-                break;
-            }
-        }
-    }
-    if (match_len == SIZE_MAX) {
-        return strdup(value);
-    }
-    if (match_len >= value_len) {
-        return strdup("");
-    }
-    size_t keep_len = value_len - match_len;
-    char *result = (char *)malloc(keep_len + 1);
-    if (!result) {
-        return NULL;
-    }
-    if (keep_len > 0) {
-        memcpy(result, value, keep_len);
-    }
-    result[keep_len] = '\0';
-    return result;
-}
-
-static char *shellExpandPatternText(const char *pattern, size_t len) {
-    char *buffer = NULL;
-    size_t length = 0;
-    size_t capacity = 0;
-    bool in_single = false;
-    bool in_double = false;
-    size_t i = 0;
-    while (i < len) {
-        char c = pattern[i];
-        if (!in_double && c == '\'') {
-            in_single = !in_single;
-            i++;
-            continue;
-        }
-        if (!in_single && c == '"') {
-            in_double = !in_double;
-            i++;
-            continue;
-        }
-        if (c == '\\' && in_double && i + 1 < len) {
-            char next = pattern[i + 1];
-            if (next == '\\' || next == '"' || next == '$' || next == '`') {
-                if (in_single || in_double) {
-                    if (next == '*' || next == '?' || next == '[' || next == ']') {
-                        shellBufferAppendChar(&buffer, &length, &capacity, '\\');
-                    }
+    size_t len = strlen(value);
+    size_t start = longest ? 0 : len;
+    bool first_literal = !strchr("*?[\\", pattern[0]);
+    while (true) {
+        if ((start == len || shellIsCharBoundary(value, start)) && (!first_literal || value[start] == pattern[0])) {
+            if (shellPatternMatch(pattern, value + start) == 0) {
+                char *out = (char *)malloc(start + 1);
+                if (out) {
+                    memcpy(out, value, start);
+                    out[start] = '\0';
                 }
-                shellBufferAppendChar(&buffer, &length, &capacity, next);
-                i += 2;
-                continue;
+                return out;
             }
         }
-        if (!in_single) {
-            if (c == '$') {
-                size_t consumed = 0;
-                char *expanded = shellExpandParameter(pattern + i + 1,
-                                                       &consumed,
-                                                       NULL,
-                                                       NULL);
-                if (expanded) {
-                    shellBufferAppendString(&buffer, &length, &capacity, expanded);
-                    free(expanded);
-                    i += consumed + 1;
-                    continue;
-                }
-            }
+        if (longest ? start == len : start == 0) {
+            break;
         }
-        if (in_single || in_double) {
-            if (c == '*' || c == '?' || c == '[' || c == ']') {
-                shellBufferAppendChar(&buffer, &length, &capacity, '\\');
-            }
-        }
-        shellBufferAppendChar(&buffer, &length, &capacity, c);
-        i++;
+        start += longest ? 1 : (size_t)-1;
     }
-    if (!buffer) {
-        return strdup("");
-    }
-    return buffer;
+    return strdup(value);
 }
 
 typedef enum {
@@ -2743,7 +2892,10 @@ static ShellRuntimeState gShellRuntimeDefault = {
 /* Default to the global runtime state to avoid pathological recursion when
  * shellGetContext() is first called before an explicit activation. */
 static __thread ShellRuntimeState *gShellRuntimeCtx = &gShellRuntimeDefault;
-static __thread ShellRuntimeState *gShellContextStack[8] = {0};
+/* One entry per builtin call and script in progress, so as deep as a script's calls go. It
+ * was 8, and a pop past that restored the wrong context: nested calls read the wrong $?. */
+static __thread ShellRuntimeState **gShellContextStack = NULL;
+static __thread size_t gShellContextCapacity = 0;
 static __thread size_t gShellContextDepth = 0;
 static __thread bool gShellCurrentBuiltinBackground = false;
 static __thread bool gShellBackgroundWorkerActive = false;
@@ -2759,6 +2911,179 @@ static PSCAL_THREAD_LOCAL bool gShellStatusSticky = false;
 static PSCAL_THREAD_LOCAL bool gShellExitRequested = false;
 static volatile sig_atomic_t gShellExitOnSignalFlag = 0;
 static PSCAL_THREAD_LOCAL bool gShellArithmeticErrorPending = false;
+static PSCAL_THREAD_LOCAL bool gShellExpansionFailed = false;
+static PSCAL_THREAD_LOCAL bool gShellNounsetSuppressed = false;
+static PSCAL_THREAD_LOCAL bool gShellProcSubDisabled = false;
+
+/* The stages of the last pipeline, or the one status of a plain command: ${PIPESTATUS[@]}. */
+#define SHELL_PIPESTATUS_MAX 128
+static PSCAL_THREAD_LOCAL int gShellPipeStatus[SHELL_PIPESTATUS_MAX];
+static PSCAL_THREAD_LOCAL size_t gShellPipeStatusCount = 0;
+
+/* Innermost first: ${BASH_SOURCE[0]}. */
+static PSCAL_THREAD_LOCAL char **gShellSourceNames = NULL;
+static PSCAL_THREAD_LOCAL size_t gShellSourceNameCount = 0;
+static PSCAL_THREAD_LOCAL bool gShellIfsUnset = false;
+static PSCAL_THREAD_LOCAL bool gShellPipeStatusFresh = false;
+static PSCAL_THREAD_LOCAL bool gShellReturnPending = false;
+static PSCAL_THREAD_LOCAL int gShellReturnStatus = 0;
+static PSCAL_THREAD_LOCAL char *gShellLastWord = NULL;
+static PSCAL_THREAD_LOCAL time_t gShellSecondsBase = 0;
+
+/* Innermost function first: ${FUNCNAME[0]}. */
+static PSCAL_THREAD_LOCAL char **gShellFunctionNames = NULL;
+static PSCAL_THREAD_LOCAL size_t gShellFunctionNameCount = 0;
+static PSCAL_THREAD_LOCAL size_t gShellFunctionNameCapacity = 0;
+
+/* Every shell variable lives in the process environment, so a child would see them all.
+ * These are the ones bash would keep to itself; a child drops them before it execs. */
+typedef struct {
+    char **names;
+    size_t count;
+    size_t capacity;
+} ShellNameSet;
+static PSCAL_THREAD_LOCAL ShellNameSet gShellUnexported = {0};
+/* `export x` before x has a value. */
+static PSCAL_THREAD_LOCAL ShellNameSet gShellExportPending = {0};
+
+static bool shellNameSetContains(const ShellNameSet *set, const char *name) {
+    for (size_t i = 0; i < set->count; ++i) {
+        if (strcmp(set->names[i], name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void shellNameSetAdd(ShellNameSet *set, const char *name) {
+    if (shellNameSetContains(set, name)) {
+        return;
+    }
+    if (set->count == set->capacity) {
+        size_t capacity = set->capacity ? set->capacity * 2 : 16;
+        char **grown = (char **)realloc(set->names, capacity * sizeof(char *));
+        if (!grown) {
+            return;
+        }
+        set->names = grown;
+        set->capacity = capacity;
+    }
+    char *copy = strdup(name);
+    if (copy) {
+        set->names[set->count++] = copy;
+    }
+}
+
+static bool shellNameSetRemove(ShellNameSet *set, const char *name) {
+    for (size_t i = 0; i < set->count; ++i) {
+        if (strcmp(set->names[i], name) == 0) {
+            free(set->names[i]);
+            set->names[i] = set->names[--set->count];
+            return true;
+        }
+    }
+    return false;
+}
+
+static void shellExportNoteNewVariable(const char *name) {
+    if (strcmp(name, "PWD") == 0 || strcmp(name, "OLDPWD") == 0) {
+        return;
+    }
+    if (!shellNameSetRemove(&gShellExportPending, name)) {
+        shellNameSetAdd(&gShellUnexported, name);
+    }
+}
+
+static void shellExportMarkExported(const char *name) {
+    if (!shellNameSetRemove(&gShellUnexported, name)) {
+        shellNameSetAdd(&gShellExportPending, name);
+    }
+}
+
+static void shellExportMarkUnexported(const char *name) {
+    shellNameSetRemove(&gShellExportPending, name);
+    shellNameSetAdd(&gShellUnexported, name);
+}
+
+static void shellExportForget(const char *name) {
+    shellNameSetRemove(&gShellExportPending, name);
+    shellNameSetRemove(&gShellUnexported, name);
+}
+
+/* declare -i, -l and -u stay with the name. */
+#define SHELL_VAR_ATTR_INTEGER 1u
+#define SHELL_VAR_ATTR_LOWER 2u
+#define SHELL_VAR_ATTR_UPPER 4u
+typedef struct {
+    char *name;
+    unsigned flags;
+} ShellVariableAttribute;
+static PSCAL_THREAD_LOCAL ShellVariableAttribute *gShellVariableAttributes = NULL;
+static PSCAL_THREAD_LOCAL size_t gShellVariableAttributeCount = 0;
+
+static bool shellVariableHasAttribute(const char *name, unsigned flag) {
+    for (size_t i = 0; i < gShellVariableAttributeCount; ++i) {
+        if (strcmp(gShellVariableAttributes[i].name, name) == 0) {
+            return (gShellVariableAttributes[i].flags & flag) != 0;
+        }
+    }
+    return false;
+}
+
+static void shellVariableSetAttribute(const char *name, unsigned set_flags, unsigned clear_flags) {
+    for (size_t i = 0; i < gShellVariableAttributeCount; ++i) {
+        if (strcmp(gShellVariableAttributes[i].name, name) == 0) {
+            gShellVariableAttributes[i].flags = (gShellVariableAttributes[i].flags & ~clear_flags) | set_flags;
+            return;
+        }
+    }
+    if (!set_flags) {
+        return;
+    }
+    ShellVariableAttribute *grown = (ShellVariableAttribute *)realloc(
+        gShellVariableAttributes, (gShellVariableAttributeCount + 1) * sizeof(ShellVariableAttribute));
+    if (!grown) {
+        return;
+    }
+    gShellVariableAttributes = grown;
+    char *copy = strdup(name);
+    if (copy) {
+        gShellVariableAttributes[gShellVariableAttributeCount].name = copy;
+        gShellVariableAttributes[gShellVariableAttributeCount].flags = set_flags;
+        gShellVariableAttributeCount++;
+    }
+}
+
+static bool shellArithmeticEvaluateText(const char *text, int depth, long long *out_value, char *error, size_t error_size);
+
+/* The value after a variable's attributes, or NULL if they leave it as it is. */
+static char *shellApplyVariableAttributes(const char *name, const char *value) {
+    if (gShellVariableAttributeCount == 0) {
+        return NULL;
+    }
+    if (shellVariableHasAttribute(name, SHELL_VAR_ATTR_INTEGER)) {
+        long long number = 0;
+        if (!shellArithmeticEvaluateText(value, 0, &number, NULL, 0)) {
+            number = 0;
+        }
+        char buffer[32];
+        snprintf(buffer, sizeof(buffer), "%lld", number);
+        return strdup(buffer);
+    }
+    bool lower = shellVariableHasAttribute(name, SHELL_VAR_ATTR_LOWER);
+    bool upper = shellVariableHasAttribute(name, SHELL_VAR_ATTR_UPPER);
+    if (!lower && !upper) {
+        return NULL;
+    }
+    char *copy = strdup(value);
+    for (char *cursor = copy; cursor && *cursor; ++cursor) {
+        unsigned char c = (unsigned char)*cursor;
+        if (c < 0x80) {
+            *cursor = (char)(lower ? tolower(c) : toupper(c));
+        }
+    }
+    return copy;
+}
 static PSCAL_THREAD_LOCAL VM *gShellCurrentVm = NULL;
 static volatile sig_atomic_t gShellPendingSignals[NSIG] = {0};
 void shellResetJobIds(void) {
@@ -2784,11 +3109,17 @@ static void shellSetContext(ShellRuntimeState *ctx) {
 }
 
 static void shellContextPush(ShellRuntimeState *ctx) {
-    if (gShellContextDepth < (sizeof(gShellContextStack) / sizeof(gShellContextStack[0]))) {
-        gShellContextStack[gShellContextDepth++] = ctx;
+    if (gShellContextDepth == gShellContextCapacity) {
+        size_t capacity = gShellContextCapacity ? gShellContextCapacity * 2 : 64;
+        ShellRuntimeState **grown = (ShellRuntimeState **)realloc(gShellContextStack, capacity * sizeof(*grown));
+        if (!grown) {
+            abort();
+        }
+        gShellContextStack = grown;
+        gShellContextCapacity = capacity;
     }
+    gShellContextStack[gShellContextDepth++] = ctx;
 }
-
 static ShellRuntimeState *shellContextPop(void) {
     if (gShellContextDepth == 0) {
         return &gShellRuntimeDefault;
@@ -2991,7 +3322,8 @@ void shellRuntimeSetLastStatus(int status) {
     shellSetTrackedVariable("EXSH_LAST_STATUS", buffer, false);
     bool suppress_errexit = shellRuntimeEvaluatingCondition();
     if (status != 0) {
-        if (gShellRuntime.errexit_enabled && !suppress_errexit) {
+        if ((gShellRuntime.errexit_enabled || gShellErrTrap.action == SHELL_TRAP_ACTION_COMMAND) &&
+            !suppress_errexit) {
             gShellRuntime.errexit_pending = true;
             gShellRuntime.errexit_defer_active = true;
         }
@@ -3185,6 +3517,25 @@ bool shellRuntimeMaybeRequestPendingExit(VM *vm) {
         return false;
     }
     gShellRuntime.errexit_pending = false;
+    if (gShellErrTrap.action == SHELL_TRAP_ACTION_COMMAND && gShellErrTrap.command) {
+        int failed_status = gShellRuntime.last_status;
+        shellRuntimeExecuteTrap(gShellErrTrap.command, "<err-trap>");
+        gShellRuntime.errexit_pending = false;
+        gShellRuntime.errexit_defer_active = false;
+        if (gShellExitRequested) {
+            /* `exit` in the trap. */
+            if (vm) {
+                vm->exit_requested = true;
+                vm->abort_requested = true;
+            }
+            return true;
+        }
+        /* $? is still the command that failed. */
+        gShellRuntime.last_status = failed_status;
+    }
+    if (!gShellRuntime.errexit_enabled) {
+        return false;
+    }
     shellRuntimeRequestExit();
     if (vm) {
         vm->exit_requested = true;
@@ -3222,6 +3573,22 @@ void shellRuntimeRunSignalTrap(int signo) {
     char label[32];
     snprintf(label, sizeof(label), "<trap-%d>", signo);
     shellRuntimeExecuteTrap(entry->command, label);
+}
+
+static void shellRuntimeRunDebugTrap(void) {
+    if (gShellDebugTrap.action == SHELL_TRAP_ACTION_COMMAND && gShellDebugTrap.command &&
+        shellLocalScopeDepth() == 0) {
+        shellRuntimeExecuteTrap(gShellDebugTrap.command, "<debug-trap>");
+    }
+}
+
+/* A function does not see the RETURN trap of its caller, so this fires only for the
+ * function that set it. */
+static void shellRuntimeRunReturnTrap(void) {
+    if (gShellReturnTrap.action == SHELL_TRAP_ACTION_COMMAND && gShellReturnTrap.command &&
+        gShellReturnTrapDepth == shellLocalScopeDepth() && gShellReturnTrapDepth > 0) {
+        shellRuntimeExecuteTrap(gShellReturnTrap.command, "<return-trap>");
+    }
 }
 
 void shellRuntimeRunExitTrap(void) {
@@ -3456,10 +3823,35 @@ bool shellRuntimeSignalName(int signo, bool include_prefix, char *buffer, size_t
     return false;
 }
 
+/* A signal ignored when a script starts cannot be trapped or reset, and trap lists it.
+ * Hosts only: in the app the disposition belongs to the app, not to this shell. */
+#if !defined(PSCAL_TARGET_IOS)
+static bool gShellSignalIgnoredOnEntry[NSIG];
+#endif
+
+void shellRuntimeNoteIgnoredSignals(void) {
+#if !defined(PSCAL_TARGET_IOS)
+    for (size_t i = 0; i < sizeof(kShellSignalNames) / sizeof(kShellSignalNames[0]); ++i) {
+        int signo = kShellSignalNames[i].signo;
+        struct sigaction current;
+        if (signo > 0 && signo < NSIG && sigaction(signo, NULL, &current) == 0 &&
+            current.sa_handler == SIG_IGN) {
+            gShellSignalIgnoredOnEntry[signo] = true;
+            gShellSignalTraps[signo].action = SHELL_TRAP_ACTION_IGNORE;
+        }
+    }
+#endif
+}
+
 bool shellRuntimeSetSignalTrap(int signo, ShellTrapAction action, const char *command) {
     if (signo <= 0 || signo >= NSIG) {
         return false;
     }
+#if !defined(PSCAL_TARGET_IOS)
+    if (gShellSignalIgnoredOnEntry[signo] && !shellRuntimeIsInteractive()) {
+        return true;
+    }
+#endif
 
     char *command_copy = NULL;
     if (action == SHELL_TRAP_ACTION_COMMAND) {
@@ -3536,6 +3928,14 @@ bool shellRuntimePosixMode(void) {
 }
 
 void shellRuntimeSetInteractive(bool interactive) {
+    /* Scripts expand aliases only after shopt -s expand_aliases; a person at a prompt
+     * always starts with them on. */
+    if (interactive && !gShellInteractiveMode) {
+        ShellOptionEntry *aliases = shellShoptFindOption("expand_aliases");
+        if (aliases) {
+            aliases->enabled = true;
+        }
+    }
     gShellInteractiveMode = interactive;
 }
 
@@ -3546,10 +3946,16 @@ bool shellRuntimeIsInteractive(void) {
 /* $-: the letters in bash's order. These are the options this shell tracks, and the
  * ones it reports as always on, as a bash script sees them (`hB`). */
 static char *shellRuntimeOptionFlags(void) {
-    char flags[8];
+    char flags[16];
     size_t count = 0;
+    if (gShellRuntime.allexport_enabled) {
+        flags[count++] = 'a';
+    }
     if (gShellRuntime.errexit_enabled) {
         flags[count++] = 'e';
+    }
+    if (gShellRuntime.noglob_enabled) {
+        flags[count++] = 'f';
     }
     flags[count++] = 'h';
     if (shellRuntimeIsInteractive()) {
@@ -3558,7 +3964,21 @@ static char *shellRuntimeOptionFlags(void) {
     if (shellRuntimeIsInteractive() && gShellRuntime.job_control_enabled) {
         flags[count++] = 'm';
     }
-    flags[count++] = 'B';
+    if (gShellRuntime.nounset_enabled) {
+        flags[count++] = 'u';
+    }
+    if (gShellRuntime.verbose_enabled) {
+        flags[count++] = 'v';
+    }
+    if (gShellRuntime.xtrace_enabled) {
+        flags[count++] = 'x';
+    }
+    if (!gShellRuntime.braceexpand_disabled) {
+        flags[count++] = 'B';
+    }
+    if (gShellRuntime.noclobber_enabled) {
+        flags[count++] = 'C';
+    }
     if (shellRuntimeIsInteractive()) {
         flags[count++] = 'H';
     }
@@ -3637,6 +4057,10 @@ static bool shellHandleSpecialAssignment(const char *name, const char *value) {
         shellRandomAssignFromText(value);
         return true;
     }
+    if (strcmp(name, "SECONDS") == 0) {
+        gShellSecondsBase = time(NULL) - (value ? strtol(value, NULL, 10) : 0);
+        return true;
+    }
     return false;
 }
 
@@ -3698,6 +4122,11 @@ static ShellArrayVariable *shellArrayRegistryFindMutable(const char *name) {
         }
     }
     return NULL;
+}
+
+static bool shellArrayRegistryIndexedExists(const char *name) {
+    const ShellArrayVariable *var = shellArrayRegistryFindConst(name);
+    return var && var->kind == SHELL_ARRAY_KIND_INDEXED;
 }
 
 static const ShellArrayVariable *shellArrayRegistryFindConst(const char *name) {
@@ -4038,6 +4467,7 @@ ShellRuntimeState *shellRuntimeCreateContext(void) {
     ctx->last_removed_job_id = 0;
     ctx->last_removed_job_status = 0;
     ctx->last_removed_job_valid = false;
+    ctx->finished_job_count = 0;
     /* Deep-copy owned runtime state so contexts do not share pointers. */
     ctx->dir_stack = NULL;
     ctx->dir_stack_count = 0;
@@ -4381,6 +4811,7 @@ void shellRuntimeDestroyContext(ShellRuntimeState *ctx) {
 typedef enum {
     SHELL_READ_LINE_OK,
     SHELL_READ_LINE_EOF,
+    SHELL_READ_LINE_TIMEOUT,
     SHELL_READ_LINE_ERROR
 } ShellReadLineResult;
 
@@ -5572,6 +6003,7 @@ typedef struct {
     char *subject;
     bool matched;
     int incoming_status;
+    bool skipped;
 } ShellCaseContext;
 
 typedef struct {
@@ -5603,6 +6035,7 @@ static bool shellCaseStackPush(const char *subject_text) {
     ShellCaseContext *ctx = &gShellCaseStack.items[gShellCaseStack.count++];
     ctx->subject = copy;
     ctx->matched = false;
+    ctx->skipped = false;
     return true;
 }
 

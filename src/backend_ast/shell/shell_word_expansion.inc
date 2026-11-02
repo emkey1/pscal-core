@@ -21,6 +21,7 @@ static char *shellExpandWord(const char *text,
                              bool **out_quoted_map,
                              size_t *out_quoted_len,
                              bool *out_array_zero);
+static bool shellArithmeticEvaluate(const char *expr, long long *out_value, char *error, size_t error_size);
 
 static char *shellNormalizeDollarCommandInline(const char *command, size_t len) {
     if (!command) {
@@ -98,49 +99,11 @@ static bool shellParseInlineDollarCommand(const char *text,
     if (!text || start + 1 >= text_len || text[start] != '$' || text[start + 1] != '(') {
         return false;
     }
-    size_t i = start + 2;
-    int depth = 1;
-    bool in_single = false;
-    bool in_double = false;
-    while (i < text_len) {
-        char c = text[i];
-        if (c == '\\' && i + 1 < text_len) {
-            if (text[i + 1] == '\n') {
-                i += 2;
-                continue;
-            }
-            if (!in_single) {
-                i += 2;
-                continue;
-            }
-        }
-        if (!in_double && c == '\'') {
-            in_single = !in_single;
-            i++;
-            continue;
-        }
-        if (!in_single && c == '"') {
-            in_double = !in_double;
-            i++;
-            continue;
-        }
-        if (in_single || in_double) {
-            i++;
-            continue;
-        }
-        if (c == '(') {
-            depth++;
-        } else if (c == ')') {
-            depth--;
-            if (depth == 0) {
-                break;
-            }
-        }
-        i++;
-    }
-    if (depth != 0 || i >= text_len || text[i] != ')') {
+    size_t stop = shellScanDollarParen(text, text_len, start + 2);
+    if (stop == SHELL_SCAN_UNTERMINATED) {
         return false;
     }
+    size_t i = stop - 1;
     size_t span = (i + 1) - start;
     if (out_span) {
         *out_span = span;
@@ -196,19 +159,178 @@ static bool shellParseInlineBacktickCommand(const char *text,
 /* Not encoded in a word: only shellExpandHereDocument passes it. */
 #define SHELL_WORD_FLAG_HERE_DOCUMENT (1 << 6)
 
+/* Marks a value so a builtin can tell `declare a=(x)` from `declare a="(x)"`. */
+#define SHELL_ARRAY_LITERAL_MARK '\x1f'
+
+static void shellSubshellResetState(pid_t dollar_pid);
+
+#include "shell_parameter.inc"
+
 static char *shellExpandHereDocument(const char *body, bool quoted) {
     if (quoted) {
         return body ? strdup(body) : strdup("");
     }
-    return shellExpandWord(body,
-                           SHELL_WORD_FLAG_HAS_ARITHMETIC | SHELL_WORD_FLAG_HERE_DOCUMENT,
-                           NULL, 0, NULL, NULL, NULL);
+    char *expanded = shellExpandWord(body,
+                                     SHELL_WORD_FLAG_HAS_ARITHMETIC | SHELL_WORD_FLAG_HERE_DOCUMENT,
+                                     NULL, 0, NULL, NULL, NULL);
+    shellFlattenArraySeparators(expanded);
+    return expanded;
 }
 
-static char *shellExpandParameter(const char *input,
-                                  size_t *out_consumed,
-                                  bool *out_is_array_expansion,
-                                  size_t *out_array_count) {
+/* <(cmd) and >(cmd). A host gives the command a pipe and the word a /dev/fd path. iOS
+ * has no process to run it in and no such path to open, so a file stands in: <(cmd)
+ * runs now and >(cmd) reads the file when the command that named it is done. */
+typedef struct {
+    int fd;
+    pid_t pid;
+    char *path;
+    char *command;
+    VM *owner;
+} ShellProcSub;
+
+static PSCAL_THREAD_LOCAL ShellProcSub *gShellProcSubs = NULL;
+static PSCAL_THREAD_LOCAL size_t gShellProcSubCount = 0;
+
+static bool shellProcSubRemember(ShellProcSub entry) {
+    ShellProcSub *grown = (ShellProcSub *)realloc(gShellProcSubs, (gShellProcSubCount + 1) * sizeof(ShellProcSub));
+    if (!grown) {
+        return false;
+    }
+    gShellProcSubs = grown;
+    gShellProcSubs[gShellProcSubCount++] = entry;
+    return true;
+}
+
+static int shellProcSubRun(const char *source, const char *label) {
+    ShellRunOptions opts;
+    memset(&opts, 0, sizeof(opts));
+    opts.no_cache = 1;
+    opts.quiet = true;
+    opts.suppress_warnings = true;
+    opts.exit_on_signal = shellRuntimeExitOnSignal();
+    const char *frontend = shellRuntimeGetArg0();
+    opts.frontend_path = frontend ? frontend : "exsh";
+    opts.first_line = gShellCurrentCommandLine;
+    bool exit_requested = false;
+    return shellRunSource(source, label, &opts, &exit_requested);
+}
+
+static char *shellProcessSubstitution(char direction, const char *command) {
+    fflush(stdout);
+    fflush(stderr);
+#if defined(PSCAL_TARGET_IOS)
+    const char *dir = shellSafeGetenv("TMPDIR");
+    char path[PATH_MAX];
+    static atomic_uint counter;
+    snprintf(path, sizeof(path), "%s/.exsh-procsub-%d-%u", (dir && *dir) ? dir : "/tmp", (int)getpid(),
+             atomic_fetch_add(&counter, 1));
+    size_t size = strlen(command) + strlen(path) + 32;
+    char *script = (char *)malloc(size);
+    if (!script) {
+        return NULL;
+    }
+    ShellProcSub entry = {.fd = -1, .pid = -1, .path = strdup(path), .command = NULL, .owner = gShellCurrentVm};
+    if (direction == '<') {
+        snprintf(script, size, "{ %s\n} > '%s'", command, path);
+        int saved_status = gShellRuntime.last_status;
+        shellProcSubRun(script, "<process-substitution>");
+        shellUpdateStatus(saved_status);
+    } else {
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+        if (fd >= 0) {
+            close(fd);
+        }
+        snprintf(script, size, "{ %s\n} < '%s'", command, path);
+        entry.command = script;
+        script = NULL;
+    }
+    free(script);
+    shellProcSubRemember(entry);
+    return strdup(path);
+#else
+    int fds[2];
+    if (pipe(fds) != 0) {
+        shellReportRecoverableError(gShellCurrentVm, true, "process substitution: %s", strerror(errno));
+        return NULL;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        shellReportRecoverableError(gShellCurrentVm, true, "process substitution: %s", strerror(errno));
+        close(fds[0]);
+        close(fds[1]);
+        return NULL;
+    }
+    if (pid == 0) {
+        for (size_t i = 0; i < gShellProcSubCount; ++i) {
+            if (gShellProcSubs[i].fd >= 0) {
+                close(gShellProcSubs[i].fd);
+            }
+        }
+        gShellProcSubCount = 0;
+        /* The shell ignores it for itself. A closed reader must end this child. */
+        signal(SIGPIPE, SIG_DFL);
+        dup2(direction == '<' ? fds[1] : fds[0], direction == '<' ? STDOUT_FILENO : STDIN_FILENO);
+        close(fds[0]);
+        close(fds[1]);
+        shellSubshellResetState(shellRuntimeDollarPid());
+        int status = shellProcSubRun(command, "<process-substitution>");
+        fflush(stdout);
+        fflush(stderr);
+        _exit(status);
+    }
+    int keep = direction == '<' ? fds[0] : fds[1];
+    close(direction == '<' ? fds[1] : fds[0]);
+    ShellProcSub entry = {.fd = keep, .pid = pid, .path = NULL, .command = NULL, .owner = gShellCurrentVm};
+    shellProcSubRemember(entry);
+    char path[64];
+    snprintf(path, sizeof(path), "/dev/fd/%d", keep);
+    return strdup(path);
+#endif
+}
+
+/* The command that named them is done. What it opened it holds on its own. */
+static void shellProcessSubstitutionsFinish(VM *vm) {
+#if defined(PSCAL_TARGET_IOS)
+    /* A stage on a thread may not have opened its file yet. */
+    if (gShellRuntime.pipeline.active && gShellRuntime.pipeline.stage_count > 1) {
+        return;
+    }
+#endif
+    size_t kept = 0;
+    for (size_t i = 0; i < gShellProcSubCount; ++i) {
+        ShellProcSub *entry = &gShellProcSubs[i];
+        if (entry->owner != vm) {
+            gShellProcSubs[kept++] = *entry;
+            continue;
+        }
+        if (entry->fd >= 0) {
+            close(entry->fd);
+        }
+        if (entry->pid > 0) {
+            int status = 0;
+            (void)waitpid(entry->pid, &status, WNOHANG);
+        }
+        if (entry->command) {
+            int saved_status = gShellRuntime.last_status;
+            shellProcSubRun(entry->command, "<process-substitution>");
+            shellUpdateStatus(saved_status);
+            free(entry->command);
+        }
+        if (entry->path) {
+            unlink(entry->path);
+            free(entry->path);
+        }
+    }
+    gShellProcSubCount = kept;
+}
+
+static char *shellExpandParameterEx(const char *input,
+                                    bool in_double,
+                                    size_t *out_consumed,
+                                    bool *out_is_array_expansion,
+                                    size_t *out_array_count,
+                                    bool **out_map,
+                                    size_t *out_map_len) {
     if (out_is_array_expansion) {
         *out_is_array_expansion = false;
     }
@@ -218,457 +340,25 @@ static char *shellExpandParameter(const char *input,
     if (out_consumed) {
         *out_consumed = 0;
     }
+    if (out_map) {
+        *out_map = NULL;
+    }
+    if (out_map_len) {
+        *out_map_len = 0;
+    }
     if (!input || !*input) {
         return NULL;
     }
     if (*input == '{') {
-        const char *closing = strchr(input + 1, '}');
-        if (!closing) {
+        size_t stop = shellScanBraceParam(input, strlen(input), 1, in_double);
+        if (stop == SHELL_SCAN_UNTERMINATED) {
             return NULL;
         }
         if (out_consumed) {
-            *out_consumed = (size_t)(closing - input + 1);
+            *out_consumed = stop;
         }
-        const char *inner = input + 1;
-        size_t inner_len = (size_t)(closing - inner);
-        if (inner_len == 1 && inner[0] == '-') {
-            /* Before the default-value scan below, which takes it for `${name-word}`. */
-            return shellRuntimeOptionFlags();
-        }
-        /* ${?} is $?, and ${#} is $#: the name scans below only know identifiers. */
-        if (inner_len == 1 && strchr("?$!#", inner[0])) {
-            char special[2] = {inner[0], '\0'};
-            return shellExpandParameter(special, NULL, out_is_array_expansion, out_array_count);
-        }
-        if (inner_len == 0) {
-            return strdup("");
-        }
-        if (*inner == '#') {
-            const char *name_start = inner + 1;
-            if (name_start >= closing) {
-                return NULL;
-            }
-            if (inner_len == 2 && strchr("?$!-", name_start[0])) {
-                char special[2] = {name_start[0], '\0'};
-                char *value = shellExpandParameter(special, NULL, NULL, NULL);
-                if (!value) {
-                    return NULL;
-                }
-                char buffer[32];
-                snprintf(buffer, sizeof(buffer), "%zu", strlen(value));
-                free(value);
-                return strdup(buffer);
-            }
-            size_t name_len = 0;
-            if (isdigit((unsigned char)*name_start)) {
-                while (name_start + name_len < closing && isdigit((unsigned char)name_start[name_len])) {
-                    name_len++;
-                }
-            } else if (!consumeShellIdentifier(name_start, (size_t)(closing - name_start), &name_len, false)) {
-                return NULL;
-            }
-            const char *cursor = name_start + name_len;
-            if (cursor == name_start) {
-                return NULL;
-            }
-            if (cursor == closing) {
-                char *value = shellLookupParameterValue(name_start, name_len);
-                if (!value) {
-                    return NULL;
-                }
-                size_t val_len = strlen(value);
-                if (val_len > 0 && isValidUtf8Bytes(value, val_len)) {
-                    val_len = utf8CodepointCount(value, val_len);
-                }
-                free(value);
-                char buffer[32];
-                snprintf(buffer, sizeof(buffer), "%zu", val_len);
-                return strdup(buffer);
-            }
-            if (*cursor != '[') {
-                return NULL;
-            }
-            const char *subscript_start = cursor + 1;
-            const char *subscript_end =
-                memchr(subscript_start, ']', (size_t)(closing - subscript_start));
-            if (!subscript_end || subscript_end > closing) {
-                return NULL;
-            }
-            size_t subscript_len = (size_t)(subscript_end - subscript_start);
-            const char *after_bracket = subscript_end + 1;
-            while (after_bracket < closing &&
-                   isspace((unsigned char)*after_bracket)) {
-                after_bracket++;
-            }
-            if (after_bracket != closing) {
-                return NULL;
-            }
-            while (subscript_len > 0 &&
-                   isspace((unsigned char)subscript_start[0])) {
-                subscript_start++;
-                subscript_len--;
-            }
-            while (subscript_len > 0 &&
-                   isspace((unsigned char)subscript_start[subscript_len - 1])) {
-                subscript_len--;
-            }
-            if (subscript_len == 1 &&
-                (subscript_start[0] == '@' || subscript_start[0] == '*')) {
-                const ShellArrayVariable *array_var =
-                    shellArrayRegistryLookup(name_start, name_len);
-                size_t count = 0;
-                if (array_var) {
-                    count = array_var->count;
-                } else {
-                    char *raw = shellLookupRawEnvironmentValue(name_start, name_len);
-                    if (!raw) {
-                        return NULL;
-                    }
-                    char **items = NULL;
-                    if (!shellParseArrayValues(raw, &items, &count)) {
-                        free(raw);
-                        return NULL;
-                    }
-                    free(raw);
-                    shellFreeArrayValues(items, count);
-                }
-                char buffer[32];
-                snprintf(buffer, sizeof(buffer), "%zu", count);
-                return strdup(buffer);
-            }
-            char *element = shellExpandArraySubscriptValue(
-                name_start, name_len, subscript_start, subscript_len, NULL, NULL);
-            if (!element) {
-                return NULL;
-            }
-            size_t elem_len = strlen(element);
-            if (elem_len > 0 && isValidUtf8Bytes(element, elem_len)) {
-                elem_len = utf8CodepointCount(element, elem_len);
-            }
-            free(element);
-            char buffer[32];
-            snprintf(buffer, sizeof(buffer), "%zu", elem_len);
-            return strdup(buffer);
-        }
-
-        if (*inner == '!') {
-            const char *name_start = inner + 1;
-            if (name_start >= closing) {
-                return NULL;
-            }
-            size_t name_len = 0;
-            if (!consumeShellIdentifier(name_start, (size_t)(closing - name_start), &name_len, false)) {
-                return NULL;
-            }
-            const char *cursor = name_start + name_len;
-            if (cursor == closing || *cursor != '[') {
-                return NULL;
-            }
-            const char *subscript_start = cursor + 1;
-            const char *subscript_end = memchr(subscript_start, ']', (size_t)(closing - subscript_start));
-            if (!subscript_end || subscript_end > closing) {
-                return NULL;
-            }
-            size_t subscript_len = (size_t)(subscript_end - subscript_start);
-            const char *after_bracket = subscript_end + 1;
-            while (after_bracket < closing && isspace((unsigned char)*after_bracket)) {
-                after_bracket++;
-            }
-            if (after_bracket != closing) {
-                return NULL;
-            }
-            if (!(subscript_len == 1 && (subscript_start[0] == '@' || subscript_start[0] == '*'))) {
-                return NULL;
-            }
-            const ShellArrayVariable *array_var = shellArrayRegistryLookup(name_start, name_len);
-            char **items = NULL;
-            char **keys = NULL;
-            size_t count = 0;
-            ShellArrayKind kind = SHELL_ARRAY_KIND_INDEXED;
-            bool using_registry = false;
-            if (array_var) {
-                items = array_var->values;
-                keys = array_var->keys;
-                count = array_var->count;
-                kind = array_var->kind;
-                using_registry = true;
-            } else {
-                char *raw = shellLookupRawEnvironmentValue(name_start, name_len);
-                if (!raw) {
-                    return NULL;
-                }
-                if (!shellParseArrayLiteral(raw, &items, &keys, &count, &kind)) {
-                    free(raw);
-                    return NULL;
-                }
-                free(raw);
-            }
-            char *joined = NULL;
-            if (kind == SHELL_ARRAY_KIND_ASSOCIATIVE) {
-                if (subscript_start[0] == '@') {
-                    joined = shellJoinArrayValuesWithSeparator(keys, count, SHELL_ARRAY_ELEMENT_SEP);
-                } else {
-                    joined = shellJoinArrayValues(keys, count);
-                }
-            } else {
-                char separator = (subscript_start[0] == '@') ? SHELL_ARRAY_ELEMENT_SEP : ' ';
-                joined = shellJoinNumericIndices(count, separator);
-            }
-            if (!using_registry) {
-                shellFreeArrayValues(items, count);
-                if (keys) {
-                    shellFreeArrayValues(keys, count);
-                }
-            }
-            if (!joined) {
-                joined = strdup("");
-            }
-            return joined;
-        }
-
-        const char *inner_end = inner + inner_len;
-        const char *default_pos = NULL;
-        bool default_requires_value = false;
-        size_t bracket_depth = 0;
-        for (const char *scan = inner; scan < inner_end; ++scan) {
-            char ch = *scan;
-            if (ch == '[') {
-                bracket_depth++;
-                continue;
-            }
-            if (ch == ']' && bracket_depth > 0) {
-                bracket_depth--;
-                continue;
-            }
-            if (bracket_depth > 0) {
-                continue;
-            }
-            if (ch == ':' && (scan + 1) < inner_end && scan[1] == '-') {
-                default_pos = scan;
-                default_requires_value = true;
-                break;
-            }
-            if (ch == '-' && (scan == inner || scan[-1] != ':')) {
-                default_pos = scan;
-                default_requires_value = false;
-                break;
-            }
-        }
-        if (default_pos) {
-            size_t name_len = (size_t)(default_pos - inner);
-            if (name_len == 0) {
-                return NULL;
-            }
-            bool simple_name = false;
-            if (name_len == 1) {
-                unsigned char first = (unsigned char)inner[0];
-                if (isalnum(first) || first == '_' || first == '*' || first == '@' ||
-                    first == '#' || first == '?' || first == '$') {
-                    simple_name = true;
-                }
-            } else {
-                simple_name = true;
-                size_t consumed = 0;
-                simple_name = consumeShellIdentifier(inner, name_len, &consumed, false) && consumed == name_len;
-            }
-            if (simple_name) {
-                bool is_set = false;
-                char *value = shellLookupParameterValueInternal(inner, name_len, &is_set);
-                if (!value) {
-                    return NULL;
-                }
-                bool use_default = !is_set || (default_requires_value && value[0] == '\0');
-                if (!use_default) {
-                    return value;
-                }
-                free(value);
-                const char *default_start = default_pos + (default_requires_value ? 2 : 1);
-                size_t default_len = (size_t)(inner_end - default_start);
-                char *raw_default = (char *)malloc(default_len + 1);
-                if (!raw_default) {
-                    return NULL;
-                }
-                if (default_len > 0) {
-                    memcpy(raw_default, default_start, default_len);
-                }
-                raw_default[default_len] = '\0';
-                char *expanded_default = shellExpandWord(raw_default, 0, NULL, 0, NULL, NULL, NULL);
-                free(raw_default);
-                if (!expanded_default) {
-                    return NULL;
-                }
-                return expanded_default;
-            }
-        }
-
-        const char *colon = memchr(inner, ':', inner_len);
-        if (colon && colon > inner) {
-            const char *offset_start = colon + 1;
-            if (offset_start >= inner_end ||
-                !isdigit((unsigned char)*offset_start)) {
-                return NULL;
-            }
-            size_t offset_value = 0;
-            size_t offset_digits = 0;
-            const char *cursor = offset_start;
-            while (cursor < inner_end && isdigit((unsigned char)*cursor)) {
-                if (offset_value > (SIZE_MAX - 9) / 10) {
-                    offset_value = SIZE_MAX;
-                } else {
-                    offset_value = offset_value * 10 + (size_t)(*cursor - '0');
-                }
-                cursor++;
-                offset_digits++;
-            }
-            if (offset_digits == 0) {
-                return NULL;
-            }
-            const char *after_offset = cursor;
-            bool have_length = false;
-            size_t length_value = 0;
-            if (after_offset < inner_end) {
-                if (*after_offset != ':') {
-                    return NULL;
-                }
-                const char *length_start = after_offset + 1;
-                if (length_start >= inner_end ||
-                    !isdigit((unsigned char)*length_start)) {
-                    return NULL;
-                }
-                const char *length_cursor = length_start;
-                size_t length_digits = 0;
-                while (length_cursor < inner_end &&
-                       isdigit((unsigned char)*length_cursor)) {
-                    if (length_value > (SIZE_MAX - 9) / 10) {
-                        length_value = SIZE_MAX;
-                    } else {
-                        length_value =
-                            length_value * 10 + (size_t)(*length_cursor - '0');
-                    }
-                    length_cursor++;
-                    length_digits++;
-                }
-                if (length_digits == 0 || length_cursor != inner_end) {
-                    return NULL;
-                }
-                have_length = true;
-            }
-            size_t name_len = (size_t)(colon - inner);
-            char *value = shellLookupParameterValue(inner, name_len);
-            if (!value) {
-                return NULL;
-            }
-            size_t value_len = strlen(value);
-            bool utf8_value = (value_len > 0 && isValidUtf8Bytes(value, value_len));
-            size_t logical_len = utf8_value ? utf8CodepointCount(value, value_len) : value_len;
-            size_t start_index = offset_value;
-            if (start_index > logical_len) {
-                start_index = logical_len;
-            }
-            size_t start_byte = utf8_value
-                ? utf8ByteOffsetForCodepointIndex(value, value_len, start_index)
-                : start_index;
-            size_t available = logical_len - start_index;
-            size_t copy_len = available;
-            if (have_length && length_value < copy_len) {
-                copy_len = length_value;
-            }
-            size_t copy_bytes = utf8_value
-                ? (utf8ByteOffsetForCodepointIndex(value + start_byte,
-                                                   value_len - start_byte,
-                                                   copy_len))
-                : copy_len;
-            char *result = (char *)malloc(copy_bytes + 1);
-            if (!result) {
-                free(value);
-                return NULL;
-            }
-            if (copy_bytes > 0) {
-                memcpy(result, value + start_byte, copy_bytes);
-            }
-            result[copy_bytes] = '\0';
-            free(value);
-            return result;
-        }
-
-        const char *cursor = inner;
-        size_t name_len = 0;
-        if (isdigit((unsigned char)*inner)) {
-            /* ${1}: the identifier rule below refuses a leading digit. */
-            while (cursor < closing && isdigit((unsigned char)*cursor)) {
-                cursor++;
-            }
-            if (cursor == closing) {
-                return shellLookupParameterValue(inner, inner_len);
-            }
-            return NULL;
-        }
-        if (!consumeShellIdentifier(inner, (size_t)(closing - inner), &name_len, false)) {
-            return NULL;
-        }
-        cursor += name_len;
-        if (cursor < closing && *cursor == '[') {
-            const char *subscript_start = cursor + 1;
-            const char *subscript_end = memchr(subscript_start, ']', (size_t)(closing - subscript_start));
-            if (!subscript_end || subscript_end > closing) {
-                return NULL;
-            }
-            size_t subscript_len = (size_t)(subscript_end - subscript_start);
-            const char *after_bracket = subscript_end + 1;
-            while (after_bracket < closing && isspace((unsigned char)*after_bracket)) {
-                after_bracket++;
-            }
-            if (after_bracket != closing) {
-                return NULL;
-            }
-            size_t array_count = 0;
-            bool array_expansion = false;
-            char *expanded = shellExpandArraySubscriptValue(inner,
-                                                            name_len,
-                                                            subscript_start,
-                                                            subscript_len,
-                                                            &array_count,
-                                                            &array_expansion);
-            if (expanded && array_expansion) {
-                if (out_is_array_expansion) {
-                    *out_is_array_expansion = true;
-                }
-                if (out_array_count) {
-                    *out_array_count = array_count;
-                }
-            }
-            return expanded;
-        }
-        if (cursor < closing && (*cursor == '%' || *cursor == '#')) {
-            bool remove_suffix = (*cursor == '%');
-            bool longest = false;
-            char op = *cursor;
-            cursor++;
-            if (cursor < closing && *cursor == op) {
-                longest = true;
-                cursor++;
-            }
-            const char *pattern_start = cursor;
-            size_t pattern_len = (size_t)(closing - pattern_start);
-            char *expanded_pattern = shellExpandPatternText(pattern_start, pattern_len);
-            if (!expanded_pattern) {
-                return NULL;
-            }
-            char *value = shellLookupParameterValue(inner, name_len);
-            if (!value) {
-                free(expanded_pattern);
-                return NULL;
-            }
-            char *result = remove_suffix ? shellRemovePatternSuffix(value, expanded_pattern, longest)
-                                         : shellRemovePatternPrefix(value, expanded_pattern, longest);
-            free(value);
-            free(expanded_pattern);
-            return result;
-        }
-        if (cursor != closing) {
-            return NULL;
-        }
-        return shellLookupParameterValue(inner, name_len);
+        return shellExpandBraceParameter(input + 1, stop - 2, in_double, out_is_array_expansion, out_array_count,
+                                         out_map, out_map_len);
     }
 
     if (*input == '$') {
@@ -723,8 +413,12 @@ static char *shellExpandParameter(const char *input,
             *out_consumed = 1;
         }
         size_t array_count = 0;
-        char *joined = shellJoinPositionalParameters(*input == '@', &array_count);
-        if (joined && *input == '@') {
+        if (*input == '*' && in_double) {
+            return shellJoinWithIfs(gParamValues, gParamCount > 0 ? (size_t)gParamCount : 0);
+        }
+        /* Unquoted, $* is $@. */
+        char *joined = shellJoinPositionalParameters(true, &array_count);
+        if (joined) {
             if (out_is_array_expansion) {
                 *out_is_array_expansion = true;
             }
@@ -745,26 +439,30 @@ static char *shellExpandParameter(const char *input,
         return strdup("exsh");
     }
 
-    if (isdigit((unsigned char)*input)) {
-        const char *cursor = input;
-        while (isdigit((unsigned char)*cursor)) {
-            cursor++;
-        }
-        if (out_consumed) {
-            *out_consumed = (size_t)(cursor - input);
-        }
-        return shellLookupParameterValue(input, (size_t)(cursor - input));
-    }
-
+    /* One digit: $10 is $1 and then a 0. */
     size_t name_len = 0;
-    if (consumeShellIdentifier(input, strlen(input), &name_len, false)) {
-        if (out_consumed) {
-            *out_consumed = name_len;
-        }
-        return shellLookupParameterValue(input, name_len);
+    if (isdigit((unsigned char)*input)) {
+        name_len = 1;
+    } else if (!consumeShellIdentifier(input, strlen(input), &name_len, false)) {
+        return NULL;
     }
+    if (out_consumed) {
+        *out_consumed = name_len;
+    }
+    bool is_set = false;
+    char *value = shellLookupParameterValueInternal(input, name_len, &is_set);
+    if (!is_set && gShellRuntime.nounset_enabled && !gShellNounsetSuppressed) {
+        shellReportRecoverableError(gShellCurrentVm, true, "%.*s: unbound variable", (int)name_len, input);
+        shellExpansionFail();
+    }
+    return value;
+}
 
-    return NULL;
+static char *shellExpandParameter(const char *input,
+                                  size_t *out_consumed,
+                                  bool *out_is_array_expansion,
+                                  size_t *out_array_count) {
+    return shellExpandParameterEx(input, false, out_consumed, out_is_array_expansion, out_array_count, NULL, NULL);
 }
 
 static void shellMarkArithmeticError(void) {
@@ -772,504 +470,7 @@ static void shellMarkArithmeticError(void) {
     gShellArithmeticErrorPending = true;
 }
 
-typedef struct {
-    const char *input;
-    size_t length;
-    size_t pos;
-} ShellArithmeticParser;
-
-static void shellArithmeticSkipWhitespace(ShellArithmeticParser *parser) {
-    if (!parser) {
-        return;
-    }
-    while (parser->pos < parser->length &&
-           isspace((unsigned char)parser->input[parser->pos])) {
-        parser->pos++;
-    }
-}
-
-static bool shellArithmeticParseValueString(const char *text, long long *out_value) {
-    if (!out_value) {
-        return false;
-    }
-    if (!text || *text == '\0') {
-        *out_value = 0;
-        return true;
-    }
-    errno = 0;
-    char *endptr = NULL;
-    long long value = strtoll(text, &endptr, 0);
-    if (errno != 0) {
-        return false;
-    }
-    if (endptr && *endptr != '\0') {
-        while (endptr && *endptr && isspace((unsigned char)*endptr)) {
-            endptr++;
-        }
-        if (endptr && *endptr != '\0') {
-            return false;
-        }
-    }
-    *out_value = value;
-    return true;
-}
-
-static bool shellArithmeticParseExpression(ShellArithmeticParser *parser, long long *out_value);
-
-static bool shellArithmeticParsePrimary(ShellArithmeticParser *parser, long long *out_value) {
-    if (!parser || !out_value) {
-        return false;
-    }
-    shellArithmeticSkipWhitespace(parser);
-    if (parser->pos >= parser->length) {
-        return false;
-    }
-    char c = parser->input[parser->pos];
-    if (c == '(') {
-        parser->pos++;
-        if (!shellArithmeticParseExpression(parser, out_value)) {
-            return false;
-        }
-        shellArithmeticSkipWhitespace(parser);
-        if (parser->pos >= parser->length || parser->input[parser->pos] != ')') {
-            return false;
-        }
-        parser->pos++;
-        return true;
-    }
-    if (c == '$') {
-        parser->pos++;
-        size_t consumed = 0;
-        char *value = shellExpandParameter(parser->input + parser->pos,
-                                           &consumed,
-                                           NULL,
-                                           NULL);
-        if (!value) {
-            return false;
-        }
-        parser->pos += consumed;
-        long long parsed = 0;
-        bool ok = shellArithmeticParseValueString(value, &parsed);
-        free(value);
-        if (!ok) {
-            return false;
-        }
-        *out_value = parsed;
-        return true;
-    }
-    size_t name_len = 0;
-    if (consumeShellIdentifier(parser->input + parser->pos,
-                               parser->length - parser->pos,
-                               &name_len,
-                               false)) {
-        size_t start = parser->pos;
-        parser->pos += name_len;
-        char *value = shellLookupParameterValue(parser->input + start, name_len);
-        if (!value) {
-            return false;
-        }
-        long long parsed = 0;
-        bool ok = shellArithmeticParseValueString(value, &parsed);
-        free(value);
-        if (!ok) {
-            return false;
-        }
-        *out_value = parsed;
-        return true;
-    }
-    if (isdigit((unsigned char)c)) {
-        const char *start_ptr = parser->input + parser->pos;
-        errno = 0;
-        char *endptr = NULL;
-        long long value = strtoll(start_ptr, &endptr, 0);
-        if (errno != 0 || endptr == start_ptr) {
-            return false;
-        }
-        size_t consumed = (size_t)(endptr - start_ptr);
-        parser->pos += consumed;
-        if (parser->pos < parser->length) {
-            size_t next_name_len = 0;
-            if (consumeShellIdentifier(parser->input + parser->pos,
-                                       parser->length - parser->pos,
-                                       &next_name_len,
-                                       false)) {
-                return false;
-            }
-        }
-        *out_value = value;
-        return true;
-    }
-    return false;
-}
-
-static bool shellArithmeticParseUnary(ShellArithmeticParser *parser, long long *out_value) {
-    if (!parser || !out_value) {
-        return false;
-    }
-    shellArithmeticSkipWhitespace(parser);
-    if (parser->pos >= parser->length) {
-        return false;
-    }
-    char c = parser->input[parser->pos];
-    if (c == '+') {
-        parser->pos++;
-        return shellArithmeticParseUnary(parser, out_value);
-    }
-    if (c == '-') {
-        parser->pos++;
-        long long value = 0;
-        if (!shellArithmeticParseUnary(parser, &value)) {
-            return false;
-        }
-        *out_value = -value;
-        return true;
-    }
-    return shellArithmeticParsePrimary(parser, out_value);
-}
-
-static bool shellArithmeticParseTerm(ShellArithmeticParser *parser, long long *out_value) {
-    if (!parser || !out_value) {
-        return false;
-    }
-    long long value = 0;
-    if (!shellArithmeticParseUnary(parser, &value)) {
-        return false;
-    }
-    while (true) {
-        shellArithmeticSkipWhitespace(parser);
-        if (parser->pos >= parser->length) {
-            break;
-        }
-        char op = parser->input[parser->pos];
-        if (op != '*' && op != '/' && op != '%') {
-            break;
-        }
-        parser->pos++;
-        long long rhs = 0;
-        if (!shellArithmeticParseUnary(parser, &rhs)) {
-            return false;
-        }
-        if (op == '*') {
-            value *= rhs;
-        } else if (op == '/') {
-            if (rhs == 0) {
-                return false;
-            }
-            value /= rhs;
-        } else {
-            if (rhs == 0) {
-                return false;
-            }
-            value %= rhs;
-        }
-    }
-    *out_value = value;
-    return true;
-}
-
-static bool shellArithmeticParseExpression(ShellArithmeticParser *parser, long long *out_value) {
-    if (!parser || !out_value) {
-        return false;
-    }
-    long long value = 0;
-    if (!shellArithmeticParseTerm(parser, &value)) {
-        return false;
-    }
-    while (true) {
-        shellArithmeticSkipWhitespace(parser);
-        if (parser->pos >= parser->length) {
-            break;
-        }
-        char op = parser->input[parser->pos];
-        if (op != '+' && op != '-') {
-            break;
-        }
-        parser->pos++;
-        long long rhs = 0;
-        if (!shellArithmeticParseTerm(parser, &rhs)) {
-            return false;
-        }
-        if (op == '+') {
-            value += rhs;
-        } else {
-            value -= rhs;
-        }
-    }
-    *out_value = value;
-    return true;
-}
-
-static char *shellLetFindAssignment(char *expr) {
-    if (!expr) {
-        return NULL;
-    }
-
-    bool in_single = false;
-    bool in_double = false;
-    for (char *p = expr; *p; ++p) {
-        if (*p == '\\' && p[1]) {
-            ++p;
-            continue;
-        }
-        if (!in_double && *p == 0x27 /* '\'' */) {
-            in_single = !in_single;
-            continue;
-        }
-        if (!in_single && *p == '"') {
-            in_double = !in_double;
-            continue;
-        }
-        if (in_single || in_double) {
-            continue;
-        }
-        if (*p != '=') {
-            continue;
-        }
-
-        char prev = (p > expr) ? p[-1] : '\0';
-        char next = p[1];
-        if (prev == '=' || prev == '!' || prev == '<' || prev == '>') {
-            continue;
-        }
-        if (next == '=') {
-            continue;
-        }
-        return p;
-    }
-    return NULL;
-}
-
-static char *shellEvaluateArithmetic(const char *expr, bool *out_error) {
-    if (out_error) {
-        *out_error = false;
-    }
-    if (!expr) {
-        if (out_error) {
-            *out_error = true;
-        }
-        return NULL;
-    }
-    ShellArithmeticParser parser;
-    parser.input = expr;
-    parser.length = strlen(expr);
-    parser.pos = 0;
-    long long value = 0;
-    if (!shellArithmeticParseExpression(&parser, &value)) {
-        if (out_error) {
-            *out_error = true;
-        }
-        return NULL;
-    }
-    shellArithmeticSkipWhitespace(&parser);
-    if (parser.pos < parser.length) {
-        if (out_error) {
-            *out_error = true;
-        }
-        return NULL;
-    }
-    char buffer[64];
-    int written = snprintf(buffer, sizeof(buffer), "%lld", value);
-    if (written < 0) {
-        if (out_error) {
-            *out_error = true;
-        }
-        return NULL;
-    }
-    char *result = strdup(buffer);
-    if (!result) {
-        if (out_error) {
-            *out_error = true;
-        }
-        return NULL;
-    }
-    return result;
-}
-
-static bool shellLetEvaluateExpression(VM *vm, const char *text, long long *out_value) {
-    if (!text) {
-        runtimeError(vm, "let: expected expression");
-        shellMarkArithmeticError();
-        return false;
-    }
-
-    char *copy = strdup(text);
-    if (!copy) {
-        runtimeError(vm, "let: out of memory");
-        shellMarkArithmeticError();
-        return false;
-    }
-
-    char *start = copy;
-    while (*start && isspace((unsigned char)*start)) {
-        start++;
-    }
-    char *end = start + strlen(start);
-    while (end > start && isspace((unsigned char)end[-1])) {
-        end--;
-    }
-    *end = '\0';
-
-    if (*start == '\0') {
-        runtimeError(vm, "let: expected expression");
-        shellMarkArithmeticError();
-        free(copy);
-        return false;
-    }
-
-    char *eq = shellLetFindAssignment(start);
-    if (!eq) {
-        bool eval_error = false;
-        char *result = shellEvaluateArithmetic(start, &eval_error);
-        if (!result || eval_error) {
-            runtimeError(vm, "let: arithmetic syntax error: \"%s\"", text);
-            shellMarkArithmeticError();
-            free(result);
-            free(copy);
-            return false;
-        }
-        long long value = 0;
-        bool ok = shellArithmeticParseValueString(result, &value);
-        free(result);
-        if (!ok) {
-            runtimeError(vm, "let: arithmetic syntax error: \"%s\"", text);
-            shellMarkArithmeticError();
-            free(copy);
-            return false;
-        }
-        if (out_value) {
-            *out_value = value;
-        }
-        free(copy);
-        return true;
-    }
-    char *rhs = eq + 1;
-    while (*rhs && isspace((unsigned char)*rhs)) {
-        rhs++;
-    }
-    if (*rhs == '\0') {
-        runtimeError(vm, "let: arithmetic syntax error: \"%s\"", text);
-        shellMarkArithmeticError();
-        free(copy);
-        return false;
-    }
-
-    bool eval_error = false;
-    char *rhs_result = shellEvaluateArithmetic(rhs, &eval_error);
-    if (!rhs_result || eval_error) {
-        runtimeError(vm, "let: arithmetic syntax error: \"%s\"", text);
-        shellMarkArithmeticError();
-        free(rhs_result);
-        free(copy);
-        return false;
-    }
-    long long rhs_value = 0;
-    bool rhs_ok = shellArithmeticParseValueString(rhs_result, &rhs_value);
-    free(rhs_result);
-    if (!rhs_ok) {
-        runtimeError(vm, "let: arithmetic syntax error: \"%s\"", text);
-        shellMarkArithmeticError();
-        free(copy);
-        return false;
-    }
-
-    char *lhs_end = eq;
-    while (lhs_end > start && isspace((unsigned char)lhs_end[-1])) {
-        lhs_end--;
-    }
-
-    char op = '\0';
-    if (lhs_end > start) {
-        char candidate = lhs_end[-1];
-        if (candidate == '+' || candidate == '-' || candidate == '*' || candidate == '/' || candidate == '%') {
-            op = candidate;
-            lhs_end--;
-            while (lhs_end > start && isspace((unsigned char)lhs_end[-1])) {
-                lhs_end--;
-            }
-        }
-    }
-
-    lhs_end[0] = '\0';
-    char *name = start;
-    while (*name && isspace((unsigned char)*name)) {
-        name++;
-    }
-    if (*name == '\0') {
-        runtimeError(vm, "let: expected identifier");
-        shellMarkArithmeticError();
-        free(copy);
-        return false;
-    }
-    if (!shellIsValidEnvName(name)) {
-        runtimeError(vm, "let: %s: invalid identifier", name);
-        shellMarkArithmeticError();
-        free(copy);
-        return false;
-    }
-
-    long long new_value = rhs_value;
-    if (op != '\0') {
-        char *current_text = shellLookupParameterValue(name, strlen(name));
-        long long current_value = 0;
-        bool current_ok = shellArithmeticParseValueString(current_text, &current_value);
-        free(current_text);
-        if (!current_ok) {
-            runtimeError(vm, "let: %s: invalid numeric value", name);
-            shellMarkArithmeticError();
-            free(copy);
-            return false;
-        }
-        switch (op) {
-            case '+':
-                new_value = current_value + rhs_value;
-                break;
-            case '-':
-                new_value = current_value - rhs_value;
-                break;
-            case '*':
-                new_value = current_value * rhs_value;
-                break;
-            case '/':
-                if (rhs_value == 0) {
-                    runtimeError(vm, "let: division by zero");
-                    shellMarkArithmeticError();
-                    free(copy);
-                    return false;
-                }
-                new_value = current_value / rhs_value;
-                break;
-            case '%':
-                if (rhs_value == 0) {
-                    runtimeError(vm, "let: division by zero");
-                    shellMarkArithmeticError();
-                    free(copy);
-                    return false;
-                }
-                new_value = current_value % rhs_value;
-                break;
-            default:
-                runtimeError(vm, "let: unsupported assignment");
-                shellMarkArithmeticError();
-                free(copy);
-                return false;
-        }
-    }
-
-    char buffer[64];
-    snprintf(buffer, sizeof(buffer), "%lld", new_value);
-    if (!shellSetTrackedVariable(name, buffer, false)) {
-        runtimeError(vm, "let: failed to assign %s", name);
-        shellMarkArithmeticError();
-        free(copy);
-        return false;
-    }
-
-    if (out_value) {
-        *out_value = new_value;
-    }
-    free(copy);
-    return true;
-}
+#include "shell_arithmetic.inc"
 
 static char *shellExpandWord(const char *text,
                              uint8_t flags,
@@ -1322,13 +523,23 @@ static char *shellExpandWord(const char *text,
     bool in_double_segment = false;
     bool saw_single_marker = false;
     bool saw_double_marker = false;
-    bool has_arithmetic = (flags & SHELL_WORD_FLAG_HAS_ARITHMETIC) != 0;
     size_t sub_index = 0;
+    bool here_document = (flags & SHELL_WORD_FLAG_HERE_DOCUMENT) != 0;
+    bool assignment_word = (flags & SHELL_WORD_FLAG_ASSIGNMENT) != 0;
+    const char *first_eq = assignment_word ? strchr(text, '=') : NULL;
 
     bool saw_empty_array_expansion = false;
 
     for (size_t i = 0; i < text_len;) {
         char c = text[i];
+        if (c == SHELL_QUOTE_MARK_BYTE && i + 1 < text_len) {
+            if (!shellQuotedMapAppendRepeated(track_quotes, &quoted_map, &quoted_len, &quoted_cap, true, 1)) {
+                goto expand_error;
+            }
+            shellBufferAppendChar(&buffer, &length, &capacity, text[i + 1]);
+            i += 2;
+            continue;
+        }
         if (c == SHELL_QUOTE_MARK_SINGLE) {
             saw_single_marker = true;
             in_single_segment = !in_single_segment;
@@ -1353,6 +564,79 @@ static char *shellExpandWord(const char *text,
             shellBufferAppendChar(&buffer, &length, &capacity, c);
             i++;
             continue;
+        }
+
+        if (c == '~' && !quoted_flag && !here_document &&
+            (i == 0 || (first_eq && text + i > first_eq && (text[i - 1] == ':' || text + i - 1 == first_eq)))) {
+            size_t consumed = 0;
+            char *home = shellTildeExpansion(text + i, text_len - i, first_eq != NULL, &consumed);
+            if (home) {
+                /* Whatever it holds is not split or matched again. */
+                if (!shellQuotedMapAppendRepeated(track_quotes, &quoted_map, &quoted_len, &quoted_cap, true,
+                                                  strlen(home))) {
+                    free(home);
+                    goto expand_error;
+                }
+                shellBufferAppendString(&buffer, &length, &capacity, home);
+                free(home);
+                i += consumed;
+                continue;
+            }
+        }
+
+        if ((c == '<' || c == '>') && i + 1 < text_len && text[i + 1] == '(' && !quoted_flag && !here_document &&
+            !gShellProcSubDisabled) {
+            size_t stop = shellScanDollarParen(text, text_len, i + 2);
+            if (stop != SHELL_SCAN_UNTERMINATED) {
+                char *command = shellNormalizeDollarCommandInline(text + i + 2, stop - i - 3);
+                char *path = command ? shellProcessSubstitution(c, command) : NULL;
+                free(command);
+                if (path) {
+                    if (!shellQuotedMapAppendRepeated(track_quotes, &quoted_map, &quoted_len, &quoted_cap, true,
+                                                      strlen(path))) {
+                        free(path);
+                        goto expand_error;
+                    }
+                    shellBufferAppendString(&buffer, &length, &capacity, path);
+                    free(path);
+                }
+                i = stop;
+                continue;
+            }
+        }
+
+        if (c == '$' && i + 2 < text_len && text[i + 1] == '(' && text[i + 2] == '(') {
+            size_t stop = shellScanArithmetic(text, text_len, i + 3);
+            if (stop != SHELL_SCAN_UNTERMINATED) {
+                size_t expr_len = stop - 2 - (i + 3);
+                char *expr = (char *)malloc(expr_len + 1);
+                if (!expr) {
+                    goto expand_error;
+                }
+                memcpy(expr, text + i + 3, expr_len);
+                expr[expr_len] = '\0';
+                long long value = 0;
+                char error[256];
+                if (!shellArithmeticEvaluate(expr, &value, error, sizeof(error))) {
+                    if (!gShellExpansionFailed) {
+                        shellReportRecoverableError(gShellCurrentVm, true, "%s: %s", expr, error);
+                        shellExpansionFail();
+                    }
+                    free(expr);
+                    i = text_len;
+                    continue;
+                }
+                free(expr);
+                char result[32];
+                snprintf(result, sizeof(result), "%lld", value);
+                if (!shellQuotedMapAppendRepeated(track_quotes, &quoted_map, &quoted_len, &quoted_cap, quoted_flag,
+                                                  strlen(result))) {
+                    goto expand_error;
+                }
+                shellBufferAppendString(&buffer, &length, &capacity, result);
+                i = stop;
+                continue;
+            }
         }
 
         bool handled = false;
@@ -1403,8 +687,7 @@ static char *shellExpandWord(const char *text,
             continue;
         }
 
-        if (sub_count == 0 && c == '$' && i + 1 < text_len && text[i + 1] == '(' &&
-            !(i + 2 < text_len && text[i + 2] == '(')) {
+        if (sub_count == 0 && c == '$' && i + 1 < text_len && text[i + 1] == '(') {
             size_t span = 0;
             char *command = NULL;
             if (shellParseInlineDollarCommand(text, i, text_len, &span, &command)) {
@@ -1445,77 +728,6 @@ static char *shellExpandWord(const char *text,
             }
         }
 
-        if (c == '$' && has_arithmetic && i + 2 < text_len && text[i + 1] == '(' && text[i + 2] == '(') {
-            size_t expr_start = i + 3;
-            size_t j = expr_start;
-            int depth = 1;
-            while (j < text_len) {
-                char inner = text[j];
-                if (inner == '(') {
-                    depth++;
-                } else if (inner == ')') {
-                    depth--;
-                    if (depth == 0) {
-                        break;
-                    }
-                }
-                j++;
-            }
-            size_t span = 0;
-            if (depth == 0 && j + 1 < text_len && text[j + 1] == ')') {
-                span = (j + 2) - i;
-                size_t expr_len = j - expr_start;
-                char *expr = (char *)malloc(expr_len + 1);
-                if (!expr) {
-                    shellMarkArithmeticError();
-                    if (!shellQuotedMapAppendRepeated(track_quotes, &quoted_map, &quoted_len, &quoted_cap,
-                                                      quoted_flag, span)) {
-                        goto expand_error;
-                    }
-                    shellBufferAppendSlice(&buffer, &length, &capacity, text + i, span);
-                    i += span;
-                    continue;
-                }
-                if (expr_len > 0) {
-                    memcpy(expr, text + expr_start, expr_len);
-                }
-                expr[expr_len] = '\0';
-                bool eval_error = false;
-                char *result = shellEvaluateArithmetic(expr, &eval_error);
-                free(expr);
-                if (!eval_error && result) {
-                    size_t out_len = strlen(result);
-                    if (!shellQuotedMapAppendRepeated(track_quotes, &quoted_map, &quoted_len, &quoted_cap,
-                                                      quoted_flag, out_len)) {
-                        free(result);
-                        goto expand_error;
-                    }
-                    shellBufferAppendString(&buffer, &length, &capacity, result);
-                    free(result);
-                } else {
-                    shellMarkArithmeticError();
-                    if (!shellQuotedMapAppendRepeated(track_quotes, &quoted_map, &quoted_len, &quoted_cap,
-                                                      quoted_flag, span)) {
-                        goto expand_error;
-                    }
-                    shellBufferAppendSlice(&buffer, &length, &capacity, text + i, span);
-                }
-                i += span;
-                continue;
-            } else {
-                span = text_len - i;
-                shellMarkArithmeticError();
-                if (!shellQuotedMapAppendRepeated(track_quotes, &quoted_map, &quoted_len, &quoted_cap,
-                                                  quoted_flag, span)) {
-                    goto expand_error;
-                }
-                shellBufferAppendSlice(&buffer, &length, &capacity, text + i, span);
-                i = text_len;
-                continue;
-            }
-        }
-
-        bool here_document = (flags & SHELL_WORD_FLAG_HERE_DOCUMENT) != 0;
         bool treat_as_double = effective_double || here_document;
         if (c == '\\') {
             if (i + 1 < text_len) {
@@ -1548,23 +760,42 @@ static char *shellExpandWord(const char *text,
             size_t consumed = 0;
             bool array_like = false;
             size_t array_count = 0;
-            char *expanded = shellExpandParameter(text + i + 1,
-                                                 &consumed,
-                                                 &array_like,
-                                                 &array_count);
+            bool *inner_map = NULL;
+            size_t inner_map_len = 0;
+            char *expanded = shellExpandParameterEx(text + i + 1,
+                                                    quoted_flag || here_document,
+                                                    &consumed,
+                                                    &array_like,
+                                                    &array_count,
+                                                    track_quotes ? &inner_map : NULL,
+                                                    track_quotes ? &inner_map_len : NULL);
             if (expanded) {
                 size_t out_len = strlen(expanded);
                 if (array_like && array_count == 0) {
                     saw_empty_array_expansion = true;
                 }
-                if (!shellQuotedMapAppendRepeated(track_quotes, &quoted_map, &quoted_len, &quoted_cap,
-                                                  quoted_flag, out_len)) {
+                /* ${x:-"a b"}: the quotes inside the word count. */
+                bool appended = true;
+                if (inner_map && inner_map_len == out_len) {
+                    for (size_t k = 0; k < out_len && appended; ++k) {
+                        appended = shellQuotedMapAppendRepeated(track_quotes, &quoted_map, &quoted_len, &quoted_cap,
+                                                                quoted_flag || inner_map[k], 1);
+                    }
+                } else {
+                    appended = shellQuotedMapAppendRepeated(track_quotes, &quoted_map, &quoted_len, &quoted_cap,
+                                                            quoted_flag, out_len);
+                }
+                free(inner_map);
+                if (!appended) {
                     free(expanded);
                     goto expand_error;
                 }
                 shellBufferAppendString(&buffer, &length, &capacity, expanded);
                 free(expanded);
                 i += consumed + 1;
+                if (gShellExpansionFailed) {
+                    i = text_len;
+                }
                 continue;
             }
         }
@@ -2751,12 +1982,39 @@ static bool shellInvokeFunction(VM *vm, ShellCommand *cmd) {
     }
     frame_pushed = true;
 
+    /* Innermost first, in the order FUNCNAME shows them. */
+    bool name_pushed = false;
+    if (gShellFunctionNameCount == gShellFunctionNameCapacity) {
+        size_t capacity = gShellFunctionNameCapacity ? gShellFunctionNameCapacity * 2 : 8;
+        char **grown = (char **)realloc(gShellFunctionNames, capacity * sizeof(char *));
+        if (grown) {
+            gShellFunctionNames = grown;
+            gShellFunctionNameCapacity = capacity;
+        }
+    }
+    if (gShellFunctionNameCount < gShellFunctionNameCapacity) {
+        memmove(gShellFunctionNames + 1, gShellFunctionNames, gShellFunctionNameCount * sizeof(char *));
+        gShellFunctionNames[0] = (char *)name;
+        gShellFunctionNameCount++;
+        name_pushed = true;
+    }
+
     result = interpretBytecode(invoke_vm, &compiled->chunk,
                                globalSymbols, constGlobalSymbols, procedure_table, 0);
+    gShellReturnPending = false;
     if (result != INTERPRET_OK && !gShellExitRequested) {
         shellUpdateStatus(1);
     } else {
         shellUpdateStatus(shellRuntimeLastStatus());
+    }
+    if (gShellReturnTrap.action == SHELL_TRAP_ACTION_COMMAND) {
+        int status_after = shellRuntimeLastStatus();
+        shellRuntimeRunReturnTrap();
+        shellUpdateStatus(status_after);
+    }
+    if (name_pushed) {
+        gShellFunctionNameCount--;
+        memmove(gShellFunctionNames, gShellFunctionNames + 1, gShellFunctionNameCount * sizeof(char *));
     }
     if (gShellExitRequested && vm) {
         /* `exit` ended this chunk. It ends the one that called the function too. */
@@ -2826,6 +2084,9 @@ static void shellSubshellResetState(pid_t dollar_pid) {
     if (gShellExitTrap.action == SHELL_TRAP_ACTION_COMMAND) {
         shellTrapClearEntry(&gShellExitTrap);
     }
+    shellTrapClearEntry(&gShellErrTrap);
+    shellTrapClearEntry(&gShellDebugTrap);
+    shellTrapClearEntry(&gShellReturnTrap);
     memset((void *)gShellPendingSignals, 0, sizeof(gShellPendingSignals));
     gShellRuntime.in_subshell = true;
 #if defined(PSCAL_TARGET_IOS)
@@ -2889,6 +2150,61 @@ static ShellBodyState *shellBodyStateCapture(void) {
     state->dollar_pid = shellRuntimeDollarPid();
     return state;
 }
+
+typedef struct {
+    ShellRuntimeState *previous_ctx;
+    VProcEnv *previous_env;
+    int previous_subshell_pid;
+    char **saved_params;
+    int saved_param_count;
+    bool saved_params_owned;
+    mode_t saved_umask;
+} ShellBodyScope;
+
+static void shellBodyScopeEnter(ShellBodyState *state, ShellBodyScope *scope) {
+    memset(scope, 0, sizeof(*scope));
+    scope->previous_subshell_pid = vprocSubshellPid();
+    scope->saved_params = gParamValues;
+    scope->saved_param_count = gParamCount;
+    scope->saved_params_owned = gShellPositionalOwned;
+    scope->saved_umask = umask(0);
+    umask(scope->saved_umask);
+    if (!state) {
+        return;
+    }
+    scope->previous_ctx = shellRuntimeActivateContext(state->ctx);
+    shellSubshellResetState(state->dollar_pid);
+    scope->previous_env = vprocEnvActivate(state->env);
+    VProc *self = vprocCurrent();
+    if (self) {
+        vprocSetSubshellPid(vprocPid(self));
+    }
+    if (state->cwd[0]) {
+        (void)vprocChdirShim(state->cwd);
+    }
+    gParamValues = state->params;
+    gParamCount = state->param_count;
+    gShellPositionalOwned = (state->params != NULL);
+    state->params = NULL;
+    (void)vprocConsumeClosedPipe();
+}
+
+static void shellBodyScopeLeave(ShellBodyState *state, const ShellBodyScope *scope) {
+    if (!state) {
+        return;
+    }
+    if (gShellPositionalOwned) {
+        shellFreeOwnedPositionalParameters();
+    }
+    gParamValues = scope->saved_params;
+    gParamCount = scope->saved_param_count;
+    gShellPositionalOwned = scope->saved_params_owned;
+    vprocEnvActivate(scope->previous_env);
+    vprocSetSubshellPid(scope->previous_subshell_pid);
+    shellRuntimeActivateContext(scope->previous_ctx);
+    shellBodyStateFree(state);
+    umask(scope->saved_umask);
+}
 #endif
 
 /* A compound command run apart from the shell. On a host this is a forked child, which
@@ -2906,31 +2222,10 @@ static bool shellRunBody(VM *vm, ShellCommand *cmd) {
 #if defined(PSCAL_TARGET_IOS)
     ShellBodyState *state = cmd->body_state;
     cmd->body_state = NULL;
-    ShellRuntimeState *previous_ctx = NULL;
-    VProcEnv *previous_env = NULL;
-    int previous_subshell_pid = vprocSubshellPid();
-    char **saved_params = gParamValues;
-    int saved_param_count = gParamCount;
-    bool saved_params_owned = gShellPositionalOwned;
-    mode_t saved_umask = umask(0);
-    umask(saved_umask);
+    ShellBodyScope scope;
+    shellBodyScopeEnter(state, &scope);
     if (state) {
-        previous_ctx = shellRuntimeActivateContext(state->ctx);
-        shellSubshellResetState(state->dollar_pid);
         body_vm->frontendContext = state->ctx;
-        previous_env = vprocEnvActivate(state->env);
-        VProc *self = vprocCurrent();
-        if (self) {
-            vprocSetSubshellPid(vprocPid(self));
-        }
-        if (state->cwd[0]) {
-            (void)vprocChdirShim(state->cwd);
-        }
-        gParamValues = state->params;
-        gParamCount = state->param_count;
-        gShellPositionalOwned = (state->params != NULL);
-        state->params = NULL;
-        (void)vprocConsumeClosedPipe();
     }
 #endif
     size_t redirect_scope_depth = shellRuntimeRedirectScopeDepth();
@@ -2946,23 +2241,56 @@ static bool shellRunBody(VM *vm, ShellCommand *cmd) {
     freeVM(body_vm);
     free(body_vm);
 #if defined(PSCAL_TARGET_IOS)
-    if (state) {
-        if (gShellPositionalOwned) {
-            shellFreeOwnedPositionalParameters();
-        }
-        gParamValues = saved_params;
-        gParamCount = saved_param_count;
-        gShellPositionalOwned = saved_params_owned;
-        vprocEnvActivate(previous_env);
-        vprocSetSubshellPid(previous_subshell_pid);
-        shellRuntimeActivateContext(previous_ctx);
-        shellBodyStateFree(state);
-        umask(saved_umask);
-    }
+    shellBodyScopeLeave(state, &scope);
 #endif
     shellUpdateStatus(status);
     return true;
 }
+
+#if defined(PSCAL_TARGET_IOS)
+static bool shellInvokeBuiltin(VM *vm, ShellCommand *cmd);
+
+/* A function, eval or source as a stage runs apart too, as a process would under bash. The
+ * stage's thread shares the shell's context, so the commands inside would count as stages
+ * of the pipeline it is in: `echo a | f` lost f's output. */
+static bool shellStageRunsShellCode(const ShellCommand *cmd) {
+    if (!cmd || cmd->body || cmd->argc == 0 || !cmd->argv || !cmd->argv[0]) {
+        return false;
+    }
+    const char *name = cmd->argv[0];
+    if (!cmd->ignore_functions && shellFindCompiledFunction(name)) {
+        return true;
+    }
+    return strcmp(name, "eval") == 0 || strcmp(name, "source") == 0 || strcmp(name, ".") == 0;
+}
+
+static bool shellRunShellCodeStage(VM *vm, ShellCommand *cmd) {
+    VM *stage_vm = (VM *)malloc(sizeof(VM));
+    if (!stage_vm) {
+        runtimeError(vm, "subshell: out of memory");
+        shellUpdateStatus(1);
+        return true;
+    }
+    initVM(stage_vm);
+    ShellBodyState *state = cmd->body_state;
+    cmd->body_state = NULL;
+    stage_vm->frontendContext = state->ctx;
+    ShellBodyScope scope;
+    shellBodyScopeEnter(state, &scope);
+    bool ran = shellInvokeBuiltin(stage_vm, cmd);
+    (void)shellRuntimeConsumeExitRequested();
+    int status = shellRuntimeLastStatus();
+    shellRuntimeRunExitTrap();
+    if (shellRuntimeConsumeExitRequested()) {
+        status = shellRuntimeLastStatus();
+    }
+    freeVM(stage_vm);
+    free(stage_vm);
+    shellBodyScopeLeave(state, &scope);
+    shellUpdateStatus(status);
+    return ran;
+}
+#endif
 
 static bool shellInvokeBuiltin(VM *vm, ShellCommand *cmd) {
     if (!cmd || cmd->argc == 0 || !cmd->argv[0] || *cmd->argv[0] == '\0') {
@@ -2971,6 +2299,11 @@ static bool shellInvokeBuiltin(VM *vm, ShellCommand *cmd) {
     if (cmd->body) {
         return shellRunBody(vm, cmd);
     }
+#if defined(PSCAL_TARGET_IOS)
+    if (cmd->body_state) {
+        return shellRunShellCodeStage(vm, cmd);
+    }
+#endif
     const char *name_raw = cmd->argv[0];
     if (!cmd->ignore_functions && shellFindCompiledFunction(name_raw)) {
         ShellExecRedirBackup *redir_backups = NULL;
@@ -3690,6 +3023,10 @@ static int shellCollectJobs(void) {
         if (all_done) {
             /* Its status is for `wait`. A job finishing is no command the script ran, so
              * it leaves $? and set -e alone. */
+            ShellRuntimeState *ctx = shellGetContext();
+            if (ctx && ctx->finished_job_count < sizeof(ctx->finished_job_statuses) / sizeof(int)) {
+                ctx->finished_job_statuses[ctx->finished_job_count++] = job->last_status;
+            }
             shellRemoveJobAt(i);
             reaped++;
             continue;
@@ -3915,6 +3252,416 @@ static void shellParseMetadata(const char *meta, ShellCommand *cmd) {
     free(copy);
 }
 
+/* One word's fields: brace expansion, the expansions, splitting and globbing. */
+static bool shellExpandWordFields(const char *text,
+                                  uint8_t flags,
+                                  const char *meta,
+                                  size_t meta_len,
+                                  bool allow_braces,
+                                  ShellStringArray *out) {
+    if (allow_braces) {
+        ShellStringArray pieces = (ShellStringArray){0};
+        if (shellBraceExpandWord(text, &pieces)) {
+            bool ok = true;
+            for (size_t i = 0; i < pieces.count && ok; ++i) {
+                ok = shellExpandWordFields(pieces.items[i], flags, NULL, 0, false, out);
+            }
+            shellStringArrayFree(&pieces);
+            return ok;
+        }
+    }
+    bool *quoted_map = NULL;
+    size_t quoted_len = 0;
+    bool zero_array = false;
+    char *expanded = shellExpandWord(text, flags, meta, meta_len, &quoted_map, &quoted_len, &zero_array);
+    if (!expanded) {
+        return false;
+    }
+    if (quoted_map && !shellMarkQuotedGlobChars(&expanded, &quoted_map, &quoted_len)) {
+        free(expanded);
+        free(quoted_map);
+        return false;
+    }
+    char **fields = NULL;
+    size_t field_count = 0;
+    bool split = shellSplitExpandedWord(expanded, flags, quoted_map, quoted_len, zero_array, &fields, &field_count);
+    /* a=("" x): quotes make a field even with nothing in them. */
+    if (split && field_count == 0 && !zero_array && !expanded[0] &&
+        (strchr(text, SHELL_QUOTE_MARK_SINGLE) || strchr(text, SHELL_QUOTE_MARK_DOUBLE))) {
+        fields = (char **)calloc(1, sizeof(char *));
+        if (fields) {
+            fields[0] = strdup("");
+            field_count = 1;
+        }
+    }
+    free(expanded);
+    free(quoted_map);
+    if (!split) {
+        return false;
+    }
+    bool ok = true;
+    for (size_t i = 0; i < field_count; ++i) {
+        char *field = fields[i];
+        fields[i] = NULL;
+        if (!field) {
+            continue;
+        }
+        if (!ok) {
+            free(field);
+            continue;
+        }
+        bool appended = false;
+        if (!gShellRuntime.noglob_enabled && shellWordShouldGlob(flags, field)) {
+            char **glob_matches = NULL;
+            size_t glob_count = 0;
+            char *glob_pattern = shellGlobPatternFromField(field);
+            int glob_status = glob_pattern ? shellExpandGlobWithOptions(glob_pattern, &glob_matches, &glob_count)
+                                           : GLOB_NOSPACE;
+            free(glob_pattern);
+            if (glob_status == 0) {
+                for (size_t g = 0; g < glob_count; ++g) {
+                    char *match = glob_matches[g];
+                    glob_matches[g] = NULL;
+                    if (!ok || !match || !shellStringArrayAppend(out, match)) {
+                        free(match);
+                        ok = false;
+                    }
+                }
+                free(glob_matches);
+                appended = true;
+            } else if (glob_status == GLOB_NOMATCH && shellShoptOptionEnabled("failglob")) {
+                shellStripGlobMarks(field);
+                shellReportRecoverableError(gShellCurrentVm, true, "no match: %s", field);
+                shellExpansionFail();
+                appended = true;
+            } else if (glob_status == GLOB_NOMATCH && shellShoptOptionEnabled("nullglob")) {
+                appended = true;
+            } else if (glob_status != GLOB_NOMATCH) {
+                fprintf(stderr, "exsh: glob failed for '%s'\n", field);
+            }
+        }
+        if (appended) {
+            free(field);
+        } else {
+            shellStripGlobMarks(field);
+            if (!shellStringArrayAppend(out, field)) {
+                free(field);
+                ok = false;
+            }
+        }
+    }
+    free(fields);
+    return ok;
+}
+
+/* Bash's arrays keep each element's quoting: a=("b c" d) has two. The word is one piece
+ * of raw text with its markers, so split it into elements here, expand each as a word of
+ * its own, and hand back the literal the array parser reads. */
+static char *shellExpandArrayLiteralAssignment(const char *text, uint8_t flags, bool mark_literal) {
+    const char *eq = strchr(text, '=');
+    const char *open = eq ? strchr(eq, '(') : NULL;
+    const char *close = text + strlen(text);
+    while (close > text && close[-1] != ')') {
+        close--;
+    }
+    if (!open || close <= open + 1) {
+        return NULL;
+    }
+    close--;
+    bool append = eq > text && eq[-1] == '+';
+    size_t name_len = (size_t)(eq - text) - (append ? 1 : 0);
+    const ShellArrayVariable *existing = shellArrayRegistryLookup(text, name_len);
+    bool existing_associative = existing && existing->kind == SHELL_ARRAY_KIND_ASSOCIATIVE;
+    uint8_t element_flags = flags & (uint8_t)~SHELL_WORD_FLAG_ASSIGNMENT;
+    element_flags &= (uint8_t)~(SHELL_WORD_FLAG_SINGLE_QUOTED | SHELL_WORD_FLAG_DOUBLE_QUOTED);
+
+    ShellStringArray keys = (ShellStringArray){0};
+    ShellStringArray values = (ShellStringArray){0};
+    bool any_key = false;
+    bool ok = true;
+    if (append && existing) {
+        for (size_t i = 0; i < existing->count && ok; ++i) {
+            char buffer[32];
+            snprintf(buffer, sizeof(buffer), "%zu", i);
+            ok = shellStringArrayAppend(&keys, strdup((existing->keys && existing->keys[i]) ? existing->keys[i] : buffer)) &&
+                 shellStringArrayAppend(&values, strdup(existing->values[i] ? existing->values[i] : ""));
+        }
+        any_key = existing_associative;
+    } else if (append) {
+        bool is_set = false;
+        char *scalar = shellLookupParameterValueInternal(text, name_len, &is_set);
+        if (is_set && scalar) {
+            ok = shellStringArrayAppend(&keys, strdup("0")) && shellStringArrayAppend(&values, strdup(scalar));
+        }
+        free(scalar);
+    }
+    /* Appending goes after the highest index. */
+    long long next_index = (long long)values.count;
+    if (append && existing && existing->sparse) {
+        next_index = 0;
+        for (size_t i = 0; i < keys.count; ++i) {
+            long long index = strtoll(keys.items[i], NULL, 10);
+            if (index >= next_index) {
+                next_index = index + 1;
+            }
+        }
+    }
+
+    size_t body_len = (size_t)(close - open - 1);
+    const char *body = open + 1;
+    size_t pos = 0;
+    while (ok && pos < body_len) {
+        char c = body[pos];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            pos++;
+            continue;
+        }
+        size_t start = pos;
+        bool in_single = false;
+        bool in_double = false;
+        while (pos < body_len) {
+            c = body[pos];
+            if (!in_single && !in_double && (c == ' ' || c == '\t' || c == '\n' || c == '\r')) {
+                break;
+            }
+            pos = shellBraceSkip(body, body_len, pos, &in_single, &in_double);
+        }
+        size_t element_len = pos - start;
+        const char *element = body + start;
+        /* [key]=value */
+        size_t key_end = 0;
+        if (element[0] == '[') {
+            bool skip_single = false;
+            bool skip_double = false;
+            size_t k = 1;
+            while (k < element_len) {
+                if (element[k] == ']' && !skip_single && !skip_double) {
+                    if (k + 1 < element_len && element[k + 1] == '=') {
+                        key_end = k;
+                    }
+                    break;
+                }
+                k = shellBraceSkip(element, element_len, k, &skip_single, &skip_double);
+            }
+        }
+        char *copy = (char *)malloc(element_len + 1);
+        if (!copy) {
+            ok = false;
+            break;
+        }
+        memcpy(copy, element, element_len);
+        copy[element_len] = '\0';
+        if (key_end > 0) {
+            copy[key_end] = '\0';
+            char *key = shellExpandWord(copy + 1, element_flags, NULL, 0, NULL, NULL, NULL);
+            char *value = shellExpandWord(copy + key_end + 2, element_flags, NULL, 0, NULL, NULL, NULL);
+            if (key && value) {
+                shellFlattenArraySeparators(key);
+                shellFlattenArraySeparators(value);
+                char *end = NULL;
+                long long index = strtoll(key, &end, 10);
+                if (end && *end == '\0' && end != key && !existing_associative) {
+                    next_index = index + 1;
+                }
+                any_key = true;
+                ok = shellStringArrayAppend(&keys, key) && shellStringArrayAppend(&values, value);
+            } else {
+                free(key);
+                free(value);
+                ok = false;
+            }
+        } else {
+            ShellStringArray fields = (ShellStringArray){0};
+            ok = shellExpandWordFields(copy, element_flags, NULL, 0, true, &fields);
+            for (size_t i = 0; i < fields.count && ok; ++i) {
+                char buffer[32];
+                snprintf(buffer, sizeof(buffer), "%lld", next_index++);
+                ok = shellStringArrayAppend(&keys, strdup(buffer)) && shellStringArrayAppend(&values, fields.items[i]);
+                fields.items[i] = NULL;
+            }
+            shellStringArrayFree(&fields);
+        }
+        free(copy);
+    }
+
+    /* Keys 0, 1, 2... are a plain list. Anything else keeps its keys, which is how a
+     * sparse array holds together in a registry that has no gaps. */
+    bool dense = !existing_associative;
+    for (size_t i = 0; i < keys.count && dense; ++i) {
+        char buffer[32];
+        snprintf(buffer, sizeof(buffer), "%zu", i);
+        dense = strcmp(keys.items[i], buffer) == 0;
+    }
+    (void)any_key;
+
+    char *out = NULL;
+    size_t length = 0;
+    size_t capacity = 0;
+    if (ok) {
+        shellBufferAppendSlice(&out, &length, &capacity, text, name_len);
+        shellBufferAppendChar(&out, &length, &capacity, '=');
+        if (mark_literal) {
+            shellBufferAppendChar(&out, &length, &capacity, SHELL_ARRAY_LITERAL_MARK);
+        }
+        shellBufferAppendChar(&out, &length, &capacity, '(');
+        for (size_t i = 0; i < values.count; ++i) {
+            if (i > 0) {
+                shellBufferAppendChar(&out, &length, &capacity, ' ');
+            }
+            if (!dense) {
+                shellBufferAppendChar(&out, &length, &capacity, '[');
+                shellBufferAppendQuoted(&out, &length, &capacity, keys.items[i]);
+                shellBufferAppendString(&out, &length, &capacity, "]=");
+            }
+            shellBufferAppendQuoted(&out, &length, &capacity, values.items[i]);
+        }
+        shellBufferAppendChar(&out, &length, &capacity, ')');
+    }
+    shellStringArrayFree(&keys);
+    shellStringArrayFree(&values);
+    return out;
+}
+
+/* x+=y as the x=... it comes to. The array forms are handled before this. */
+static bool shellResolveAppendAssignment(char **assignment) {
+    char *text = *assignment;
+    char *eq = strchr(text, '=');
+    if (!eq || eq == text || eq[-1] != '+') {
+        return true;
+    }
+    size_t full_len = (size_t)(eq - 1 - text);
+    size_t name_len = 0;
+    size_t consumed = 0;
+    const char *subscript = NULL;
+    size_t subscript_len = 0;
+    if (!shellParamParseName(text, full_len, &name_len, &subscript, &subscript_len, &consumed) ||
+        consumed != full_len) {
+        return true;
+    }
+    ShellParamSubject subject;
+    if (!shellParamLoadSubject(text, name_len, subscript, subscript_len, &subject)) {
+        return false;
+    }
+    const char *value = eq + 1;
+    const char *old_value = (subject.value && subject.is_set) ? subject.value : "";
+    char *name = strndup(text, name_len);
+    char *out = NULL;
+    size_t length = 0;
+    size_t capacity = 0;
+    shellBufferAppendSlice(&out, &length, &capacity, text, full_len);
+    shellBufferAppendChar(&out, &length, &capacity, '=');
+    if (name && shellVariableHasAttribute(name, SHELL_VAR_ATTR_INTEGER)) {
+        /* Evaluated here, so the plain assignment sees a number. */
+        size_t n = strlen(old_value) + strlen(value) + 8;
+        char *expr = (char *)malloc(n);
+        long long total = 0;
+        if (expr) {
+            snprintf(expr, n, "(%s)+(%s)", *old_value ? old_value : "0", *value ? value : "0");
+            if (shellArithmeticEvaluateText(expr, 0, &total, NULL, 0)) {
+                char buffer[32];
+                snprintf(buffer, sizeof(buffer), "%lld", total);
+                shellBufferAppendString(&out, &length, &capacity, buffer);
+            }
+            free(expr);
+        }
+    } else {
+        shellBufferAppendString(&out, &length, &capacity, old_value);
+        shellBufferAppendString(&out, &length, &capacity, value);
+    }
+    free(name);
+    shellParamSubjectFree(&subject);
+    if (!out) {
+        return false;
+    }
+    free(text);
+    *assignment = out;
+    return true;
+}
+
+static bool shellCommandIsDeclaration(const char *name) {
+    return strcmp(name, "declare") == 0 || strcmp(name, "typeset") == 0 || strcmp(name, "local") == 0 ||
+           strcmp(name, "export") == 0 || strcmp(name, "readonly") == 0;
+}
+
+/* What the [[ builtin reads as an operator. One that came out of quotes or an expansion
+ * is an operand: `x='!'; [[ $x == '!' ]]`. */
+static bool shellCondTextLooksLikeOperator(const char *text) {
+    static const char *const kOps[] = {"&&", "||", "(", ")", "!", "==", "=", "!=", "=~", "<", ">"};
+    if (text[0] == '-') {
+        return true;
+    }
+    for (size_t i = 0; i < sizeof(kOps) / sizeof(kOps[0]); ++i) {
+        if (strcmp(text, kOps[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* The text after =~: what came from quotes matches literally. */
+static char *shellRegexFromExpanded(const char *expanded, const bool *map, size_t map_len) {
+    char *out = NULL;
+    size_t length = 0;
+    size_t capacity = 0;
+    size_t n = strlen(expanded);
+    for (size_t i = 0; i < n; ++i) {
+        if (map && i < map_len && map[i] && strchr(".^$*+?()[]{}|\\", expanded[i])) {
+            shellBufferAppendChar(&out, &length, &capacity, '\\');
+        }
+        shellBufferAppendChar(&out, &length, &capacity, expanded[i]);
+    }
+    return out ? out : strdup("");
+}
+
+static bool shellAddDoubleBracketWord(ShellCommand *cmd, const char *text, uint8_t flags, const char *meta,
+                                      size_t meta_len, bool *saw_command_word) {
+    bool *quoted_map = NULL;
+    size_t quoted_len = 0;
+    /* Bash expands an operand only when it gets there: [[ -z ${x-} || $x == a ]] under set -u. */
+    bool saved_suppressed = gShellNounsetSuppressed;
+    gShellNounsetSuppressed = true;
+    gShellProcSubDisabled = true;
+    char *expanded = shellExpandWord(text, flags, meta, meta_len, &quoted_map, &quoted_len, NULL);
+    gShellProcSubDisabled = false;
+    gShellNounsetSuppressed = saved_suppressed;
+    if (!expanded) {
+        return false;
+    }
+    shellFlattenArraySeparators(expanded);
+    if (cmd->argc > 0 && strcmp(cmd->argv[cmd->argc - 1], "=~") == 0) {
+        char *regex = shellRegexFromExpanded(expanded, quoted_map, quoted_len);
+        free(expanded);
+        expanded = regex;
+    } else if (quoted_map && cmd->argc > 0 && !shellMarkQuotedGlobChars(&expanded, &quoted_map, &quoted_len)) {
+        free(expanded);
+        free(quoted_map);
+        return false;
+    }
+    free(quoted_map);
+    if (!expanded) {
+        return false;
+    }
+    if (cmd->argc > 0 && strcmp(text, expanded) != 0 && shellCondTextLooksLikeOperator(expanded)) {
+        size_t n = strlen(expanded);
+        char *protected_text = (char *)malloc(n + 2);
+        if (!protected_text) {
+            free(expanded);
+            return false;
+        }
+        protected_text[0] = SHELL_GLOB_LITERAL_MARK;
+        memcpy(protected_text + 1, expanded, n + 1);
+        free(expanded);
+        expanded = protected_text;
+    }
+    if (!shellCommandAppendArgOwned(cmd, expanded)) {
+        return false;
+    }
+    if (saw_command_word) {
+        *saw_command_word = true;
+    }
+    return true;
+}
+
 static bool shellAddArg(ShellCommand *cmd, const char *arg, bool *saw_command_word) {
     if (!cmd || !arg) {
         return false;
@@ -3926,166 +3673,62 @@ static bool shellAddArg(ShellCommand *cmd, const char *arg, bool *saw_command_wo
     if (!shellDecodeWordSpec(arg, &text, &flags, &meta, &meta_len)) {
         return false;
     }
-    bool *quoted_map = NULL;
-    size_t quoted_len = 0;
-    bool zero_array = false;
-    char *expanded = shellExpandWord(text,
-                                     flags,
-                                     meta,
-                                     meta_len,
-                                     &quoted_map,
-                                     &quoted_len,
-                                     &zero_array);
-    if (!expanded) {
-        return false;
-    }
-    bool literal_mode = cmd->disable_field_splitting;
-    if (saw_command_word && !*saw_command_word) {
-        if ((flags & SHELL_WORD_FLAG_ASSIGNMENT) && shellLooksLikeAssignment(expanded)) {
-            bool is_array_literal = shellAssignmentIsArrayLiteral(text, flags);
-            if (!shellCommandAppendAssignmentOwned(cmd, expanded, is_array_literal)) {
-                free(quoted_map);
-                return false;
-            }
-            free(quoted_map);
-            return true;
-        }
-    } else if (!literal_mode && (flags & SHELL_WORD_FLAG_ASSIGNMENT) && shellLooksLikeAssignment(expanded)) {
-        if (!shellCommandAppendArgOwned(cmd, expanded)) {
-            free(quoted_map);
+    bool has_command = saw_command_word ? *saw_command_word : cmd->argc > 0;
+    bool assignment_word = (flags & SHELL_WORD_FLAG_ASSIGNMENT) != 0;
+    bool at_assignment = assignment_word && !has_command;
+    bool declaration = assignment_word && has_command && cmd->argc > 0 && shellCommandIsDeclaration(cmd->argv[0]);
+
+    if ((at_assignment || declaration) && shellAssignmentIsArrayLiteral(text, flags)) {
+        char *assignment = shellExpandArrayLiteralAssignment(text, flags, declaration);
+        if (!assignment) {
             return false;
         }
-        if (saw_command_word) {
-            *saw_command_word = true;
-        }
-        free(quoted_map);
-        return true;
-    }
-    if (!literal_mode && cmd->argc == 0 && strcmp(expanded, "[[") == 0) {
-        literal_mode = true;
-        cmd->disable_field_splitting = true;
-    }
-    if (literal_mode) {
-        /* `[[` decides for itself which operands are patterns. */
-        if (quoted_map && cmd->argc > 0 && strcmp(cmd->argv[0], "[[") == 0 &&
-            !shellMarkQuotedGlobChars(&expanded, &quoted_map, &quoted_len)) {
-            free(expanded);
-            free(quoted_map);
-            return false;
-        }
-        if (!shellCommandAppendArgOwned(cmd, expanded)) {
-            free(quoted_map);
-            return false;
-        }
-        if (saw_command_word) {
-            *saw_command_word = true;
-        }
-        free(quoted_map);
-        return true;
-    }
-    if (quoted_map && !shellMarkQuotedGlobChars(&expanded, &quoted_map, &quoted_len)) {
-        free(expanded);
-        free(quoted_map);
-        return false;
-    }
-    char **fields = NULL;
-    size_t field_count = 0;
-    if (!shellSplitExpandedWord(expanded,
-                                flags,
-                                quoted_map,
-                                quoted_len,
-                                zero_array,
-                                &fields,
-                                &field_count)) {
-        free(expanded);
-        free(quoted_map);
-        return false;
-    }
-    free(expanded);
-    free(quoted_map);
-    if (field_count == 0) {
-        free(fields);
-        return true;
+        return declaration ? shellCommandAppendArgOwned(cmd, assignment)
+                           : shellCommandAppendAssignmentOwned(cmd, assignment, true);
     }
 
-    for (size_t i = 0; i < field_count; ++i) {
-        char *field = fields[i];
-        if (!field) {
-            continue;
+    if ((cmd->argc == 0 && !has_command && strcmp(text, "[[") == 0) ||
+        (cmd->argc > 0 && strcmp(cmd->argv[0], "[[") == 0)) {
+        cmd->disable_field_splitting = true;
+        return shellAddDoubleBracketWord(cmd, text, flags, meta, meta_len, saw_command_word);
+    }
+
+    if (at_assignment || declaration || cmd->disable_field_splitting) {
+        char *expanded = shellExpandWord(text, flags, meta, meta_len, NULL, NULL, NULL);
+        if (!expanded) {
+            return false;
         }
-        bool appended = false;
-        if (shellWordShouldGlob(flags, field)) {
-            char **glob_matches = NULL;
-            size_t glob_count = 0;
-            char *glob_pattern = shellGlobPatternFromField(field);
-            int glob_status = glob_pattern ? shellExpandGlobPattern(glob_pattern, &glob_matches, &glob_count)
-                                           : GLOB_NOSPACE;
-            free(glob_pattern);
-            if (glob_status == 0) {
-                size_t original_argc = cmd->argc;
-                bool ok = true;
-                for (size_t g = 0; g < glob_count; ++g) {
-                    char *dup = glob_matches[g];
-                    glob_matches[g] = NULL;
-                    if (!dup) {
-                        ok = false;
-                        break;
-                    }
-                    if (!shellCommandAppendArgOwned(cmd, dup)) {
-                        free(dup);
-                        ok = false;
-                        break;
-                    }
-                }
-                if (!ok) {
-                    while (cmd->argc > original_argc) {
-                        free(cmd->argv[cmd->argc - 1]);
-                        cmd->argc--;
-                    }
-                    if (cmd->argv) {
-                        cmd->argv[cmd->argc] = NULL;
-                    }
-                    for (size_t g = 0; g < glob_count; ++g) {
-                        free(glob_matches[g]);
-                    }
-                    free(glob_matches);
-                    for (size_t j = i; j < field_count; ++j) {
-                        if (fields[j]) {
-                            free(fields[j]);
-                        }
-                    }
-                    free(fields);
-                    free(field);
-                    return false;
-                }
-                free(glob_matches);
-                appended = true;
-            } else if (glob_status != GLOB_NOMATCH) {
-                fprintf(stderr, "exsh: glob failed for '%s'\n", field);
-            }
+        shellFlattenArraySeparators(expanded);
+        if ((at_assignment || declaration) && !shellResolveAppendAssignment(&expanded)) {
+            free(expanded);
+            return false;
         }
-        if (!appended) {
-            shellStripGlobMarks(field);
-            if (!shellCommandAppendArgOwned(cmd, field)) {
-                for (size_t j = i + 1; j < field_count; ++j) {
-                    if (fields[j]) {
-                        free(fields[j]);
-                    }
-                }
-                free(fields);
+        if (at_assignment && shellLooksLikeAssignment(expanded)) {
+            return shellCommandAppendAssignmentOwned(cmd, expanded, false);
+        }
+        if (declaration || cmd->disable_field_splitting) {
+            if (!shellCommandAppendArgOwned(cmd, expanded)) {
                 return false;
             }
-            appended = true;
-        } else {
-            free(field);
+            if (saw_command_word) {
+                *saw_command_word = true;
+            }
+            return true;
         }
-        fields[i] = NULL;
+        free(expanded);
     }
-    free(fields);
-    if (saw_command_word) {
+
+    ShellStringArray fields = (ShellStringArray){0};
+    bool ok = shellExpandWordFields(text, flags, meta, meta_len, !at_assignment, &fields);
+    for (size_t i = 0; i < fields.count && ok; ++i) {
+        ok = shellCommandAppendArgOwned(cmd, fields.items[i]);
+        fields.items[i] = NULL;
+    }
+    if (ok && fields.count > 0 && saw_command_word) {
         *saw_command_word = true;
     }
-    return true;
+    shellStringArrayFree(&fields);
+    return ok;
 }
 
 static int decodeHexDigit(char c) {
@@ -4257,12 +3900,11 @@ static bool shellAddRedirection(ShellCommand *cmd, const char *spec) {
             free(copy);
             return false;
         }
-        /* `[[ $a < $b ]]` reads as a redirection until shellRewriteDoubleBracketTest. */
-        bool double_bracket = cmd->argc > 0 && cmd->argv && strcmp(cmd->argv[0], "[[") == 0;
-        ambiguous_target = strcmp(type_text, "<<<") != 0 && !double_bracket &&
+        ambiguous_target = strcmp(type_text, "<<<") != 0 &&
                            shellRedirectTargetIsAmbiguous(expanded_target, target_flags,
                                                           target_quoted_map, target_quoted_len);
         free(target_quoted_map);
+        shellFlattenArraySeparators(expanded_target);
     }
 
     if (ambiguous_target) {
@@ -4280,6 +3922,13 @@ static bool shellAddRedirection(ShellCommand *cmd, const char *spec) {
     } else if (strcmp(type_text, ">") == 0) {
         redir.kind = SHELL_RUNTIME_REDIR_OPEN;
         redir.flags = O_WRONLY | O_CREAT | O_TRUNC;
+        if (gShellRuntime.noclobber_enabled) {
+            /* set -C: a regular file stays as it is, and /dev/null still works. */
+            struct stat st;
+            if (stat(expanded_target, &st) != 0 || S_ISREG(st.st_mode)) {
+                redir.flags = O_WRONLY | O_CREAT | O_EXCL;
+            }
+        }
         redir.mode = 0666;
         redir.path = expanded_target;
         expanded_target = NULL;
