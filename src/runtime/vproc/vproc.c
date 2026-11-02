@@ -3131,6 +3131,9 @@ static bool vprocRegistryContainsValidated(VProc *vp) {
 
 static VProc *vprocForThread(void);
 static VProc *vprocResolveShellVprocForPathOps(void);
+static VProc *vprocFindByPid(int pid);
+static _Thread_local int gVprocSubshellPid;
+static _Thread_local bool gVprocClosedPipe;
 
 typedef struct {
     int pid;
@@ -12746,6 +12749,12 @@ static int vprocFindPrimaryPidForThread(pthread_t tid) {
 }
 
 static VProc *vprocResolveShellVprocForPathOps(void) {
+    if (gVprocSubshellPid > 0) {
+        VProc *subshell_vp = vprocFindByPid(gVprocSubshellPid);
+        if (subshell_vp) {
+            return subshell_vp;
+        }
+    }
     /*
      * Prefer session-scoped shell identity over thread hints. Worker threads
      * can be reused across tabs/sessions and may retain stale pid hints, while
@@ -13316,6 +13325,9 @@ ssize_t vprocWriteShim(int fd, const void *buf, size_t count) {
             if ((int)res == _EINTR) {
                 vprocDeliverPendingSignalsForCurrent();
             }
+            if ((int)res == _EPIPE) {
+                gVprocClosedPipe = true;
+            }
             return vprocSetCompatErrno((int)res);
         }
         return res;
@@ -13417,6 +13429,9 @@ ssize_t vprocWriteShim(int fd, const void *buf, size_t count) {
         vprocDebugLogf( "[vwrite] fd=%d -> host=%d write_fd=%d count=%zu\n", fd, host, write_fd, count);
     }
     ssize_t res = vprocHostWrite(write_fd, buf, count);
+    if (res < 0 && errno == EPIPE) {
+        gVprocClosedPipe = true;
+    }
     if (write_fd != host) {
         vprocHostClose(write_fd);
     }
@@ -13825,6 +13840,253 @@ static char *vprocGetcwdForVproc(VProc *vp, char *buffer, size_t size) {
     }
     memcpy(buffer, cwd, len + 1);
     return buffer;
+}
+
+struct VProcEnv {
+    int refcount;
+    pthread_mutex_t mu;
+    char **view;    /* NULL-terminated, the shape of environ */
+    size_t *caps;   /* each entry's allocation */
+    size_t count;
+    size_t capacity;
+    /* getenv's result and an iterated view stay valid for the environment's life, and a
+     * value that fits overwrites in place, so this stays small however often a loop assigns. */
+    void **retired;
+    size_t retired_count;
+    size_t retired_capacity;
+};
+
+static _Thread_local VProcEnv *gVprocEnvTls = NULL;
+static _Thread_local int gVprocSubshellPid = 0;
+static _Thread_local bool gVprocClosedPipe = false;
+extern char **environ;
+
+static void vprocEnvRetireLocked(VProcEnv *env, void *ptr) {
+    if (env->retired_count == env->retired_capacity) {
+        size_t cap = env->retired_capacity ? env->retired_capacity * 2 : 16;
+        void **resized = (void **)realloc(env->retired, cap * sizeof(void *));
+        if (!resized) {
+            return;
+        }
+        env->retired = resized;
+        env->retired_capacity = cap;
+    }
+    env->retired[env->retired_count++] = ptr;
+}
+
+static bool vprocEnvReserveLocked(VProcEnv *env, size_t needed) {
+    if (needed + 1 <= env->capacity) {
+        return true;
+    }
+    size_t cap = env->capacity ? env->capacity * 2 : 64;
+    while (cap < needed + 1) {
+        cap *= 2;
+    }
+    char **view = (char **)calloc(cap, sizeof(char *));
+    size_t *caps = (size_t *)calloc(cap, sizeof(size_t));
+    if (!view || !caps) {
+        free(view);
+        free(caps);
+        return false;
+    }
+    if (env->count > 0) {
+        memcpy(view, env->view, env->count * sizeof(char *));
+        memcpy(caps, env->caps, env->count * sizeof(size_t));
+    }
+    if (env->view) {
+        vprocEnvRetireLocked(env, env->view);
+    }
+    free(env->caps);
+    env->view = view;
+    env->caps = caps;
+    env->capacity = cap;
+    return true;
+}
+
+static ssize_t vprocEnvFindLocked(const VProcEnv *env, const char *name, size_t name_len) {
+    for (size_t i = 0; i < env->count; ++i) {
+        const char *entry = env->view[i];
+        if (entry && strncmp(entry, name, name_len) == 0 && entry[name_len] == '=') {
+            return (ssize_t)i;
+        }
+    }
+    return -1;
+}
+
+VProcEnv *vprocEnvCapture(void) {
+    VProcEnv *env = (VProcEnv *)calloc(1, sizeof(VProcEnv));
+    if (!env) {
+        return NULL;
+    }
+    env->refcount = 1;
+    pthread_mutex_init(&env->mu, NULL);
+    char **source = *vprocEnvironShim();
+    size_t count = 0;
+    while (source && source[count]) {
+        count++;
+    }
+    if (!vprocEnvReserveLocked(env, count)) {
+        vprocEnvRelease(env);
+        return NULL;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        char *copy = strdup(source[i]);
+        if (!copy) {
+            vprocEnvRelease(env);
+            return NULL;
+        }
+        env->view[env->count] = copy;
+        env->caps[env->count] = strlen(copy) + 1;
+        env->count++;
+    }
+    return env;
+}
+
+VProcEnv *vprocEnvRetain(VProcEnv *env) {
+    if (env) {
+        __sync_add_and_fetch(&env->refcount, 1);
+    }
+    return env;
+}
+
+void vprocEnvRelease(VProcEnv *env) {
+    if (!env || __sync_sub_and_fetch(&env->refcount, 1) != 0) {
+        return;
+    }
+    for (size_t i = 0; i < env->count; ++i) {
+        free(env->view[i]);
+    }
+    for (size_t i = 0; i < env->retired_count; ++i) {
+        free(env->retired[i]);
+    }
+    free(env->retired);
+    free(env->view);
+    free(env->caps);
+    pthread_mutex_destroy(&env->mu);
+    free(env);
+}
+
+VProcEnv *vprocEnvCurrent(void) {
+    return gVprocEnvTls;
+}
+
+VProcEnv *vprocEnvActivate(VProcEnv *env) {
+    VProcEnv *previous = gVprocEnvTls;
+    gVprocEnvTls = env;
+    return previous;
+}
+
+char *vprocGetenvShim(const char *name) {
+    VProcEnv *env = gVprocEnvTls;
+    if (!env) {
+        return getenv(name);
+    }
+    if (!name) {
+        return NULL;
+    }
+    size_t name_len = strlen(name);
+    char *value = NULL;
+    pthread_mutex_lock(&env->mu);
+    ssize_t index = vprocEnvFindLocked(env, name, name_len);
+    if (index >= 0) {
+        value = env->view[index] + name_len + 1;
+    }
+    pthread_mutex_unlock(&env->mu);
+    return value;
+}
+
+int vprocSetenvShim(const char *name, const char *value, int overwrite) {
+    VProcEnv *env = gVprocEnvTls;
+    if (!env) {
+        return setenv(name, value, overwrite);
+    }
+    if (!name || !*name || strchr(name, '=')) {
+        errno = EINVAL;
+        return -1;
+    }
+    const char *text = value ? value : "";
+    size_t name_len = strlen(name);
+    size_t needed = name_len + 1 + strlen(text) + 1;
+    int rc = 0;
+    pthread_mutex_lock(&env->mu);
+    ssize_t index = vprocEnvFindLocked(env, name, name_len);
+    if (index >= 0 && !overwrite) {
+        pthread_mutex_unlock(&env->mu);
+        return 0;
+    }
+    if (index >= 0 && needed <= env->caps[index]) {
+        char *entry = env->view[index];
+        memmove(entry + name_len + 1, text, needed - name_len - 1);
+        pthread_mutex_unlock(&env->mu);
+        return 0;
+    }
+    size_t cap = (index >= 0) ? env->caps[index] * 2 : needed;
+    if (cap < needed) {
+        cap = needed;
+    }
+    char *entry = (char *)malloc(cap);
+    if (!entry || (index < 0 && !vprocEnvReserveLocked(env, env->count + 1))) {
+        free(entry);
+        errno = ENOMEM;
+        rc = -1;
+    } else {
+        snprintf(entry, cap, "%s=%s", name, text);
+        if (index >= 0) {
+            vprocEnvRetireLocked(env, env->view[index]);
+            env->view[index] = entry;
+            env->caps[index] = cap;
+        } else {
+            env->caps[env->count] = cap;
+            env->view[env->count + 1] = NULL;
+            env->view[env->count] = entry;
+            env->count++;
+        }
+    }
+    pthread_mutex_unlock(&env->mu);
+    return rc;
+}
+
+int vprocUnsetenvShim(const char *name) {
+    VProcEnv *env = gVprocEnvTls;
+    if (!env) {
+        return unsetenv(name);
+    }
+    if (!name || !*name || strchr(name, '=')) {
+        errno = EINVAL;
+        return -1;
+    }
+    size_t name_len = strlen(name);
+    pthread_mutex_lock(&env->mu);
+    ssize_t index = vprocEnvFindLocked(env, name, name_len);
+    if (index >= 0) {
+        vprocEnvRetireLocked(env, env->view[index]);
+        for (size_t i = (size_t)index; i + 1 < env->count; ++i) {
+            env->view[i] = env->view[i + 1];
+            env->caps[i] = env->caps[i + 1];
+        }
+        env->count--;
+        env->view[env->count] = NULL;
+    }
+    pthread_mutex_unlock(&env->mu);
+    return 0;
+}
+
+char ***vprocEnvironShim(void) {
+    return gVprocEnvTls ? &gVprocEnvTls->view : &environ;
+}
+
+int vprocSubshellPid(void) {
+    return gVprocSubshellPid;
+}
+
+void vprocSetSubshellPid(int pid) {
+    gVprocSubshellPid = pid;
+}
+
+bool vprocConsumeClosedPipe(void) {
+    bool closed = gVprocClosedPipe;
+    gVprocClosedPipe = false;
+    return closed;
 }
 
 int vprocChdirShim(const char *path) {

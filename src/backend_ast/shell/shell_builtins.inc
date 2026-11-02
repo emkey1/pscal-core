@@ -306,6 +306,55 @@ Value vmBuiltinShellExec(VM *vm, int arg_count, Value *args) {
         goto cleanup;
     }
     result = shellExecuteCommand(vm, &cmd);
+#if defined(PSCAL_TARGET_IOS)
+    /* SIGPIPE cannot end one thread, and a builtin writing here is the subshell itself. */
+    if (gShellRuntime.in_subshell && vprocConsumeClosedPipe()) {
+        shellUpdateStatus(128 + SIGPIPE);
+        shellRuntimeRequestExit();
+        if (vm) {
+            vm->exit_requested = true;
+        }
+    }
+#endif
+
+cleanup:
+    shellRestoreCurrentVm(previous_vm);
+    return result;
+}
+
+/* Starts a compound command as one command: see shellRunBody. */
+Value vmBuiltinShellExecBody(VM *vm, int arg_count, Value *args) {
+    VM *previous_vm = shellSwapCurrentVm(vm);
+    Value result = makeVoid();
+    if (arg_count != 2 || VALUE_TYPE(args[0]) != TYPE_POINTER || !AS_POINTER(args[0])) {
+        runtimeError(vm, "shell exec: expected a compiled body and metadata");
+        shellUpdateStatus(1);
+        goto cleanup;
+    }
+    shellCollectJobs();
+    ShellCommand cmd;
+    if (!shellBuildCommand(vm, 1, &args[1], &cmd)) {
+        shellUpdateStatus(1);
+        goto cleanup;
+    }
+    char *name = strdup("(subshell)");
+    if (!shellCommandAppendArgOwned(&cmd, name)) {
+        runtimeError(vm, "shell exec: out of memory");
+        shellUpdateStatus(1);
+        shellFreeCommand(&cmd);
+        goto cleanup;
+    }
+    cmd.body = (ShellCompiledFunction *)AS_POINTER(args[0]);
+#if defined(PSCAL_TARGET_IOS)
+    cmd.body_state = shellBodyStateCapture();
+    if (!cmd.body_state) {
+        runtimeError(vm, "shell exec: out of memory");
+        shellUpdateStatus(1);
+        shellFreeCommand(&cmd);
+        goto cleanup;
+    }
+#endif
+    result = shellExecuteCommand(vm, &cmd);
 
 cleanup:
     shellRestoreCurrentVm(previous_vm);
@@ -1007,148 +1056,6 @@ Value vmBuiltinShellSubshell(VM *vm, int arg_count, Value *args) {
     return makeVoid();
 }
 
-static bool shellLoopRedirectionTargetsFd(const ShellLoopFrame *frame, int fd) {
-    if (!frame || fd < 0) {
-        return false;
-    }
-    if (!frame->applied_redirs || frame->applied_redir_count == 0) {
-        return false;
-    }
-    for (size_t i = 0; i < frame->applied_redir_count; ++i) {
-        const ShellRedirection *redir = &frame->applied_redirs[i];
-        if (!redir) {
-            continue;
-        }
-        if (redir->fd == fd) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static bool shellLoopAdoptPipeline(VM *vm,
-                                   ShellLoopFrame *frame,
-                                   int pipeline_index,
-                                   bool pipeline_head,
-                                   bool pipeline_tail) {
-    if (!frame) {
-        return true;
-    }
-    ShellPipelineContext *ctx = &gShellRuntime.pipeline;
-    if (!ctx->active || pipeline_index < 0) {
-        return true;
-    }
-    size_t stages = ctx->stage_count;
-    if ((size_t)pipeline_index >= stages) {
-        runtimeError(vm, "shell loop: pipeline index out of range");
-        return false;
-    }
-
-    bool merge_stderr =
-        (ctx->merge_stderr && (size_t)pipeline_index < stages) ? ctx->merge_stderr[pipeline_index] : false;
-    int stdin_fd = -1;
-    int stdout_fd = -1;
-    if (!pipeline_head && ctx->pipes && pipeline_index > 0) {
-        stdin_fd = ctx->pipes[pipeline_index - 1][0];
-    }
-    if (!pipeline_tail && ctx->pipes) {
-        stdout_fd = ctx->pipes[pipeline_index][1];
-    }
-
-    if (stdin_fd >= 0) {
-        if (shellLoopRedirectionTargetsFd(frame, STDIN_FILENO)) {
-            close(stdin_fd);
-            ctx->pipes[pipeline_index - 1][0] = -1;
-        } else {
-            if (!shellEnsureExecRedirBackup(STDIN_FILENO,
-                                            -1,
-                                            &frame->redir_backups,
-                                            &frame->redir_backup_count,
-                                            &frame->redir_backup_capacity)) {
-                runtimeError(vm, "shell loop: failed to prepare stdin backup");
-                close(stdin_fd);
-                ctx->pipes[pipeline_index - 1][0] = -1;
-                return false;
-            }
-           if (dup2(stdin_fd, STDIN_FILENO) == -1) {
-                int err = errno;
-                runtimeError(vm, "shell loop: failed to adopt pipeline stdin: %s", strerror(err));
-                shellRestoreExecRedirections(frame->redir_backups, frame->redir_backup_count);
-                shellFreeExecRedirBackups(frame->redir_backups, frame->redir_backup_count);
-                frame->redir_backups = NULL;
-                frame->redir_backup_count = 0;
-                frame->redir_backup_capacity = 0;
-                frame->redirs_active = false;
-                close(stdin_fd);
-                ctx->pipes[pipeline_index - 1][0] = -1;
-                return false;
-            }
-            close(stdin_fd);
-            ctx->pipes[pipeline_index - 1][0] = -1;
-            frame->redirs_active = true;
-        }
-    }
-
-    if (stdout_fd >= 0) {
-        if (shellLoopRedirectionTargetsFd(frame, STDOUT_FILENO)) {
-            close(stdout_fd);
-            ctx->pipes[pipeline_index][1] = -1;
-        } else {
-            if (!shellEnsureExecRedirBackup(STDOUT_FILENO,
-                                            -1,
-                                            &frame->redir_backups,
-                                            &frame->redir_backup_count,
-                                            &frame->redir_backup_capacity)) {
-                runtimeError(vm, "shell loop: failed to prepare stdout backup");
-                close(stdout_fd);
-                ctx->pipes[pipeline_index][1] = -1;
-                return false;
-            }
-            if (dup2(stdout_fd, STDOUT_FILENO) == -1) {
-                int err = errno;
-                runtimeError(vm, "shell loop: failed to adopt pipeline stdout: %s", strerror(err));
-                shellRestoreExecRedirections(frame->redir_backups, frame->redir_backup_count);
-                shellFreeExecRedirBackups(frame->redir_backups, frame->redir_backup_count);
-                frame->redir_backups = NULL;
-                frame->redir_backup_count = 0;
-                frame->redir_backup_capacity = 0;
-                frame->redirs_active = false;
-                close(stdout_fd);
-                ctx->pipes[pipeline_index][1] = -1;
-                return false;
-            }
-            close(stdout_fd);
-            ctx->pipes[pipeline_index][1] = -1;
-            frame->redirs_active = true;
-        }
-    }
-
-    if (merge_stderr && !shellLoopRedirectionTargetsFd(frame, STDERR_FILENO)) {
-        if (!shellEnsureExecRedirBackup(STDERR_FILENO,
-                                        STDOUT_FILENO,
-                                        &frame->redir_backups,
-                                        &frame->redir_backup_count,
-                                        &frame->redir_backup_capacity)) {
-            runtimeError(vm, "shell loop: failed to prepare stderr backup");
-            return false;
-        }
-        if (dup2(STDOUT_FILENO, STDERR_FILENO) == -1) {
-            int err = errno;
-            runtimeError(vm, "shell loop: failed to adopt pipeline stderr: %s", strerror(err));
-            shellRestoreExecRedirections(frame->redir_backups, frame->redir_backup_count);
-            shellFreeExecRedirBackups(frame->redir_backups, frame->redir_backup_count);
-            frame->redir_backups = NULL;
-            frame->redir_backup_count = 0;
-            frame->redir_backup_capacity = 0;
-            frame->redirs_active = false;
-            return false;
-        }
-        frame->redirs_active = true;
-    }
-
-    return true;
-}
-
 Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
     VM *previous_vm = shellSwapCurrentVm(vm);
     Value result = makeVoid();
@@ -1164,9 +1071,6 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
     size_t condition_payload_count = 0;
     int body_kind_value = 0;
     size_t body_payload_count = 0;
-    int pipeline_index_value = -1;
-    bool pipeline_head_value = false;
-    bool pipeline_tail_value = false;
     if (meta && *meta) {
         char *copy = strdup(meta);
         if (copy) {
@@ -1202,12 +1106,6 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
                         body_kind_value = (int)strtol(value ? value : "0", NULL, 10);
                     } else if (strcmp(key, "bodywords") == 0) {
                         body_payload_count = (size_t)strtoul(value ? value : "0", NULL, 10);
-                    } else if (strcmp(key, "pipe") == 0) {
-                        pipeline_index_value = (int)strtol(value ? value : "-1", NULL, 10);
-                    } else if (strcmp(key, "head") == 0) {
-                        shellParseBool(value, &pipeline_head_value);
-                    } else if (strcmp(key, "tail") == 0) {
-                        shellParseBool(value, &pipeline_tail_value);
                     }
                 }
             }
@@ -1218,9 +1116,6 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
         kind = SHELL_LOOP_KIND_UNTIL;
     }
 
-    ShellPipelineContext *pipeline_ctx = &gShellRuntime.pipeline;
-    bool pipeline_active = pipeline_ctx->active && pipeline_index_value >= 0 && pipeline_ctx->stage_count > 1;
-
     bool parent_skip = shellLoopSkipActive();
     ShellLoopFrame *frame = shellLoopPushFrame(kind);
     if (!frame) {
@@ -1230,30 +1125,6 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
         return result;
     }
 
-    bool previous_pipeline_flag = gShellRuntime.pipeline_subshell_active;
-    bool previous_local_scope_flag = gShellRuntime.local_scope_active;
-    bool pipeline_scope_pushed = false;
-    if (pipeline_active) {
-        if (!shellLocalScopePush()) {
-            runtimeError(vm, "shell loop: out of memory");
-            shellLoopPopFrame();
-            shellRestoreCurrentVm(previous_vm);
-            shellUpdateStatus(1);
-            return result;
-        }
-        pipeline_scope_pushed = true;
-        gShellRuntime.local_scope_active = true;
-        gShellRuntime.pipeline_subshell_active = true;
-        frame->pipeline_prev_local_scope_flag = previous_local_scope_flag;
-        frame->pipeline_prev_pipeline_flag = previous_pipeline_flag;
-        frame->pipeline_scope_pushed = true;
-        frame->pipeline_subshell = true;
-    } else {
-        frame->pipeline_prev_local_scope_flag = previous_local_scope_flag;
-        frame->pipeline_prev_pipeline_flag = previous_pipeline_flag;
-        frame->pipeline_scope_pushed = false;
-        frame->pipeline_subshell = false;
-    }
     frame->skip_body = parent_skip;
     frame->break_pending = false;
     frame->continue_pending = false;
@@ -1705,15 +1576,6 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
         }
     }
 
-    if (ok) {
-        if (!shellLoopAdoptPipeline(vm ? vm : gShellCurrentVm,
-                                    frame,
-                                    pipeline_index_value,
-                                    pipeline_head_value,
-                                    pipeline_tail_value)) {
-            ok = false;
-        }
-    }
     if (!ok) {
         shellUpdateStatus(1);
     }
@@ -1725,16 +1587,6 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
     }
     if (redir_cmd.redirs) {
         shellFreeRedirections(&redir_cmd);
-    }
-
-    if (!pipeline_active || !ok) {
-        if (pipeline_scope_pushed) {
-            shellLocalScopePop();
-            frame->pipeline_scope_pushed = false;
-        }
-        frame->pipeline_subshell = false;
-        gShellRuntime.local_scope_active = previous_local_scope_flag;
-        gShellRuntime.pipeline_subshell_active = previous_pipeline_flag;
     }
 
     shellMaybeResetPipeline();
@@ -9394,8 +9246,13 @@ Value vmBuiltinShellContinue(VM *vm, int arg_count, Value *args) {
     return makeVoid();
 }
 
-static ShellAlias *gShellAliases = NULL;
-static size_t gShellAliasCount = 0;
+#if defined(PSCAL_TARGET_IOS)
+#define gShellAliases (*(SC()->has_private_tables ? &SC()->private_aliases : &gShellAliasTable))
+#define gShellAliasCount (*(SC()->has_private_tables ? &SC()->private_alias_count : &gShellAliasTableCount))
+#else
+#define gShellAliases gShellAliasTable
+#define gShellAliasCount gShellAliasTableCount
+#endif
 
 static void shellWriteAllFd(int fd, const char *buf, size_t len) {
     if (fd < 0 || !buf || len == 0) {
@@ -11359,6 +11216,15 @@ Value vmBuiltinShellBg(VM *vm, int arg_count, Value *args) {
     return makeVoid();
 }
 
+/* `wait` asks for the job shellCollectJobs just took off the table: by %n, or by the pid
+ * in $!, which is its last process and so may not be the group's. */
+static bool shellWaitTargetIsLastRemoved(long target) {
+    return target > 0 && gShellRuntime.last_removed_job_valid &&
+           (gShellRuntime.last_removed_job_id == (size_t)target ||
+            gShellRuntime.last_removed_job_pgid == (pid_t)target ||
+            gShellRuntime.last_bg_pid == (pid_t)target);
+}
+
 Value vmBuiltinShellWait(VM *vm, int arg_count, Value *args) {
     shellCollectJobs();
     size_t visible_count = shellJobVisibleCount();
@@ -11380,7 +11246,7 @@ Value vmBuiltinShellWait(VM *vm, int arg_count, Value *args) {
         } else if (IS_INTLIKE(spec)) {
             target = (long)AS_INTEGER(spec);
         }
-        if (target > 0 && gShellRuntime.last_removed_job_id == (size_t)target) {
+        if (shellWaitTargetIsLastRemoved(target)) {
             int status = gShellRuntime.last_removed_job_status;
             gShellRuntime.last_removed_job_valid = false;
             shellUpdateStatus(status);
@@ -11451,8 +11317,7 @@ Value vmBuiltinShellWait(VM *vm, int arg_count, Value *args) {
             } else if (IS_INTLIKE(spec)) {
                 target = (long)AS_INTEGER(spec);
             }
-            if (target > 0 && gShellRuntime.last_removed_job_valid &&
-                gShellRuntime.last_removed_job_id == (size_t)target) {
+            if (shellWaitTargetIsLastRemoved(target)) {
                 fallback_status = gShellRuntime.last_removed_job_status;
                 gShellRuntime.last_removed_job_valid = false;
                 shellUpdateStatus(fallback_status);

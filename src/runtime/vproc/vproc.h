@@ -219,6 +219,24 @@ int vprocChdirShim(const char *path);
 char *vprocGetcwdShim(char *buffer, size_t size);
 int vprocShellChdirShim(const char *path);
 char *vprocShellGetcwdShim(char *buffer, size_t size);
+/* A subshell's environment and directory. There is no fork here, so a subshell is a
+ * thread and a vproc, and these keep what a process would keep for itself. A thread with
+ * no environment of its own sees the process's, and one with no subshell pid the
+ * session shell's directory. */
+typedef struct VProcEnv VProcEnv;
+VProcEnv *vprocEnvCapture(void);
+VProcEnv *vprocEnvRetain(VProcEnv *env);
+void vprocEnvRelease(VProcEnv *env);
+VProcEnv *vprocEnvCurrent(void);
+VProcEnv *vprocEnvActivate(VProcEnv *env);
+char *vprocGetenvShim(const char *name);
+int vprocSetenvShim(const char *name, const char *value, int overwrite);
+int vprocUnsetenvShim(const char *name);
+char ***vprocEnvironShim(void);
+int vprocSubshellPid(void);
+void vprocSetSubshellPid(int pid);
+/* True once since the last call if a write on this thread found its reader gone. */
+bool vprocConsumeClosedPipe(void);
 int vprocAccessShim(const char *path, int mode);
 int vprocChmodShim(const char *path, mode_t mode);
 int vprocChownShim(const char *path, uid_t uid, gid_t gid);

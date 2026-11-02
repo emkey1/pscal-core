@@ -1934,6 +1934,11 @@ typedef struct ThreadJob {
     VM* parentVm;
     ClosureEnvPayload* closureEnv;
     Symbol* closureSymbol;
+#if defined(PSCAL_TARGET_IOS)
+    /* The spawner's parameters: they are per thread here, and a worker's code reads them. */
+    int paramCount;
+    char** paramValues;
+#endif
     Thread* assignedThread;
     int assignedThreadId;
     uint32_t assignedGeneration;
@@ -2257,6 +2262,10 @@ static ThreadJob* vmThreadJobCreate(VM* vm,
     job->builtin_id = builtin_id;
     job->builtin_name = builtin_name ? strdup(builtin_name) : NULL;
     job->parentVm = vm;
+#if defined(PSCAL_TARGET_IOS)
+    job->paramCount = gParamCount;
+    job->paramValues = gParamValues;
+#endif
     job->closureEnv = NULL;
     job->closureSymbol = closureSymbol;
     job->assignedThread = NULL;
@@ -2823,6 +2832,10 @@ static bool vmThreadPrepareWorkerVm(Thread* thread, VM* owner, ThreadJob* job, i
     constGlobalSymbols = thread->vm->vmConstGlobalSymbols;
     procedure_table = thread->vm->procedureTable;
     current_procedure_table = thread->vm->procedureTable;
+    if (job) {
+        gParamCount = job->paramCount;
+        gParamValues = job->paramValues;
+    }
 #endif
     thread->vm->trace_executed = 0;
     thread->vm->owningThread = thread;

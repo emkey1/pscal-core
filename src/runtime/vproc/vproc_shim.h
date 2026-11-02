@@ -5,6 +5,7 @@
 #endif
 
 #if defined(PSCAL_TARGET_IOS) && !defined(VPROC_SHIM_DISABLED)
+#include <stdlib.h>
 #include <sys/stat.h>
 #define VPROC_SHIM_PRESENT 1
 #include "runtime/vproc/vproc.h"
@@ -56,6 +57,16 @@
 #undef signal
 #undef raise
 #undef pthread_sigmask
+#undef getenv
+#undef setenv
+#undef unsetenv
+#undef environ
+
+#define getenv vprocGetenvShim
+#define setenv vprocSetenvShim
+#define unsetenv vprocUnsetenvShim
+/* `extern char **environ;` after this declares vprocEnvironShim again, compatibly. */
+#define environ (*vprocEnvironShim())
 
 #define read  vprocReadShim
 #define write vprocWriteShim

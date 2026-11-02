@@ -83,9 +83,9 @@ extern int gWindowBottom;
 
 // --- Other Globals ---
 #define MAX_RECURSION_DEPTH 10
-extern int gParamCount;
-extern char **gParamValues;
-extern bool gParamValuesOwned;
+extern PSCAL_THREAD_LOCAL int gParamCount;
+extern PSCAL_THREAD_LOCAL char **gParamValues;
+extern PSCAL_THREAD_LOCAL bool gParamValuesOwned;
 // extern AST *globalRoot; // Defined in main.c typically
 
 // Per thread, like Free Pascal's InOutRes: Write/BlockRead/BlockWrite set

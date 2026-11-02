@@ -31,6 +31,7 @@ void registerShellFrontendBuiltins(void) {
     extBuiltinRegisterGroup(category, thread_group);
 
     registerShellBuiltin(category, runtime_group, "__shell_exec", vmBuiltinShellExec);
+    registerShellBuiltin(category, runtime_group, "__shell_exec_body", vmBuiltinShellExecBody);
     registerShellBuiltin(category, runtime_group, "__shell_pipeline", vmBuiltinShellPipeline);
     registerShellBuiltin(category, runtime_group, "__shell_arithmetic", vmBuiltinShellArithmetic);
     registerShellBuiltin(category, runtime_group, "__shell_and", vmBuiltinShellAnd);

@@ -277,6 +277,41 @@ static void shellVprocLabelScopeEnd(ShellVprocLabelScope *scope) {
     scope->prev_label[0] = '\0';
 }
 
+static ShellThreadLink shellThreadLinkCapture(void) {
+    ShellThreadLink link;
+    memset(&link, 0, sizeof(link));
+    if (!gShellRuntime.in_subshell) {
+        return link;
+    }
+    link.ctx = shellRuntimeCreateContext();
+    if (!link.ctx) {
+        return link;
+    }
+    link.env = vprocEnvRetain(vprocEnvCurrent());
+    link.subshell_pid = vprocSubshellPid();
+    return link;
+}
+
+static void shellThreadLinkEnter(const ShellThreadLink *link) {
+    if (link && link->ctx) {
+        vprocEnvActivate(link->env);
+        vprocSetSubshellPid(link->subshell_pid);
+    }
+}
+
+/* Frees what capture took. The context is the caller's: it may have been activated. */
+static void shellThreadLinkRelease(ShellThreadLink *link) {
+    if (!link) {
+        return;
+    }
+    if (link->env) {
+        vprocEnvActivate(NULL);
+        vprocSetSubshellPid(0);
+    }
+    vprocEnvRelease(link->env);
+    link->env = NULL;
+}
+
 static VProc *shellCreateVProcForStage(int stdin_host,
                                        int stdout_host,
                                        int stderr_host,
@@ -1072,6 +1107,9 @@ static int shellSpawnProcess(VM *vm,
     }
 
     {
+    pid_t dollar_pid = shellRuntimeDollarPid();
+    /* The child reaches its own exit with a copy of whatever is still buffered. */
+    shellFlushStandardStreams();
     pid_t child = fork();
         if (child < 0) {
             prep_error = errno;
@@ -1084,7 +1122,7 @@ static int shellSpawnProcess(VM *vm,
             if (ctx->active && ctx->pgid > 0) {
                 desired_pgid = ctx->pgid;
             }
-            if (setpgid(0, desired_pgid) != 0) {
+            if (!gShellRuntime.in_subshell && setpgid(0, desired_pgid) != 0) {
                 /* best-effort; ignore errors */
             }
 
@@ -1099,6 +1137,8 @@ static int shellSpawnProcess(VM *vm,
             signal(SIGTTIN, SIG_DFL);
             signal(SIGTTOU, SIG_DFL);
             signal(SIGCHLD, SIG_DFL);
+            /* The shell ignores it for itself. A closed reader must end a child. */
+            signal(SIGPIPE, SIG_DFL);
 
             if (ctx->active && ctx->pipes) {
                 size_t pipe_count = (ctx->stage_count > 0) ? (ctx->stage_count - 1) : 0;
@@ -1183,6 +1223,8 @@ static int shellSpawnProcess(VM *vm,
                 }
             }
 
+            /* This child may go on to run shell code: a function or a compound command. */
+            shellSubshellResetState(dollar_pid);
             bool builtin_ran = shellInvokeBuiltin(vm ? vm : gShellCurrentVm, (ShellCommand *)cmd);
             if (builtin_ran) {
                 int status = gShellRuntime.last_status;
@@ -1489,6 +1531,13 @@ static bool shellShouldRunCommandInForegroundWorker(const ShellCommand *cmd) {
         }
         return false;
     }
+    if (cmd->body) {
+        return true;
+    }
+    /* A function runs on the shell's own state, so never on a worker, whatever its name. */
+    if (!cmd->ignore_functions && shellFunctionIsDefined(cmd->argv[0])) {
+        return false;
+    }
     const char *name_raw = cmd->argv[0];
     char lookup_buf[PATH_MAX];
     const char *name = shellCommandLookupName(name_raw, lookup_buf, sizeof(lookup_buf));
@@ -1559,6 +1608,7 @@ typedef struct {
     char *stdout_path;
     char *stderr_path;
     int shell_pid;
+    int parent_pid;
     int kernel_pid;
     PSCALRuntimeContext *runtime_ctx;
     PSCALRuntimeContext *prev_runtime_ctx;
@@ -1567,6 +1617,7 @@ typedef struct {
     bool prev_worker_flag;
     ShellRuntimeState *prev_shell_ctx;
     VM *prev_vm;
+    ShellThreadLink link;
 #endif
 } ShellBackgroundStageCtx;
 
@@ -1596,6 +1647,7 @@ typedef struct {
     bool stopped;
     pthread_mutex_t stop_mu;
     pthread_cond_t stop_cv;
+    ShellThreadLink link;
 } ShellInProcessWorkerCtx;
 
 typedef struct {
@@ -1609,6 +1661,7 @@ typedef struct {
     VProcSessionStdio *session_stdio;
 #if defined(PSCAL_TARGET_IOS)
     PSCALRuntimeContext *runtime_ctx;
+    ShellThreadLink link;
 #endif
 } ShellPipelineStageThreadCtx;
 #endif
@@ -1649,7 +1702,8 @@ static bool shellStatusRepresentsStopSignal(int status, int *out_signal) {
     }
 }
 
-static void shellFinalizeStageVproc(VProc *vp, int status) {
+/* keep_status leaves the exit for a waiter, who reaps it. */
+static void shellFinalizeStageVprocEx(VProc *vp, int status, bool keep_status) {
     if (!vp) {
         return;
     }
@@ -1670,11 +1724,15 @@ static void shellFinalizeStageVproc(VProc *vp, int status) {
         }
     } else {
         vprocMarkExit(vp, status);
-        if (pid > 0) {
+        if (pid > 0 && !keep_status) {
             vprocDiscard(pid);
         }
     }
     vprocDestroy(vp);
+}
+
+static void shellFinalizeStageVproc(VProc *vp, int status) {
+    shellFinalizeStageVprocEx(vp, status, false);
 }
 
 static void shellInProcessWorkerCleanup(void *arg) {
@@ -1717,11 +1775,17 @@ static void shellInProcessWorkerCleanup(void *arg) {
     }
 
     vprocDeactivate();
-    shellFinalizeStageVproc(ctx->vp, ctx->status);
+    /* The shell always waits for this one, and it may lose the race to get there. */
+    shellFinalizeStageVprocEx(ctx->vp, ctx->status, true);
     ctx->vp = NULL;
 
     gShellBackgroundWorkerActive = ctx->prev_worker_flag;
     gShellCurrentBuiltinBackground = ctx->prev_bg_flag;
+    if (ctx->link.ctx) {
+        shellRuntimeDestroyContext(ctx->link.ctx);
+        ctx->link.ctx = NULL;
+    }
+    shellThreadLinkRelease(&ctx->link);
 
     if (ctx->session_stdio) {
         vprocSessionStdioActivate(NULL);
@@ -1915,6 +1979,11 @@ static ShellCommand *shellCloneCommandForBackground(const ShellCommand *src) {
     dst->is_pipeline_tail = src->is_pipeline_tail;
     dst->line = src->line;
     dst->column = src->column;
+    dst->body = src->body;
+#if defined(PSCAL_TARGET_IOS)
+    dst->body_state = src->body_state;
+    ((ShellCommand *)src)->body_state = NULL;
+#endif
     return dst;
 }
 
@@ -1975,9 +2044,10 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
      * a fresh runtime/VM for the background worker. */
     static pthread_once_t bg_builtin_once = PTHREAD_ONCE_INIT;
     pthread_once(&bg_builtin_once, registerExtendedBuiltins);
+    shellThreadLinkEnter(&ctx->link);
     /* Install isolated shell runtime + VM so background work does not mutate
      * the interactive shell's state or gShellCurrentVm. */
-    ShellRuntimeState *bg_ctx = shellRuntimeCreateContext();
+    ShellRuntimeState *bg_ctx = ctx->link.ctx ? ctx->link.ctx : shellRuntimeCreateContext();
     ShellRuntimeState *prev_ctx = NULL;
     VM *prev_vm = NULL;
     VM *bg_vm = NULL;
@@ -2036,8 +2106,9 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
     bool stderr_append = false;
     int stdin_fd = -1;
     bool stdin_redirected = false;
-    /* Background defaults: stdin -> /dev/null unless explicitly redirected. */
-    if (ctx->cmd && ctx->cmd->background) {
+    /* Background defaults: stdin -> /dev/null unless explicitly redirected.
+     * A compound command keeps its stdin. */
+    if (ctx->cmd && ctx->cmd->background && !ctx->cmd->body) {
         stdin_fd = -2;
     }
 
@@ -2083,7 +2154,7 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
         }
     }
 
-    if (!stdin_redirected && stdin_fd < 0) {
+    if (!stdin_redirected && stdin_fd < 0 && !(cmd && cmd->body)) {
 #if defined(PSCAL_TARGET_IOS)
         stdin_fd = vprocHostOpen("/dev/null", O_RDONLY);
 #else
@@ -2179,7 +2250,9 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
     ctx->vp = vp;
     vprocRegisterThread(vp, pthread_self());
     int shell_pid = vprocGetShellSelfPid();
-    if (shell_pid > 0) {
+    if (ctx->parent_pid > 0) {
+        vprocSetParent(vprocPid(vp), ctx->parent_pid);
+    } else if (shell_pid > 0) {
         vprocSetParent(vprocPid(vp), shell_pid);
     }
     int shell_sid = (shell_pid > 0) ? vprocGetSid(shell_pid) : -1;
@@ -2314,7 +2387,8 @@ cleanup:
     }
     vprocDeactivate();
     if (vp) {
-        shellFinalizeStageVproc(vp, bg_status);
+        /* `wait` asks for the status. The job table reaps it, as it would a process. */
+        shellFinalizeStageVprocEx(vp, bg_status, true);
         ctx->vp = NULL;
     }
 #else
@@ -2348,9 +2422,15 @@ cleanup:
         ctx->bg_vm = NULL;
     }
     if (bg_ctx) {
-        free(bg_ctx);
+        if (ctx->link.ctx == bg_ctx) {
+            shellRuntimeDestroyContext(bg_ctx);
+            ctx->link.ctx = NULL;
+        } else {
+            free(bg_ctx);
+        }
         ctx->bg_shell_ctx = NULL;
     }
+    shellThreadLinkRelease(&ctx->link);
     if (ctx->runtime_ctx_swapped && PSCALRuntimeSetCurrentRuntimeContext) {
         PSCALRuntimeSetCurrentRuntimeContext(ctx->prev_runtime_ctx);
         ctx->runtime_ctx_swapped = false;
@@ -2394,6 +2474,10 @@ static void *shellInProcessWorkerMain(void *arg) {
     ctx->prev_worker_flag = gShellBackgroundWorkerActive;
     gShellCurrentBuiltinBackground = false;
     gShellBackgroundWorkerActive = true;
+    shellThreadLinkEnter(&ctx->link);
+    if (ctx->link.ctx) {
+        shellRuntimeActivateContext(ctx->link.ctx);
+    }
 
     pthread_cleanup_push(shellInProcessWorkerCleanup, ctx);
 
@@ -2778,6 +2862,10 @@ static bool shellEnsurePipeline(size_t stages, bool negated) {
         ctx->in_process = true;
         ctx->in_process_worker = false;
         ctx->session_stdio = vprocSessionStdioCurrent();
+        if (gShellRuntime.in_subshell && vprocCurrent()) {
+            /* Its stages stay in the subshell's group, which the terminal signals. */
+            ctx->pgid = vprocGetPgid(vprocPid(vprocCurrent()));
+        }
         shellPipelineSessionCloseSpool(ctx);
         shellPipelineSessionSnapshotStdStreams(ctx);
 //    fprintf(stderr, "[pipe] ensure stages=%zu in_process=1\n", stages);
@@ -4734,7 +4822,8 @@ static void *shellPipelineStageThreadMain(void *arg) {
     bool worker_ctx_ready = true;
     static pthread_once_t bg_builtin_once = PTHREAD_ONCE_INIT;
     pthread_once(&bg_builtin_once, registerExtendedBuiltins);
-    bg_shell_ctx = shellRuntimeCreateContext();
+    shellThreadLinkEnter(&tctx->link);
+    bg_shell_ctx = tctx->link.ctx ? tctx->link.ctx : shellRuntimeCreateContext();
     if (bg_shell_ctx) {
         prev_shell_ctx = shellRuntimeActivateContext(bg_shell_ctx);
         bg_vm = (VM *)calloc(1, sizeof(VM));
@@ -4746,7 +4835,12 @@ static void *shellPipelineStageThreadMain(void *arg) {
         } else {
             shellRuntimeActivateContext(prev_shell_ctx);
             prev_shell_ctx = NULL;
-            free(bg_shell_ctx);
+            if (tctx->link.ctx == bg_shell_ctx) {
+                shellRuntimeDestroyContext(bg_shell_ctx);
+                tctx->link.ctx = NULL;
+            } else {
+                free(bg_shell_ctx);
+            }
             bg_shell_ctx = NULL;
             worker_ctx_ready = false;
         }
@@ -4819,9 +4913,15 @@ static void *shellPipelineStageThreadMain(void *arg) {
             free(bg_vm);
         }
         if (bg_shell_ctx) {
-            free(bg_shell_ctx);
+            if (tctx->link.ctx == bg_shell_ctx) {
+                shellRuntimeDestroyContext(bg_shell_ctx);
+                tctx->link.ctx = NULL;
+            } else {
+                free(bg_shell_ctx);
+            }
         }
     }
+    shellThreadLinkRelease(&tctx->link);
     if (swapped_stdio) {
         vprocSessionStdioActivate(prev_session_stdio);
     }
@@ -4990,6 +5090,7 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
         worker->apply_exec_redirs = (cmd && cmd->redir_count > 0);
         worker->shell_pid = shell_pid;
         worker->kernel_pid = vprocGetKernelPid();
+        worker->link = shellThreadLinkCapture();
 
         pthread_attr_t attr;
         pthread_attr_init(&attr);
@@ -4999,6 +5100,10 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
         int rc = pthread_create(&stage_thread, &attr, shellInProcessWorkerMain, worker);
         pthread_attr_destroy(&attr);
         if (rc != 0) {
+            if (worker->link.ctx) {
+                shellRuntimeDestroyContext(worker->link.ctx);
+            }
+            shellThreadLinkRelease(&worker->link);
             shellFinalizeStageVproc(vp, 1);
             shellFreeCommand(cloned);
             free(cloned);
@@ -5055,7 +5160,9 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
                     if (shell_sid > 0) {
                         (void)vprocSetSid((int)async_stage_pid, shell_sid);
                     }
-                    (void)vprocSetParent((int)async_stage_pid, shell_pid);
+                    /* The parent is the vproc that can wait: `wait` here, in a nested
+                     * shell or a subshell, only matches its own children. */
+                    (void)vprocSetParent((int)async_stage_pid, shellStageParentPid(shell_pid));
                 }
                 if (async_bg_pgid > 0) {
                     (void)vprocSetPgid((int)async_stage_pid, (int)async_bg_pgid);
@@ -5086,10 +5193,14 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
                 bg_ctx->synthetic_pid = (int)async_stage_pid;
             }
             bg_ctx->shell_pid = vprocGetShellSelfPid();
+            if (bg_ctx->shell_pid > 0) {
+                bg_ctx->parent_pid = shellStageParentPid(bg_ctx->shell_pid);
+            }
             bg_ctx->kernel_pid = vprocGetKernelPid();
             bg_ctx->runtime_ctx = PSCALRuntimeGetCurrentRuntimeContext
                 ? PSCALRuntimeGetCurrentRuntimeContext()
                 : NULL;
+            bg_ctx->link = shellThreadLinkCapture();
 
             pthread_t stage_thread = 0;
             pthread_attr_t attr;
@@ -5101,6 +5212,10 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
             if (rc != 0) {
                 shellFreeCommand(cloned);
                 free(cloned);
+                if (bg_ctx->link.ctx) {
+                    shellRuntimeDestroyContext(bg_ctx->link.ctx);
+                }
+                shellThreadLinkRelease(&bg_ctx->link);
                 free(bg_ctx);
                 runtimeError(vm, "pipeline: failed to create background stage thread");
                 shellUpdateStatus(1);
@@ -5153,6 +5268,7 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
         tctx->runtime_ctx = PSCALRuntimeGetCurrentRuntimeContext
             ? PSCALRuntimeGetCurrentRuntimeContext()
             : NULL;
+        tctx->link = shellThreadLinkCapture();
 #endif
         if (async_tail) {
             ShellPipelineContext *ctx_clone = shellCloneSingleStagePipelineContext(ctx);
@@ -5189,6 +5305,12 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
                 shellFreeClonedPipelineContext(tctx->ctx);
                 tctx->ctx = NULL;
             }
+#if defined(PSCAL_TARGET_IOS)
+            if (tctx->link.ctx) {
+                shellRuntimeDestroyContext(tctx->link.ctx);
+            }
+            shellThreadLinkRelease(&tctx->link);
+#endif
             free(tctx);
             runtimeError(vm, "pipeline: failed to create stage thread");
             shellUpdateStatus(1);
@@ -5580,7 +5702,7 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
                 }
             }
 #else
-            bool ran_builtin = shellInvokeBuiltin(vm, cmd);
+            bool ran_builtin = !cmd->body && shellInvokeBuiltin(vm, cmd);
             if (ran_builtin) {
                 if (assignments_applied) {
                     shellRestoreAssignments(assignment_backups, assignment_backup_count);
@@ -5683,9 +5805,9 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
             ShellVprocLabelScope label_scope;
             shellVprocLabelScopeBegin(&label_scope, cmd);
 #endif
-            bool ran_builtin = shellInvokeBuiltin(vm, cmd);
+            bool ran_builtin = !cmd->body && shellInvokeBuiltin(vm, cmd);
 #if defined(PSCAL_TARGET_IOS)
-            if (!ran_builtin) {
+            if (!ran_builtin && !cmd->body) {
                 ran_builtin = shellDispatchSmallclueAppletInProcess(vm, cmd);
             }
             shellVprocLabelScopeEnd(&label_scope);
@@ -5715,7 +5837,7 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
     }
 
     pid_t child = -1;
-    if (cmd->argv && cmd->argv[0] && cmd->argv[0][0] != '\0') {
+    if (!cmd->body && cmd->argv && cmd->argv[0] && cmd->argv[0][0] != '\0') {
         shellHashRecordExecution(cmd->argv[0]);
     }
     bool ignore_job_signals = background_execution &&
@@ -5746,7 +5868,10 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
         return makeVoid();
     }
 
-    if (ctx->active) {
+    /* Commands in a subshell stay in its process group, the one the terminal knows. */
+    if (gShellRuntime.in_subshell) {
+        /* nothing to do */
+    } else if (ctx->active) {
         pid_t target_pgid = (ctx->pgid > 0) ? ctx->pgid : child;
         if (setpgid(child, target_pgid) != 0) {
             if (errno != EACCES && errno != ESRCH) {

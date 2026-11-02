@@ -647,7 +647,7 @@ static char *shellExpandParameter(const char *input,
             *out_consumed = 1;
         }
         char buffer[32];
-        snprintf(buffer, sizeof(buffer), "%d", (int)getpid());
+        snprintf(buffer, sizeof(buffer), "%d", (int)shellRuntimeDollarPid());
         return strdup(buffer);
     }
 
@@ -1586,6 +1586,12 @@ static void shellFreeCommand(ShellCommand *cmd) {
     cmd->argv = NULL;
     cmd->argc = 0;
     shellFreeRedirections(cmd);
+#if defined(PSCAL_TARGET_IOS)
+    if (cmd->body_state) {
+        shellBodyStateFree(cmd->body_state);
+        cmd->body_state = NULL;
+    }
+#endif
 }
 
 static bool shellParseBool(const char *value, bool *out_flag) {
@@ -2660,14 +2666,23 @@ static bool shellInvokeFunction(VM *vm, ShellCommand *cmd) {
     bool frame_pushed = false;
     InterpretResult result = INTERPRET_OK;
     size_t redirect_scope_depth = shellRuntimeRedirectScopeDepth();
-    if (!function_vm_in_use) {
+    /* The pipeline that called the function is still the shell's: its negation and status
+     * apply when the call returns, whatever the body's pipelines do. A stage's context may
+     * be in use by the stages beside it, and those keep it. */
+    ShellPipelineContext *caller_pipeline = &gShellRuntime.pipeline;
+    ShellPipelineContext saved_pipeline = *caller_pipeline;
+    bool pipeline_saved = caller_pipeline->stage_count <= 1;
+    if (pipeline_saved) {
+        memset(caller_pipeline, 0, sizeof(*caller_pipeline));
+        caller_pipeline->pgid = -1;
+    }
+    if (!__atomic_test_and_set(&function_vm_in_use, __ATOMIC_ACQUIRE)) {
         if (!function_vm_initialized) {
             initVM(&function_vm);
             function_vm_initialized = true;
         } else {
             vmResetExecutionState(&function_vm);
         }
-        function_vm_in_use = true;
         using_cached_vm = true;
         invoke_vm = &function_vm;
     } else {
@@ -2696,17 +2711,25 @@ static bool shellInvokeFunction(VM *vm, ShellCommand *cmd) {
 
     result = interpretBytecode(invoke_vm, &compiled->chunk,
                                globalSymbols, constGlobalSymbols, procedure_table, 0);
-    if (result != INTERPRET_OK) {
+    if (result != INTERPRET_OK && !gShellExitRequested) {
         shellUpdateStatus(1);
     } else {
         shellUpdateStatus(shellRuntimeLastStatus());
     }
+    if (gShellExitRequested && vm) {
+        /* `exit` ended this chunk. It ends the one that called the function too. */
+        vm->exit_requested = true;
+    }
 
 invoke_cleanup:
     shellRuntimeUnwindRedirectScopes(redirect_scope_depth);
+    if (pipeline_saved) {
+        shellResetPipeline();
+        *caller_pipeline = saved_pipeline;
+    }
     if (using_cached_vm) {
         vmResetExecutionState(&function_vm);
-        function_vm_in_use = false;
+        __atomic_clear(&function_vm_in_use, __ATOMIC_RELEASE);
     } else if (nested_vm) {
         if (nested_vm_initialized) {
             freeVM(nested_vm);
@@ -2731,13 +2754,196 @@ invoke_cleanup:
     return true;
 }
 
+/* What a subshell does not inherit, or must not touch: the parent's pipeline (its pipe
+ * ends are closed here or are not ours), jobs, job control and traps. */
+static void shellSubshellResetState(pid_t dollar_pid) {
+    gShellRuntime.subshell_parent_pid = dollar_pid;
+    ShellPipelineContext *ctx = &gShellRuntime.pipeline;
+    free(ctx->pids);
+    free(ctx->merge_stderr);
+    free(ctx->pipes);
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->pgid = -1;
+    for (size_t i = 0; i < gShellJobCount; ++i) {
+        free(gShellJobs[i].pids);
+        free(gShellJobs[i].command);
+    }
+    free(gShellJobs);
+    gShellJobs = NULL;
+    gShellJobCount = 0;
+    gShellRuntime.job_control_enabled = false;
+    gShellRuntime.job_control_initialized = true;
+    for (int signo = 1; signo < NSIG; ++signo) {
+        if (gShellSignalTraps[signo].action == SHELL_TRAP_ACTION_COMMAND) {
+            shellTrapClearEntry(&gShellSignalTraps[signo]);
+#if !defined(PSCAL_TARGET_IOS)
+            signal(signo, SIG_DFL);
+#endif
+        }
+    }
+    if (gShellExitTrap.action == SHELL_TRAP_ACTION_COMMAND) {
+        shellTrapClearEntry(&gShellExitTrap);
+    }
+    memset((void *)gShellPendingSignals, 0, sizeof(gShellPendingSignals));
+    gShellRuntime.in_subshell = true;
+#if defined(PSCAL_TARGET_IOS)
+    if (!gShellRuntime.has_private_tables) {
+        pthread_mutex_lock(&gShellFunctionTableMutex);
+        shellCopyDefinitionTables(&gShellRuntime,
+                                  gShellFunctionTable,
+                                  gShellFunctionTableCount,
+                                  gShellAliasTable,
+                                  gShellAliasTableCount,
+                                  gShellOptionTable);
+        pthread_mutex_unlock(&gShellFunctionTableMutex);
+    }
+#endif
+}
+
+#if defined(PSCAL_TARGET_IOS)
+static void shellBodyStateFree(ShellBodyState *state) {
+    if (!state) {
+        return;
+    }
+    if (state->ctx) {
+        shellRuntimeDestroyContext(state->ctx);
+    }
+    vprocEnvRelease(state->env);
+    if (state->params) {
+        shellFreeParameterArray(state->params, state->param_count);
+    }
+    free(state);
+}
+
+static ShellBodyState *shellBodyStateCapture(void) {
+    ShellBodyState *state = (ShellBodyState *)calloc(1, sizeof(ShellBodyState));
+    if (!state) {
+        return NULL;
+    }
+    state->ctx = shellRuntimeCreateContext();
+    state->env = vprocEnvCapture();
+    if (!state->ctx || !state->env) {
+        shellBodyStateFree(state);
+        return NULL;
+    }
+    if (gParamCount > 0 && gParamValues) {
+        state->params = (char **)calloc((size_t)gParamCount, sizeof(char *));
+        if (!state->params) {
+            shellBodyStateFree(state);
+            return NULL;
+        }
+        for (int i = 0; i < gParamCount; ++i) {
+            state->params[i] = strdup(gParamValues[i] ? gParamValues[i] : "");
+            state->param_count = i + 1;
+            if (!state->params[i]) {
+                shellBodyStateFree(state);
+                return NULL;
+            }
+        }
+    }
+    if (!vprocShellGetcwdShim(state->cwd, sizeof(state->cwd))) {
+        state->cwd[0] = '\0';
+    }
+    state->dollar_pid = shellRuntimeDollarPid();
+    return state;
+}
+#endif
+
+/* A compound command run apart from the shell. On a host this is a forked child, which
+ * has its own everything. On iOS it is this thread and the vproc it runs under, with what
+ * shellBodyStateCapture took. `exit` ends the body, and its status is the command's. */
+static bool shellRunBody(VM *vm, ShellCommand *cmd) {
+    VM *body_vm = (VM *)malloc(sizeof(VM));
+    if (!body_vm) {
+        runtimeError(vm, "subshell: out of memory");
+        shellUpdateStatus(1);
+        return true;
+    }
+    initVM(body_vm);
+    body_vm->frontendContext = vm ? vm->frontendContext : NULL;
+#if defined(PSCAL_TARGET_IOS)
+    ShellBodyState *state = cmd->body_state;
+    cmd->body_state = NULL;
+    ShellRuntimeState *previous_ctx = NULL;
+    VProcEnv *previous_env = NULL;
+    int previous_subshell_pid = vprocSubshellPid();
+    char **saved_params = gParamValues;
+    int saved_param_count = gParamCount;
+    bool saved_params_owned = gShellPositionalOwned;
+    mode_t saved_umask = umask(0);
+    umask(saved_umask);
+    if (state) {
+        previous_ctx = shellRuntimeActivateContext(state->ctx);
+        shellSubshellResetState(state->dollar_pid);
+        body_vm->frontendContext = state->ctx;
+        previous_env = vprocEnvActivate(state->env);
+        VProc *self = vprocCurrent();
+        if (self) {
+            vprocSetSubshellPid(vprocPid(self));
+        }
+        if (state->cwd[0]) {
+            (void)vprocChdirShim(state->cwd);
+        }
+        gParamValues = state->params;
+        gParamCount = state->param_count;
+        gShellPositionalOwned = (state->params != NULL);
+        state->params = NULL;
+        (void)vprocConsumeClosedPipe();
+    }
+#endif
+    size_t redirect_scope_depth = shellRuntimeRedirectScopeDepth();
+    InterpretResult result = interpretBytecode(body_vm, &cmd->body->chunk,
+                                               globalSymbols, constGlobalSymbols, procedure_table, 0);
+    shellRuntimeUnwindRedirectScopes(redirect_scope_depth);
+    bool exit_requested = shellRuntimeConsumeExitRequested();
+    int status = (result == INTERPRET_OK || exit_requested) ? shellRuntimeLastStatus() : 1;
+    shellRuntimeRunExitTrap();
+    if (shellRuntimeConsumeExitRequested()) {
+        status = shellRuntimeLastStatus();
+    }
+    freeVM(body_vm);
+    free(body_vm);
+#if defined(PSCAL_TARGET_IOS)
+    if (state) {
+        if (gShellPositionalOwned) {
+            shellFreeOwnedPositionalParameters();
+        }
+        gParamValues = saved_params;
+        gParamCount = saved_param_count;
+        gShellPositionalOwned = saved_params_owned;
+        vprocEnvActivate(previous_env);
+        vprocSetSubshellPid(previous_subshell_pid);
+        shellRuntimeActivateContext(previous_ctx);
+        shellBodyStateFree(state);
+        umask(saved_umask);
+    }
+#endif
+    shellUpdateStatus(status);
+    return true;
+}
+
 static bool shellInvokeBuiltin(VM *vm, ShellCommand *cmd) {
     if (!cmd || cmd->argc == 0 || !cmd->argv[0] || *cmd->argv[0] == '\0') {
         return false;
     }
+    if (cmd->body) {
+        return shellRunBody(vm, cmd);
+    }
     const char *name_raw = cmd->argv[0];
-    if (!cmd->ignore_functions && shellInvokeFunction(vm, cmd)) {
-        return true;
+    if (!cmd->ignore_functions && shellFindCompiledFunction(name_raw)) {
+        ShellExecRedirBackup *redir_backups = NULL;
+        size_t redir_backup_count = 0;
+        shellFlushStandardStreams();
+        /* No VM: a redirection that fails fails the call, not the script. */
+        if (!shellApplyExecRedirections(NULL, cmd, &redir_backups, &redir_backup_count)) {
+            shellUpdateStatus(1);
+            return true;
+        }
+        bool ran = shellInvokeFunction(vm, cmd);
+        shellFlushStandardStreams();
+        shellRestoreExecRedirections(redir_backups, redir_backup_count);
+        shellFreeExecRedirBackups(redir_backups, redir_backup_count);
+        return ran;
     }
     char lookup_buf[PATH_MAX];
     const char *name = shellCommandLookupName(name_raw, lookup_buf, sizeof(lookup_buf));
@@ -2976,6 +3182,7 @@ static void shellRemoveJobAt(size_t index) {
     ShellRuntimeState *ctx = shellGetContext();
     if (ctx) {
         ctx->last_removed_job_id = job->id;
+        ctx->last_removed_job_pgid = job->pgid;
         ctx->last_removed_job_status = job->last_status;
         ctx->last_removed_job_valid = true;
     }
@@ -3169,7 +3376,15 @@ static ShellJob *shellRegisterJob(pid_t pgid, const pid_t *pids, size_t pid_coun
                 if (sid > 0 && sid == (int)pids[i]) {
                     continue;
                 }
-                vprocSetParent(pids[i], shell_pid);
+                /* The vproc that starts a job is the one whose `wait` must find it. A task
+                 * mirrored from the vproc table (no command) keeps its parent. */
+                VProc *waiter = cmd ? vprocCurrent() : NULL;
+                int waiter_pid = waiter ? vprocPid(waiter) : -1;
+                if (waiter_pid > 0 && waiter_pid != pids[i]) {
+                    vprocSetParent(pids[i], waiter_pid);
+                } else if (!cmd) {
+                    vprocSetParent(pids[i], shell_pid);
+                }
             }
         }
     }
@@ -3253,7 +3468,8 @@ static int shellCollectJobs(void) {
     }
     shell_pid = vprocGetShellSelfPid();
     current_sid = (shell_pid > 0) ? vprocGetSid(shell_pid) : 0;
-    size_t snap_cap = vprocSnapshot(NULL, 0);
+    /* A subshell's jobs are the ones it started, not its shell's that run beside it. */
+    size_t snap_cap = gShellRuntime.in_subshell ? 0 : vprocSnapshot(NULL, 0);
     if (snap_cap > 0) {
             VProcSnapshot *snaps = (VProcSnapshot *)calloc(snap_cap, sizeof(VProcSnapshot));
             if (snaps) {
@@ -3432,11 +3648,8 @@ static int shellCollectJobs(void) {
         }
 
         if (all_done) {
-            int status = job->last_status;
-            bool disowned = job->disowned;
-            if (!disowned) {
-                shellUpdateStatus(status);
-            }
+            /* Its status is for `wait`. A job finishing is no command the script ran, so
+             * it leaves $? and set -e alone. */
             shellRemoveJobAt(i);
             reaped++;
             continue;

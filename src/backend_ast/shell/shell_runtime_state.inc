@@ -576,6 +576,8 @@ typedef struct ShellRuntimeState {
     bool break_requested;
     bool continue_requested;
     bool pipeline_subshell_active;
+    bool in_subshell;
+    pid_t subshell_parent_pid; /* $$ in a subshell is its shell's */
     int break_requested_levels;
     int continue_requested_levels;
     char **dir_stack;
@@ -613,6 +615,7 @@ typedef struct ShellRuntimeState {
     ShellJob *jobs;
     size_t job_count;
     size_t last_removed_job_id;
+    pid_t last_removed_job_pgid;
     int last_removed_job_status;
     bool last_removed_job_valid;
     ShellJobControlContext job_control_ctx;
@@ -632,6 +635,13 @@ typedef struct ShellRuntimeState {
     ShellLoopFrame *loop_stack;
     size_t loop_stack_size;
     size_t loop_stack_capacity;
+    /* A subshell's own definitions: on iOS no fork gives it a copy of these. */
+    bool has_private_tables;
+    struct ShellFunctionEntry *private_functions;
+    size_t private_function_count;
+    ShellAlias *private_aliases;
+    size_t private_alias_count;
+    struct ShellOptionEntry *private_options;
 } ShellRuntimeState;
 
 static ShellRuntimeState *shellGetContext(void);
@@ -687,22 +697,32 @@ typedef struct {
     int column;
 } ShellCallFrame;
 
-static ShellCallFrame *gShellCallStack = NULL;
-static size_t gShellCallStackCount = 0;
-static size_t gShellCallStackCapacity = 0;
+/* On iOS a subshell or pipeline stage runs its own interpreter on a thread. */
+static PSCAL_THREAD_LOCAL ShellCallFrame *gShellCallStack = NULL;
+static PSCAL_THREAD_LOCAL size_t gShellCallStackCount = 0;
+static PSCAL_THREAD_LOCAL size_t gShellCallStackCapacity = 0;
 
-static char **gShellSourceStack = NULL;
-static size_t gShellSourceDepth = 0;
-static size_t gShellSourceCapacity = 0;
+static PSCAL_THREAD_LOCAL char **gShellSourceStack = NULL;
+static PSCAL_THREAD_LOCAL size_t gShellSourceDepth = 0;
+static PSCAL_THREAD_LOCAL size_t gShellSourceCapacity = 0;
 
-typedef struct {
+typedef struct ShellFunctionEntry {
     char *name;
     char *parameter_metadata;
     ShellCompiledFunction *compiled;
 } ShellFunctionEntry;
 
-static ShellFunctionEntry *gShellFunctions = NULL;
-static size_t gShellFunctionCount = 0;
+static ShellFunctionEntry *gShellFunctionTable = NULL;
+static size_t gShellFunctionTableCount = 0;
+static ShellAlias *gShellAliasTable = NULL;
+static size_t gShellAliasTableCount = 0;
+#if defined(PSCAL_TARGET_IOS)
+#define gShellFunctions (*(SC()->has_private_tables ? &SC()->private_functions : &gShellFunctionTable))
+#define gShellFunctionCount (*(SC()->has_private_tables ? &SC()->private_function_count : &gShellFunctionTableCount))
+#else
+#define gShellFunctions gShellFunctionTable
+#define gShellFunctionCount gShellFunctionTableCount
+#endif
 
 static int shellParseEnvBool(const char *value) {
     if (!value) {
@@ -1092,14 +1112,14 @@ static bool shellArithmeticParseValueString(const char *text, long long *out_val
 static char *shellEvaluateArithmetic(const char *expr, bool *out_error);
 static void shellMarkArithmeticError(void);
 
-static bool gShellPositionalOwned = false;
+static PSCAL_THREAD_LOCAL bool gShellPositionalOwned = false;
 
-typedef struct {
+typedef struct ShellOptionEntry {
     const char *name;
     bool enabled;
 } ShellOptionEntry;
 
-static ShellOptionEntry gShellOptions[] = {
+static ShellOptionEntry gShellOptionTable[] = {
     {"assoc_expand_once", false},
     {"autocd", false},
     {"cdable_vars", false},
@@ -1154,7 +1174,12 @@ static ShellOptionEntry gShellOptions[] = {
     {"xpg_echo", false}
 };
 
-static const size_t gShellOptionCount = sizeof(gShellOptions) / sizeof(gShellOptions[0]);
+static const size_t gShellOptionCount = sizeof(gShellOptionTable) / sizeof(gShellOptionTable[0]);
+#if defined(PSCAL_TARGET_IOS)
+#define gShellOptions (SC()->has_private_tables ? SC()->private_options : gShellOptionTable)
+#else
+#define gShellOptions gShellOptionTable
+#endif
 
 static bool shellShoptOptionEnabled(const char *name);
 
@@ -1165,9 +1190,9 @@ typedef struct {
 
 static ShellBindOption *gShellBindOptions = NULL;
 static size_t gShellBindOptionCount = 0;
-static int gShellCurrentCommandLine = 0;
-static int gShellCurrentCommandColumn = 0;
-static const char *gShellCurrentCommandName = NULL;
+static PSCAL_THREAD_LOCAL int gShellCurrentCommandLine = 0;
+static PSCAL_THREAD_LOCAL int gShellCurrentCommandColumn = 0;
+static PSCAL_THREAD_LOCAL const char *gShellCurrentCommandName = NULL;
 static pthread_once_t gShellUtf8LocaleOnce = PTHREAD_ONCE_INIT;
 static locale_t gShellUtf8Locale = (locale_t)0;
 
@@ -2198,6 +2223,27 @@ typedef struct {
     bool is_array_literal;
 } ShellAssignmentEntry;
 
+#if defined(PSCAL_TARGET_IOS)
+/* What a subshell starts with, taken on the shell's thread when it is started, because
+ * the thread that runs it may start after the shell has moved on. */
+typedef struct {
+    ShellRuntimeState *ctx;
+    VProcEnv *env;
+    char **params;
+    int param_count;
+    char cwd[PATH_MAX];
+    pid_t dollar_pid;
+} ShellBodyState;
+
+/* What a thread started by a subshell takes from it, beyond the vproc every new thread
+ * starts under. Empty outside a subshell. */
+typedef struct {
+    ShellRuntimeState *ctx;
+    VProcEnv *env;
+    int subshell_pid;
+} ShellThreadLink;
+#endif
+
 typedef struct {
     char **argv;
     size_t argc;
@@ -2213,7 +2259,16 @@ typedef struct {
     bool is_pipeline_tail;
     int line;
     int column;
+    /* A compound command run apart from the shell; argv[0] only names it. */
+    ShellCompiledFunction *body;
+#if defined(PSCAL_TARGET_IOS)
+    ShellBodyState *body_state;
+#endif
 } ShellCommand;
+
+#if defined(PSCAL_TARGET_IOS)
+static void shellBodyStateFree(ShellBodyState *state);
+#endif
 
 typedef enum {
     SHELL_LOOP_KIND_WHILE,
@@ -2568,6 +2623,7 @@ static void shellRestoreExecRedirections(ShellExecRedirBackup *backups, size_t c
 static void shellFreeExecRedirBackups(ShellExecRedirBackup *backups, size_t count);
 static void shellFreeRedirections(ShellCommand *cmd);
 static void shellAbortPipeline(void);
+static void shellResetPipeline(void);
 
 typedef struct ShellLoopFrame {
     ShellLoopKind kind;
@@ -2598,10 +2654,6 @@ typedef struct ShellLoopFrame {
     ShellExecRedirBackup *redir_backups;
     size_t redir_backup_count;
     size_t redir_backup_capacity;
-    bool pipeline_subshell;
-    bool pipeline_scope_pushed;
-    bool pipeline_prev_local_scope_flag;
-    bool pipeline_prev_pipeline_flag;
 } ShellLoopFrame;
 
 #define gShellLoopStack (SC()->loop_stack)
@@ -2691,12 +2743,12 @@ static __thread int gShellSavedStdFds[3] = { -1, -1, -1 };
 #define gShellRuntime (*shellGetContext())
 
 static unsigned long gShellStatusVersion = 0;
-static bool gShellStatusSticky = false;
+static PSCAL_THREAD_LOCAL bool gShellStatusSticky = false;
 
-static bool gShellExitRequested = false;
+static PSCAL_THREAD_LOCAL bool gShellExitRequested = false;
 static volatile sig_atomic_t gShellExitOnSignalFlag = 0;
-static bool gShellArithmeticErrorPending = false;
-static VM *gShellCurrentVm = NULL;
+static PSCAL_THREAD_LOCAL bool gShellArithmeticErrorPending = false;
+static PSCAL_THREAD_LOCAL VM *gShellCurrentVm = NULL;
 static volatile sig_atomic_t gShellPendingSignals[NSIG] = {0};
 void shellResetJobIds(void) {
     gShellRuntimeDefault.job_next_id = 1;
@@ -2743,6 +2795,10 @@ ShellRuntimeState *shellRuntimeActivateContext(ShellRuntimeState *ctx) {
     ShellRuntimeState *previous = shellGetContext();
     shellSetContext(ctx);
     return previous;
+}
+
+static pid_t shellRuntimeDollarPid(void) {
+    return gShellRuntime.in_subshell ? gShellRuntime.subshell_parent_pid : getpid();
 }
 
 bool shellRuntimeCurrentBuiltinBackground(void) {
@@ -3810,15 +3866,6 @@ static void shellLoopFrameFreeData(ShellLoopFrame *frame) {
     if (!frame) {
         return;
     }
-    if (frame->pipeline_scope_pushed) {
-        shellLocalScopePop();
-        frame->pipeline_scope_pushed = false;
-    }
-    if (frame->pipeline_subshell) {
-        gShellRuntime.pipeline_subshell_active = frame->pipeline_prev_pipeline_flag;
-        gShellRuntime.local_scope_active = frame->pipeline_prev_local_scope_flag;
-        frame->pipeline_subshell = false;
-    }
     if (frame->for_variable) {
         free(frame->for_variable);
         frame->for_variable = NULL;
@@ -3896,6 +3943,51 @@ static void shellLoopFrameFreeData(ShellLoopFrame *frame) {
         frame->applied_redir_count = 0;
     }
     frame->redirs_active = false;
+}
+
+/* A failed copy leaves the table empty: the subshell cannot see the definition. */
+static void shellCopyDefinitionTables(ShellRuntimeState *ctx,
+                                      const ShellFunctionEntry *functions,
+                                      size_t function_count,
+                                      const ShellAlias *aliases,
+                                      size_t alias_count,
+                                      const ShellOptionEntry *options) {
+    if (function_count > 0) {
+        ctx->private_functions = (ShellFunctionEntry *)calloc(function_count, sizeof(ShellFunctionEntry));
+        for (size_t i = 0; ctx->private_functions && i < function_count; ++i) {
+            ShellFunctionEntry *dst = &ctx->private_functions[ctx->private_function_count];
+            dst->name = strdup(functions[i].name);
+            dst->parameter_metadata = functions[i].parameter_metadata
+                                          ? strdup(functions[i].parameter_metadata)
+                                          : NULL;
+            /* Bodies are never freed: another session may be running them. */
+            dst->compiled = functions[i].compiled;
+            if (dst->name) {
+                ctx->private_function_count++;
+            }
+        }
+    }
+    if (alias_count > 0) {
+        ctx->private_aliases = (ShellAlias *)calloc(alias_count, sizeof(ShellAlias));
+        for (size_t i = 0; ctx->private_aliases && i < alias_count; ++i) {
+            ShellAlias *dst = &ctx->private_aliases[ctx->private_alias_count];
+            dst->name = strdup(aliases[i].name);
+            dst->value = strdup(aliases[i].value);
+            if (dst->name && dst->value) {
+                ctx->private_alias_count++;
+            } else {
+                free(dst->name);
+                free(dst->value);
+                dst->name = NULL;
+                dst->value = NULL;
+            }
+        }
+    }
+    ctx->private_options = (ShellOptionEntry *)malloc(sizeof(gShellOptionTable));
+    if (ctx->private_options) {
+        memcpy(ctx->private_options, options, sizeof(gShellOptionTable));
+        ctx->has_private_tables = true;
+    }
 }
 
 ShellRuntimeState *shellRuntimeCreateContext(void) {
@@ -4106,6 +4198,21 @@ ShellRuntimeState *shellRuntimeCreateContext(void) {
     ctx->loop_stack = NULL;
     ctx->loop_stack_size = 0;
     ctx->loop_stack_capacity = 0;
+
+    ctx->has_private_tables = false;
+    ctx->private_functions = NULL;
+    ctx->private_function_count = 0;
+    ctx->private_aliases = NULL;
+    ctx->private_alias_count = 0;
+    ctx->private_options = NULL;
+    if (template_ctx->has_private_tables) {
+        shellCopyDefinitionTables(ctx,
+                                  template_ctx->private_functions,
+                                  template_ctx->private_function_count,
+                                  template_ctx->private_aliases,
+                                  template_ctx->private_alias_count,
+                                  template_ctx->private_options);
+    }
     return ctx;
 }
 
@@ -4113,6 +4220,23 @@ void shellRuntimeDestroyContext(ShellRuntimeState *ctx) {
     if (!ctx || ctx == &gShellRuntimeDefault) {
         return;
     }
+    for (size_t i = 0; i < ctx->private_function_count; ++i) {
+        free(ctx->private_functions[i].name);
+        free(ctx->private_functions[i].parameter_metadata);
+    }
+    free(ctx->private_functions);
+    ctx->private_functions = NULL;
+    ctx->private_function_count = 0;
+    for (size_t i = 0; i < ctx->private_alias_count; ++i) {
+        free(ctx->private_aliases[i].name);
+        free(ctx->private_aliases[i].value);
+    }
+    free(ctx->private_aliases);
+    ctx->private_aliases = NULL;
+    ctx->private_alias_count = 0;
+    free(ctx->private_options);
+    ctx->private_options = NULL;
+    ctx->has_private_tables = false;
     if (ctx->history.entries) {
         for (size_t i = 0; i < ctx->history.count; ++i) {
             free(ctx->history.entries[i]);
@@ -4992,10 +5116,6 @@ static ShellLoopFrame *shellLoopPushFrame(ShellLoopKind kind) {
     frame.redir_backups = NULL;
     frame.redir_backup_count = 0;
     frame.redir_backup_capacity = 0;
-    frame.pipeline_subshell = false;
-    frame.pipeline_scope_pushed = false;
-    frame.pipeline_prev_local_scope_flag = false;
-    frame.pipeline_prev_pipeline_flag = false;
     gShellLoopStack[gShellLoopStackSize++] = frame;
     return &gShellLoopStack[gShellLoopStackSize - 1];
 }
@@ -5423,7 +5543,7 @@ typedef struct {
     size_t capacity;
 } ShellCaseContextStack;
 
-static ShellCaseContextStack gShellCaseStack = {NULL, 0, 0};
+static PSCAL_THREAD_LOCAL ShellCaseContextStack gShellCaseStack = {NULL, 0, 0};
 
 static bool shellCaseStackPush(const char *subject_text) {
     if (!subject_text) {

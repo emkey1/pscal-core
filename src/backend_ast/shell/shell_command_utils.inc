@@ -2294,7 +2294,7 @@ static char *shellLookupParameterValueInternal(const char *name,
             }
             case '$': {
                 char buffer[32];
-                snprintf(buffer, sizeof(buffer), "%d", (int)getpid());
+                snprintf(buffer, sizeof(buffer), "%d", (int)shellRuntimeDollarPid());
                 if (out_is_set) {
                     *out_is_set = true;
                 }

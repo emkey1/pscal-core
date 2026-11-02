@@ -1,6 +1,6 @@
 #include <stdbool.h>
 #include "core/globals.h"
 
-int gParamCount = 0;
-char **gParamValues = NULL;
-bool gParamValuesOwned = false;
+PSCAL_THREAD_LOCAL int gParamCount = 0;
+PSCAL_THREAD_LOCAL char **gParamValues = NULL;
+PSCAL_THREAD_LOCAL bool gParamValuesOwned = false;
