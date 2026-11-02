@@ -193,11 +193,16 @@ static bool shellParseInlineBacktickCommand(const char *text,
     return true;
 }
 
+/* Not encoded in a word: only shellExpandHereDocument passes it. */
+#define SHELL_WORD_FLAG_HERE_DOCUMENT (1 << 6)
+
 static char *shellExpandHereDocument(const char *body, bool quoted) {
     if (quoted) {
         return body ? strdup(body) : strdup("");
     }
-    return shellExpandWord(body, SHELL_WORD_FLAG_HAS_ARITHMETIC, NULL, 0, NULL, NULL, NULL);
+    return shellExpandWord(body,
+                           SHELL_WORD_FLAG_HAS_ARITHMETIC | SHELL_WORD_FLAG_HERE_DOCUMENT,
+                           NULL, 0, NULL, NULL, NULL);
 }
 
 static char *shellExpandParameter(const char *input,
@@ -230,6 +235,11 @@ static char *shellExpandParameter(const char *input,
             /* Before the default-value scan below, which takes it for `${name-word}`. */
             return shellRuntimeOptionFlags();
         }
+        /* ${?} is $?, and ${#} is $#: the name scans below only know identifiers. */
+        if (inner_len == 1 && strchr("?$!#", inner[0])) {
+            char special[2] = {inner[0], '\0'};
+            return shellExpandParameter(special, NULL, out_is_array_expansion, out_array_count);
+        }
         if (inner_len == 0) {
             return strdup("");
         }
@@ -238,8 +248,23 @@ static char *shellExpandParameter(const char *input,
             if (name_start >= closing) {
                 return NULL;
             }
+            if (inner_len == 2 && strchr("?$!-", name_start[0])) {
+                char special[2] = {name_start[0], '\0'};
+                char *value = shellExpandParameter(special, NULL, NULL, NULL);
+                if (!value) {
+                    return NULL;
+                }
+                char buffer[32];
+                snprintf(buffer, sizeof(buffer), "%zu", strlen(value));
+                free(value);
+                return strdup(buffer);
+            }
             size_t name_len = 0;
-            if (!consumeShellIdentifier(name_start, (size_t)(closing - name_start), &name_len, false)) {
+            if (isdigit((unsigned char)*name_start)) {
+                while (name_start + name_len < closing && isdigit((unsigned char)name_start[name_len])) {
+                    name_len++;
+                }
+            } else if (!consumeShellIdentifier(name_start, (size_t)(closing - name_start), &name_len, false)) {
                 return NULL;
             }
             const char *cursor = name_start + name_len;
@@ -1490,11 +1515,17 @@ static char *shellExpandWord(const char *text,
             }
         }
 
-        bool treat_as_double = effective_double;
+        bool here_document = (flags & SHELL_WORD_FLAG_HERE_DOCUMENT) != 0;
+        bool treat_as_double = effective_double || here_document;
         if (c == '\\') {
             if (i + 1 < text_len) {
                 char next = text[i + 1];
-                if (!treat_as_double || next == '$' || next == '"' || next == '\\' || next == '`' || next == '\n') {
+                if (here_document && next == '\n') {
+                    i += 2;
+                    continue;
+                }
+                if (!treat_as_double || next == '$' || (next == '"' && !here_document) || next == '\\' ||
+                    next == '`' || next == '\n') {
                     if (!shellQuotedMapAppendRepeated(track_quotes, &quoted_map, &quoted_len, &quoted_cap,
                                                       quoted_flag, 1)) {
                         goto expand_error;
@@ -3080,7 +3111,7 @@ static bool shellInvokeBuiltin(VM *vm, ShellCommand *cmd) {
         }
     }
     if (!handled && canonical && strcmp(canonical, ":") == 0) {
-        shellUpdateStatus(0);
+        shellUpdateStatus(cmd->empty_stage_status);
         handled = true;
     }
     if (!handled && canonical && strcmp(canonical, "true") == 0) {
@@ -3935,6 +3966,13 @@ static bool shellAddArg(ShellCommand *cmd, const char *arg, bool *saw_command_wo
         cmd->disable_field_splitting = true;
     }
     if (literal_mode) {
+        /* `[[` decides for itself which operands are patterns. */
+        if (quoted_map && cmd->argc > 0 && strcmp(cmd->argv[0], "[[") == 0 &&
+            !shellMarkQuotedGlobChars(&expanded, &quoted_map, &quoted_len)) {
+            free(expanded);
+            free(quoted_map);
+            return false;
+        }
         if (!shellCommandAppendArgOwned(cmd, expanded)) {
             free(quoted_map);
             return false;
@@ -3944,6 +3982,11 @@ static bool shellAddArg(ShellCommand *cmd, const char *arg, bool *saw_command_wo
         }
         free(quoted_map);
         return true;
+    }
+    if (quoted_map && !shellMarkQuotedGlobChars(&expanded, &quoted_map, &quoted_len)) {
+        free(expanded);
+        free(quoted_map);
+        return false;
     }
     char **fields = NULL;
     size_t field_count = 0;
@@ -3974,7 +4017,10 @@ static bool shellAddArg(ShellCommand *cmd, const char *arg, bool *saw_command_wo
         if (shellWordShouldGlob(flags, field)) {
             char **glob_matches = NULL;
             size_t glob_count = 0;
-            int glob_status = shellExpandGlobPattern(field, &glob_matches, &glob_count);
+            char *glob_pattern = shellGlobPatternFromField(field);
+            int glob_status = glob_pattern ? shellExpandGlobPattern(glob_pattern, &glob_matches, &glob_count)
+                                           : GLOB_NOSPACE;
+            free(glob_pattern);
             if (glob_status == 0) {
                 size_t original_argc = cmd->argc;
                 bool ok = true;
@@ -4019,6 +4065,7 @@ static bool shellAddArg(ShellCommand *cmd, const char *arg, bool *saw_command_wo
             }
         }
         if (!appended) {
+            shellStripGlobMarks(field);
             if (!shellCommandAppendArgOwned(cmd, field)) {
                 for (size_t j = i + 1; j < field_count; ++j) {
                     if (fields[j]) {
@@ -4087,6 +4134,25 @@ static char *decodeHexString(const char *hex, size_t *out_len) {
         *out_len = decoded_len;
     }
     return decoded;
+}
+
+static bool shellAppendCombinedRedirect(ShellCommand *cmd, const char *path, bool append);
+
+/* An unquoted expansion must leave exactly one word to open. */
+static bool shellRedirectTargetIsAmbiguous(const char *expanded, uint8_t flags, const bool *quoted_map, size_t quoted_len) {
+    if (*expanded == '\0') {
+        return (flags & (SHELL_WORD_FLAG_SINGLE_QUOTED | SHELL_WORD_FLAG_DOUBLE_QUOTED)) == 0;
+    }
+    const char *ifs = shellSafeGetenv("IFS");
+    if (!ifs) {
+        ifs = " \t\n";
+    }
+    for (size_t i = 0; expanded[i]; ++i) {
+        if ((!quoted_map || i >= quoted_len || !quoted_map[i]) && strchr(ifs, expanded[i])) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool shellAddRedirection(ShellCommand *cmd, const char *spec) {
@@ -4170,27 +4236,42 @@ static bool shellAddRedirection(ShellCommand *cmd, const char *spec) {
     }
 
     char *expanded_target = NULL;
+    bool ambiguous_target = false;
     if (strcmp(type_text, "<<") != 0) {
         if (!target_spec || *target_spec == '\0') {
             free(word_encoded);
             free(copy);
             return false;
         }
+        bool *target_quoted_map = NULL;
+        size_t target_quoted_len = 0;
         expanded_target = shellExpandWord(target_text,
                                           target_flags,
                                           target_meta,
                                           target_meta_len,
-                                          NULL,
-                                          NULL,
+                                          &target_quoted_map,
+                                          &target_quoted_len,
                                           NULL);
         if (!expanded_target) {
             free(word_encoded);
             free(copy);
             return false;
         }
+        /* `[[ $a < $b ]]` reads as a redirection until shellRewriteDoubleBracketTest. */
+        bool double_bracket = cmd->argc > 0 && cmd->argv && strcmp(cmd->argv[0], "[[") == 0;
+        ambiguous_target = strcmp(type_text, "<<<") != 0 && !double_bracket &&
+                           shellRedirectTargetIsAmbiguous(expanded_target, target_flags,
+                                                          target_quoted_map, target_quoted_len);
+        free(target_quoted_map);
     }
 
-    if (strcmp(type_text, "<") == 0) {
+    if (ambiguous_target) {
+        redir.kind = SHELL_RUNTIME_REDIR_DUP;
+        redir.ambiguous = true;
+        redir.dup_target_fd = -1;
+        redir.path = expanded_target;
+        expanded_target = NULL;
+    } else if (strcmp(type_text, "<") == 0) {
         redir.kind = SHELL_RUNTIME_REDIR_OPEN;
         redir.flags = O_RDONLY;
         redir.mode = 0;
@@ -4264,12 +4345,22 @@ static bool shellAddRedirection(ShellCommand *cmd, const char *spec) {
             char *endptr = NULL;
             errno = 0;
             long value = strtol(expanded_target, &endptr, 10);
-            if (errno != 0 || !endptr || *endptr != '\0') {
-                free(expanded_target);
-                free(copy);
-                return false;
+            if (errno != 0 || !endptr || *endptr != '\0' || *expanded_target == '\0') {
+                if (fd == STDOUT_FILENO && strcmp(type_text, ">&") == 0 && *expanded_target) {
+                    /* `>&word` that is not a descriptor means `&>word`. */
+                    bool added = shellAppendCombinedRedirect(cmd, expanded_target, false);
+                    free(expanded_target);
+                    free(word_encoded);
+                    free(copy);
+                    return added;
+                }
+                redir.ambiguous = true;
+                redir.dup_target_fd = -1;
+                redir.path = expanded_target;
+                expanded_target = NULL;
+            } else {
+                redir.dup_target_fd = (int)value;
             }
-            redir.dup_target_fd = (int)value;
         }
         free(expanded_target);
         expanded_target = NULL;

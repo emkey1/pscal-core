@@ -568,6 +568,7 @@ typedef struct ShellRuntimeState {
     bool job_control_initialized;
     ShellJobControlCaps job_control_caps;
     bool errexit_enabled;
+    bool pipefail_enabled;
     bool errexit_pending;
     bool errexit_defer_active;
     bool trap_enabled;
@@ -2217,6 +2218,8 @@ typedef struct {
     char *here_string_literal;
     char *here_string;
     size_t here_string_length;
+    /* Fails when applied, in its turn among the command's redirections. */
+    bool ambiguous;
 } ShellRedirection;
 
 typedef struct {
@@ -2256,6 +2259,7 @@ typedef struct {
     bool disable_field_splitting;
     bool ignore_functions;
     bool ran_command_substitution;
+    int empty_stage_status;
     int pipeline_index;
     bool is_pipeline_head;
     bool is_pipeline_tail;
@@ -2656,6 +2660,8 @@ typedef struct ShellLoopFrame {
     ShellExecRedirBackup *redir_backups;
     size_t redir_backup_count;
     size_t redir_backup_capacity;
+    int status; /* the loop's status: its last body command's, 0 if the body never ran */
+    bool keep_status; /* started while skipping, so nothing ran and nothing changes */
 } ShellLoopFrame;
 
 #define gShellLoopStack (SC()->loop_stack)
@@ -5114,6 +5120,8 @@ static ShellLoopFrame *shellLoopPushFrame(ShellLoopKind kind) {
     }
     ShellLoopFrame frame;
     frame.kind = kind;
+    frame.status = 0;
+    frame.keep_status = false;
     frame.skip_body = false;
     frame.break_pending = false;
     frame.continue_pending = false;
@@ -5560,6 +5568,7 @@ static int shellJobControlSendPid(pid_t pid, int signo) {
 typedef struct {
     char *subject;
     bool matched;
+    int incoming_status;
 } ShellCaseContext;
 
 typedef struct {

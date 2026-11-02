@@ -1044,6 +1044,7 @@ static int shellSpawnProcess(VM *vm,
      * failed process and the rest of a pipeline still runs. */
     int redir_error = 0;
     const char *redir_error_target = NULL;
+    enum { SHELL_REDIR_ERROR_AMBIGUOUS = -1 };
     for (size_t i = 0; i < cmd->redir_count; ++i) {
         if (op_count >= op_capacity) {
             prep_error = ENOMEM;
@@ -1070,6 +1071,11 @@ static int shellSpawnProcess(VM *vm,
                 break;
             }
             case SHELL_RUNTIME_REDIR_DUP: {
+                if (redir->ambiguous) {
+                    redir_error = SHELL_REDIR_ERROR_AMBIGUOUS;
+                    redir_error_target = redir->path;
+                    break;
+                }
                 op.type = SHELL_REDIR_OP_DUP;
                 op.close_target = redir->close_target;
                 op.source_fd = redir->dup_target_fd;
@@ -1221,7 +1227,8 @@ static int shellSpawnProcess(VM *vm,
 
             /* After the earlier ones: `cmd 2>log >/missing` reports into log. */
             if (redir_error != 0) {
-                fprintf(stderr, "exsh: %s: %s\n", redir_error_target, strerror(redir_error));
+                fprintf(stderr, "exsh: %s: %s\n", redir_error_target,
+                        redir_error == SHELL_REDIR_ERROR_AMBIGUOUS ? "ambiguous redirect" : strerror(redir_error));
                 _exit(1);
             }
 
@@ -1997,6 +2004,7 @@ static ShellCommand *shellCloneCommandForBackground(const ShellCommand *src) {
     dst->background = src->background;
     dst->disable_field_splitting = src->disable_field_splitting;
     dst->ignore_functions = src->ignore_functions;
+    dst->empty_stage_status = src->empty_stage_status;
     dst->pipeline_index = src->pipeline_index;
     dst->is_pipeline_head = src->is_pipeline_head;
     dst->is_pipeline_tail = src->is_pipeline_tail;
@@ -2176,6 +2184,10 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
                     stderr_append = (r->flags & O_APPEND) != 0;
                 }
             } else if (r->kind == SHELL_RUNTIME_REDIR_DUP) {
+                if (r->ambiguous && !redir_failed_target) {
+                    redir_failed_target = r->path;
+                    redir_failed_errno = EINVAL;
+                }
                 if (r->fd == STDERR_FILENO && r->dup_target_fd == STDOUT_FILENO && stdout_raw) {
                     stderr_raw = stdout_raw;
                     stderr_append = stdout_append;
@@ -3015,6 +3027,12 @@ static bool shellEnsurePipeline(size_t stages, bool negated) {
     return true;
 }
 
+/* The pipeline's status so far, given the next stage's: the last stage's, or under
+ * pipefail the last one's that failed. */
+static int shellPipelineNextStatus(int status, int stage_status) {
+    return (gShellRuntime.pipefail_enabled && stage_status == 0) ? status : stage_status;
+}
+
 static int shellFinishPipeline(const ShellCommand *tail_cmd) {
     ShellPipelineContext *ctx = &gShellRuntime.pipeline;
     if (!ctx->active) {
@@ -3151,6 +3169,15 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd) {
                 shellShebangThreadCtxFree(bg_ctx);
             }
         }
+        if (ctx->stage_status) {
+            int combined = 0;
+            for (size_t i = 0; i < ctx->stage_count; ++i) {
+                combined = shellPipelineNextStatus(combined, ctx->stage_status[i]);
+            }
+            if (gShellRuntime.pipefail_enabled) {
+                final_status = combined;
+            }
+        }
         bool job_control = false;
         if (!ctx->background) {
             shellEnsureJobControl();
@@ -3227,7 +3254,7 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd) {
                 stopped_job = true;
                 final_status = wait_res.status_mapped;
             } else {
-                final_status = wait_res.status_mapped;
+                final_status = shellPipelineNextStatus(final_status, wait_res.status_mapped);
                 ctx->pids[i] = -1;
             }
         }
@@ -3734,26 +3761,30 @@ static bool shellApplyExecRedirections(const ShellCommand *cmd,
                     }
                 }
 #endif
-                if (!shellDupOntoTarget(vp_current, (vfd >= 0) ? vfd : fd, target_fd, dbg, "open")) {
-                    int err = errno;
-                    if (dbg) {
-                        fprintf(stderr, "[redir] dup %d->%d failed: %s\n", fd, target_fd, strerror(err));
+                /* With the target closed, as in `exec 3> f`, open can land right on it.
+                 * Then it is done, and closing the source would undo it. */
+                if (((vfd >= 0) ? vfd : fd) != target_fd) {
+                    if (!shellDupOntoTarget(vp_current, (vfd >= 0) ? vfd : fd, target_fd, dbg, "open")) {
+                        int err = errno;
+                        if (dbg) {
+                            fprintf(stderr, "[redir] dup %d->%d failed: %s\n", fd, target_fd, strerror(err));
+                        }
+                        shellRedirectionFailed(redir->path, err);
+#if defined(PSCAL_TARGET_IOS)
+                        if (vp_current && vfd >= 0) {
+                            vprocCloseShim(vfd);
+                        } else
+#endif
+                        vprocHostClose(fd);
+                        goto redir_error;
                     }
-                    shellRedirectionFailed(redir->path, err);
 #if defined(PSCAL_TARGET_IOS)
                     if (vp_current && vfd >= 0) {
                         vprocCloseShim(vfd);
                     } else
 #endif
                     vprocHostClose(fd);
-                    goto redir_error;
                 }
-#if defined(PSCAL_TARGET_IOS)
-                if (vp_current && vfd >= 0) {
-                    vprocCloseShim(vfd);
-                } else
-#endif
-                vprocHostClose(fd);
                 if (target_fd == STDOUT_FILENO) {
                     stdout_redirected = true;
                 }
@@ -3763,6 +3794,11 @@ static bool shellApplyExecRedirections(const ShellCommand *cmd,
                 if (dbg) {
                     fprintf(stderr, "[redir] dup fd=%d target=%d close=%d\n",
                             redir->dup_target_fd, target_fd, (int)redir->close_target);
+                }
+                if (redir->ambiguous) {
+                    fprintf(stderr, "exsh: %s: ambiguous redirect\n", redir->path ? redir->path : "");
+                    shellUpdateStatus(1);
+                    goto redir_error;
                 }
                 if (target_fd == STDOUT_FILENO && redir->dup_target_fd == STDOUT_FILENO && stdout_redirected) {
                     target_fd = STDERR_FILENO;
@@ -4930,6 +4966,11 @@ static void *shellPipelineStageThreadMain(void *arg) {
                                        tctx->pipeline_tail);
         vprocSetPipelineStage(false);
     }
+    /* Each stage has its own slot, read only once it has been joined. */
+    if (!tctx->owns_ctx_snapshot && tctx->ctx && tctx->ctx->stage_status &&
+        tctx->stage_pos < tctx->ctx->stage_count) {
+        tctx->ctx->stage_status[tctx->stage_pos] = status;
+    }
     if (getenv("PSCALI_PIPE_DEBUG")) {
         fprintf(stderr,
                 "[pipe-thread] stage=%zu cmd=%s status=%d tail=%d bg=%d worker=%d\n",
@@ -5423,6 +5464,17 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
 }
 #endif /* PSCAL_TARGET_IOS */
 
+static void shellExitUnlessInteractive(VM *vm, const char *reason) {
+    if (shellRuntimeIsInteractive()) {
+        return;
+    }
+    shellRuntimeRequestExit();
+    if (vm) {
+        vm->exit_requested = true;
+        vm->current_builtin_name = reason;
+    }
+}
+
 static bool shellExecuteExecBuiltin(VM *vm, ShellCommand *cmd) {
     if (!shellCommandIsExecBuiltin(cmd)) {
         return false;
@@ -5479,6 +5531,16 @@ static bool shellExecuteExecBuiltin(VM *vm, ShellCommand *cmd) {
     shellRestoreExecRedirections(backups, backup_count);
     shellFreeExecRedirBackups(backups, backup_count);
     shellUpdateStatus((err == ENOENT) ? 127 : 126);
+    /* Neither a script nor a subshell outlives a failed exec, as under bash. */
+    if (gShellRuntime.in_subshell) {
+        shellRuntimeRequestExit();
+        if (vm) {
+            vm->exit_requested = true;
+            vm->current_builtin_name = "exec";
+        }
+    } else if (!shellShoptOptionEnabled("execfail")) {
+        shellExitUnlessInteractive(vm, "exec");
+    }
     return true;
 }
 
@@ -5500,6 +5562,22 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
         return makeVoid();
     }
     ShellPipelineContext *ctx = &gShellRuntime.pipeline;
+    /* A stage or background job with no command word, like `x=1 | cat` or `> f &`, runs
+     * apart from the shell as any other does: it holds its pipe ends, and its assignments
+     * do not reach the shell. `:` gives it a command to run. */
+    if (cmd->argc == 0 && (cmd->background || (ctx->active && ctx->stage_count > 1))) {
+        char *colon = strdup(":");
+        if (!colon || !shellCommandAppendArgOwned(cmd, colon)) {
+            runtimeError(vm, "shell exec: out of memory");
+            if (ctx->active) {
+                shellAbortPipeline();
+            }
+            shellFreeCommand(cmd);
+            shellScalarCacheInvalidate();
+            return makeVoid();
+        }
+        cmd->empty_stage_status = cmd->ran_command_substitution ? gShellRuntime.last_status : 0;
+    }
 #if defined(PSCAL_TARGET_IOS)
     bool prefer_worker = shellShouldRunCommandInForegroundWorker(cmd);
     bool force_pipeline_builtin = false;
@@ -5612,8 +5690,10 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
                     runtimeError(vm, "shell exec: failed to apply assignment '%s': %s",
                                  failed_assignment ? failed_assignment : "<assignment>",
                                  strerror(errno));
-                    shellUpdateStatus(errno ? errno : 1);
+                    shellUpdateStatus(1);
                 }
+                /* Readonly and the like: with no command to fail, a script ends here, as under bash. */
+                shellExitUnlessInteractive(vm, "assignment");
             } else if (!cmd->ran_command_substitution) {
                 /* `d=$(mktemp -d) || exit 1`: otherwise the status stays that of the
                  * last substitution, which shellRunCommandSubstitution has set. */
@@ -5621,6 +5701,16 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
             }
         } else if (!cmd->ran_command_substitution) {
             shellUpdateStatus(0);
+        }
+        /* The files are opened and the descriptors put back at once: `> f` creates f. */
+        if (cmd->redir_count > 0) {
+            ShellExecRedirBackup *redir_backups = NULL;
+            size_t redir_backup_count = 0;
+            shellFlushStandardStreams();
+            if (shellApplyExecRedirections(cmd, &redir_backups, &redir_backup_count)) {
+                shellRestoreExecRedirections(redir_backups, redir_backup_count);
+                shellFreeExecRedirBackups(redir_backups, redir_backup_count);
+            }
         }
         if (ctx->active) {
             int status = gShellRuntime.last_status;
@@ -5668,7 +5758,7 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
                 runtimeError(vm, "shell exec: failed to apply assignment '%s': %s",
                              failed_assignment ? failed_assignment : "<assignment>",
                              strerror(errno));
-                shellUpdateStatus(errno ? errno : 1);
+                shellUpdateStatus(1);
             }
             if (ctx->active) {
                 shellAbortPipeline();

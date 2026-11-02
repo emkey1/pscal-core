@@ -1290,6 +1290,14 @@ static bool shellApplyAssignmentsTemporary(const ShellCommand *cmd,
     return true;
 }
 
+/* Goes before a quoted glob character on its way through field splitting, which only the
+ * expanded text survives: `\\*`, `a'?'b`. A mark byte already in the text gets one too. */
+#define SHELL_GLOB_LITERAL_MARK ((char)0x1e)
+
+static bool shellGlobCharNeedsMark(char c, bool quoted) {
+    return c == SHELL_GLOB_LITERAL_MARK || (quoted && strchr("*?[]\\", c));
+}
+
 static bool shellWordShouldGlob(uint8_t flags, const char *text) {
     if (!text || !*text) {
         return false;
@@ -1298,11 +1306,85 @@ static bool shellWordShouldGlob(uint8_t flags, const char *text) {
         return false;
     }
     for (const char *cursor = text; *cursor; ++cursor) {
+        if (*cursor == SHELL_GLOB_LITERAL_MARK && cursor[1]) {
+            ++cursor;
+            continue;
+        }
         if (*cursor == '*' || *cursor == '?' || *cursor == '[') {
             return true;
         }
     }
     return false;
+}
+
+/* Takes ownership of `expanded` and the map, which grow with the marks they gain. */
+static bool shellMarkQuotedGlobChars(char **expanded, bool **quoted_map, size_t *quoted_len) {
+    const char *text = *expanded;
+    const bool *map = *quoted_map;
+    size_t marks = 0;
+    size_t length = strlen(text);
+    for (size_t i = 0; i < length; ++i) {
+        if (shellGlobCharNeedsMark(text[i], i < *quoted_len && map[i])) {
+            marks++;
+        }
+    }
+    if (marks == 0) {
+        return true;
+    }
+    char *new_text = (char *)malloc(length + marks + 1);
+    bool *new_map = (bool *)malloc((length + marks) * sizeof(bool));
+    if (!new_text || !new_map) {
+        free(new_text);
+        free(new_map);
+        return false;
+    }
+    size_t out = 0;
+    size_t map_out = 0;
+    for (size_t i = 0; i < length; ++i) {
+        bool quoted = i < *quoted_len && map[i];
+        if (shellGlobCharNeedsMark(text[i], quoted)) {
+            new_text[out++] = SHELL_GLOB_LITERAL_MARK;
+            new_map[map_out++] = true;
+        }
+        new_text[out++] = text[i];
+        new_map[map_out++] = quoted;
+    }
+    new_text[out] = '\0';
+    free(*expanded);
+    free(*quoted_map);
+    *expanded = new_text;
+    *quoted_map = new_map;
+    *quoted_len = map_out;
+    return true;
+}
+
+/* A marked field as a glob pattern, in place: each marked character behind a backslash. */
+static void shellGlobMarksToBackslashes(char *field) {
+    for (char *cursor = field; *cursor; ++cursor) {
+        if (*cursor == SHELL_GLOB_LITERAL_MARK && cursor[1]) {
+            *cursor++ = '\\';
+        }
+    }
+}
+
+static char *shellGlobPatternFromField(const char *field) {
+    char *pattern = strdup(field);
+    if (pattern) {
+        shellGlobMarksToBackslashes(pattern);
+    }
+    return pattern;
+}
+
+/* A marked field as the text it stands for, in place. */
+static void shellStripGlobMarks(char *field) {
+    char *out = field;
+    for (const char *cursor = field; *cursor; ++cursor) {
+        if (*cursor == SHELL_GLOB_LITERAL_MARK && cursor[1]) {
+            ++cursor;
+        }
+        *out++ = *cursor;
+    }
+    *out = '\0';
 }
 
 typedef struct {
@@ -3476,7 +3558,7 @@ static bool shellDirectoryStackEnsureInitialised(VM *vm, const char *builtin) {
         gShellRuntime.dir_stack[0] = NULL;
         gShellRuntime.dir_stack_count = 0;
         gShellRuntime.dir_stack_initialised = false;
-        shellUpdateStatus(errno ? errno : 1);
+        shellUpdateStatus(1);
         return false;
     }
     return true;
@@ -3551,7 +3633,7 @@ static bool shellDirectoryStackChdir(VM *vm,
     char old_cwd[PATH_MAX];
     if (!SHELL_GETCWD(old_cwd, sizeof(old_cwd))) {
         shellDirectoryStackReportErrno(vm, builtin);
-        shellUpdateStatus(errno ? errno : 1);
+        shellUpdateStatus(1);
         return false;
     }
     if (SHELL_CHDIR(target) != 0) {
@@ -3561,13 +3643,13 @@ static bool shellDirectoryStackChdir(VM *vm,
         pscalRuntimeDebugLog(logBuf);
 #endif
         shellDirectoryStackReportErrno(vm, builtin);
-        shellUpdateStatus(errno ? errno : 1);
+        shellUpdateStatus(1);
         return false;
     }
     char new_cwd[PATH_MAX];
     if (!SHELL_GETCWD(new_cwd, sizeof(new_cwd))) {
         shellDirectoryStackReportErrno(vm, builtin);
-        shellUpdateStatus(errno ? errno : 1);
+        shellUpdateStatus(1);
         (void)SHELL_CHDIR(old_cwd);
         return false;
     }

@@ -1125,6 +1125,7 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
     }
 
     frame->skip_body = parent_skip;
+    frame->keep_status = parent_skip;
     frame->break_pending = false;
     frame->continue_pending = false;
     if (condition_kind_value < SHELL_LOOP_CONDITION_NONE ||
@@ -1270,6 +1271,12 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
                     ok = false;
                     break;
                 }
+                if (quoted_map && !shellMarkQuotedGlobChars(&expanded, &quoted_map, &quoted_len)) {
+                    free(expanded);
+                    free(quoted_map);
+                    ok = false;
+                    break;
+                }
                 char **fields = NULL;
                 size_t field_count = 0;
                 if (!shellSplitExpandedWord(expanded,
@@ -1300,7 +1307,11 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
                     if (shellWordShouldGlob(word_flags, field_value)) {
                         char **glob_matches = NULL;
                         size_t glob_count = 0;
-                        int glob_status = shellExpandGlobPattern(field_value, &glob_matches, &glob_count);
+                        char *glob_pattern = shellGlobPatternFromField(field_value);
+                        int glob_status = glob_pattern
+                            ? shellExpandGlobPattern(glob_pattern, &glob_matches, &glob_count)
+                            : GLOB_NOSPACE;
+                        free(glob_pattern);
                         if (glob_status == 0) {
                             bool glob_ok = true;
                             for (size_t g = 0; g < glob_count; ++g) {
@@ -1317,6 +1328,7 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
                             }
                             free(glob_matches);
                             free(field_value);
+                            field_value = NULL;
                             fields[f] = NULL;
                             if (!glob_ok) {
                                 ok = false;
@@ -1332,6 +1344,7 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
                         break;
                     }
                     if (field_value) {
+                        shellStripGlobMarks(field_value);
                         if (!shellLoopFrameAppendValue(frame, &values_capacity, field_value)) {
                             ok = false;
                             fields[f] = NULL;
@@ -1577,6 +1590,7 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
     }
 
     if (!ok) {
+        frame->status = 1;
         shellUpdateStatus(1);
     }
 
@@ -1594,6 +1608,14 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
     return result;
 }
 
+/* errexit already had its say about the command that set this status. Only a failure it
+ * ignored, as in `false && true`, gets here again, and that does not end the script. */
+static void shellLoopRestoreStatus(int status) {
+    shellRuntimeEnterCondition();
+    shellUpdateStatus(status);
+    shellRuntimeLeaveCondition();
+}
+
 Value vmBuiltinShellLoopEnd(VM *vm, int arg_count, Value *args) {
     VM *previous_vm = shellSwapCurrentVm(vm);
     (void)arg_count;
@@ -1602,6 +1624,9 @@ Value vmBuiltinShellLoopEnd(VM *vm, int arg_count, Value *args) {
     if (frame) {
         bool propagate_continue = frame->continue_pending;
         bool propagate_break = frame->break_pending;
+        if (!frame->keep_status && !gShellExitRequested) {
+            shellLoopRestoreStatus(frame->status);
+        }
         shellLoopPopFrame();
         if (gShellLoopStackSize == 0) {
             if (propagate_break) {
@@ -1637,8 +1662,11 @@ Value vmBuiltinShellLeaveCondition(VM *vm, int arg_count, Value *args) {
 
 Value vmBuiltinShellLeaveConditionPreserve(VM *vm, int arg_count, Value *args) {
     (void)vm;
-    (void)arg_count;
     (void)args;
+    /* Its one argument says a compound command under `!` has just finished. */
+    if (arg_count == 1) {
+        shellUpdateStatus(gShellRuntime.last_status == 0 ? 1 : 0);
+    }
     shellRuntimeLeaveCondition();
     return makeVoid();
 }
@@ -1688,6 +1716,7 @@ Value vmBuiltinShellCase(VM *vm, int arg_count, Value *args) {
         goto cleanup;
     }
     free(expanded_subject);
+    shellCaseStackTop()->incoming_status = gShellRuntime.last_status;
     shellUpdateStatus(0);
 
 cleanup:
@@ -1710,6 +1739,11 @@ Value vmBuiltinShellCaseClause(VM *vm, int arg_count, Value *args) {
         shellUpdateStatus(1);
         goto cleanup;
     }
+    /* A clause has matched and its body is next. */
+    if (AS_STRING(args[0]) && strcmp(AS_STRING(args[0]), "restore") == 0) {
+        shellUpdateStatus(ctx->incoming_status);
+        goto cleanup;
+    }
     if (ctx->matched) {
         shellUpdateStatus(1);
         goto cleanup;
@@ -1729,14 +1763,20 @@ Value vmBuiltinShellCaseClause(VM *vm, int arg_count, Value *args) {
             pattern_text = pattern_spec ? pattern_spec : "";
             pattern_flags = 0;
         }
+        bool *pattern_map = NULL;
+        size_t pattern_map_len = 0;
         char *expanded_pattern = shellExpandWord(pattern_text,
                                                 pattern_flags,
                                                 pattern_meta,
                                                 pattern_meta_len,
-                                                NULL,
-                                                NULL,
+                                                &pattern_map,
+                                                &pattern_map_len,
                                                 NULL);
-        if (!expanded_pattern) {
+        bool marked = expanded_pattern &&
+                      (!pattern_map || shellMarkQuotedGlobChars(&expanded_pattern, &pattern_map, &pattern_map_len));
+        free(pattern_map);
+        if (!marked) {
+            free(expanded_pattern);
             runtimeError(vm, "shell case clause: out of memory");
             shellUpdateStatus(1);
             goto cleanup;
@@ -1745,12 +1785,16 @@ Value vmBuiltinShellCaseClause(VM *vm, int arg_count, Value *args) {
             ShellPatternFlags match_flags = shellShoptOptionEnabled("nocasematch")
                 ? SHELL_PATTERN_NOCASE
                 : SHELL_PATTERN_NONE;
-            if (shellPatternMatchEx(expanded_pattern, subject, match_flags) == 0) {
+            char *glob_pattern = shellGlobPatternFromField(expanded_pattern);
+            int match_rc = glob_pattern ? shellPatternMatchEx(glob_pattern, subject, match_flags) : FNM_NOMATCH;
+            free(glob_pattern);
+            if (match_rc == 0) {
                 free(expanded_pattern);
                 matched = true;
                 break;
             }
         } else {
+            shellStripGlobMarks(expanded_pattern);
             if (shellUtf8StringCompare(expanded_pattern,
                                        subject,
                                        shellShoptOptionEnabled("nocasematch")) == 0) {
@@ -2545,6 +2589,23 @@ static bool shellEvaluateFileBinary(const char *left,
 
 Value vmBuiltinShellDoubleBracket(VM *vm, int arg_count, Value *args) {
     (void)vm;
+    /* Only the pattern after one of these operators keeps its quoted glob characters
+     * apart, behind a backslash. Every other operand is plain text. */
+    for (int i = arg_count - 1; i >= 0; --i) {
+        if (VALUE_TYPE(args[i]) != TYPE_STRING || !AS_STRING(args[i])) {
+            continue;
+        }
+        char *text = AS_STRING(args[i]);
+        const char *before = (i > 0 && VALUE_TYPE(args[i - 1]) == TYPE_STRING && AS_STRING(args[i - 1]))
+                                 ? AS_STRING(args[i - 1])
+                                 : "";
+        if (strcmp(before, "==") == 0 || strcmp(before, "=") == 0 || strcmp(before, "!=") == 0 ||
+            strcmp(before, "=~") == 0) {
+            shellGlobMarksToBackslashes(text);
+        } else {
+            shellStripGlobMarks(text);
+        }
+    }
     /* Be tolerant of unmatched parsing so that [[ ... ]] still works even if
      * the rewrite step failed and left a trailing "]]" argument. */
     while (arg_count > 0) {
@@ -2730,7 +2791,7 @@ Value vmBuiltinShellCd(VM *vm, int arg_count, Value *args) {
         } else {
             runtimeError(vm, "cd: failed to update environment");
         }
-        shellUpdateStatus(errno ? errno : 1);
+        shellUpdateStatus(1);
         free(old_cwd);
         return makeVoid();
     }
@@ -2745,7 +2806,7 @@ Value vmBuiltinShellPwd(VM *vm, int arg_count, Value *args) {
     char cwd[PATH_MAX];
     if (!SHELL_GETCWD(cwd, sizeof(cwd))) {
         runtimeError(vm, "pwd: %s", strerror(errno));
-        shellUpdateStatus(errno ? errno : 1);
+        shellUpdateStatus(1);
         return makeVoid();
     }
 #if defined(PSCAL_TARGET_IOS)
@@ -2938,7 +2999,7 @@ Value vmBuiltinShellClear(VM *vm, int arg_count, Value *args) {
     const char *sequence = "\x1B[3J\x1B[H\x1B[2J";
     if (fputs(sequence, stdout) == EOF) {
         runtimeError(vm, "clear: failed to write escape sequence");
-        shellUpdateStatus(errno ? errno : 1);
+        shellUpdateStatus(1);
         return makeVoid();
     }
     fflush(stdout);
@@ -4943,7 +5004,7 @@ Value vmBuiltinShellSource(VM *vm, int arg_count, Value *args) {
     char *source = shellLoadFile(path);
     if (!source) {
         runtimeError(vm, "source: unable to read '%s'", path);
-        shellUpdateStatus(errno ? errno : 1);
+        shellUpdateStatus(1);
         return makeVoid();
     }
 
@@ -5271,6 +5332,17 @@ Value vmBuiltinShellExecCommand(VM *vm, int arg_count, Value *args) {
 Value vmBuiltinShellReturn(VM *vm, int arg_count, Value *args) {
     VM *previous_vm = shellSwapCurrentVm(vm);
     int status = gShellRuntime.last_status;
+
+    bool top_level = shellLocalScopeDepth() == 0 && shellRuntimeIsOutermostScript();
+#if defined(PSCAL_TARGET_IOS)
+    /* A subshell there is a thread, with no record of the calls around it. */
+    top_level = top_level && !gShellRuntime.in_subshell;
+#endif
+    if (top_level) {
+        runtimeError(vm, "return: can only `return' from a function or sourced script");
+        shellRestoreCurrentVm(previous_vm);
+        return makeVoid();
+    }
 
     if (arg_count > 1) {
         runtimeError(vm, "return: too many arguments");
@@ -7293,7 +7365,7 @@ Value vmBuiltinShellReadonly(VM *vm, int arg_count, Value *args) {
                     runtimeError(vm, "readonly: unable to set '%s'", name);
                 }
                 free(name);
-                shellUpdateStatus(errno ? errno : 1);
+                shellUpdateStatus(1);
                 return makeVoid();
             }
             if (!shellReadonlyAdd(name)) {
@@ -7322,7 +7394,7 @@ Value vmBuiltinShellReadonly(VM *vm, int arg_count, Value *args) {
                     } else {
                         runtimeError(vm, "readonly: unable to set '%s'", text);
                     }
-                    shellUpdateStatus(errno ? errno : 1);
+                    shellUpdateStatus(1);
                     return makeVoid();
                 }
             }
@@ -8163,7 +8235,7 @@ Value vmBuiltinShellTimes(VM *vm, int arg_count, Value *args) {
     clock_t result = times(&time_info);
     if (result == (clock_t)-1) {
         runtimeError(vm, "times: %s", strerror(errno));
-        shellUpdateStatus(errno ? errno : 1);
+        shellUpdateStatus(1);
         return makeVoid();
     }
     long ticks_per_second = sysconf(_SC_CLK_TCK);
@@ -8996,38 +9068,38 @@ Value vmBuiltinShellSet(VM *vm, int arg_count, Value *args) {
             parsing_options = false;
             break;
         }
-        if (strcmp(token, "-e") == 0) {
-            gShellRuntime.errexit_enabled = true;
-            gShellRuntime.errexit_pending = false;
-            gShellRuntime.errexit_defer_active = false;
-        } else if (strcmp(token, "+e") == 0) {
-            gShellRuntime.errexit_enabled = false;
-            gShellRuntime.errexit_pending = false;
-            gShellRuntime.errexit_defer_active = false;
-        } else if ((strcmp(token, "-o") == 0 || strcmp(token, "+o") == 0)) {
+        if (token[0] == '-' || token[0] == '+') {
+            /* Letters combine, as in `set -eu` and `set -euo pipefail`, and each `o`
+             * takes the next word. Unsupported options are ignored, as before. */
             bool enable = (token[0] == '-');
-            if (i + 1 >= arg_count) {
-                runtimeError(vm, "set: missing option name for %s", token);
-                ok = false;
-                break;
-            }
-            Value name_val = args[++i];
-            if (VALUE_TYPE(name_val) != TYPE_STRING || !AS_STRING(name_val)) {
-                runtimeError(vm, "set: option name must be a string");
-                ok = false;
-                break;
-            }
-            if (strcasecmp(AS_STRING(name_val), "errexit") == 0) {
-                gShellRuntime.errexit_enabled = enable;
-                if (!enable) {
+            for (const char *flag = token + 1; *flag && ok; ++flag) {
+                const char *name = NULL;
+                if (*flag == 'e') {
+                    name = "errexit";
+                } else if (*flag == 'o') {
+                    if (i + 1 >= arg_count) {
+                        runtimeError(vm, "set: missing option name for %s", token);
+                        ok = false;
+                        break;
+                    }
+                    Value name_val = args[++i];
+                    if (VALUE_TYPE(name_val) != TYPE_STRING || !AS_STRING(name_val)) {
+                        runtimeError(vm, "set: option name must be a string");
+                        ok = false;
+                        break;
+                    }
+                    name = AS_STRING(name_val);
+                }
+                if (name && strcasecmp(name, "errexit") == 0) {
+                    gShellRuntime.errexit_enabled = enable;
                     gShellRuntime.errexit_pending = false;
                     gShellRuntime.errexit_defer_active = false;
+                } else if (name && strcasecmp(name, "pipefail") == 0) {
+                    gShellRuntime.pipefail_enabled = enable;
+                } else if (name && strcasecmp(name, "posix") == 0) {
+                    shellRuntimeSetPosixMode(enable);
                 }
-            } else if (strcasecmp(AS_STRING(name_val), "posix") == 0) {
-                shellRuntimeSetPosixMode(enable);
             }
-        } else if (token[0] == '-' || token[0] == '+') {
-            // Unsupported option, ignore for now to match previous behaviour.
         } else {
             positional_start = i;
             parsing_options = false;
@@ -11361,6 +11433,9 @@ Value vmBuiltinShellWait(VM *vm, int arg_count, Value *args) {
                 shellUpdateStatus(fallback_status);
                 return makeVoid();
             }
+            if (target > 0) {
+                fallback_status = 127;
+            }
         }
         shellUpdateStatus(fallback_status);
         return makeVoid();
@@ -11938,7 +12013,6 @@ Value vmHostShellLoopCheckCondition(VM *vm) {
     shellUpdateStatus(status);
 
     shellRuntimeLeaveCondition();
-    shellUpdateStatus(0);
 
     return makeBoolean(ready);
 }
@@ -11974,7 +12048,6 @@ Value vmHostShellLoopCheckBody(VM *vm) {
     bool ready = shellLoopEvaluateConditionSimple(frame, &cond_status);
     shellUpdateStatus(cond_status);
     shellRuntimeLeaveCondition();
-    shellUpdateStatus(0);
 
     if (!ready) {
         return makeBoolean(false);
@@ -12027,6 +12100,7 @@ Value vmHostShellLoopIsReady(VM *vm) {
             } else if (!shellLoopEvaluateCForCondition(frame, &condition_ready)) {
                 frame->skip_body = true;
                 frame->break_pending = true;
+                frame->status = 1;
                 shellUpdateStatus(1);
                 ready = false;
             } else {
@@ -12046,6 +12120,7 @@ Value vmHostShellLoopAdvance(VM *vm) {
     if (!frame) {
         return makeBoolean(false);
     }
+    frame->status = gShellRuntime.last_status;
 
     if (gShellExitRequested || gShellRuntime.break_requested) {
         frame->break_pending = true;
@@ -12068,6 +12143,7 @@ Value vmHostShellLoopAdvance(VM *vm) {
         if (frame->for_index < frame->for_count) {
             if (!shellAssignLoopVariable(frame->for_variable, frame->for_values[frame->for_index])) {
                 runtimeError(vm, "shell loop: failed to assign '%s'", frame->for_variable ? frame->for_variable : "<var>");
+                frame->status = 1;
                 shellUpdateStatus(1);
                 frame->skip_body = false;
                 frame->for_active = false;
@@ -12083,6 +12159,7 @@ Value vmHostShellLoopAdvance(VM *vm) {
         }
     } else if (frame->kind == SHELL_LOOP_KIND_CFOR) {
         if (!shellLoopExecuteCForUpdate(frame)) {
+            frame->status = 1;
             shellUpdateStatus(1);
             frame->skip_body = false;
             frame->break_pending = true;
@@ -12091,6 +12168,7 @@ Value vmHostShellLoopAdvance(VM *vm) {
         }
         bool condition_ready = false;
         if (!shellLoopEvaluateCForCondition(frame, &condition_ready)) {
+            frame->status = 1;
             shellUpdateStatus(1);
             frame->skip_body = false;
             frame->break_pending = true;
@@ -12098,13 +12176,11 @@ Value vmHostShellLoopAdvance(VM *vm) {
             return makeBoolean(false);
         }
         should_continue = condition_ready;
+        shellLoopRestoreStatus(frame->status);
     }
 
     frame->skip_body = false;
     shellMaybeResetPipeline();
-    if (!should_continue) {
-        shellUpdateStatus(0);
-    }
     return makeBoolean(should_continue);
 }
 
