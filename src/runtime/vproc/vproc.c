@@ -2457,6 +2457,15 @@ static ssize_t vprocInprocPipeRead(struct pscal_fd *fd, void *buf, size_t bufsiz
     pthread_mutex_lock(&pipe->mu);
     pipe->active_ops++;
     while (pipe->count == 0 && !pipe->write_closed) {
+        if (fd->flags & O_NONBLOCK) {
+            pipe->active_ops--;
+            bool destroy = vprocInprocPipeShouldDestroy(pipe);
+            pthread_mutex_unlock(&pipe->mu);
+            if (destroy) {
+                vprocInprocPipeFree(pipe);
+            }
+            return _EAGAIN;
+        }
         pipe->wait_readers++;
         struct timespec ts;
         vprocInprocPipeWaitDeadline(&ts);
@@ -2519,6 +2528,15 @@ static ssize_t vprocInprocPipeWrite(struct pscal_fd *fd, const void *buf, size_t
         return _EPIPE;
     }
     while (pipe->count == pipe->cap && !pipe->read_closed) {
+        if (fd->flags & O_NONBLOCK) {
+            pipe->active_ops--;
+            bool destroy = vprocInprocPipeShouldDestroy(pipe);
+            pthread_mutex_unlock(&pipe->mu);
+            if (destroy) {
+                vprocInprocPipeFree(pipe);
+            }
+            return _EAGAIN;
+        }
         pipe->wait_writers++;
         struct timespec ts;
         vprocInprocPipeWaitDeadline(&ts);
@@ -7201,6 +7219,10 @@ static ssize_t vprocLocationPscalRead(struct pscal_fd *fd, void *buf, size_t buf
             reader->offset = 0;
             reader->last_seq = gLocationDevice.seq;
             break;
+        }
+        if (fd->flags & O_NONBLOCK) {
+            pthread_mutex_unlock(&gLocationDevice.mu);
+            return _EAGAIN;
         }
         pthread_cond_wait(&gLocationDevice.cond, &gLocationDevice.mu);
     }
@@ -13222,6 +13244,137 @@ int vprocFchdirShim(int fd) {
 #else
     return fchdir(host);
 #endif
+}
+
+/* One open file sits under the whole session's terminal: its reader thread and
+ * every later command use it, and nothing would put O_NONBLOCK back after a
+ * command left it set. Reads of it come through the session's queue, which ignores
+ * the flag anyway, while tty_write would stop waiting for room, so it stays blocking. */
+static bool vprocFdIsSessionStdio(struct pscal_fd *pscal_fd, int host) {
+    VProcSessionStdio *session = vprocSessionStdioCurrent();
+    if (!session) {
+        return false;
+    }
+    if (pscal_fd) {
+        return pscal_fd == session->stdin_pscal_fd ||
+               pscal_fd == session->stdout_pscal_fd ||
+               pscal_fd == session->stderr_pscal_fd ||
+               pscal_fd == session->pty_slave;
+    }
+    return vprocSessionFdMatchesHost(host, session->stdin_host_fd) ||
+           vprocSessionFdMatchesHost(host, session->stdout_host_fd) ||
+           vprocSessionFdMatchesHost(host, session->stderr_host_fd);
+}
+
+/* An in-process pipe, PTY or the location device has no host descriptor. What
+ * fcntl means on one: the file status flags are the pscal_fd's own, of which only
+ * O_NONBLOCK can change; vprocSimulatedExec keeps every slot, so close-on-exec is
+ * accepted and not kept; and none of them can be locked. */
+static int vprocFcntlPscalFd(struct pscal_fd *pscal_fd, int cmd, int arg) {
+    switch (cmd) {
+        case F_GETFD:
+        case F_SETFD:
+            return 0;
+        case F_GETFL: {
+            lock(&pscal_fd->lock);
+            unsigned flags = pscal_fd->flags;
+            unlock(&pscal_fd->lock);
+            int mode = O_RDONLY;
+            if (pscal_fd->ops->read && pscal_fd->ops->write) {
+                mode = (int)(flags & O_ACCMODE);
+            } else if (pscal_fd->ops->write) {
+                mode = O_WRONLY;
+            }
+            return mode | (int)(flags & O_NONBLOCK);
+        }
+        case F_SETFL:
+            if (vprocFdIsSessionStdio(pscal_fd, -1)) {
+                return 0;
+            }
+            lock(&pscal_fd->lock);
+            pscal_fd->flags = (pscal_fd->flags & ~(unsigned)O_NONBLOCK) | ((unsigned)arg & O_NONBLOCK);
+            unlock(&pscal_fd->lock);
+            return 0;
+        default:
+            errno = EINVAL;
+            return -1;
+    }
+}
+
+int vprocFcntlShim(int fd, int cmd, ...) {
+    /* As libc's fcntl does, take the argument whether or not this command has one.
+     * Pointer-sized holds either kind: an int's upper half is undefined, so the
+     * commands that take one narrow it again. */
+    va_list ap;
+    va_start(ap, cmd);
+    intptr_t arg = va_arg(ap, intptr_t);
+    va_end(ap);
+
+    VProc *vp = vprocForThread();
+    if (vp && (cmd == F_DUPFD || cmd == F_DUPFD_CLOEXEC)) {
+        if ((int)arg < 0) {
+            errno = EINVAL;
+            return -1;
+        }
+        return vprocDupAbove(vp, fd, (int)arg);
+    }
+    struct pscal_fd *pscal_fd = NULL;
+    int host = vprocResolveFdForShim(vp, fd, 1, &pscal_fd);
+    if (pscal_fd) {
+        int rc = vprocFcntlPscalFd(pscal_fd, cmd, (int)arg);
+        int saved_errno = errno;
+        pscal_fd_close(pscal_fd);
+        errno = saved_errno;
+        return rc;
+    }
+    if (host < 0) {
+        return -1;
+    }
+    switch (cmd) {
+        case F_GETFD:
+        case F_GETFL:
+            return fcntl(host, cmd);
+        case F_SETFL: {
+            int flags = (int)arg;
+            if (vprocFdIsSessionStdio(NULL, host)) {
+                int current = fcntl(host, F_GETFL);
+                if (current < 0) {
+                    return -1;
+                }
+                flags = (flags & ~O_NONBLOCK) | (current & O_NONBLOCK);
+            }
+            return fcntl(host, F_SETFL, flags);
+        }
+        case F_DUPFD:
+        case F_DUPFD_CLOEXEC:
+        case F_SETFD:
+            return fcntl(host, cmd, (int)arg);
+        default:
+            return fcntl(host, cmd, arg);
+    }
+}
+
+/* Pipes and terminals have no offset to read at. */
+ssize_t vprocPreadShim(int fd, void *buf, size_t count, off_t offset) {
+    struct pscal_fd *pscal_fd = NULL;
+    int host = vprocResolveFdForShim(vprocForThread(), fd, 1, &pscal_fd);
+    if (pscal_fd) {
+        pscal_fd_close(pscal_fd);
+        errno = ESPIPE;
+        return -1;
+    }
+    return host < 0 ? -1 : pread(host, buf, count, offset);
+}
+
+ssize_t vprocPwriteShim(int fd, const void *buf, size_t count, off_t offset) {
+    struct pscal_fd *pscal_fd = NULL;
+    int host = vprocResolveFdForShim(vprocForThread(), fd, 1, &pscal_fd);
+    if (pscal_fd) {
+        pscal_fd_close(pscal_fd);
+        errno = ESPIPE;
+        return -1;
+    }
+    return host < 0 ? -1 : pwrite(host, buf, count, offset);
 }
 
 static int vprocSetCompatErrno(int err) {

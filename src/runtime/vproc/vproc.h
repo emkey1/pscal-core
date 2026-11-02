@@ -156,6 +156,14 @@ int vprocFilenoShim(FILE *stream);
 int vprocFtruncateShim(int fd, off_t length);
 int vprocFutimensShim(int fd, const struct timespec times[2]);
 int vprocFchdirShim(int fd);
+/* fcntl, pread and pwrite on a vproc fd. On one with no host descriptor (an
+ * in-process pipe, a PTY) pread and pwrite fail ESPIPE and locks fail EINVAL. A
+ * lock on a host file belongs to the process, as every fcntl lock does, so it does
+ * not keep two vprocs apart. O_NONBLOCK does not change on the session's own
+ * terminal, which the session's reader shares. */
+int vprocFcntlShim(int fd, int cmd, ...);
+ssize_t vprocPreadShim(int fd, void *buf, size_t count, off_t offset);
+ssize_t vprocPwriteShim(int fd, const void *buf, size_t count, off_t offset);
 /* Inherit the current vproc into new threads created via pthread_create shim. */
 int vprocPthreadCreateShim(pthread_t *thread,
                            const pthread_attr_t *attr,
