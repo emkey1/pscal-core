@@ -335,12 +335,23 @@ static bool shellParseCommandMetadata(const char *meta, size_t meta_len,
     return true;
 }
 
+/* The longest the reader waits for output before it checks whether the command has
+ * ended. Output and end of file wake it at once, so this only delays the end of a
+ * command that left something holding the write end. The wait starts at 1 ms and
+ * doubles: a short command is seen to end soon after, a long quiet one costs few
+ * wakeups. */
+#define SHELL_COMMAND_SUB_MAX_WAIT_MS 64
+/* Where the read end lives on a host, well above what a script names for itself. */
+#define SHELL_COMMAND_SUB_READ_FD_MIN 64
+
 typedef struct {
     int fd;
     char *buffer;
     size_t length;
     size_t capacity;
     int error;
+    bool command_done;
+    bool abandoned;
 } ShellCommandSubReadContext;
 
 static void shellCommandSubstitutionDrain(ShellCommandSubReadContext *ctx) {
@@ -351,21 +362,28 @@ static void shellCommandSubstitutionDrain(ShellCommandSubReadContext *ctx) {
     if (flags >= 0) {
         (void)fcntl(ctx->fd, F_SETFL, flags | O_NONBLOCK);
     }
-    char buffer[256];
+    char buffer[16384];
     int idle_spins = 0;
+    int wait_ms = 1;
     bool saw_data = false;
     while (true) {
         ssize_t n = vprocHostRead(ctx->fd, buffer, sizeof(buffer));
         if (n > 0) {
             saw_data = true;
             idle_spins = 0;
+            wait_ms = 1;
+            if (ctx->error) {
+                continue;
+            }
             if (!shellBufferEnsure(&ctx->buffer, &ctx->length, &ctx->capacity, (size_t)n)) {
+                /* Go on reading and drop the rest: if this stopped, the command would
+                 * sit on a full pipe for good. */
                 ctx->error = ENOMEM;
                 free(ctx->buffer);
                 ctx->buffer = NULL;
                 ctx->length = 0;
                 ctx->capacity = 0;
-                break;
+                continue;
             }
             memcpy(ctx->buffer + ctx->length, buffer, (size_t)n);
             ctx->length += (size_t)n;
@@ -375,6 +393,14 @@ static void shellCommandSubstitutionDrain(ShellCommandSubReadContext *ctx) {
         } else if (errno == EINTR) {
             continue;
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (!__atomic_load_n(&ctx->command_done, __ATOMIC_ACQUIRE)) {
+                struct pollfd wait_fd = {.fd = ctx->fd, .events = POLLIN, .revents = 0};
+                (void)vprocHostPoll(&wait_fd, 1, wait_ms);
+                if (wait_ms < SHELL_COMMAND_SUB_MAX_WAIT_MS) {
+                    wait_ms *= 2;
+                }
+                continue;
+            }
             /* Command substitution output is complete once execution returns.
              * Avoid blocking forever on leaked write-end descriptors. */
             int max_spins = saw_data ? 4 : 20;
@@ -393,8 +419,54 @@ static void shellCommandSubstitutionDrain(ShellCommandSubReadContext *ctx) {
             break;
         }
     }
-    vprocHostClose(ctx->fd);
-    ctx->fd = -1;
+}
+
+/* Runs for as long as the command does, because the command can write more than a
+ * pipe holds. It is a raw host thread: it uses host descriptors only, and a thread
+ * registered with the vproc would be cancelled along with it. A fork on the shell's
+ * thread can catch it at any point, which is safe because all it ever holds is
+ * malloc's locks, and libc resets those in the child. */
+static void *shellCommandSubstitutionReaderMain(void *arg) {
+    ShellCommandSubReadContext *ctx = (ShellCommandSubReadContext *)arg;
+    sigset_t all_signals;
+    sigfillset(&all_signals);
+    (void)pthread_sigmask(SIG_SETMASK, &all_signals, NULL);
+    shellCommandSubstitutionDrain(ctx);
+    if (__atomic_load_n(&ctx->abandoned, __ATOMIC_ACQUIRE)) {
+        pthread_detach(pthread_self());
+        vprocHostClose(ctx->fd);
+        free(ctx->buffer);
+        free(ctx);
+    }
+    return NULL;
+}
+
+static bool shellCommandSubstitutionStartReader(ShellCommandSubReadContext *ctx, pthread_t *thread) {
+#if defined(PSCAL_TARGET_IOS)
+    /* On iOS pthread_sigmask here would change the vproc's mask, so the thread blocks
+     * its own signals as it starts. */
+    return vprocHostPthreadCreate(thread, NULL, shellCommandSubstitutionReaderMain, ctx) == 0;
+#else
+    /* A signal must not reach the shell's handlers on this thread, even as it starts. */
+    sigset_t all_signals;
+    sigset_t saved_signals;
+    sigfillset(&all_signals);
+    bool masked = pthread_sigmask(SIG_SETMASK, &all_signals, &saved_signals) == 0;
+    int rc = vprocHostPthreadCreate(thread, NULL, shellCommandSubstitutionReaderMain, ctx);
+    if (masked) {
+        (void)pthread_sigmask(SIG_SETMASK, &saved_signals, NULL);
+    }
+    return rc == 0;
+#endif
+}
+
+/* The shell's thread is being cancelled or is exiting, so it will not reach the join:
+ * in the app a killed background body is cancelled, and exit() is pthread_exit. The
+ * context is on the heap for this, and the reader cleans up after itself. */
+static void shellCommandSubstitutionAbandon(void *arg) {
+    ShellCommandSubReadContext *ctx = (ShellCommandSubReadContext *)arg;
+    __atomic_store_n(&ctx->abandoned, true, __ATOMIC_RELEASE);
+    __atomic_store_n(&ctx->command_done, true, __ATOMIC_RELEASE);
 }
 
 static char *shellRunCommandSubstitution(const char *command) {
@@ -411,13 +483,9 @@ static char *shellRunCommandSubstitution(const char *command) {
     size_t result_length = 0;
     bool from_cache = false;
 
-    ShellCommandSubReadContext reader = {
-        .fd = -1,
-        .buffer = NULL,
-        .length = 0,
-        .capacity = 0,
-        .error = 0,
-    };
+    ShellCommandSubReadContext *reader = NULL;
+    pthread_t reader_thread;
+    bool reader_started = false;
 
     int pipes[2] = {-1, -1};
     int saved_stdout = -1;
@@ -475,7 +543,17 @@ static char *shellRunCommandSubstitution(const char *command) {
         gShellRuntime.scalar_cache_misses++;
     }
 
-    if (vprocHostPipe(pipes) != 0) {
+    reader = (ShellCommandSubReadContext *)calloc(1, sizeof(*reader));
+    if (!reader) {
+        result = strdup("");
+        result_length = 0;
+        goto substitution_finish;
+    }
+    reader->fd = -1;
+
+    /* Unowned: the reader may still be on the read end when a vproc is destroyed,
+     * and it must not find that number closed and handed to someone else. */
+    if (vprocHostPipeUnowned(pipes) != 0) {
         result = strdup("");
         result_length = 0;
         goto substitution_finish;
@@ -573,16 +651,30 @@ static char *shellRunCommandSubstitution(const char *command) {
     vprocHostClose(pipes[1]);
     pipes[1] = -1;
 
-    /* The reader owns the read end from here on and the drain closes it.
-     * Leaving the number in pipes[0] too made the cleanup below close it a
+    /* The read end is in reader->fd alone from here on, and closed once, after the
+     * join. Leaving the number in pipes[0] too made the cleanup below close it a
      * second time, and a thread that opened an fd in between got its fd
      * closed under it: a pool worker's first Delay creates the SIGINT
      * self-pipe lazily, lands on the just-freed number, loses its read end,
      * and from then on pscalRuntimeConsumeSigint() drains the next
      * substitution's pipe, which reuses that number
      * (thread_worker_reuse.exsh: "WaitForThread: expected thread id"). */
-    reader.fd = pipes[0];
+    reader->fd = pipes[0];
     pipes[0] = -1;
+#if !defined(PSCAL_TARGET_IOS)
+    /* The command shares this process's descriptors: `cmd 3> f` or `exec 3> f` would
+     * replace a low number while the reader is on it. On iOS those numbers are vproc
+     * slots, and nothing there is ever exec'd. */
+    int high_read_fd = fcntl(reader->fd, F_DUPFD, SHELL_COMMAND_SUB_READ_FD_MIN);
+    if (high_read_fd >= 0) {
+        vprocHostClose(reader->fd);
+        reader->fd = high_read_fd;
+    }
+    (void)fcntl(reader->fd, F_SETFD, FD_CLOEXEC);
+#endif
+    reader_started = shellCommandSubstitutionStartReader(reader, &reader_thread);
+
+    pthread_cleanup_push(shellCommandSubstitutionAbandon, reader);
 
     memset(&opts, 0, sizeof(opts));
     opts.no_cache = 1;
@@ -665,6 +757,9 @@ static char *shellRunCommandSubstitution(const char *command) {
     }
 
     shellFlushStandardStreams();
+    /* On iOS this thread's stdout stream has its own copy of the write end, which
+     * would stay open until stdout is next used: no end of file for the reader. */
+    shellInvalidateVprocStreamForFd(STDOUT_FILENO);
 
     if (mapped_stdout_redirected && saved_mapped_stdout >= 0) {
         vprocHostDup2(saved_mapped_stdout, mapped_stdout_fd);
@@ -692,12 +787,19 @@ static char *shellRunCommandSubstitution(const char *command) {
         saved_stdout = -1;
     }
 
-    /* Drain synchronously to avoid background lifetime issues. */
-    shellCommandSubstitutionDrain(&reader);
+    __atomic_store_n(&reader->command_done, true, __ATOMIC_RELEASE);
+    if (reader_started) {
+        pthread_join(reader_thread, NULL);
+    } else {
+        /* No thread to be had, so what the command wrote is what fit in the pipe. */
+        shellCommandSubstitutionDrain(reader);
+    }
 
-    if (reader.fd >= 0) {
-        vprocHostClose(reader.fd);
-        reader.fd = -1;
+    pthread_cleanup_pop(0);
+
+    if (reader->fd >= 0) {
+        vprocHostClose(reader->fd);
+        reader->fd = -1;
     }
     if (pipes[0] >= 0) {
         vprocHostClose(pipes[0]);
@@ -715,14 +817,14 @@ static char *shellRunCommandSubstitution(const char *command) {
     int final_status = status;
     shellUpdateStatus(final_status);
 
-    if (!reader.buffer) {
+    if (!reader->buffer) {
         result = strdup("");
         result_length = 0;
         goto substitution_finish;
     }
 
-    char *output = reader.buffer;
-    size_t length = reader.length;
+    char *output = reader->buffer;
+    size_t length = reader->length;
     while (length > 0 && (output[length - 1] == '\n' || output[length - 1] == '\r')) {
         output[--length] = '\0';
     }
@@ -745,9 +847,10 @@ substitution_finish:
         saved_stdout_pscal = NULL;
     }
 #endif
-    if (reader.error && !exit_requested) {
-        shellUpdateStatus(reader.error);
+    if (reader && reader->error && !exit_requested) {
+        shellUpdateStatus(reader->error);
     }
+    free(reader);
     if (capture_frame) {
         capture_frame->entry = stored_entry;
         capture_frame->from_cache = from_cache;

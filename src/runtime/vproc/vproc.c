@@ -8556,6 +8556,14 @@ ssize_t vprocHostWrite(int fd, const void *buf, size_t count) {
 #endif
 }
 
+int vprocHostPoll(struct pollfd *fds, nfds_t nfds, int timeout) {
+#if defined(PSCAL_TARGET_IOS)
+    return vprocHostPollRaw(fds, nfds, timeout);
+#else
+    return poll(fds, nfds, timeout);
+#endif
+}
+
 int vprocHostPthreadCreate(pthread_t *thread,
                            const pthread_attr_t *attr,
                            void *(*start_routine)(void *),
