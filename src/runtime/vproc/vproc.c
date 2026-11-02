@@ -7973,6 +7973,23 @@ int vprocAdoptPscalFd(VProc *vp, int target_fd, struct pscal_fd *pscal_fd) {
     return 0;
 }
 
+/* An entry closing its host fd takes any saved stdio number with it. Otherwise
+ * vprocDestroy closes that number again, and by then it may be another command's. */
+static void vprocForgetSavedStdioLocked(VProc *vp, int host_fd) {
+    if (host_fd < 0) {
+        return;
+    }
+    if (host_fd == vp->stdin_host_fd) {
+        vp->stdin_host_fd = -1;
+    }
+    if (host_fd == vp->stdout_host_fd) {
+        vp->stdout_host_fd = -1;
+    }
+    if (host_fd == vp->stderr_host_fd) {
+        vp->stderr_host_fd = -1;
+    }
+}
+
 void vprocDestroy(VProc *vp) {
     if (!vp) {
         return;
@@ -8859,6 +8876,9 @@ int vprocClose(VProc *vp, int fd) {
     vp->entries[fd].pscal_fd = NULL;
     vp->entries[fd].kind = VPROC_FD_NONE;
     vp->entries[fd].inherit = false;
+    if (kind == VPROC_FD_HOST) {
+        vprocForgetSavedStdioLocked(vp, host);
+    }
     pthread_mutex_unlock(&vp->mu);
     if (kind == VPROC_FD_PSCAL && pscal_fd) {
         int rc = pscal_fd_close(pscal_fd);
