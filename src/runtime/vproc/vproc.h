@@ -105,6 +105,7 @@ int vprocHostDup(int fd);
 int vprocHostOpen(const char *path, int flags, ...);
 /* Create a host pipe without routing through the shim table. */
 int vprocHostPipe(int pipefd[2]);
+int vprocHostPipeUnowned(int pipefd[2]);
 /* Create a host socket without routing through the shim table. */
 int vprocHostSocket(int domain, int type, int protocol);
 /* Accept a host socket without routing through the shim table. */
@@ -504,6 +505,7 @@ static inline int vprocHostOpen(const char *path, int flags, ...) {
     return open(path, flags, mode);
 }
 static inline int vprocHostPipe(int pipefd[2]) { return pipe(pipefd); }
+static inline int vprocHostPipeUnowned(int pipefd[2]) { return pipe(pipefd); }
 static inline off_t vprocHostLseek(int fd, off_t offset, int whence) { return lseek(fd, offset, whence); }
 static inline int vprocHostFsync(int fd) { return fsync(fd); }
 static inline int vprocHostClose(int fd) { return close(fd); }

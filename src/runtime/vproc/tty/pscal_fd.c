@@ -50,7 +50,10 @@ static bool gPollWakeNoSigpipe = false;
 static pthread_once_t gPollWakeOnce = PTHREAD_ONCE_INIT;
 
 static void pscalPollInit(void) {
-    if (vprocHostPipe(gPollWakePipe) != 0) {
+    /* One pipe for the whole process. When the first command to poll owned it, ending
+     * that command closed it and left these numbers to whatever opened next: a wakeup
+     * wrote a NUL into that file, and pscalPollDrain read that file's data away. */
+    if (vprocHostPipeUnowned(gPollWakePipe) != 0) {
         gPollWakePipe[0] = -1;
         gPollWakePipe[1] = -1;
         return;

@@ -3253,21 +3253,20 @@ void saveBytecodeToCache(const char* source_path, const char* compiler_id, const
         return;
     }
     snprintf(tmp_path, tmp_len, "%s.tmp.%ld", cache_path, (long)getpid());
-    int fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (fd < 0 && errno == EEXIST) {
+    // fopen, not open and fdopen: on iOS open returns a vproc slot, and fdopen took
+    // that number for a host descriptor. It wrote the entry into whatever had the
+    // number and then closed it, which killed the Go runtime when that was its kqueue.
+    FILE* f = fopen(tmp_path, "wbx");
+    if (!f && errno == EEXIST) {
         unlink(tmp_path);
-        fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        f = fopen(tmp_path, "wbx");
     }
-    FILE* f = fd >= 0 ? fdopen(fd, "wb") : NULL;
     if (!f) {
-        if (fd >= 0) {
-            close(fd);
-            unlink(tmp_path);
-        }
         free(tmp_path);
         free(cache_path);
         return;
     }
+    (void)chmod(tmp_path, 0600);
     bool ok = serializeBytecodeChunk(f, source_path, chunk, source_hash, combined_hash, true);
     if (fclose(f) != 0) ok = false;
     if (!ok || rename(tmp_path, cache_path) != 0) {

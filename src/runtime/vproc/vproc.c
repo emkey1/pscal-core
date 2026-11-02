@@ -1125,8 +1125,11 @@ static int vprocHostFsyncRaw(int fd) {
 
 static int vprocHostFstatRaw(int fd, struct stat *st) {
     static int (*fn)(int, struct stat *) = NULL;
+    /* Not __fstat: that is the old syscall, with a 32-bit inode and a different
+     * layout. st_mode came back as the inode's low bits, so one file in sixteen
+     * looked like a directory, and st_size came back as 0. */
     if (!fn) {
-        fn = (int (*)(int, struct stat *))vprocResolveSymbol("__fstat");
+        fn = (int (*)(int, struct stat *))vprocResolveSymbol("fstat64");
     }
     if (!fn) {
         fn = (int (*)(int, struct stat *))vprocResolveSymbol("fstat");
@@ -8368,6 +8371,16 @@ int vprocHostOpen(const char *path, int flags, ...) {
     return fd;
 #else
     return open(path, flags, mode);
+#endif
+}
+
+/* A pipe that outlives every vproc. vprocHostPipe makes the current vproc its owner,
+ * and destroying that vproc closes it. */
+int vprocHostPipeUnowned(int pipefd[2]) {
+#if defined(PSCAL_TARGET_IOS)
+    return vprocHostPipeRaw(pipefd);
+#else
+    return pipe(pipefd);
 #endif
 }
 

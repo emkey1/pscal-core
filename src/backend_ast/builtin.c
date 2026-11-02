@@ -5343,7 +5343,7 @@ static void vmEnsureSigintPipe(void) {
 static void init_pipe_once(void) {
 #if defined(PSCAL_TARGET_IOS)
     int host_pipe[2] = {-1, -1};
-    if (vprocHostPipe(host_pipe) != 0) {
+    if (vprocHostPipeUnowned(host_pipe) != 0) {
         g_vm_sigint_pipe[0] = -1;
         g_vm_sigint_pipe[1] = -1;
         return;
