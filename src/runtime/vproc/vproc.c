@@ -8457,6 +8457,10 @@ int vprocHostFsync(int fd) {
 #endif
 }
 
+int vprocHostSigaction(int sig, const struct sigaction *act, struct sigaction *oldact) {
+    return vprocHostSigactionRaw(sig, act, oldact);
+}
+
 int vprocHostClose(int fd) {
 #if defined(PSCAL_TARGET_IOS)
     VProc *vp = vprocForThread();
@@ -13083,6 +13087,23 @@ int vprocFtruncateShim(int fd, off_t length) {
 int vprocFutimensShim(int fd, const struct timespec times[2]) {
     int host = shimTranslate(fd, 1);
     return host < 0 ? -1 : futimens(host, times);
+}
+
+/* A vproc's cwd is a path of its own, which the host's fchdir would not move. */
+int vprocFchdirShim(int fd) {
+    int host = shimTranslate(fd, 1);
+    if (host < 0) {
+        return -1;
+    }
+#if defined(F_GETPATH)
+    char path[PATH_MAX];
+    if (fcntl(host, F_GETPATH, path) != 0) {
+        return -1;
+    }
+    return vprocChdirShim(path);
+#else
+    return fchdir(host);
+#endif
 }
 
 static int vprocSetCompatErrno(int err) {

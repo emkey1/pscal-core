@@ -106,23 +106,6 @@ static bool pathVirtualizedIsVprocDevicePath(const char *path) {
 }
 #endif
 
-static bool vprocFdIsPscal(int fd) {
-#if defined(PSCAL_TARGET_IOS)
-    VProc *vp = vprocCurrent();
-    if (!vp) {
-        return false;
-    }
-    struct pscal_fd *psfd = vprocGetPscalFd(vp, fd);
-    if (psfd) {
-        pscal_fd_close(psfd);
-        return true;
-    }
-#else
-    (void)fd;
-#endif
-    return false;
-}
-
 #if defined(PSCAL_TARGET_IOS)
 static int vprocStreamRead(void *cookie, char *buf, int len) {
     if (!buf || len <= 0) {
@@ -162,8 +145,9 @@ static int vprocStreamClose(void *cookie) {
 }
 
 static FILE *vprocFdopenCompat(int fd, const char *mode) {
-    bool is_pscal = vprocFdIsPscal(fd);
-    if (!is_pscal) {
+    /* With a vproc current, fd is a slot in its table, whatever the slot holds.
+     * fdopen would use and later close the host descriptor with that number. */
+    if (!vprocCurrent()) {
         FILE *fp = fdopen(fd, mode);
         if (!fp) {
             vprocCloseShim(fd);
@@ -575,35 +559,6 @@ static const char *pathVirtualizedPrepare(const char *path, char expanded[PATH_M
     return target ? target : path;
 }
 
-static void pathVirtualizedEnsureParent(const char *path) {
-    if (!path || *path != '/') {
-        return;
-    }
-    char buf[PATH_MAX];
-    size_t len = strlen(path);
-    if (len >= sizeof(buf)) {
-        return;
-    }
-    memcpy(buf, path, len + 1);
-    for (char *p = buf + len; p >= buf; --p) {
-        if (*p == '/') {
-            *p = '\0';
-            break;
-        }
-    }
-    if (buf[0] == '\0') {
-        return;
-    }
-    for (char *p = buf + 1; *p; ++p) {
-        if (*p == '/') {
-            *p = '\0';
-            mkdir(buf, 0777);
-            *p = '/';
-        }
-    }
-    mkdir(buf, 0777);
-}
-
 static int pathVirtualizedOpenHost(const char *path, int oflag, mode_t mode, bool has_mode) {
 #if defined(PSCAL_TARGET_IOS)
     if (pscalHostOpenRaw) {
@@ -652,7 +607,6 @@ int pscalPathVirtualized_open(const char *path, int oflag, ...) {
     const char *target = pathVirtualizedPrepare(path, expanded);
     LOG_EXPANSION("open", path, target);
     if (has_mode) {
-        pathVirtualizedEnsureParent(target);
         return pathVirtualizedOpenHost(target, oflag, mode, true);
     }
 

@@ -3525,6 +3525,7 @@ typedef struct {
     int stdout_fd;
     int stderr_fd;
     int status;
+    bool entry_returned;
     volatile int finished;
     pthread_t worker_thread;
     pthread_t main_thread;
@@ -3691,6 +3692,7 @@ static void *shellToolThreadMain(void *arg) {
         /* Interrupted */
         ctx->status = 130;
     }
+    ctx->entry_returned = true;
 
     if (ctx->use_shell_context) {
         shellRuntimeActivateContext(prev_ctx);
@@ -3740,7 +3742,13 @@ static void *shellToolThreadMain(void *arg) {
 
 static void *shellToolWaiterMain(void *arg) {
     ShellToolThreadContext *ctx = (ShellToolThreadContext *)arg;
-    pthread_join(ctx->worker_thread, NULL);
+    void *exit_value = NULL;
+    pthread_join(ctx->worker_thread, &exit_value);
+    /* exit() is pthread_exit in the app, so Pascal's halt(3) ends the thread before
+     * it can store a status. */
+    if (!ctx->entry_returned && exit_value != PTHREAD_CANCELED) {
+        ctx->status = (int)(intptr_t)exit_value & 0xff;
+    }
     ctx->finished = 1;
     pthread_kill(ctx->main_thread, SIGURG);
     if (getenv("PSCALI_TOOL_DEBUG")) {
@@ -3784,6 +3792,40 @@ static void *shellToolSigintCatcherMain(void *arg) {
         }
     }
     return NULL;
+}
+
+static void shellToolSigintCatcherStopHandler(int signo) {
+    (void)signo;
+}
+
+/* One directed SIGINT breaks the catcher's final sigwait(). The host drops an
+ * ignored signal instead of queueing it, and a process started with SIGINT ignored
+ * (a script's `cmd &` does that) then waited here for ever. So the signal is caught
+ * for as long as this takes. The lock stops two sessions restoring each other's
+ * disposition. */
+static void shellToolStopSigintCatcher(ShellToolThreadContext *ctx) {
+    static pthread_mutex_t stop_mu = PTHREAD_MUTEX_INITIALIZER;
+    struct sigaction stop_action;
+    struct sigaction previous;
+    memset(&stop_action, 0, sizeof(stop_action));
+    stop_action.sa_handler = shellToolSigintCatcherStopHandler;
+    stop_action.sa_flags = SA_RESTART;
+    sigemptyset(&stop_action.sa_mask);
+
+    pthread_mutex_lock(&stop_mu);
+    ctx->sigint_catcher_stop = 1;
+    bool ignored = vprocHostSigaction(SIGINT, NULL, &previous) == 0 &&
+                   previous.sa_handler == SIG_IGN;
+    if (ignored) {
+        vprocHostSigaction(SIGINT, &stop_action, NULL);
+    }
+    pthread_kill(ctx->sigint_catcher_thread, SIGINT);
+    pthread_join(ctx->sigint_catcher_thread, NULL);
+    if (ignored) {
+        vprocHostSigaction(SIGINT, &previous, NULL);
+    }
+    pthread_mutex_unlock(&stop_mu);
+    ctx->sigint_catcher_active = false;
 }
 #endif
 
@@ -3995,11 +4037,7 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
 
 #if defined(PSCAL_TARGET_IOS)
     if (context->sigint_catcher_active) {
-        context->sigint_catcher_stop = 1;
-        /* Break the catcher's blocking sigwait() with one directed SIGINT. */
-        pthread_kill(context->sigint_catcher_thread, SIGINT);
-        pthread_join(context->sigint_catcher_thread, NULL);
-        context->sigint_catcher_active = false;
+        shellToolStopSigintCatcher(context);
     }
 #endif
     pthread_join(waiter_thread, NULL);

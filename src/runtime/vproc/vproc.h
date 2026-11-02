@@ -122,6 +122,8 @@ int vprocHostClose(int fd);
 ssize_t vprocHostRead(int fd, void *buf, size_t count);
 /* Write to a host descriptor without routing through the shim table. */
 ssize_t vprocHostWrite(int fd, const void *buf, size_t count);
+/* The host's signal disposition, not the one the current vproc has recorded. */
+int vprocHostSigaction(int sig, const struct sigaction *act, struct sigaction *oldact);
 /* Virtual isatty shim for session-backed TTYs. */
 int vprocIsattyShim(int fd);
 /* Enable/disable the virtual location device (/dev/location). */
@@ -148,6 +150,7 @@ int vprocFilenoShim(FILE *stream);
 /* ftruncate and futimens on a vproc fd. */
 int vprocFtruncateShim(int fd, off_t length);
 int vprocFutimensShim(int fd, const struct timespec times[2]);
+int vprocFchdirShim(int fd);
 /* Inherit the current vproc into new threads created via pthread_create shim. */
 int vprocPthreadCreateShim(pthread_t *thread,
                            const pthread_attr_t *attr,
@@ -529,6 +532,9 @@ static inline int vprocHostFsync(int fd) { return fsync(fd); }
 static inline int vprocHostClose(int fd) { return close(fd); }
 static inline ssize_t vprocHostRead(int fd, void *buf, size_t count) { return read(fd, buf, count); }
 static inline ssize_t vprocHostWrite(int fd, const void *buf, size_t count) { return write(fd, buf, count); }
+static inline int vprocHostSigaction(int sig, const struct sigaction *act, struct sigaction *oldact) {
+    return sigaction(sig, act, oldact);
+}
 static inline int vprocIoctlShim(int fd, unsigned long request, ...) {
     va_list ap;
     va_start(ap, request);
