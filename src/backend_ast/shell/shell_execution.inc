@@ -2570,12 +2570,42 @@ static void shellPipelineSessionSnapshotStdStreams(ShellPipelineContext *ctx) {
 }
 #endif
 
+#if defined(PSCAL_TARGET_IOS)
+/* Stages are threads of one process, so the only place a stage can read `X=1 cmd`
+ * from is the process environment, and it reads it whenever it gets there. The
+ * assignment stays until the pipeline ends, which also shows it to the stages
+ * launched after it. */
+static bool shellPipelineDeferAssignments(ShellPipelineContext *ctx,
+                                          ShellAssignmentBackup *backups,
+                                          size_t count) {
+    ShellDeferredAssignments *entry = (ShellDeferredAssignments *)malloc(sizeof(*entry));
+    if (!entry) {
+        return false;
+    }
+    entry->next = ctx->deferred_assignments;
+    entry->backups = backups;
+    entry->count = count;
+    ctx->deferred_assignments = entry;
+    return true;
+}
+
+static void shellPipelineRestoreDeferredAssignments(ShellPipelineContext *ctx) {
+    while (ctx->deferred_assignments) {
+        ShellDeferredAssignments *entry = ctx->deferred_assignments;
+        ctx->deferred_assignments = entry->next;
+        shellRestoreAssignments(entry->backups, entry->count);
+        free(entry);
+    }
+}
+#endif
+
 static void shellResetPipeline(void) {
     ShellPipelineContext *ctx = &gShellRuntime.pipeline;
     if (!ctx->active) {
         return;
     }
 #if defined(PSCAL_TARGET_IOS)
+    shellPipelineRestoreDeferredAssignments(ctx);
     shellPipelineSessionRestoreStdStreams(ctx);
     shellPipelineSessionCloseSpool(ctx);
     ctx->in_process = false;
@@ -4310,7 +4340,7 @@ static int shellRunBuiltinInProcess(VM *vm,
 #endif
         }
         if (!builtin_ran) {
-            runtimeError(vm, "%s: command unavailable in pipeline", cmd->argv[0]);
+            fprintf(stderr, "exsh: %s: command not found\n", cmd->argv[0]);
             shellUpdateStatus(127);
             if (tool_dbg && pipe_dbg) {
                 fprintf(stderr, "[run-builtin] builtin not found for %s\n", cmd && cmd->argv ? cmd->argv[0] : "<nil>");
@@ -5609,7 +5639,10 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
                                                                pipeline_head,
                                                                pipeline_tail);
             if (assignments_applied) {
-                shellRestoreAssignments(assignment_backups, assignment_backup_count);
+                if (!stage_ok || !ctx->active || ctx->background ||
+                    !shellPipelineDeferAssignments(ctx, assignment_backups, assignment_backup_count)) {
+                    shellRestoreAssignments(assignment_backups, assignment_backup_count);
+                }
                 assignments_applied = false;
                 assignment_backups = NULL;
                 assignment_backup_count = 0;

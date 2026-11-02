@@ -337,6 +337,7 @@ Value vmHostShellLoopCheckCondition(struct VM_s* vm);
 Value vmHostShellLoopExecuteBody(struct VM_s* vm);
 Value vmHostShellLoopCheckBody(struct VM_s* vm);
 Value vmHostShellLoopIsReady(struct VM_s* vm);
+Value vmHostShellScopeIsReady(struct VM_s* vm);
 Value vmHostShellPollJobs(struct VM_s* vm);
 bool shellBuiltinTestFastEval(const char **argv, int argc, bool is_bracket, bool *out_result);
 bool shellBuiltinArithmeticFastEval(const char *expression, int *out_status);
@@ -346,6 +347,9 @@ typedef enum {
     SHELL_TRAP_ACTION_COMMAND
 } ShellTrapAction;
 bool shellRuntimeConsumeExitRequested(void);
+size_t shellRuntimeRedirectScopeDepth(void);
+void shellRuntimeUnwindRedirectScopes(size_t depth);
+bool shellRuntimeExchangePositionalOwned(bool owned);
 int shellRuntimeLastStatus(void);
 void shellRuntimeRecordHistory(const char *line);
 void shellRuntimeSetArg0(const char *name);

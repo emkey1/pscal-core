@@ -95,6 +95,7 @@ typedef enum {
     HOST_FN_INTERFACE_LOOKUP,
     HOST_FN_INTERFACE_IS,
     HOST_FN_INTERFACE_ASSERT,
+    HOST_FN_SHELL_SCOPE_IS_READY,
     // ... add other host function IDs here ...
     HOST_FN_COUNT
 } HostFunctionID;

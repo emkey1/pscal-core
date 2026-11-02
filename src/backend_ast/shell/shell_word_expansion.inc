@@ -2659,6 +2659,7 @@ static bool shellInvokeFunction(VM *vm, ShellCommand *cmd) {
     bool nested_vm_initialized = false;
     bool frame_pushed = false;
     InterpretResult result = INTERPRET_OK;
+    size_t redirect_scope_depth = shellRuntimeRedirectScopeDepth();
     if (!function_vm_in_use) {
         if (!function_vm_initialized) {
             initVM(&function_vm);
@@ -2702,6 +2703,7 @@ static bool shellInvokeFunction(VM *vm, ShellCommand *cmd) {
     }
 
 invoke_cleanup:
+    shellRuntimeUnwindRedirectScopes(redirect_scope_depth);
     if (using_cached_vm) {
         vmResetExecutionState(&function_vm);
         function_vm_in_use = false;

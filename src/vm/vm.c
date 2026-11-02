@@ -8058,6 +8058,10 @@ static Value vmHostShellLoopIsReadyHost(VM* vm) {
     return vmHostShellLoopIsReady(vm);
 }
 
+static Value vmHostShellScopeIsReadyHost(VM* vm) {
+    return vmHostShellScopeIsReady(vm);
+}
+
 static void vmReleaseExecutionResources(VM* vm) {
     if (!vm) return;
 
@@ -8320,6 +8324,7 @@ void initVM(VM* vm) { // As in all.txt, with frameCount
     registerHostFunction(vm, HOST_FN_SHELL_LOOP_ADVANCE, vmHostShellLoopAdvanceHost);
     registerHostFunction(vm, HOST_FN_SHELL_POLL_JOBS, vmHostShellPollJobsHost);
     registerHostFunction(vm, HOST_FN_SHELL_LOOP_IS_READY, vmHostShellLoopIsReadyHost);
+    registerHostFunction(vm, HOST_FN_SHELL_SCOPE_IS_READY, vmHostShellScopeIsReadyHost);
     registerHostFunction(vm, HOST_FN_CREATE_CLOSURE, vmHostCreateClosure);
     registerHostFunction(vm, HOST_FN_BOX_INTERFACE, vmHostBoxInterface);
     registerHostFunction(vm, HOST_FN_INTERFACE_LOOKUP, vmHostInterfaceLookup);

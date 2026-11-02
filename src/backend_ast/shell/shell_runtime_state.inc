@@ -545,6 +545,7 @@ typedef struct {
     struct pscal_fd **pscal_pipe_read;
     struct pscal_fd **pscal_pipe_write;
     struct pscal_fd **pscal_pipe_write_hold;
+    struct ShellDeferredAssignments *deferred_assignments;
 #endif
 } ShellPipelineContext;
 
@@ -1195,6 +1196,15 @@ static void shellFreeParameterArray(char **values, int count) {
         free(values[i]);
     }
     free(values);
+}
+
+/* A nested exsh on iOS points $1 at its own argv. Without this, `set --` in it
+ * would free that as the array the caller's `set --` allocated. What the nested
+ * `set --` allocates is left to leak, as in shellRunExshShebang. */
+bool shellRuntimeExchangePositionalOwned(bool owned) {
+    bool previous = gShellPositionalOwned;
+    gShellPositionalOwned = owned;
+    return previous;
 }
 
 static void shellFreeOwnedPositionalParameters(void) {
@@ -2240,6 +2250,14 @@ typedef struct {
     bool had_previous;
     bool previous_was_array;
 } ShellAssignmentBackup;
+
+#if defined(PSCAL_TARGET_IOS)
+typedef struct ShellDeferredAssignments {
+    struct ShellDeferredAssignments *next;
+    ShellAssignmentBackup *backups;
+    size_t count;
+} ShellDeferredAssignments;
+#endif
 
 typedef struct {
     char *name;

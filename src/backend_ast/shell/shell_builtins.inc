@@ -882,13 +882,16 @@ Value vmBuiltinShellOr(VM *vm, int arg_count, Value *args) {
 typedef struct {
     ShellExecRedirBackup *backups;
     size_t backup_count;
+    bool failed;
 } ShellSubshellFrame;
 
-static ShellSubshellFrame *gShellSubshellStack = NULL;
-static size_t gShellSubshellStackSize = 0;
-static size_t gShellSubshellStackCapacity = 0;
+/* Per thread: on iOS a pipeline stage or a nested exsh runs a VM of its own on a
+ * worker thread, and these frames restore that thread's descriptors. */
+static _Thread_local ShellSubshellFrame *gShellSubshellStack = NULL;
+static _Thread_local size_t gShellSubshellStackSize = 0;
+static _Thread_local size_t gShellSubshellStackCapacity = 0;
 
-static bool shellSubshellStackPush(ShellExecRedirBackup *backups, size_t backup_count) {
+static bool shellSubshellStackPush(ShellExecRedirBackup *backups, size_t backup_count, bool failed) {
     if (gShellSubshellStackSize >= gShellSubshellStackCapacity) {
         size_t new_cap = (gShellSubshellStackCapacity == 0) ? 4 : (gShellSubshellStackCapacity * 2);
         ShellSubshellFrame *resized = (ShellSubshellFrame *)realloc(gShellSubshellStack, new_cap * sizeof(ShellSubshellFrame));
@@ -901,6 +904,7 @@ static bool shellSubshellStackPush(ShellExecRedirBackup *backups, size_t backup_
     ShellSubshellFrame *slot = &gShellSubshellStack[gShellSubshellStackSize++];
     slot->backups = backups;
     slot->backup_count = backup_count;
+    slot->failed = failed;
     return true;
 }
 
@@ -910,19 +914,52 @@ static ShellSubshellFrame shellSubshellStackPop(void) {
         return frame;
     }
     frame = gShellSubshellStack[--gShellSubshellStackSize];
+    if (gShellSubshellStackSize == 0) {
+        free(gShellSubshellStack);
+        gShellSubshellStack = NULL;
+        gShellSubshellStackCapacity = 0;
+    }
     return frame;
 }
 
+static void shellSubshellFrameClose(ShellSubshellFrame *frame) {
+    if (frame->backups) {
+        shellFlushStandardStreams();
+        shellRestoreExecRedirections(frame->backups, frame->backup_count);
+        shellFreeExecRedirBackups(frame->backups, frame->backup_count);
+        frame->backups = NULL;
+    }
+}
+
+size_t shellRuntimeRedirectScopeDepth(void) {
+    return gShellSubshellStackSize;
+}
+
+/* return and exit stop a chunk before it reaches a scope's mode=leave, so the
+ * caller of the chunk closes what was left open. */
+void shellRuntimeUnwindRedirectScopes(size_t depth) {
+    while (gShellSubshellStackSize > depth) {
+        ShellSubshellFrame frame = shellSubshellStackPop();
+        shellSubshellFrameClose(&frame);
+    }
+}
+
+Value vmHostShellScopeIsReady(VM *vm) {
+    (void)vm;
+    return makeBoolean(gShellSubshellStackSize > 0 &&
+                       !gShellSubshellStack[gShellSubshellStackSize - 1].failed);
+}
+
+/* The redirections of a compound command, around its whole body. A redirection
+ * that fails reports the error and fails the command, without running the body
+ * and without ending the script. */
 Value vmBuiltinShellSubshell(VM *vm, int arg_count, Value *args) {
     VM *previous_vm = shellSwapCurrentVm(vm);
     const char *meta = (arg_count > 0 && VALUE_TYPE(args[0]) == TYPE_STRING) ? AS_STRING(args[0]) : "";
     bool leave = (meta && strstr(meta, "mode=leave") != NULL);
     if (leave) {
         ShellSubshellFrame frame = shellSubshellStackPop();
-        if (frame.backups) {
-            shellRestoreExecRedirections(frame.backups, frame.backup_count);
-            shellFreeExecRedirBackups(frame.backups, frame.backup_count);
-        }
+        shellSubshellFrameClose(&frame);
         shellRestoreCurrentVm(previous_vm);
         return makeVoid();
     }
@@ -944,7 +981,9 @@ Value vmBuiltinShellSubshell(VM *vm, int arg_count, Value *args) {
         }
     }
     if (ok && cmd.redir_count > 0) {
-        if (!shellApplyExecRedirections(vm ? vm : gShellCurrentVm, &cmd, &backups, &backup_count)) {
+        shellFlushStandardStreams();
+        /* No VM: runtimeError reports the failure and leaves the script running. */
+        if (!shellApplyExecRedirections(NULL, &cmd, &backups, &backup_count)) {
             ok = false;
         }
     }
@@ -953,20 +992,15 @@ Value vmBuiltinShellSubshell(VM *vm, int arg_count, Value *args) {
         cmd.redirs = NULL;
         cmd.redir_count = 0;
     }
-    if (ok && (backups || backup_count == 0)) {
-        if (!shellSubshellStackPush(backups, backup_count)) {
-            if (backups) {
-                shellRestoreExecRedirections(backups, backup_count);
-                shellFreeExecRedirBackups(backups, backup_count);
-            }
-            ok = false;
+    if (!shellSubshellStackPush(backups, backup_count, !ok)) {
+        if (backups) {
+            shellRestoreExecRedirections(backups, backup_count);
+            shellFreeExecRedirBackups(backups, backup_count);
         }
-    } else if (backups) {
-        shellRestoreExecRedirections(backups, backup_count);
-        shellFreeExecRedirBackups(backups, backup_count);
+        runtimeError(vm, "shell: out of memory");
+        ok = false;
     }
     if (!ok) {
-        runtimeError(vm, "subshell: failed to apply redirections");
         shellUpdateStatus(1);
     }
     shellRestoreCurrentVm(previous_vm);

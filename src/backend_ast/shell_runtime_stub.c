@@ -66,4 +66,9 @@ PSCAL_WEAK Value vmHostShellLoopIsReady(VM* vm) {
     return makeNil();
 }
 
+PSCAL_WEAK Value vmHostShellScopeIsReady(VM* vm) {
+    (void)vm;
+    return makeNil();
+}
+
 #endif /* !defined(FRONTEND_SHELL) */
