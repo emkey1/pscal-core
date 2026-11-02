@@ -119,6 +119,8 @@ FILE* pscalRuntimeVmStdin(void);
 FILE* pscalRuntimeVmStdout(void);
 FILE* pscalRuntimeVmStderr(void);
 bool pscalRuntimeVmIsSharedFileStream(FILE* stream);
+/* Writes out this thread's VM output. Empty where a process exit does it for us. */
+void pscalRuntimeVmFlushOutput(void);
 
 /* VM-native general built-ins */
 Value vmBuiltinInttostr(struct VM_s* vm, int arg_count, Value* args);

@@ -206,6 +206,7 @@ static FILE *shellVprocStreamOpenShim(int std_fd,
     if (buf_mode >= 0) {
         setvbuf(fp, NULL, buf_mode, 0);
     }
+    vprocStreamSkipFlushAll(fp);
     cache->fp = fp;
     cache->host_fd = -1;
     cache->host_identity_valid = false;
@@ -282,6 +283,7 @@ static FILE *shellVprocStreamOpen(int std_fd,
     if (buf_mode >= 0) {
         setvbuf(fp, NULL, buf_mode, 0);
     }
+    vprocStreamSkipFlushAll(fp);
     cache->fp = fp;
     cache->host_fd = host_fd;
     struct stat host_st;
@@ -303,7 +305,7 @@ static FILE *shellVprocStderr(void) {
 }
 
 static FILE *shellVprocStdin(void) {
-    return shellVprocStreamOpen(STDIN_FILENO, &gShellVprocStdin, "r", -1);
+    return shellVprocStreamOpen(STDIN_FILENO, &gShellVprocStdin, "r", _IOFBF);
 }
 
 static int shellVprocPuts(const char *text) {

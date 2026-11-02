@@ -3579,6 +3579,9 @@ static void* threadStart(void* arg) {
                 break;
         }
 
+        // The worker may wait a long time for its next job, or never get one.
+        pscalRuntimeVmFlushOutput();
+
         // A job that ends holding VM mutexes (a runtime error or a cancel
         // between lock and unlock, or a missing unlock) would otherwise keep
         // them locked forever: the next lock() anywhere, and program exit,
@@ -8353,6 +8356,7 @@ void initVM(VM* vm) { // As in all.txt, with frameCount
 
 void freeVM(VM* vm) {
     if (!vm) return;
+    pscalRuntimeVmFlushOutput();
     vmProcUnregister(vm);
     vmReleaseExecutionResources(vm);
     freeValue(&vm->threadMyself);

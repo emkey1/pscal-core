@@ -129,6 +129,21 @@ ssize_t vprocHostWrite(int fd, const void *buf, size_t count);
 int vprocHostPoll(struct pollfd *fds, nfds_t nfds, int timeout);
 /* The host's signal disposition, not the one the current vproc has recorded. */
 int vprocHostSigaction(int sig, const struct sigaction *act, struct sigaction *oldact);
+/* fflush(NULL) locks every stream in the process, and a stream keeps its lock through a
+ * read or write that blocks. Commands wait for each other through pipes, so that walk can
+ * wait for ever: `pascal x | tr a b`, where tr needs pascal's end of the pipe closed. It
+ * also writes another command's buffer to the caller's descriptor when the stream goes
+ * through vproc slots. A stream that can block or that belongs to one vproc's descriptors
+ * stays out of the walk, and whoever writes it flushes it. __SIGN is libc's own flag for
+ * this. A refill clears it on a line-buffered or unbuffered stream, so a stream that reads
+ * has to be fully buffered. */
+static inline void vprocStreamSkipFlushAll(FILE *stream) {
+#if defined(__SIGN)
+    stream->_flags = (short)(stream->_flags | __SIGN);
+#else
+    (void)stream;
+#endif
+}
 /* Virtual isatty shim for session-backed TTYs. */
 int vprocIsattyShim(int fd);
 /* Enable/disable the virtual location device (/dev/location). */

@@ -222,6 +222,7 @@ static FILE *vmVprocStreamOpenShim(int std_fd,
     if (buf_mode >= 0) {
         setvbuf(fp, NULL, buf_mode, 0);
     }
+    vprocStreamSkipFlushAll(fp);
     cache->fp = fp;
     cache->host_fd = -1;
     cache->host_identity_valid = false;
@@ -303,6 +304,7 @@ static FILE *vmVprocStreamOpen(int std_fd,
     if (buf_mode >= 0) {
         setvbuf(fp, NULL, buf_mode, 0);
     }
+    vprocStreamSkipFlushAll(fp);
     cache->fp = fp;
     cache->host_fd = host_fd;
     struct stat host_st;
@@ -324,7 +326,15 @@ static FILE *vmVprocStderr(void) {
 }
 
 static FILE *vmVprocStdin(void) {
-    return vmVprocStreamOpen(STDIN_FILENO, &gVmVprocStdin, "r", -1);
+    return vmVprocStreamOpen(STDIN_FILENO, &gVmVprocStdin, "r", _IOFBF);
+}
+
+/* What this thread's VM wrote and has not flushed. Nothing else reaches it: see
+ * vprocStreamSkipFlushAll. */
+void pscalRuntimeVmFlushOutput(void) {
+    if (gVmVprocStdout.fp) {
+        fflush(gVmVprocStdout.fp);
+    }
 }
 
 static bool vmFdMatchesFileIdentity(int fd, int other_fd) {
@@ -386,7 +396,7 @@ static FILE *vmVprocSharedShimStream(int std_fd,
 }
 
 FILE* pscalRuntimeVmStdin(void) {
-    return vmVprocSharedShimStream(STDIN_FILENO, &gVmStdinSharedShim, "r", -1);
+    return vmVprocSharedShimStream(STDIN_FILENO, &gVmStdinSharedShim, "r", _IOFBF);
 }
 
 FILE* pscalRuntimeVmStdout(void) {
@@ -462,6 +472,9 @@ static bool vmStreamTargetsSharedStdin(FILE *stream) {
         return true;
     }
     return false;
+}
+
+void pscalRuntimeVmFlushOutput(void) {
 }
 
 FILE* pscalRuntimeVmStdin(void) {
@@ -3666,6 +3679,7 @@ Value vmBuiltinFprintf(VM* vm, int arg_count, Value* args) {
 // fflush([file])
 Value vmBuiltinFflush(VM* vm, int arg_count, Value* args) {
     if (arg_count == 0) {
+        pscalRuntimeVmFlushOutput();
         fflush(NULL);
         return makeInt(0);
     }
@@ -5216,6 +5230,7 @@ static void vmRestoreColorState(void) {
 
 // atexit handler: restore terminal settings and ensure cursor visibility
 static void vmAtExitCleanup(void) {
+    pscalRuntimeVmFlushOutput();
     pscalFxEndSession();
     vmRestoreTerminal();
     if (pscalRuntimeStdoutIsInteractive()) {
