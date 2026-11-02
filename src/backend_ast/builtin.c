@@ -71,6 +71,7 @@ typedef struct {
     int std_fd;
     bool can_read;
     bool can_write;
+    bool redirected_stdin;
 } VmVprocShimCookie;
 
 typedef struct VmShimCookieNode {
@@ -81,6 +82,9 @@ typedef struct VmShimCookieNode {
 static __thread VmVprocStream gVmVprocStdout = { NULL, -1, STDOUT_FILENO };
 static __thread VmVprocStream gVmVprocStderr = { NULL, -1, STDERR_FILENO };
 static __thread VmVprocStream gVmVprocStdin = { NULL, -1, STDIN_FILENO };
+/* The thread's stdin while fd 0 is a file or pipe, apart from the terminal's FILE so
+ * that neither sees the other's buffer. */
+static __thread VmVprocStream gVmVprocRedirectedStdin = { NULL, -1, STDIN_FILENO };
 static VmVprocStream gVmStdoutSharedShim = { NULL, -1, STDOUT_FILENO };
 static VmVprocStream gVmStderrSharedShim = { NULL, -1, STDERR_FILENO };
 static VmVprocStream gVmStdinSharedShim = { NULL, -1, STDIN_FILENO };
@@ -145,7 +149,19 @@ static int vmVprocShimRead(void *cookie, char *buf, int len) {
         errno = EBADF;
         return -1;
     }
-    ssize_t res = vprocReadShim(ctx->std_fd, buf, (size_t)len);
+    ssize_t res;
+    if (ctx->redirected_stdin) {
+        /* Without waiting: see vmInputGetc. Not cancellable either, because Ctrl-C can
+         * cancel this thread, and the FILE's lock would then stay held for good. */
+        int cancel_state;
+        pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+        res = vprocReadRedirectedStdin(buf, (size_t)len);
+        int read_errno = errno;
+        pthread_setcancelstate(cancel_state, NULL);
+        errno = read_errno;
+    } else {
+        res = vprocReadShim(ctx->std_fd, buf, (size_t)len);
+    }
     if (res < 0) {
         return -1;
     }
@@ -206,6 +222,7 @@ static FILE *vmVprocStreamOpenShim(int std_fd,
     cookie->std_fd = std_fd;
     cookie->can_read = strchr(mode, 'r') != NULL;
     cookie->can_write = (strchr(mode, 'w') != NULL) || (strchr(mode, 'a') != NULL);
+    cookie->redirected_stdin = (cache == &gVmVprocRedirectedStdin);
     vmShimCookieTrackAdd(cookie);
 
     FILE *fp = funopen(cookie,
@@ -327,6 +344,11 @@ static FILE *vmVprocStderr(void) {
 }
 
 static FILE *vmVprocStdin(void) {
+    /* Through the shim whatever fd 0 is: a FILE over a dup of it would stay open after
+     * the thread ends, and would block where Ctrl-C cannot reach it. */
+    if (vprocStdinIsRedirected()) {
+        return vmVprocStreamOpenShim(STDIN_FILENO, &gVmVprocRedirectedStdin, "r", _IOFBF);
+    }
     return vmVprocStreamOpen(STDIN_FILENO, &gVmVprocStdin, "r", _IOFBF);
 }
 
@@ -336,6 +358,17 @@ void pscalRuntimeVmFlushOutput(void) {
     if (gVmVprocStdout.fp) {
         fflush(gVmVprocStdout.fp);
     }
+}
+
+/* The FILE to read for `stream`. On a redirected stdin Read, Readln and Eof must all
+ * use one: the stdin that CLike names is a FILE of its own over the same fd 0, and what
+ * it buffers the others never see, so a loop of eof(stdin) and scanf lost lines. */
+static FILE *vmInputStream(FILE *stream) {
+    if (stream && (stream == gVmStdinSharedShim.fp || stream == gVmVprocStdin.fp) &&
+        vprocStdinIsRedirected()) {
+        return vmVprocStdin();
+    }
+    return stream;
 }
 
 static bool vmFdMatchesFileIdentity(int fd, int other_fd) {
@@ -416,7 +449,8 @@ bool pscalRuntimeVmIsSharedFileStream(FILE* stream) {
     if (stream == stdin || stream == stdout || stream == stderr) {
         return true;
     }
-    if (stream == gVmVprocStdin.fp || stream == gVmVprocStdout.fp || stream == gVmVprocStderr.fp) {
+    if (stream == gVmVprocStdin.fp || stream == gVmVprocStdout.fp || stream == gVmVprocStderr.fp ||
+        stream == gVmVprocRedirectedStdin.fp) {
         return true;
     }
     if (stream == gVmStdinSharedShim.fp || stream == gVmStdoutSharedShim.fp || stream == gVmStderrSharedShim.fp) {
@@ -476,6 +510,10 @@ static bool vmStreamTargetsSharedStdin(FILE *stream) {
 }
 
 void pscalRuntimeVmFlushOutput(void) {
+}
+
+static FILE *vmInputStream(FILE *stream) {
+    return stream;
 }
 
 FILE* pscalRuntimeVmStdin(void) {
@@ -5980,6 +6018,133 @@ static bool vmLineBufReserve(VmLineBuf *line, size_t need) {
     return true;
 }
 
+typedef enum {
+    VM_READ_NO_SIGNAL,
+    VM_READ_RESUMED, /* Stopped and continued: read on. */
+    VM_READ_UNWIND   /* The VM's flags are set: give up the read. */
+} VmReadSignal;
+
+/* Act on a Ctrl-C or Ctrl-Z that reached a blocked read. */
+static VmReadSignal vmTakeReadSignal(VM *vm) {
+#if defined(PSCAL_TARGET_IOS)
+    /* If a frontend thread was hard-stopped while blocked in select/poll,
+     * convert that stop into a cooperative pending signal so ReadLn can
+     * unwind back to the shell prompt. */
+    vmWaitIfStoppedWithCheckpoint();
+#endif
+    if (pscalRuntimeConsumeSigint()) {
+        if (vm) {
+            vm->abort_requested = true;
+            vm->exit_requested = true;
+        }
+        return VM_READ_UNWIND;
+    }
+    if (pscalRuntimeConsumeSigtstp()) {
+#if defined(PSCAL_TARGET_IOS)
+        if (!vmShouldUseCooperativeSuspend() && vmRequestHardSuspendCurrentVproc()) {
+            vmWaitIfStoppedWithCheckpoint();
+            return VM_READ_RESUMED;
+        }
+#endif
+        if (vm) {
+            vm->abort_requested = false;
+            vm->exit_requested = true;
+            vm->suspend_unwind_requested = true;
+        }
+        shellRuntimeSetLastStatus(128 + SIGTSTP);
+        return VM_READ_UNWIND;
+    }
+#if defined(PSCAL_TARGET_IOS)
+    int cur_pid = vprocGetPidShim();
+    if (cur_pid <= 0) {
+        cur_pid = vprocGetShellSelfPid();
+    }
+    if (cur_pid > 0) {
+        sigset_t pending;
+        sigemptyset(&pending);
+        if (vprocSigpending(cur_pid, &pending) == 0 &&
+            (sigismember(&pending, SIGINT) || sigismember(&pending, SIGTSTP))) {
+            sigset_t watchset;
+            sigemptyset(&watchset);
+            sigaddset(&watchset, SIGINT);
+            sigaddset(&watchset, SIGTSTP);
+            int signo = 0;
+            if (vprocSigwait(cur_pid, &watchset, &signo) == 0) {
+                if (signo == SIGTSTP &&
+                    !vmShouldUseCooperativeSuspend() &&
+                    vmRequestHardSuspendCurrentVproc()) {
+                    vmWaitIfStoppedWithCheckpoint();
+                    return VM_READ_RESUMED;
+                }
+                if (vm) {
+                    vm->abort_requested = (signo == SIGINT);
+                    vm->exit_requested = true;
+                    vm->suspend_unwind_requested = (signo == SIGTSTP);
+                }
+                if (signo == SIGTSTP) {
+                    shellRuntimeSetLastStatus(128 + SIGTSTP);
+                }
+                return VM_READ_UNWIND;
+            }
+        }
+    }
+#endif
+    if (vm && (vm->abort_requested || vm->exit_requested)) {
+        return VM_READ_UNWIND;
+    }
+    return VM_READ_NO_SIGNAL;
+}
+
+#if defined(PSCAL_TARGET_IOS)
+/* fgetc for the VM's input. A redirected stdin's read does not wait, and the waiting is
+ * done here: stdio holds the FILE's lock during a read, and only out here can Ctrl-C and
+ * Ctrl-Z unwind the program. Returns EOF with the VM's flags set if the program is to end. */
+static int vmInputGetc(VM *vm, FILE *stream) {
+    for (;;) {
+        errno = 0;
+        int ch = fgetc(stream);
+        int read_errno = errno;
+        if (ch != EOF || !ferror(stream) || (read_errno != EINTR && read_errno != EAGAIN)) {
+            return ch;
+        }
+        clearerr(stream);
+        if (vmTakeReadSignal(vm) == VM_READ_UNWIND) {
+            return EOF;
+        }
+        if (read_errno == EAGAIN) {
+            usleep(10 * 1000);
+        }
+    }
+}
+
+/* One line of a redirected stdin. No terminal is behind it, so every byte is data,
+ * including ^C and the caret notation the session input uses for it. The result is
+ * what hosts get from getline in vmReadLineInterruptible. */
+static bool vmReadRedirectedLine(VM *vm, FILE *stream, VmLineBuf *line) {
+    size_t len = 0;
+    int ch;
+    while ((ch = vmInputGetc(vm, stream)) != EOF && ch != '\n') {
+        if (!vmLineBufReserve(line, len + 2)) {
+            return false;
+        }
+        line->data[len++] = (char)ch;
+    }
+    line->data[len] = '\0';
+    if (ch == EOF && (len == 0 || (vm && (vm->abort_requested || vm->exit_requested)))) {
+        line->data[0] = '\0';
+        return false;
+    }
+    line->len = strcspn(line->data, "\r");
+    line->data[line->len] = '\0';
+    return true;
+}
+#else
+static int vmInputGetc(VM *vm, FILE *stream) {
+    (void)vm;
+    return fgetc(stream);
+}
+#endif
+
 /* Read one line from `stream` into `line` (grown as needed, NUL-terminated,
  * line->len set; the caller frees line->data). The line break is not
  * stored. A line has no length limit: the fixed buffers this used to fill
@@ -5995,6 +6160,11 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, VmLineBuf *line) {
     int fd = fileno(stream);
     bool is_stdin_stream = vmStreamTargetsSharedStdin(stream);
 #if defined(PSCAL_TARGET_IOS)
+    /* Not the session's input: that is the terminal, and `prog < file` must not wait
+     * for the keyboard. */
+    if (is_stdin_stream && vprocStdinIsRedirected()) {
+        return vmReadRedirectedLine(vm, vmInputStream(stream), line);
+    }
     bool is_shared_stdin_stream = is_stdin_stream;
     bool tool_dbg = getenv("PSCALI_TOOL_DEBUG") != NULL;
     if (is_shared_stdin_stream) {
@@ -6101,79 +6271,15 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, VmLineBuf *line) {
                 break;
             }
             buffer = line->data;
-#if defined(PSCAL_TARGET_IOS)
-            /* If a frontend thread was hard-stopped while blocked in select/poll,
-             * convert that stop into a cooperative pending signal so ReadLn can
-             * unwind back to the shell prompt. */
-            vmWaitIfStoppedWithCheckpoint();
-#endif
-            if (pscalRuntimeConsumeSigint()) {
-                if (vm) {
-                    vm->abort_requested = true;
-                    vm->exit_requested = true;
-                }
-                buffer[0] = '\0';
-                return false;
-            }
-            if (pscalRuntimeConsumeSigtstp()) {
-#if defined(PSCAL_TARGET_IOS)
-                if (!vmShouldUseCooperativeSuspend() && vmRequestHardSuspendCurrentVproc()) {
-                    vmWaitIfStoppedWithCheckpoint();
+            {
+                VmReadSignal read_signal = vmTakeReadSignal(vm);
+                if (read_signal == VM_READ_RESUMED) {
                     continue;
                 }
-#endif
-                if (vm) {
-                    vm->abort_requested = false;
-                    vm->exit_requested = true;
-                    vm->suspend_unwind_requested = true;
+                if (read_signal == VM_READ_UNWIND) {
+                    buffer[0] = '\0';
+                    return false;
                 }
-                shellRuntimeSetLastStatus(128 + SIGTSTP);
-                buffer[0] = '\0';
-                return false;
-            }
-#if defined(PSCAL_TARGET_IOS)
-            {
-                int cur_pid = vprocGetPidShim();
-                if (cur_pid <= 0) {
-                    cur_pid = vprocGetShellSelfPid();
-                }
-                if (cur_pid > 0) {
-                    sigset_t pending;
-                    sigemptyset(&pending);
-                    if (vprocSigpending(cur_pid, &pending) == 0 &&
-                        (sigismember(&pending, SIGINT) || sigismember(&pending, SIGTSTP))) {
-                        sigset_t watchset;
-                        sigemptyset(&watchset);
-                        sigaddset(&watchset, SIGINT);
-                        sigaddset(&watchset, SIGTSTP);
-                        int signo = 0;
-                        if (vprocSigwait(cur_pid, &watchset, &signo) == 0) {
-#if defined(PSCAL_TARGET_IOS)
-                            if (signo == SIGTSTP &&
-                                !vmShouldUseCooperativeSuspend() &&
-                                vmRequestHardSuspendCurrentVproc()) {
-                                vmWaitIfStoppedWithCheckpoint();
-                                continue;
-                            }
-#endif
-                            if (vm) {
-                                vm->abort_requested = (signo == SIGINT);
-                                vm->exit_requested = true;
-                                vm->suspend_unwind_requested = (signo == SIGTSTP);
-                            }
-                            if (signo == SIGTSTP) {
-                                shellRuntimeSetLastStatus(128 + SIGTSTP);
-                            }
-                            buffer[0] = '\0';
-                            return false;
-                        }
-                    }
-                }
-            }
-#endif
-            if (vm && (vm->abort_requested || vm->exit_requested)) {
-                buffer[0] = '\0';
-                return false;
             }
 #if defined(PSCAL_TARGET_IOS)
             if (sigint_fd >= 0 && !read_is_host) {
@@ -6207,7 +6313,15 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, VmLineBuf *line) {
 #if defined(PSCAL_TARGET_IOS)
             if (use_session_read) {
                 char ch;
-                ssize_t n = vprocSessionReadInputShimMode(&ch, 1, false);
+                /* Polling, not parked in the session input's condition wait. Ctrl-C from
+                 * the keyboard bar is a signal alone: nothing wakes that wait, and it can
+                 * cancel this thread there, leaving the input's mutex held, so the next
+                 * key was lost. After Ctrl-Z the stopped program took that key itself. */
+                ssize_t n = vprocSessionReadInputShimMode(&ch, 1, true);
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    usleep(50 * 1000);
+                    continue;
+                }
                 if (n == 0) {
                     if (tool_dbg && stream == stdin) {
                         fprintf(stderr, "[readln] session read EOF len=%zu\n", len);
@@ -8675,12 +8789,13 @@ Value vmBuiltinEof(VM* vm, int arg_count, Value* args) {
         return makeBoolean(true);
     }
 
+    stream = vmInputStream(stream);
 #if defined(PSCAL_TARGET_IOS)
     /* Eof runs under globals_mutex, which every VM in the app takes to start, and this
      * read can wait as long as its input likes. */
     int released_globals_locks = vmSuspendReleaseGlobalsMutex();
 #endif
-    int c = fgetc(stream);
+    int c = vmInputGetc(vm, stream);
 #if defined(PSCAL_TARGET_IOS)
     vmSuspendReacquireGlobalsMutex(released_globals_locks);
 #endif
@@ -9220,10 +9335,10 @@ static bool builtinParseIntForType(VarType type, const char* text, const char** 
 /* The next whitespace-delimited token of `stream`, in a buffer grown to fit
  * (Read used to cut tokens at 1023 bytes and return the rest as the next
  * token). The caller frees *out. False at end of input. */
-static bool readTokenAlloc(FILE* stream, char** out, size_t* out_len) {
+static bool readTokenAlloc(VM* vm, FILE* stream, char** out, size_t* out_len) {
     int ch;
     do {
-        ch = fgetc(stream);
+        ch = vmInputGetc(vm, stream);
     } while (ch != EOF && isspace(ch));
     if (ch == EOF) {
         return false;
@@ -9244,7 +9359,7 @@ static bool readTokenAlloc(FILE* stream, char** out, size_t* out_len) {
             cap *= 2;
         }
         buf[len++] = (char)ch;
-        ch = fgetc(stream);
+        ch = vmInputGetc(vm, stream);
     }
     if (ch != EOF) {
         ungetc(ch, stream);
@@ -9274,7 +9389,7 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
                 vmCommitLastIoError(io_error);
                 return makeVoid();
             }
-            input_stream = AS_FILE(*a0);
+            input_stream = vmInputStream(AS_FILE(*a0));
             var_start_index = 1;
             // A typed file of a scalar type holds its elements in the binary
             // layout Write gives them (same test as Write's).
@@ -9312,13 +9427,17 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
             continue;
         }
         if (VALUE_TYPE(*dst) == TYPE_CHAR) {
-            int ch = fgetc(input_stream);
+            int ch = vmInputGetc(vm, input_stream);
             if (ch == EOF) { io_error = feof(input_stream) ? 0 : 1; break; }
             SET_CHAR_VALUE(dst, ch);
             SET_INT_VALUE(dst, AS_CHAR(*dst));
             continue;
         }
         if (VALUE_TYPE(*dst) == TYPE_RECORD || VALUE_TYPE(*dst) == TYPE_ARRAY) {
+            int first = vmInputGetc(vm, input_stream);   // Wait for a pipe's first bytes.
+            if (first != EOF) {
+                ungetc(first, input_stream);
+            }
             if (!readStructuredValue(input_stream, dst)) {
                 io_error = 1;
                 break;
@@ -9328,7 +9447,7 @@ Value vmBuiltinRead(VM* vm, int arg_count, Value* args) {
 
         char* buffer = NULL;
         size_t buffer_len = 0;
-        if (!readTokenAlloc(input_stream, &buffer, &buffer_len)) {
+        if (!readTokenAlloc(vm, input_stream, &buffer, &buffer_len)) {
             io_error = feof(input_stream) ? 0 : 1;
             break;
         }
@@ -9429,7 +9548,7 @@ Value vmBuiltinReadln(VM* vm, int arg_count, Value* args) {
                 vmCommitLastIoError(io_error);
                 return makeVoid();
             }
-            input_stream = AS_FILE(*a0);
+            input_stream = vmInputStream(AS_FILE(*a0));
             var_start_index = 1;
         }
     }

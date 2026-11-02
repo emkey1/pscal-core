@@ -14654,6 +14654,37 @@ int vprocIsattyShim(int fd) {
     return vprocHostIsatty(host);
 }
 
+bool vprocStdinIsRedirected(void) {
+    VProc *vp = vprocForThread();
+    if (!vp) {
+        return false;
+    }
+    VProcSessionStdio *session = vprocSessionStdioCurrent();
+    struct pscal_fd *pscal_fd = NULL;
+    int host_fd = vprocResolveFdForShim(vp, STDIN_FILENO, 0, &pscal_fd);
+    if (pscal_fd) {
+        bool terminal = pscal_fd->tty != NULL ||
+                        (session && (session->stdin_pscal_fd == pscal_fd ||
+                                     session->pty_slave == pscal_fd));
+        pscal_fd_close(pscal_fd);
+        return !terminal;
+    }
+    if (host_fd < 0) {
+        return false;
+    }
+    /* A session with no PTY takes its terminal input through a host pipe. */
+    if (vp->stdin_from_session ||
+        (session && vprocSessionFdMatchesHost(host_fd, session->stdin_host_fd))) {
+        return false;
+    }
+    struct stat st;
+    if (vprocHostFstatRaw(host_fd, &st) != 0) {
+        return false;
+    }
+    return S_ISREG(st.st_mode) || S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode) ||
+           (S_ISCHR(st.st_mode) && !vprocHostIsatty(host_fd));
+}
+
 int pscalTtyCurrentPid(void) {
     return (int)vprocGetPidShim();
 }
@@ -17056,6 +17087,48 @@ static short vprocSessionInputPollEvents(VProcSessionStdio *session,
         ready |= POLLHUP;
     }
     return ready;
+}
+
+/* Not through vprocReadShim: it acts on a pending signal, and SIGINT's default action
+ * ends the thread there, with the VM's frames and any lock it holds. Background job
+ * control does not apply either: a file or pipe is not the terminal. */
+ssize_t vprocReadRedirectedStdin(void *buf, size_t count) {
+    VProc *vp = vprocForThread();
+    sigset_t pending;
+    sigemptyset(&pending);
+    if (vp && vprocSigpending(vprocPid(vp), &pending) == 0 &&
+        (sigismember(&pending, SIGINT) || sigismember(&pending, SIGTSTP))) {
+        errno = EINTR;
+        return -1;
+    }
+    vprocDeliverPendingSignalsForCurrent();
+    struct pscal_fd *pscal_fd = NULL;
+    int host = vprocResolveFdForShim(vp, STDIN_FILENO, 0, &pscal_fd);
+    if (pscal_fd) {
+        ssize_t res;
+        int events = pscal_fd->ops && pscal_fd->ops->poll ? pscal_fd->ops->poll(pscal_fd) : POLL_ERR;
+        if (vprocPollMapReady(events, POLLIN)) {
+            res = pscal_fd->ops->read(pscal_fd, buf, count);
+            if (res < 0) {
+                res = vprocSetCompatErrno((int)res);
+            }
+        } else {
+            errno = EAGAIN;
+            res = -1;
+        }
+        pscal_fd_close(pscal_fd);
+        return res;
+    }
+    if (host < 0) {
+        return -1;
+    }
+    struct pollfd pfd = { .fd = host, .events = POLLIN, .revents = 0 };
+    int ready = vprocHostPollRaw(&pfd, 1, 0);
+    if (ready == 0 || (ready < 0 && errno == EINTR)) {
+        errno = EAGAIN;
+        return -1;
+    }
+    return vprocHostRead(host, buf, count);
 }
 
 int vprocPollShim(struct pollfd *fds, nfds_t nfds, int timeout) {

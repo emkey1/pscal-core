@@ -163,6 +163,14 @@ static inline void vprocStreamSkipFlushAll(FILE *stream) {
 }
 /* Virtual isatty shim for session-backed TTYs. */
 int vprocIsattyShim(int fd);
+/* True when the current vproc's fd 0 is a file, pipe, socket or other non-terminal
+ * rather than the session's terminal. */
+bool vprocStdinIsRedirected(void);
+/* One try at reading a redirected fd 0, for a caller that unwinds by itself on Ctrl-C
+ * and Ctrl-Z. It never waits. Returns the count, 0 at end of input, or -1 with errno
+ * EINTR (SIGINT or SIGTSTP is pending, and stays pending), EAGAIN (nothing to read yet)
+ * or the read's own error. */
+ssize_t vprocReadRedirectedStdin(void *buf, size_t count);
 /* Enable/disable the virtual location device (/dev/location). */
 void vprocLocationDeviceSetEnabled(bool enabled);
 /* Write a payload to the virtual location device. */
