@@ -117,7 +117,7 @@ static void shellFreeCommand(ShellCommand *cmd);
 static void shellUpdateStatus(int status);
 static bool shellCommandIsExecBuiltin(const ShellCommand *cmd);
 static bool shellExecuteExecBuiltin(VM *vm, ShellCommand *cmd);
-static bool shellApplyExecRedirections(VM *vm, const ShellCommand *cmd,
+static bool shellApplyExecRedirections(const ShellCommand *cmd,
                                        ShellExecRedirBackup **out_backups,
                                        size_t *out_count);
 static bool shellEnsureExecRedirBackup(int target_fd,
@@ -393,6 +393,7 @@ static char *shellRunCommandSubstitution(const char *command) {
     int saved_break_levels = gShellRuntime.break_requested_levels;
     bool saved_continue_requested = gShellRuntime.continue_requested;
     int saved_continue_levels = gShellRuntime.continue_requested_levels;
+    bool saved_errexit_enabled = gShellRuntime.errexit_enabled;
     bool saved_errexit_pending = gShellRuntime.errexit_pending;
     bool saved_errexit_defer_active = gShellRuntime.errexit_defer_active;
     VM *saved_vm = gShellCurrentVm;
@@ -415,6 +416,7 @@ static char *shellRunCommandSubstitution(const char *command) {
             } else {
                 result_length = cached_entry->result_length;
             }
+            shellUpdateStatus(cached_entry->status);
             goto substitution_finish;
         }
         gShellRuntime.scalar_cache_misses++;
@@ -567,6 +569,10 @@ static char *shellRunCommandSubstitution(const char *command) {
         gShellRuntime.continue_requested_levels = 0;
         gShellRuntime.errexit_pending = false;
         gShellRuntime.errexit_defer_active = false;
+        /* As in bash, -e is off in here: `set -e; x=$(false; echo ok)` assigns ok. */
+        if (!shellRuntimePosixMode() && !shellShoptOptionEnabled("inherit_errexit")) {
+            gShellRuntime.errexit_enabled = false;
+        }
         if (saved_vm) {
             saved_vm->exit_requested = false;
             saved_vm->abort_requested = false;
@@ -592,6 +598,7 @@ static char *shellRunCommandSubstitution(const char *command) {
         gShellRuntime.break_requested_levels = saved_break_levels;
         gShellRuntime.continue_requested = saved_continue_requested;
         gShellRuntime.continue_requested_levels = saved_continue_levels;
+        gShellRuntime.errexit_enabled = saved_errexit_enabled;
         gShellRuntime.errexit_pending = saved_errexit_pending;
         gShellRuntime.errexit_defer_active = saved_errexit_defer_active;
         if (saved_vm) {
@@ -647,10 +654,9 @@ static char *shellRunCommandSubstitution(const char *command) {
     }
 #endif
 
-    int final_status = shellRuntimeLastStatus();
-    if (!exit_requested && status != EXIT_SUCCESS) {
-        final_status = status;
-    }
+    /* shellRunSource ran in its own runtime context, so this is the only place its
+     * status survives: reading the last status here would find this shell's own. */
+    int final_status = status;
     shellUpdateStatus(final_status);
 
     if (!reader.buffer) {
@@ -670,11 +676,13 @@ static char *shellRunCommandSubstitution(const char *command) {
     if (*source && allow_scalar_cache) {
         stored_entry = shellScalarCacheStore(source, result, result_length);
         if (stored_entry) {
+            stored_entry->status = final_status;
             gShellRuntime.scalar_cache_stores++;
         }
     }
 
 substitution_finish:
+    gShellRuntime.command_substitutions_run++;
 #if defined(PSCAL_TARGET_IOS)
     if (saved_stdout_pscal) {
         pscal_fd_close(saved_stdout_pscal);
@@ -2291,6 +2299,12 @@ static char *shellLookupParameterValueInternal(const char *name,
                     *out_is_set = true;
                 }
                 return strdup(buffer);
+            }
+            case '-': {
+                if (out_is_set) {
+                    *out_is_set = true;
+                }
+                return shellRuntimeOptionFlags();
             }
             case '$': {
                 char buffer[32];

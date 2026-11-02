@@ -1031,8 +1031,7 @@ Value vmBuiltinShellSubshell(VM *vm, int arg_count, Value *args) {
     }
     if (ok && cmd.redir_count > 0) {
         shellFlushStandardStreams();
-        /* No VM: runtimeError reports the failure and leaves the script running. */
-        if (!shellApplyExecRedirections(NULL, &cmd, &backups, &backup_count)) {
+        if (!shellApplyExecRedirections(&cmd, &backups, &backup_count)) {
             ok = false;
         }
     }
@@ -1559,8 +1558,9 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
             }
         }
         if (ok && redir_cmd.redir_count > 0) {
-            if (!shellApplyExecRedirections(vm ? vm : gShellCurrentVm, &redir_cmd, &redir_backups, &redir_backup_count)) {
+            if (!shellApplyExecRedirections(&redir_cmd, &redir_backups, &redir_backup_count)) {
                 ok = false;
+                frame->skip_body = true;
             } else {
                 frame->redirs_active = true;
                 frame->redir_backups = redir_backups;
@@ -11982,14 +11982,17 @@ Value vmHostShellLoopIsReady(VM *vm) {
         } else if (frame->kind == SHELL_LOOP_KIND_FOR) {
             ready = frame->for_active && !frame->skip_body;
         } else if (frame->kind == SHELL_LOOP_KIND_CFOR) {
+            /* Skipping: the condition would overwrite the status of what caused it. */
             bool condition_ready = false;
-            if (!shellLoopEvaluateCForCondition(frame, &condition_ready)) {
+            if (frame->skip_body) {
+                ready = false;
+            } else if (!shellLoopEvaluateCForCondition(frame, &condition_ready)) {
                 frame->skip_body = true;
                 frame->break_pending = true;
                 shellUpdateStatus(1);
                 ready = false;
             } else {
-                ready = condition_ready && !frame->skip_body;
+                ready = condition_ready;
             }
         } else {
             ready = !frame->skip_body;

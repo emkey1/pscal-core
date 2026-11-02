@@ -226,6 +226,10 @@ static char *shellExpandParameter(const char *input,
         }
         const char *inner = input + 1;
         size_t inner_len = (size_t)(closing - inner);
+        if (inner_len == 1 && inner[0] == '-') {
+            /* Before the default-value scan below, which takes it for `${name-word}`. */
+            return shellRuntimeOptionFlags();
+        }
         if (inner_len == 0) {
             return strdup("");
         }
@@ -658,6 +662,13 @@ static char *shellExpandParameter(const char *input,
         char buffer[32];
         snprintf(buffer, sizeof(buffer), "%d", gShellRuntime.last_status);
         return strdup(buffer);
+    }
+
+    if (*input == '-') {
+        if (out_consumed) {
+            *out_consumed = 1;
+        }
+        return shellRuntimeOptionFlags();
     }
 
     if (*input == '!') {
@@ -2934,9 +2945,7 @@ static bool shellInvokeBuiltin(VM *vm, ShellCommand *cmd) {
         ShellExecRedirBackup *redir_backups = NULL;
         size_t redir_backup_count = 0;
         shellFlushStandardStreams();
-        /* No VM: a redirection that fails fails the call, not the script. */
-        if (!shellApplyExecRedirections(NULL, cmd, &redir_backups, &redir_backup_count)) {
-            shellUpdateStatus(1);
+        if (!shellApplyExecRedirections(cmd, &redir_backups, &redir_backup_count)) {
             return true;
         }
         bool ran = shellInvokeFunction(vm, cmd);
@@ -3038,7 +3047,7 @@ static bool shellInvokeBuiltin(VM *vm, ShellCommand *cmd) {
     ShellExecRedirBackup *redir_backups = NULL;
     size_t redir_backup_count = 0;
     shellFlushStandardStreams();
-    if (!shellApplyExecRedirections(vm, cmd, &redir_backups, &redir_backup_count)) {
+    if (!shellApplyExecRedirections(cmd, &redir_backups, &redir_backup_count)) {
         if (args) {
             for (int i = 0; i < arg_count; ++i) {
                 freeValue(&args[i]);

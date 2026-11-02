@@ -597,6 +597,7 @@ typedef struct ShellRuntimeState {
     unsigned long scalar_cache_stores;
     size_t scalar_cache_generation;
     size_t scalar_capture_peak_depth;
+    unsigned long command_substitutions_run;
     ShellHistory history;
     char *history_path;
     size_t history_size_limit;
@@ -2254,6 +2255,7 @@ typedef struct {
     bool background;
     bool disable_field_splitting;
     bool ignore_functions;
+    bool ran_command_substitution;
     int pipeline_index;
     bool is_pipeline_head;
     bool is_pipeline_tail;
@@ -3530,6 +3532,29 @@ void shellRuntimeSetInteractive(bool interactive) {
 
 bool shellRuntimeIsInteractive(void) {
     return gShellInteractiveMode;
+}
+
+/* $-: the letters in bash's order. These are the options this shell tracks, and the
+ * ones it reports as always on, as a bash script sees them (`hB`). */
+static char *shellRuntimeOptionFlags(void) {
+    char flags[8];
+    size_t count = 0;
+    if (gShellRuntime.errexit_enabled) {
+        flags[count++] = 'e';
+    }
+    flags[count++] = 'h';
+    if (shellRuntimeIsInteractive()) {
+        flags[count++] = 'i';
+    }
+    if (shellRuntimeIsInteractive() && gShellRuntime.job_control_enabled) {
+        flags[count++] = 'm';
+    }
+    flags[count++] = 'B';
+    if (shellRuntimeIsInteractive()) {
+        flags[count++] = 'H';
+    }
+    flags[count] = '\0';
+    return strdup(flags);
 }
 
 static void shellRuntimeRememberStandardFds(void) {
@@ -5612,6 +5637,7 @@ typedef struct {
     char *command;
     char *result;
     size_t result_length;
+    int status;
     size_t generation;
     unsigned long hits;
     unsigned long stores;
@@ -5753,6 +5779,7 @@ SHELL_STATIC_UNUSED ShellScalarCacheEntry *shellScalarCacheStore(const char *com
     }
     entry->result = copy;
     entry->result_length = copy_length;
+    entry->status = 0;
     entry->generation = gShellScalarCacheGeneration;
     entry->hits = 0;
     entry->stores = 1;

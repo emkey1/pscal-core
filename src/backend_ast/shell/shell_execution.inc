@@ -665,6 +665,7 @@ static bool shellBuildCommand(VM *vm, int arg_count, Value *args, ShellCommand *
     }
     shellParseMetadata(AS_STRING(meta), out_cmd);
     bool saw_command_word = false;
+    unsigned long substitutions_before = gShellRuntime.command_substitutions_run;
     if (redir_dbg) {
         fprintf(stderr, "[redir-build] arg_count=%d meta=%s\n", arg_count, AS_STRING(meta));
     }
@@ -692,6 +693,7 @@ static bool shellBuildCommand(VM *vm, int arg_count, Value *args, ShellCommand *
             }
         }
     }
+    out_cmd->ran_command_substitution = gShellRuntime.command_substitutions_run != substitutions_before;
     shellRewriteDoubleBracketTest(out_cmd);
     return true;
 }
@@ -986,6 +988,11 @@ static bool shellExpandAliasesIfNeeded(VM *vm, ShellCommand *cmd) {
         }
         return false;
     }
+    /* Alias text is split into words, not parsed, so its `&>` arrives as an argument.
+     * Anywhere else that word was quoted and means itself: echo "&>" x. */
+    if (depth > 0) {
+        shellPatchCombinedRedirectTokens(cmd);
+    }
     return true;
 }
 
@@ -1032,6 +1039,11 @@ static int shellSpawnProcess(VM *vm,
 
     size_t op_count = 0;
     int prep_error = 0;
+    /* A redirection that cannot open fails this command, not the script. The child
+     * reports it and exits 1, so a pipeline stage, `&` and `wait` see an ordinary
+     * failed process and the rest of a pipeline still runs. */
+    int redir_error = 0;
+    const char *redir_error_target = NULL;
     for (size_t i = 0; i < cmd->redir_count; ++i) {
         if (op_count >= op_capacity) {
             prep_error = ENOMEM;
@@ -1049,8 +1061,9 @@ static int shellSpawnProcess(VM *vm,
                 }
                 int fd = open(redir->path, redir->flags, redir->mode);
                 if (fd < 0) {
-                    prep_error = errno;
-                    goto spawn_cleanup;
+                    redir_error = errno;
+                    redir_error_target = redir->path;
+                    break;
                 }
                 op.type = SHELL_REDIR_OP_OPEN;
                 op.source_fd = fd;
@@ -1102,6 +1115,9 @@ static int shellSpawnProcess(VM *vm,
             default:
                 prep_error = EINVAL;
                 goto spawn_cleanup;
+        }
+        if (redir_error != 0) {
+            break;
         }
         ops[op_count++] = op;
     }
@@ -1188,7 +1204,7 @@ static int shellSpawnProcess(VM *vm,
                         if (dup2(op->source_fd, op->target_fd) < 0) {
                             int err = errno;
                             fprintf(stderr, "exsh: %s: %s\n", cmd->argv[0], strerror(err));
-                            _exit(126);
+                            _exit(1);
                         }
                         break;
                     case SHELL_REDIR_OP_DUP:
@@ -1196,11 +1212,17 @@ static int shellSpawnProcess(VM *vm,
                             close(op->target_fd);
                         } else if (dup2(op->source_fd, op->target_fd) < 0) {
                             int err = errno;
-                            fprintf(stderr, "exsh: %s: %s\n", cmd->argv[0], strerror(err));
-                            _exit(126);
+                            fprintf(stderr, "exsh: %d: %s\n", op->source_fd, strerror(err));
+                            _exit(1);
                         }
                         break;
                 }
+            }
+
+            /* After the earlier ones: `cmd 2>log >/missing` reports into log. */
+            if (redir_error != 0) {
+                fprintf(stderr, "exsh: %s: %s\n", redir_error_target, strerror(redir_error));
+                _exit(1);
             }
 
             if (stdin_fd >= 0 && stdin_fd != STDIN_FILENO) {
@@ -1816,6 +1838,7 @@ static int shellBgOpenPath(const char *raw_path,
                            char *out_final,
                            size_t out_final_sz);
 #endif
+static void shellRedirectionFailed(const char *target, int err);
 
 #if defined(PSCAL_TARGET_IOS)
 static void shellInProcessBackgroundCancelCleanup(void *arg) {
@@ -2106,6 +2129,10 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
     bool stderr_append = false;
     int stdin_fd = -1;
     bool stdin_redirected = false;
+    /* The first redirection that cannot open fails the job. It is reported once the job
+     * has a vproc, so `wait` gets the status. */
+    const char *redir_failed_target = NULL;
+    int redir_failed_errno = 0;
     /* Background defaults: stdin -> /dev/null unless explicitly redirected.
      * A compound command keeps its stdin. */
     if (ctx->cmd && ctx->cmd->background && !ctx->cmd->body) {
@@ -2137,6 +2164,9 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
                     if (fd >= 0) {
                         stdin_fd = fd;
                         stdin_redirected = true;
+                    } else if (!redir_failed_target) {
+                        redir_failed_target = r->path;
+                        redir_failed_errno = errno;
                     }
                 } else if (r->fd == STDOUT_FILENO && r->path) {
                     stdout_raw = r->path;
@@ -2192,6 +2222,10 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
     if (stdout_path && *stdout_path) {
         char resolved_out[PATH_MAX];
         vm_stdout = shellBgOpenPath(stdout_path, stdout_append, resolved_out, sizeof(resolved_out));
+        if (vm_stdout < 0 && !redir_failed_target) {
+            redir_failed_target = stdout_path;
+            redir_failed_errno = errno;
+        }
         if (vm_stdout >= 0 && resolved_out[0]) {
             free(stdout_path);
             stdout_path = strdup(resolved_out);
@@ -2206,6 +2240,10 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
     if (stderr_path && *stderr_path) {
         char resolved_err[PATH_MAX];
         vm_stderr = shellBgOpenPath(stderr_path, stderr_append, resolved_err, sizeof(resolved_err));
+        if (vm_stderr < 0 && !redir_failed_target) {
+            redir_failed_target = stderr_path;
+            redir_failed_errno = errno;
+        }
         if (vm_stderr >= 0 && resolved_err[0]) {
             free(stderr_path);
             stderr_path = strdup(resolved_err);
@@ -2330,7 +2368,12 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
         fprintf(stderr, "[bg-stage] pre-run fdmap stdin host=%d stdout host=%d stderr host=%d bg_flag=%d\n",
                 host_in, host_out, host_err, (int)gShellCurrentBuiltinBackground);
     }
-    bg_status = shellRunBuiltinInProcess(vm, cmd, stdin_fd, vm_stdout, vm_stderr, false);
+    if (redir_failed_target) {
+        shellRedirectionFailed(redir_failed_target, redir_failed_errno);
+        bg_status = 1;
+    } else {
+        bg_status = shellRunBuiltinInProcess(vm, cmd, stdin_fd, vm_stdout, vm_stderr, false);
+    }
     if (tool_dbg && pipe_dbg) {
         fprintf(stderr, "[bg-stage] finished run status=%d\n", bg_status);
     }
@@ -3590,7 +3633,20 @@ static void shellFreeExecRedirBackups(ShellExecRedirBackup *backups, size_t coun
     free(backups);
 }
 
-static bool shellApplyExecRedirections(VM *vm, const ShellCommand *cmd,
+/* A redirection that fails fails its command and the script goes on, as in bash.
+ * runtimeError would stop the VM. The status is 1 whatever the errno was. */
+static void shellRedirectionFailed(const char *target, int err) {
+    fprintf(stderr, "exsh: %s: %s\n", target, strerror(err ? err : EINVAL));
+    shellUpdateStatus(1);
+}
+
+static void shellRedirectionFailedForFd(int fd, int err) {
+    char target[32];
+    snprintf(target, sizeof(target), "%d", fd);
+    shellRedirectionFailed(target, err);
+}
+
+static bool shellApplyExecRedirections(const ShellCommand *cmd,
                                        ShellExecRedirBackup **out_backups,
                                        size_t *out_count) {
     bool dbg = (getenv("PSCALI_REDIR_DEBUG") != NULL) || (getenv("PSCALI_PIPE_DEBUG") != NULL);
@@ -3629,9 +3685,7 @@ static bool shellApplyExecRedirections(VM *vm, const ShellCommand *cmd,
             if (err == 0) {
                 err = ENOMEM;
             }
-            runtimeError(vm, "exec: failed to prepare redirection for fd %d: %s",
-                         target_fd, strerror(err));
-            shellUpdateStatus(err ? err : 1);
+            shellRedirectionFailedForFd(target_fd, err);
             goto redir_error;
         }
         switch (redir->kind) {
@@ -3642,8 +3696,7 @@ static bool shellApplyExecRedirections(VM *vm, const ShellCommand *cmd,
                             redir->flags, redir->mode);
                 }
                 if (!redir->path) {
-                    runtimeError(vm, "exec: missing redirection target");
-                    shellUpdateStatus(1);
+                    shellRedirectionFailed("redirection", EINVAL);
                     goto redir_error;
                 }
 #if defined(PSCAL_TARGET_IOS)
@@ -3666,8 +3719,7 @@ static bool shellApplyExecRedirections(VM *vm, const ShellCommand *cmd,
                     if (dbg) {
                         fprintf(stderr, "[redir] open failed: %s\n", strerror(err));
                     }
-                    runtimeError(vm, "exec: %s: %s", redir->path, strerror(err));
-                    shellUpdateStatus(err ? err : 1);
+                    shellRedirectionFailed(redir->path, err);
                     goto redir_error;
                 }
                 int vfd = -1;
@@ -3675,9 +3727,9 @@ static bool shellApplyExecRedirections(VM *vm, const ShellCommand *cmd,
                 if (vp_current) {
                     vfd = vprocAdoptHostFd(vp_current, fd);
                     if (vfd < 0) {
+                        int err = errno;
                         vprocHostClose(fd);
-                        runtimeError(vm, "exec: %s: %s", redir->path, strerror(errno));
-                        shellUpdateStatus(errno ? errno : 1);
+                        shellRedirectionFailed(redir->path, err);
                         goto redir_error;
                     }
                 }
@@ -3687,8 +3739,7 @@ static bool shellApplyExecRedirections(VM *vm, const ShellCommand *cmd,
                     if (dbg) {
                         fprintf(stderr, "[redir] dup %d->%d failed: %s\n", fd, target_fd, strerror(err));
                     }
-                    runtimeError(vm, "exec: %s: %s", redir->path, strerror(err));
-                    shellUpdateStatus(err ? err : 1);
+                    shellRedirectionFailed(redir->path, err);
 #if defined(PSCAL_TARGET_IOS)
                     if (vp_current && vfd >= 0) {
                         vprocCloseShim(vfd);
@@ -3719,15 +3770,13 @@ static bool shellApplyExecRedirections(VM *vm, const ShellCommand *cmd,
                 if (redir->close_target) {
                     if (close(target_fd) != 0 && errno != EBADF) {
                         int err = errno;
-                        runtimeError(vm, "exec: failed to close fd %d: %s", target_fd, strerror(err));
-                        shellUpdateStatus(err ? err : 1);
+                        shellRedirectionFailedForFd(target_fd, err);
                         goto redir_error;
                     }
                     shellResetStandardStream(target_fd);
                 } else {
                     if (redir->dup_target_fd < 0) {
-                        runtimeError(vm, "exec: invalid file descriptor %d", redir->dup_target_fd);
-                        shellUpdateStatus(1);
+                        shellRedirectionFailedForFd(redir->dup_target_fd, EBADF);
                         goto redir_error;
                     }
                     if (!shellDupOntoTarget(vp_current, redir->dup_target_fd, target_fd, dbg, "dup")) {
@@ -3736,9 +3785,7 @@ static bool shellApplyExecRedirections(VM *vm, const ShellCommand *cmd,
                             fprintf(stderr, "[redir] dup2 %d->%d failed: %s\n",
                                     redir->dup_target_fd, target_fd, strerror(err));
                         }
-                        runtimeError(vm, "exec: failed to duplicate fd %d: %s",
-                                     redir->dup_target_fd, strerror(err));
-                        shellUpdateStatus(err ? err : 1);
+                        shellRedirectionFailedForFd(redir->dup_target_fd, err);
                         goto redir_error;
                     }
                 }
@@ -3748,8 +3795,7 @@ static bool shellApplyExecRedirections(VM *vm, const ShellCommand *cmd,
                 int pipefd[2];
                 if (pipe(pipefd) != 0) {
                     int err = errno;
-                    runtimeError(vm, "exec: failed to create heredoc pipe: %s", strerror(err));
-                    shellUpdateStatus(err ? err : 1);
+                    shellRedirectionFailed("here-document", err);
                     goto redir_error;
                 }
                 const char *body = redir->here_doc ? redir->here_doc : "";
@@ -3765,8 +3811,7 @@ static bool shellApplyExecRedirections(VM *vm, const ShellCommand *cmd,
                             continue;
                         }
                         int err = errno;
-                        runtimeError(vm, "exec: failed to write heredoc: %s", strerror(err));
-                        shellUpdateStatus(err ? err : 1);
+                        shellRedirectionFailed("here-document", err);
                         close(pipefd[0]);
                         close(pipefd[1]);
                         goto redir_error;
@@ -3777,8 +3822,7 @@ static bool shellApplyExecRedirections(VM *vm, const ShellCommand *cmd,
                 close(pipefd[1]);
                 if (dup2(pipefd[0], target_fd) < 0) {
                     int err = errno;
-                    runtimeError(vm, "exec: failed to apply heredoc: %s", strerror(err));
-                    shellUpdateStatus(err ? err : 1);
+                    shellRedirectionFailed("here-document", err);
                     close(pipefd[0]);
                     goto redir_error;
                 }
@@ -3790,8 +3834,7 @@ static bool shellApplyExecRedirections(VM *vm, const ShellCommand *cmd,
                 int pipefd[2];
                 if (pipe(pipefd) != 0) {
                     int err = errno;
-                    runtimeError(vm, "exec: failed to create here-string pipe: %s", strerror(err));
-                    shellUpdateStatus(err ? err : 1);
+                    shellRedirectionFailed("here-string", err);
                     goto redir_error;
                 }
                 const char *body = redir->here_string ? redir->here_string
@@ -3808,8 +3851,7 @@ static bool shellApplyExecRedirections(VM *vm, const ShellCommand *cmd,
                             continue;
                         }
                         int err = errno;
-                        runtimeError(vm, "exec: failed to write here-string: %s", strerror(err));
-                        shellUpdateStatus(err ? err : 1);
+                        shellRedirectionFailed("here-string", err);
                         close(pipefd[0]);
                         close(pipefd[1]);
                         goto redir_error;
@@ -3824,8 +3866,7 @@ static bool shellApplyExecRedirections(VM *vm, const ShellCommand *cmd,
                             continue;
                         }
                         int err = errno;
-                        runtimeError(vm, "exec: failed to terminate here-string: %s", strerror(err));
-                        shellUpdateStatus(err ? err : 1);
+                        shellRedirectionFailed("here-string", err);
                         close(pipefd[0]);
                         close(pipefd[1]);
                         goto redir_error;
@@ -3835,8 +3876,7 @@ static bool shellApplyExecRedirections(VM *vm, const ShellCommand *cmd,
                 close(pipefd[1]);
                 if (dup2(pipefd[0], target_fd) < 0) {
                     int err = errno;
-                    runtimeError(vm, "exec: failed to apply here-string: %s", strerror(err));
-                    shellUpdateStatus(err ? err : 1);
+                    shellRedirectionFailed("here-string", err);
                     close(pipefd[0]);
                     goto redir_error;
                 }
@@ -3845,8 +3885,7 @@ static bool shellApplyExecRedirections(VM *vm, const ShellCommand *cmd,
                 break;
             }
             default:
-                runtimeError(vm, "exec: unsupported redirection");
-                shellUpdateStatus(1);
+                shellRedirectionFailed("redirection", EINVAL);
                 goto redir_error;
         }
     }
@@ -4137,7 +4176,8 @@ static int shellRunBuiltinInProcess(VM *vm,
         if (getenv("PSCALI_PIPE_DEBUG")) {
             fprintf(stderr, "[pipeline-bg] apply redirs count=%zu\n", cmd ? cmd->redir_count : 0);
         }
-        if (!shellApplyExecRedirections(vm, cmd, &backups, &backup_count)) {
+        if (!shellApplyExecRedirections(cmd, &backups, &backup_count)) {
+            status = 1;
             goto cleanup;
         }
         applied_redirs = true;
@@ -5396,7 +5436,7 @@ static bool shellExecuteExecBuiltin(VM *vm, ShellCommand *cmd) {
     if (cmd->argc <= 1) {
         ShellExecRedirBackup *backups = NULL;
         size_t backup_count = 0;
-        if (!shellApplyExecRedirections(vm, cmd, &backups, &backup_count)) {
+        if (!shellApplyExecRedirections(cmd, &backups, &backup_count)) {
             return true;
         }
         shellFreeExecRedirBackups(backups, backup_count);
@@ -5406,7 +5446,7 @@ static bool shellExecuteExecBuiltin(VM *vm, ShellCommand *cmd) {
 
     ShellExecRedirBackup *backups = NULL;
     size_t backup_count = 0;
-    if (!shellApplyExecRedirections(vm, cmd, &backups, &backup_count)) {
+    if (!shellApplyExecRedirections(cmd, &backups, &backup_count)) {
         return true;
     }
 
@@ -5459,7 +5499,6 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
         shellScalarCacheInvalidate();
         return makeVoid();
     }
-    shellPatchCombinedRedirectTokens(cmd);
     ShellPipelineContext *ctx = &gShellRuntime.pipeline;
 #if defined(PSCAL_TARGET_IOS)
     bool prefer_worker = shellShouldRunCommandInForegroundWorker(cmd);
@@ -5575,10 +5614,12 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
                                  strerror(errno));
                     shellUpdateStatus(errno ? errno : 1);
                 }
-            } else {
+            } else if (!cmd->ran_command_substitution) {
+                /* `d=$(mktemp -d) || exit 1`: otherwise the status stays that of the
+                 * last substitution, which shellRunCommandSubstitution has set. */
                 shellUpdateStatus(0);
             }
-        } else {
+        } else if (!cmd->ran_command_substitution) {
             shellUpdateStatus(0);
         }
         if (ctx->active) {
