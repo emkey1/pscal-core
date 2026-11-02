@@ -14126,12 +14126,33 @@ char *vprocGetcwdShim(char *buffer, size_t size) {
     return vprocGetcwdForVproc(vp, buffer, size);
 }
 
+/* A builtin, and a file it sources, each run under a vproc stacked on this thread, and
+ * what they start inherits its cwd from the top of that stack. So cd has to reach all of
+ * them, down to the vproc that owns the shell's directory, or a script's next rm acts on
+ * the old directory while its pwd reports the new one. */
+static void vprocCwdFollowOwner(VProc *owner) {
+    char cwd[PATH_MAX];
+    vprocCurrentVirtualCwd(owner, cwd, sizeof(cwd));
+    VProc *vp = gVProcCurrent;
+    size_t depth = gVProcStackDepth;
+    while (vp && vp != owner) {
+        if (vprocRegistryContains(vp)) {
+            vprocSetVirtualCwd(vp, cwd);
+        }
+        vp = (depth > 0) ? gVProcStack[--depth] : NULL;
+    }
+}
+
 int vprocShellChdirShim(const char *path) {
     VProc *vp = vprocResolvePathOpsVproc(true);
     if (!vp) {
         return vprocHostChdirRaw(path);
     }
-    return vprocChdirForVproc(vp, path);
+    int rc = vprocChdirForVproc(vp, path);
+    if (rc == 0) {
+        vprocCwdFollowOwner(vp);
+    }
+    return rc;
 }
 
 char *vprocShellGetcwdShim(char *buffer, size_t size) {

@@ -36,6 +36,59 @@ extern void pscalRuntimeDebugLog(const char *message);
 #define SHELL_CHDIR(path) chdir((path))
 #endif
 
+/* A shell or script run as a command has its own directory: its cd reaches what it runs,
+ * and its caller stays where it was. On iOS it shares the process with its caller, so the
+ * vproc it runs under owns that directory while it runs, as a subshell's does, and PWD and
+ * OLDPWD go back by hand. */
+void shellCwdScopeEnter(ShellCwdScope *scope) {
+    if (!scope) {
+        return;
+    }
+    memset(scope, 0, sizeof(*scope));
+#if defined(PSCAL_TARGET_IOS)
+    VProc *vp = vprocCurrent();
+    if (!vp) {
+        return;
+    }
+    scope->saved_subshell_pid = vprocSubshellPid();
+    vprocSetSubshellPid(vprocPid(vp));
+#endif
+    char cwd[PATH_MAX];
+    scope->cwd = SHELL_GETCWD(cwd, sizeof(cwd)) ? strdup(cwd) : NULL;
+    const char *value = getenv("PWD");
+    scope->pwd = value ? strdup(value) : NULL;
+    value = getenv("OLDPWD");
+    scope->oldpwd = value ? strdup(value) : NULL;
+    scope->active = true;
+}
+
+void shellCwdScopeLeave(ShellCwdScope *scope) {
+    if (!scope || !scope->active) {
+        return;
+    }
+    scope->active = false;
+    if (scope->cwd) {
+        (void)SHELL_CHDIR(scope->cwd);
+    }
+#if defined(PSCAL_TARGET_IOS)
+    vprocSetSubshellPid(scope->saved_subshell_pid);
+#endif
+    if (scope->pwd) {
+        setenv("PWD", scope->pwd, 1);
+    } else {
+        unsetenv("PWD");
+    }
+    if (scope->oldpwd) {
+        setenv("OLDPWD", scope->oldpwd, 1);
+    } else {
+        unsetenv("OLDPWD");
+    }
+    free(scope->cwd);
+    free(scope->pwd);
+    free(scope->oldpwd);
+    scope->cwd = scope->pwd = scope->oldpwd = NULL;
+}
+
 #if defined(PSCAL_TARGET_IOS)
 static const char *shellVisiblePath(const char *path, char *buffer, size_t buffer_len) {
     if (!path) {
@@ -580,7 +633,10 @@ static char *shellRunCommandSubstitution(const char *command) {
         }
         runtime_state_overridden = true;
         (void)pscalEnvSnapshotTake(&env_snapshot);
+        ShellCwdScope cwd_scope;
+        shellCwdScopeEnter(&cwd_scope);
         status = shellRunSource(source, "<command-substitution>", &opts, &exit_requested);
+        shellCwdScopeLeave(&cwd_scope);
     }
 
     if (scope_pushed) {

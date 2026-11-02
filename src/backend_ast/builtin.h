@@ -351,6 +351,15 @@ bool shellRuntimeConsumeExitRequested(void);
 size_t shellRuntimeRedirectScopeDepth(void);
 void shellRuntimeUnwindRedirectScopes(size_t depth);
 bool shellRuntimeExchangePositionalOwned(bool owned);
+typedef struct {
+    bool active;
+    int saved_subshell_pid;
+    char *cwd;
+    char *pwd;
+    char *oldpwd;
+} ShellCwdScope;
+void shellCwdScopeEnter(ShellCwdScope *scope);
+void shellCwdScopeLeave(ShellCwdScope *scope);
 int shellRuntimeLastStatus(void);
 void shellRuntimeRecordHistory(const char *line);
 void shellRuntimeSetArg0(const char *name);

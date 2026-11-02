@@ -552,7 +552,11 @@ static int shellTryRunScriptFallback(VM *vm, const ShellCommand *cmd) {
 
     shellRuntimeSetArg0(cmd->argv[0]);
     bool exit_requested = false;
+    /* A script run as a command has a directory of its own. */
+    ShellCwdScope cwd_scope;
+    shellCwdScopeEnter(&cwd_scope);
     int status = shellRunSource(source, cmd->argv[0], &opts, &exit_requested);
+    shellCwdScopeLeave(&cwd_scope);
     free(source);
     shellRuntimeSetArg0(frontend_path);
 
