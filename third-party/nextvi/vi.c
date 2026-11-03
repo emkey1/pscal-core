@@ -19,6 +19,9 @@
 #include "common/path_truncate.h"
 #if defined(PSCAL_TARGET_IOS)
 #include "ios/vproc.h"
+/* Every descriptor nextvi calls fcntl on is a slot in the vproc's table: its pipes
+ * come from the pipe shim, and what it writes comes through exTrackFdForVproc. */
+#define fcntl(fd, ...) vprocFcntlShim((fd), __VA_ARGS__)
 #endif
 #include "vi.h"
 #if defined(PSCAL_TARGET_IOS)

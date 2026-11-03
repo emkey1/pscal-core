@@ -2268,6 +2268,36 @@ static void pathTruncateEnsureProcPidDir(const char *procdir, int pid) {
     pathTruncateEnsureDir(pid_dir);
 }
 
+/* What /proc/<pid>/fd lists. A vproc's numbers are slots in its table, which is all a
+ * program there knows of. Only the app itself, which no vproc stands for, has the
+ * host's, and *host_table says which it was. A pid with neither has nothing to show. */
+static size_t pathTruncateCollectProcFds(pid_t pid, VProcFdSnapshot *out, size_t capacity, bool *host_table) {
+    *host_table = false;
+#if defined(PSCAL_TARGET_IOS) || defined(VPROC_ENABLE_STUBS_FOR_TESTS)
+    ssize_t slots = vprocSnapshotFds((int)pid, out, capacity);
+    if (slots >= 0) {
+        return (size_t)slots;
+    }
+    if (pid != getpid()) {
+        return 0;
+    }
+#endif
+    *host_table = true;
+    size_t count = 0;
+    for (size_t fd = 0; fd < capacity; ++fd) {
+        if (fcntl((int)fd, F_GETFD) < 0) {
+            continue;
+        }
+        off_t pos = lseek((int)fd, 0, SEEK_CUR);
+        int open_flags = fcntl((int)fd, F_GETFL);
+        out[count].fd = (int)fd;
+        out[count].open_flags = open_flags < 0 ? 0 : open_flags;
+        out[count].pos = pos < 0 ? 0 : pos;
+        count++;
+    }
+    return count;
+}
+
 static void pathTruncateWriteProcPidEntries(const char *procdir,
                                             const char *prefix,
                                             pid_t pid,
@@ -2644,12 +2674,11 @@ static void pathTruncateWriteProcPidEntries(const char *procdir,
         open_max = 256;
     }
     bool *fd_keep = (bool *)calloc((size_t)open_max, sizeof(bool));
-    for (long fd = 0; fd < open_max; ++fd) {
-        errno = 0;
-        int fd_flags = fcntl((int)fd, F_GETFD);
-        if (fd_flags < 0) {
-            continue;
-        }
+    VProcFdSnapshot *fd_table = (VProcFdSnapshot *)calloc((size_t)open_max, sizeof(VProcFdSnapshot));
+    bool host_table = false;
+    size_t fd_count = fd_table ? pathTruncateCollectProcFds(pid, fd_table, (size_t)open_max, &host_table) : 0;
+    for (size_t row = 0; row < fd_count; ++row) {
+        long fd = fd_table[row].fd;
         if (fd_keep) {
             fd_keep[fd] = true;
         }
@@ -2664,7 +2693,7 @@ static void pathTruncateWriteProcPidEntries(const char *procdir,
         if (snprintf(host_ref, sizeof(host_ref), "/dev/fd/%ld", fd) <= 0) {
             continue;
         }
-        ssize_t n = readlink(host_ref, host_target, sizeof(host_target) - 1);
+        ssize_t n = host_table ? readlink(host_ref, host_target, sizeof(host_target) - 1) : -1;
         if (n < 0) {
             snprintf(host_target, sizeof(host_target), "/dev/fd/%ld", fd);
         } else {
@@ -2686,19 +2715,12 @@ static void pathTruncateWriteProcPidEntries(const char *procdir,
         if (!f) {
             continue;
         }
-        off_t pos = lseek((int)fd, 0, SEEK_CUR);
-        if (pos < 0) {
-            pos = 0;
-        }
-        int open_flags = fcntl((int)fd, F_GETFL);
-        if (open_flags < 0) {
-            open_flags = 0;
-        }
-        fprintf(f, "pos:\t%lld\n", (long long)pos);
-        fprintf(f, "flags:\t0%o\n", open_flags);
+        fprintf(f, "pos:\t%lld\n", (long long)fd_table[row].pos);
+        fprintf(f, "flags:\t0%o\n", fd_table[row].open_flags);
         fprintf(f, "mnt_id:\t0\n");
         fclose(f);
     }
+    free(fd_table);
     if (fd_keep) {
         pathTruncatePruneNumericDirectoryChildren(fd_dir, fd_keep, open_max);
         pathTruncatePruneNumericDirectoryChildren(fdinfo_dir, fd_keep, open_max);

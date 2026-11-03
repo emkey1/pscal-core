@@ -4172,13 +4172,24 @@ static char *shellRuntimeOptionFlags(void) {
     return strdup(flags);
 }
 
+/* fcntl on 0-2 or on what the dup macro returned. On iOS those are slots in the vproc's
+ * table. The shell's other fcntl calls are on host descriptors and stay raw: a
+ * stream's translated fd, the substitution reader's pipe, a redirection's saved fd. */
+static int shellSlotFcntl(int fd, int cmd, int arg) {
+#if defined(PSCAL_TARGET_IOS)
+    return vprocFcntlShim(fd, cmd, arg);
+#else
+    return fcntl(fd, cmd, arg);
+#endif
+}
+
 static void shellRuntimeRememberStandardFds(void) {
     if (gShellSavedStdFds[0] < 0) gShellSavedStdFds[0] = dup(STDIN_FILENO);
     if (gShellSavedStdFds[1] < 0) gShellSavedStdFds[1] = dup(STDOUT_FILENO);
     if (gShellSavedStdFds[2] < 0) gShellSavedStdFds[2] = dup(STDERR_FILENO);
     for (int i = 0; i < 3; ++i) {
         if (gShellSavedStdFds[i] >= 0) {
-            fcntl(gShellSavedStdFds[i], F_SETFD, FD_CLOEXEC);
+            shellSlotFcntl(gShellSavedStdFds[i], F_SETFD, FD_CLOEXEC);
         }
     }
 }
@@ -4190,7 +4201,7 @@ void shellRuntimeEnsureStandardFds(void) {
         if (targets[i] < 0) {
             continue;
         }
-        int rc = fcntl(targets[i], F_GETFD);
+        int rc = shellSlotFcntl(targets[i], F_GETFD, 0);
         if (rc < 0 && errno == EBADF && gShellSavedStdFds[i] >= 0) {
             dup2(gShellSavedStdFds[i], targets[i]);
             shellResetStandardStream(targets[i]);
@@ -6045,7 +6056,7 @@ static SHELL_JC_UNUSED void shellJobControlSaveShellIo(void) {
         for (int i = 0; i < 3; ++i) {
             jc->saved_stdio[i] = dup(i);
             if (jc->saved_stdio[i] >= 0) {
-                fcntl(jc->saved_stdio[i], F_SETFD, FD_CLOEXEC);
+                shellSlotFcntl(jc->saved_stdio[i], F_SETFD, FD_CLOEXEC);
             }
         }
         jc->saved_stdio_valid = true;

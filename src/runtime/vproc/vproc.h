@@ -73,6 +73,13 @@ typedef struct {
     char command[64];
 } VProcSnapshot;
 
+/* One open descriptor of a vproc, as /proc/<pid>/fd shows it. */
+typedef struct {
+    int fd;
+    int open_flags;
+    off_t pos;
+} VProcFdSnapshot;
+
 #if defined(PSCAL_TARGET_IOS) || defined(VPROC_ENABLE_STUBS_FOR_TESTS)
 
 VProcOptions vprocDefaultOptions(void);
@@ -87,6 +94,9 @@ VProc *vprocCurrent(void);
 bool vprocWaitIfStopped(VProc *vp);
 
 size_t vprocSnapshot(VProcSnapshot *out, size_t capacity);
+/* The table of the vproc with this pid, whichever thread asks: its open slots numbered
+ * below capacity, lowest first. Returns how many, or -1 if no vproc has the pid. */
+ssize_t vprocSnapshotFds(int pid, VProcFdSnapshot *out, size_t capacity);
 
 int vprocTranslateFd(VProc *vp, int fd);
 struct pscal_fd *vprocGetPscalFd(VProc *vp, int fd);

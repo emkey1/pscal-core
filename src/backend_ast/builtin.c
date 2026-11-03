@@ -1779,6 +1779,17 @@ static bool readKeySeqComplete(const unsigned char *seq, size_t len) {
     return true;
 }
 
+/* fcntl on the command's stdin. On iOS fd 0 is a slot in its vproc's table, and the
+ * host's fd 0 has nothing to do with it. The other fcntl calls in this file are on
+ * host descriptors (the SIGINT pipe, a stream's translated fd) and stay raw. */
+static int vmStdinFcntl(int cmd, int arg) {
+#if defined(PSCAL_TARGET_IOS)
+    return vprocFcntlShim(STDIN_FILENO, cmd, arg);
+#else
+    return fcntl(STDIN_FILENO, cmd, arg);
+#endif
+}
+
 // Fetch a console byte, skipping any stray DSR responses (ESC [ row ; col R)
 // that may have been sent by the terminal for cursor queries. Ensures those
 // sequences do not satisfy ReadKey.
@@ -1805,10 +1816,10 @@ static int readKeyFetchConsoleByte(void) {
         size_t seq_len = 0;
         seq[seq_len++] = 0x1B;
 
-        int orig_flags = fcntl(STDIN_FILENO, F_GETFL);
+        int orig_flags = vmStdinFcntl(F_GETFL, 0);
         bool toggled_nonblock = false;
         if (orig_flags != -1 && (orig_flags & O_NONBLOCK) == 0) {
-            if (fcntl(STDIN_FILENO, F_SETFL, orig_flags | O_NONBLOCK) == 0) {
+            if (vmStdinFcntl(F_SETFL, orig_flags | O_NONBLOCK) == 0) {
                 toggled_nonblock = true;
             }
         }
@@ -1839,7 +1850,7 @@ static int readKeyFetchConsoleByte(void) {
         }
 
         if (toggled_nonblock && orig_flags != -1) {
-            fcntl(STDIN_FILENO, F_SETFL, orig_flags);
+            vmStdinFcntl(F_SETFL, orig_flags);
         }
 
         /* Check if the captured sequence is ESC [ digits ; digits R */
@@ -6600,9 +6611,9 @@ static int getCursorPosition(int *row, int *col) {
 
     // Some callers may have left stdin in non-blocking mode; temporarily
     // make it blocking so VTIME/VMIN can take effect.
-    stdin_flags = fcntl(STDIN_FILENO, F_GETFL);
+    stdin_flags = vmStdinFcntl(F_GETFL, 0);
     if (stdin_flags != -1 && (stdin_flags & O_NONBLOCK)) {
-        if (fcntl(STDIN_FILENO, F_SETFL, stdin_flags & ~O_NONBLOCK) == 0) {
+        if (vmStdinFcntl(F_SETFL, stdin_flags & ~O_NONBLOCK) == 0) {
             restore_blocking = true;
         }
     }
@@ -6820,7 +6831,7 @@ cleanup:
         }
     }
     if (restore_blocking && stdin_flags != -1) {
-        fcntl(STDIN_FILENO, F_SETFL, stdin_flags);
+        vmStdinFcntl(F_SETFL, stdin_flags);
     }
     return ret_status; // 0 for success or non-critical error, -1 for critical error
 }

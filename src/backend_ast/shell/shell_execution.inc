@@ -3675,7 +3675,7 @@ static bool shellEnsureExecRedirBackup(int target_fd,
         }
     }
     if (dup_fd < 0) {
-        dup_fd = dup(source_fd);
+        dup_fd = vprocHostDup(source_fd);
         if (dup_fd >= 0) {
             fcntl(dup_fd, F_SETFD, FD_CLOEXEC);
         }
@@ -3684,7 +3684,7 @@ static bool shellEnsureExecRedirBackup(int target_fd,
 #ifdef F_DUPFD_CLOEXEC
         int alt_fd = fcntl(source_fd, F_DUPFD_CLOEXEC, avoid_fd + 1);
         if (alt_fd >= 0) {
-            close(dup_fd);
+            vprocHostClose(dup_fd);
             dup_fd = alt_fd;
         } else if (errno == EINVAL) {
             alt_fd = -1;

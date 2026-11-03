@@ -13523,6 +13523,58 @@ ssize_t vprocPwriteShim(int fd, const void *buf, size_t count, off_t offset) {
     return host < 0 ? -1 : pwrite(host, buf, count, offset);
 }
 
+/* The registry lock keeps the vproc alive, since vprocDestroy takes it out of the
+ * registry first, and its own lock keeps each host descriptor open while it is asked.
+ * A pscal_fd has a lock of its own, so it is asked after both are let go. */
+ssize_t vprocSnapshotFds(int pid, VProcFdSnapshot *out, size_t capacity) {
+    if (pid <= 0 || !out || capacity == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    struct pscal_fd **pscal_fds = (struct pscal_fd **)calloc(capacity, sizeof(*pscal_fds));
+    if (!pscal_fds) {
+        return -1;
+    }
+    ssize_t count = -1;
+    pthread_mutex_lock(&gVProcRegistryMu);
+    for (size_t i = 0; i < gVProcRegistryCount; ++i) {
+        VProc *vp = gVProcRegistry[i];
+        if (!vp || vp->pid != pid) {
+            continue;
+        }
+        count = 0;
+        pthread_mutex_lock(&vp->mu);
+        for (size_t fd = 0; fd < vp->capacity && fd < capacity; ++fd) {
+            const VProcFdEntry *entry = &vp->entries[fd];
+            int open_flags = 0;
+            off_t pos = 0;
+            if (entry->kind == VPROC_FD_PSCAL && entry->pscal_fd) {
+                pscal_fds[count] = pscal_fd_retain(entry->pscal_fd);
+            } else if (entry->kind == VPROC_FD_HOST) {
+                open_flags = fcntl(entry->host_fd, F_GETFL);
+                pos = lseek(entry->host_fd, 0, SEEK_CUR);
+            } else {
+                continue;
+            }
+            out[count].fd = (int)fd;
+            out[count].open_flags = open_flags < 0 ? 0 : open_flags;
+            out[count].pos = pos < 0 ? 0 : pos;
+            count++;
+        }
+        pthread_mutex_unlock(&vp->mu);
+        break;
+    }
+    pthread_mutex_unlock(&gVProcRegistryMu);
+    for (ssize_t i = 0; i < count; ++i) {
+        if (pscal_fds[i]) {
+            out[i].open_flags = vprocFcntlPscalFd(pscal_fds[i], F_GETFL, 0);
+            pscal_fd_close(pscal_fds[i]);
+        }
+    }
+    free(pscal_fds);
+    return count;
+}
+
 static int vprocSetCompatErrno(int err) {
     errno = pscalCompatErrno(err);
     return -1;

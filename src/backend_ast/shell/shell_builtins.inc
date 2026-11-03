@@ -183,7 +183,7 @@ static void shellSaveStandardFds(ShellStdFdBackup *backup) {
     for (int i = 0; i < 3; ++i) {
         int fd = dup(targets[i]);
         if (fd >= 0) {
-            fcntl(fd, F_SETFD, FD_CLOEXEC);
+            shellSlotFcntl(fd, F_SETFD, FD_CLOEXEC);
             backup->saved_fds[i] = fd;
             backup->saved_valid[i] = true;
         } else {
