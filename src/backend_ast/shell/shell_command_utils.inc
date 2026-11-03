@@ -3511,6 +3511,7 @@ static bool shellArrayRegistryInitializeAssociative(const char *name) {
         var->values = NULL;
         var->keys = NULL;
         var->count = 0;
+        var->sparse = false;
     } else {
         shellArrayVariableClear(var);
     }

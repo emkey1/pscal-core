@@ -4270,6 +4270,7 @@ static void shellArrayVariableClear(ShellArrayVariable *var) {
     var->keys = NULL;
     var->count = 0;
     var->kind = SHELL_ARRAY_KIND_INDEXED;
+    var->sparse = false;
 }
 
 static bool shellArrayRegistryEnsureCapacity(size_t needed) {
@@ -4291,6 +4292,7 @@ static bool shellArrayRegistryEnsureCapacity(size_t needed) {
         resized[i].keys = NULL;
         resized[i].count = 0;
         resized[i].kind = SHELL_ARRAY_KIND_INDEXED;
+        resized[i].sparse = false;
     }
     gShellArrayVars = resized;
     gShellArrayVarCapacity = new_capacity;
@@ -4342,6 +4344,7 @@ static bool shellArrayRegistryStore(const char *name,
         var->keys = NULL;
         var->count = 0;
         var->kind = SHELL_ARRAY_KIND_INDEXED;
+        var->sparse = false;
     } else {
         shellArrayVariableClear(var);
     }
@@ -4795,6 +4798,7 @@ ShellRuntimeState *shellRuntimeCreateContext(void) {
                 const ShellArrayVariable *src = &template_ctx->array_vars[i];
                 dst->name = src->name ? strdup(src->name) : NULL;
                 dst->kind = src->kind;
+                dst->sparse = src->sparse;
                 dst->count = src->count;
                 if (src->count > 0 && src->values) {
                     dst->values = (char **)calloc(src->count, sizeof(char *));
