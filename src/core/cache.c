@@ -136,7 +136,7 @@
 #define PSB3_SEC_META  PSB3_FOURCC('M', 'E', 'T', 'A')
 #define PSB3_SECTION_ALIGN 8u
 
-static uint32_t g_astCacheVersion = 0;
+static PSCAL_THREAD_LOCAL uint32_t g_astCacheVersion = 0;
 
 // Why the most recent loadBytecodeFromCache()/loadBytecodeFromFile()/
 // loadBytecodeFromFileUnlinked() call returned false (pscalCacheLastLoadError).
@@ -3244,15 +3244,16 @@ void saveBytecodeToCache(const char* source_path, const char* compiler_id, const
 
     // Written beside the entry and renamed over it, so a reader -- another
     // process compiling or running the same source -- sees the old entry or
-    // the new one, never a partly written file. The pid keeps two writers'
-    // temporaries apart; one a crashed writer left behind is replaced.
-    size_t tmp_len = strlen(cache_path) + 32;
+    // the new one, never a partly written file. The pid and thread keep two
+    // writers' temporaries apart (on iOS two writers can be one process); one a
+    // crashed writer left behind is replaced.
+    size_t tmp_len = strlen(cache_path) + 64;
     char* tmp_path = (char*)malloc(tmp_len);
     if (!tmp_path) {
         free(cache_path);
         return;
     }
-    snprintf(tmp_path, tmp_len, "%s.tmp.%ld", cache_path, (long)getpid());
+    snprintf(tmp_path, tmp_len, "%s.tmp.%ld.%lx", cache_path, (long)getpid(), (unsigned long)(uintptr_t)pthread_self());
     // fopen, not open and fdopen: on iOS open returns a vproc slot, and fdopen took
     // that number for a host descriptor. It wrote the entry into whatever had the
     // number and then closed it, which killed the Go runtime when that was its kqueue.

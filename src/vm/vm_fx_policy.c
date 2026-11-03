@@ -1,5 +1,6 @@
 #include "vm/vm_fx_policy.h"
 #include "core/cache.h"
+#include "core/globals.h"
 #include "core/utils.h"
 
 #include <errno.h>
@@ -12,7 +13,7 @@
 static const char kFxJournalMagic[4] = {'P', 'S', 'F', 'X'};
 #define FX_JOURNAL_VERSION 1
 
-static EffectMask g_fx_cli_denied_mask = FX_PURE;
+static PSCAL_THREAD_LOCAL EffectMask g_fx_cli_denied_mask = FX_PURE;
 // pthread_once (not a lazily-checked plain bool): PSCAL_VM_DENY is read
 // concurrently by every TaskSpawn'd worker VM's first builtin call via
 // pscalFxPolicyActive()/vmApplyFxPolicy(), so the "checked once, then
@@ -63,6 +64,10 @@ bool pscalFxParseDenyList(const char *csv, EffectMask *out_mask) {
 
 void pscalFxSetDeniedMask(EffectMask mask) {
     g_fx_cli_denied_mask = mask;
+}
+
+EffectMask pscalFxGetDeniedMask(void) {
+    return g_fx_cli_denied_mask;
 }
 
 bool pscalFxPolicyActive(void) {

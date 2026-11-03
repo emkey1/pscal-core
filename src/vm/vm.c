@@ -652,7 +652,7 @@ static void vmOpcodeProfileInitOnce(void);
 static void vmOpcodeProfileRecord(uint8_t opcode);
 static void vmOpcodeProfileAtExit(void);
 
-static bool s_vmVerboseErrors = false;
+static PSCAL_THREAD_LOCAL bool s_vmVerboseErrors = false;
 
 static const char *const kOpcodeNames[OPCODE_COUNT] = {
 #define OP(name, value, operands, stack_in, stack_out) [value] = #name,
@@ -1938,6 +1938,13 @@ typedef struct ThreadJob {
     /* The spawner's parameters: they are per thread here, and a worker's code reads them. */
     int paramCount;
     char** paramValues;
+    /* Likewise the conventions of the run it belongs to, since a process can hold several. */
+    FrontendKind frontendKind;
+    int suppressWriteSpacing;
+    int uppercaseBooleans;
+    bool verboseErrors;
+    EffectMask fxDeniedMask;
+    CrtAttributes crt;
 #endif
     Thread* assignedThread;
     int assignedThreadId;
@@ -2265,6 +2272,12 @@ static ThreadJob* vmThreadJobCreate(VM* vm,
 #if defined(PSCAL_TARGET_IOS)
     job->paramCount = gParamCount;
     job->paramValues = gParamValues;
+    job->frontendKind = frontendGetKind();
+    job->suppressWriteSpacing = gSuppressWriteSpacing;
+    job->uppercaseBooleans = gUppercaseBooleans;
+    job->verboseErrors = s_vmVerboseErrors;
+    job->fxDeniedMask = pscalFxGetDeniedMask();
+    crtAttributesCapture(&job->crt);
 #endif
     job->closureEnv = NULL;
     job->closureSymbol = closureSymbol;
@@ -2835,6 +2848,12 @@ static bool vmThreadPrepareWorkerVm(Thread* thread, VM* owner, ThreadJob* job, i
     if (job) {
         gParamCount = job->paramCount;
         gParamValues = job->paramValues;
+        frontendPushKind(job->frontendKind);
+        gSuppressWriteSpacing = job->suppressWriteSpacing;
+        gUppercaseBooleans = job->uppercaseBooleans;
+        s_vmVerboseErrors = job->verboseErrors;
+        pscalFxSetDeniedMask(job->fxDeniedMask);
+        crtAttributesApply(&job->crt);
     }
 #endif
     thread->vm->trace_executed = 0;
@@ -6940,27 +6959,30 @@ static Value vmHostCreateClosure(VM* vm) {
 
 typedef struct RuntimeVTableEntry {
     char* className;
+    const void* run;  // the run's procedure table: its addresses are what the table holds
     Value* table;
     struct RuntimeVTableEntry* next;
 } RuntimeVTableEntry;
 
-// Interface method tables, one per "<class>|<interface>" pair, shared by
-// every VM in the process (worker threads box interfaces too), so the list
-// is only touched under runtimeVTablesMutex. An entry's table is never
-// changed once built; interface values point straight at it.
+// Interface method tables, one per "<class>|<interface>" pair of a run, shared
+// by its VMs (worker threads box interfaces too), so the list is only touched
+// under runtimeVTablesMutex. An entry's table is never changed once built;
+// interface values point straight at it. A process can run several programs
+// (iOS), at once or in turn, and their tables hold different addresses under
+// the same names, so an entry goes when its run's root VM does.
 static RuntimeVTableEntry* runtimeVTables = NULL;
 static pthread_mutex_t runtimeVTablesMutex = PTHREAD_MUTEX_INITIALIZER;
 
-static RuntimeVTableEntry* findRuntimeVTableEntry(const char* classNameLower) {
+static RuntimeVTableEntry* findRuntimeVTableEntry(const void* run, const char* classNameLower) {
     for (RuntimeVTableEntry* entry = runtimeVTables; entry; entry = entry->next) {
-        if (entry->className && strcasecmp(entry->className, classNameLower) == 0) {
+        if (entry->run == run && entry->className && strcasecmp(entry->className, classNameLower) == 0) {
             return entry;
         }
     }
     return NULL;
 }
 
-static RuntimeVTableEntry* createRuntimeVTableEntry(const char* classNameLower) {
+static RuntimeVTableEntry* createRuntimeVTableEntry(const void* run, const char* classNameLower) {
     RuntimeVTableEntry* entry = (RuntimeVTableEntry*)calloc(1, sizeof(RuntimeVTableEntry));
     if (!entry) {
         return NULL;
@@ -6970,17 +6992,14 @@ static RuntimeVTableEntry* createRuntimeVTableEntry(const char* classNameLower) 
         free(entry);
         return NULL;
     }
+    entry->run = run;
     entry->table = NULL;
     entry->next = runtimeVTables;
     runtimeVTables = entry;
     return entry;
 }
 
-static void vmFreeRuntimeVTables(void) {
-    pthread_mutex_lock(&runtimeVTablesMutex);
-    RuntimeVTableEntry* entry = runtimeVTables;
-    runtimeVTables = NULL;
-    pthread_mutex_unlock(&runtimeVTablesMutex);
+static void vmFreeRuntimeVTableEntries(RuntimeVTableEntry* entry) {
     while (entry) {
         RuntimeVTableEntry* next = entry->next;
         free(entry->className);
@@ -6991,6 +7010,35 @@ static void vmFreeRuntimeVTables(void) {
         free(entry);
         entry = next;
     }
+}
+
+static void vmFreeRuntimeVTables(void) {
+    pthread_mutex_lock(&runtimeVTablesMutex);
+    RuntimeVTableEntry* entry = runtimeVTables;
+    runtimeVTables = NULL;
+    pthread_mutex_unlock(&runtimeVTablesMutex);
+    vmFreeRuntimeVTableEntries(entry);
+}
+
+static void vmFreeRuntimeVTablesOfRun(const void* run) {
+    if (!run) {
+        return;
+    }
+    RuntimeVTableEntry* doomed = NULL;
+    pthread_mutex_lock(&runtimeVTablesMutex);
+    RuntimeVTableEntry** link = &runtimeVTables;
+    while (*link) {
+        RuntimeVTableEntry* entry = *link;
+        if (entry->run == run) {
+            *link = entry->next;
+            entry->next = doomed;
+            doomed = entry;
+        } else {
+            link = &entry->next;
+        }
+    }
+    pthread_mutex_unlock(&runtimeVTablesMutex);
+    vmFreeRuntimeVTableEntries(doomed);
 }
 
 static void vmCleanupGlobalCachesIfIdle(void) {
@@ -7243,7 +7291,7 @@ static Value* ensureRuntimeInterfaceVTable(VM* vm,
     snprintf(cache_key, sizeof(cache_key), "%s|%s", class_lower, interface_lower);
 
     pthread_mutex_lock(&runtimeVTablesMutex);
-    RuntimeVTableEntry* entry = findRuntimeVTableEntry(cache_key);
+    RuntimeVTableEntry* entry = findRuntimeVTableEntry(vm->procedureTable, cache_key);
     if (!entry || !entry->table || VALUE_TYPE(*entry->table) != TYPE_ARRAY || !AS_ARRAY(*entry->table)) {
         Value arr;
         if (!buildRuntimeInterfaceVTable(className, class_lower, interfaceType, &arr)) {
@@ -7251,7 +7299,7 @@ static Value* ensureRuntimeInterfaceVTable(VM* vm,
             return NULL;
         }
         if (!entry) {
-            entry = createRuntimeVTableEntry(cache_key);
+            entry = createRuntimeVTableEntry(vm->procedureTable, cache_key);
             if (!entry) {
                 freeValue(&arr);
                 pthread_mutex_unlock(&runtimeVTablesMutex);
@@ -7880,13 +7928,26 @@ static Value vmHostPrintf(VM* vm) {
         args[arg_count - 1 - i] = pop(vm);
     }
 
+    // stdout is unbuffered on iOS (vproc_stdio_shim.h), so each fputc below was a
+    // system call, and frontends sharing a descriptor interleaved mid-line. One
+    // write per call, which is what a host's buffered stdout gives.
+    FILE* out = stdout;
+#if defined(PSCAL_TARGET_IOS)
+    char* pending = NULL;
+    size_t pending_len = 0;
+    FILE* pending_stream = open_memstream(&pending, &pending_len);
+    if (pending_stream) {
+        out = pending_stream;
+    }
+#endif
+
     const char* fmt = (isPascalStringType(VALUE_TYPE(args[0])) && AS_STRING(args[0])) ? AS_STRING(args[0]) : "";
     int arg_index = 1;
     size_t flen = strlen(fmt);
     for (size_t i = 0; i < flen; ++i) {
         if (fmt[i] == '%' && i + 1 < flen) {
             if (fmt[i + 1] == '%') {
-                fputc('%', stdout);
+                fputc('%', out);
                 i++;
             } else if (arg_index < arg_count) {
                 size_t j = i + 1;
@@ -7970,13 +8031,13 @@ static Value vmHostPrintf(VM* vm) {
                             if (bits == 8) s = (signed char)s;
                             else if (bits == 16) s = (short)s;
                             else if (bits == 32) s = (int32_t)s;
-                            fprintf(stdout, conv, s);
+                            fprintf(out, conv, s);
                         } else {
                             unsigned long long u = (unsigned long long)s;
                             if (bits == 8) u &= 0xFFULL;
                             else if (bits == 16) u &= 0xFFFFULL;
                             else if (bits == 32) u &= 0xFFFFFFFFULL;
-                            fprintf(stdout, conv, u);
+                            fprintf(out, conv, u);
                         }
                         break;
                     }
@@ -7991,11 +8052,11 @@ static Value vmHostPrintf(VM* vm) {
                             conv[pos++] = 'L';
                             conv[pos++] = spec;
                             conv[pos] = '\0';
-                            fprintf(stdout, conv, rv);
+                            fprintf(out, conv, rv);
                         } else {
                             conv[pos++] = spec;
                             conv[pos] = '\0';
-                            fprintf(stdout, conv, (double)rv);
+                            fprintf(out, conv, (double)rv);
                         }
                         break;
                     }
@@ -8003,7 +8064,7 @@ static Value vmHostPrintf(VM* vm) {
                         char ch = (VALUE_TYPE(v) == TYPE_CHAR) ? (char)AS_CHAR(v) : (char)AS_INTEGER(v);
                         conv[pos++] = 'c';
                         conv[pos] = '\0';
-                        fprintf(stdout, conv, (int)(unsigned char)ch);
+                        fprintf(out, conv, (int)(unsigned char)ch);
                         break;
                     }
                     case 's': {
@@ -8020,20 +8081,20 @@ static Value vmHostPrintf(VM* vm) {
                         }
                         conv[pos++] = 's';
                         conv[pos] = '\0';
-                        fprintf(stdout, conv, sv);
+                        fprintf(out, conv, sv);
                         break;
                     }
                     default:
-                        printValueToStream(v, stdout);
+                        printValueToStream(v, out);
                         break;
                 }
                 freeValue(&v);
                 i = j;
             } else {
-                fputc('%', stdout);
+                fputc('%', out);
             }
         } else {
-            fputc(fmt[i], stdout);
+            fputc(fmt[i], out);
         }
     }
 
@@ -8042,6 +8103,15 @@ static Value vmHostPrintf(VM* vm) {
     }
     freeValue(&args[0]);
     free(args);
+#if defined(PSCAL_TARGET_IOS)
+    if (pending_stream) {
+        fclose(pending_stream);
+        if (pending_len > 0) {
+            fwrite(pending, 1, pending_len, stdout);
+        }
+        free(pending);
+    }
+#endif
     fflush(stdout);
     return makeInt(0);
 }
@@ -8356,6 +8426,7 @@ void initVM(VM* vm) { // As in all.txt, with frameCount
 
 void freeVM(VM* vm) {
     if (!vm) return;
+    const void* run = vm->owningThread ? NULL : vm->procedureTable;  // a worker's table is its root's
     pscalRuntimeVmFlushOutput();
     vmProcUnregister(vm);
     vmReleaseExecutionResources(vm);
@@ -8422,6 +8493,7 @@ void freeVM(VM* vm) {
     // committed slot before unmapping -- no separate loop needed here
     // (VM 2.0 Phase 5a checkpoint 5a-ii).
     pthread_mutex_destroy(&vm->mutexRegistryLock);
+    vmFreeRuntimeVTablesOfRun(run);
     vmCleanupGlobalCachesIfIdle();
     // No explicit freeing of vm->host_functions array itself as it's part of
     // the VM struct. If HostFn entries allocated memory, that would require

@@ -43,6 +43,7 @@ extern int PSCALRuntimeSetTabStartupCommand(const char *command);
 #include "common/pascal_state.h"
 #include "clike/state.h"
 #include "rea/state.h"
+#include "rea/frontend_hooks.h"
 extern bool pscalRuntimeConsumeSigint(void);
 extern bool pscalRuntimeConsumeSigtstp(void);
 extern char **environ;
@@ -225,7 +226,8 @@ static void shellInvalidateFrontendState(FrontendKind kind) {
             break;
         case FRONTEND_KIND_REA:
         case FRONTEND_KIND_AETHER:
-            reaInvalidateGlobalState();
+            /* Through the hooks: this thread's Aether run has registries of its own. */
+            reaFrontendInvalidateGlobalState();
             break;
         case FRONTEND_KIND_SHELL:
             pascalInvalidateGlobalState();

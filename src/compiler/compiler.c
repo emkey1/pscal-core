@@ -24,19 +24,19 @@
 #include <stdlib.h>
 
 // Debug printing gate
-static int compiler_debug = 0;
+static PSCAL_THREAD_LOCAL int compiler_debug = 0;
 #define DBG_PRINTF(...) do { if (compiler_debug) fprintf(stderr, __VA_ARGS__); } while(0)
 
 #define MAX_GLOBALS 256 // Define a reasonable limit for global variables for now
 #define NO_VTABLE_ENTRY -1
 
-static bool compiler_had_error = false;
-static const char* current_compilation_unit_name = NULL;
-static AST* gCurrentProgramRoot = NULL;
-static HashTable* current_class_const_table = NULL;
-static AST* current_class_record_type = NULL;
-static int compiler_dynamic_locals = 0;
-static int anonymous_type_name_counter = 1;
+static PSCAL_THREAD_LOCAL bool compiler_had_error = false;
+static PSCAL_THREAD_LOCAL const char* current_compilation_unit_name = NULL;
+static PSCAL_THREAD_LOCAL AST* gCurrentProgramRoot = NULL;
+static PSCAL_THREAD_LOCAL HashTable* current_class_const_table = NULL;
+static PSCAL_THREAD_LOCAL AST* current_class_record_type = NULL;
+static PSCAL_THREAD_LOCAL int compiler_dynamic_locals = 0;
+static PSCAL_THREAD_LOCAL int anonymous_type_name_counter = 1;
 
 typedef struct {
     int constant_index;
@@ -54,9 +54,9 @@ static VarType resolveOrdinalBuiltinTypeName(const char *name) {
     return type;
 }
 
-static AddressConstantEntry* address_constant_entries = NULL;
-static int address_constant_count = 0;
-static int address_constant_capacity = 0;
+static PSCAL_THREAD_LOCAL AddressConstantEntry* address_constant_entries = NULL;
+static PSCAL_THREAD_LOCAL int address_constant_count = 0;
+static PSCAL_THREAD_LOCAL int address_constant_capacity = 0;
 typedef struct {
     BytecodeChunk* chunk;
     char** classes;
@@ -88,13 +88,13 @@ static const char* getSerializablePointerBaseTypeName(AST* type_node);
 static bool emitImplicitMyselfFieldValue(BytecodeChunk* chunk, int line, const char* fieldName);
 static bool closureLiteralEscapesCurrentRoutine(AST *expr_node);
 static void markClosureLiteralEscapes(Symbol *psym);
-static BytecodeChunk* tracked_vtable_chunk = NULL;
-static char** emitted_vtable_classes = NULL;
-static int emitted_vtable_count = 0;
-static int emitted_vtable_capacity = 0;
-static VTableTrackerState* vtable_tracker_stack = NULL;
-static int vtable_tracker_depth = 0;
-static int vtable_tracker_capacity = 0;
+static PSCAL_THREAD_LOCAL BytecodeChunk* tracked_vtable_chunk = NULL;
+static PSCAL_THREAD_LOCAL char** emitted_vtable_classes = NULL;
+static PSCAL_THREAD_LOCAL int emitted_vtable_count = 0;
+static PSCAL_THREAD_LOCAL int emitted_vtable_capacity = 0;
+static PSCAL_THREAD_LOCAL VTableTrackerState* vtable_tracker_stack = NULL;
+static PSCAL_THREAD_LOCAL int vtable_tracker_depth = 0;
+static PSCAL_THREAD_LOCAL int vtable_tracker_capacity = 0;
 
 static void freeVTableClassList(char** list, int count) {
     if (!list) return;
@@ -389,8 +389,8 @@ typedef struct {
     int scope_depth;    // The scope depth of this loop
 } Loop;
 
-static Loop loop_stack[MAX_LOOP_DEPTH];
-static int loop_depth = -1; // -1 means we are not in a loop
+static PSCAL_THREAD_LOCAL Loop loop_stack[MAX_LOOP_DEPTH];
+static PSCAL_THREAD_LOCAL int loop_depth = -1; // -1 means we are not in a loop
 
 typedef struct {
     bool is_field;
@@ -398,8 +398,10 @@ typedef struct {
     char field_name[MAX_SYMBOL_LENGTH];
 } LoopControlTarget;
 
-static LoopControlTarget loop_control_stack[MAX_LOOP_DEPTH * 4];
-static int loop_control_depth = 0;
+// On the heap, since a TLS block is per thread whether or not the thread compiles.
+#define LOOP_CONTROL_STACK_SIZE (MAX_LOOP_DEPTH * 4)
+static PSCAL_THREAD_LOCAL LoopControlTarget* loop_control_stack = NULL;
+static PSCAL_THREAD_LOCAL int loop_control_depth = 0;
 
 typedef struct {
     uint8_t index;
@@ -424,12 +426,12 @@ typedef struct FunctionCompilerState {
     bool returns_value;
 } FunctionCompilerState;
 
-static FunctionCompilerState* current_function_compiler = NULL;
-static bool inline_routine_active = false;
-static int inline_routine_result_slot = -1;
-static int* inline_routine_exit_jumps = NULL;
-static int inline_routine_exit_count = 0;
-static int inline_routine_exit_capacity = 0;
+static PSCAL_THREAD_LOCAL FunctionCompilerState* current_function_compiler = NULL;
+static PSCAL_THREAD_LOCAL bool inline_routine_active = false;
+static PSCAL_THREAD_LOCAL int inline_routine_result_slot = -1;
+static PSCAL_THREAD_LOCAL int* inline_routine_exit_jumps = NULL;
+static PSCAL_THREAD_LOCAL int inline_routine_exit_count = 0;
+static PSCAL_THREAD_LOCAL int inline_routine_exit_capacity = 0;
 
 static int addUpvalue(FunctionCompilerState* fc, uint8_t index, bool isLocal, bool is_ref, bool source_is_ref);
 
@@ -460,15 +462,15 @@ typedef struct {
 #define NESTED_CAPTURE_PATH_MAX 64
 #define NESTED_CAPTURE_LIST_MAX 255  // Symbol.upvalue_count is a uint8_t
 
-static NestedCallCapture* nested_call_captures = NULL;
-static int nested_call_capture_count = 0;
-static int nested_call_capture_capacity = 0;
-static Symbol** fixed_capture_lists = NULL;  // routines a closure literal was emitted for
-static int fixed_capture_list_count = 0;
-static int fixed_capture_list_capacity = 0;
-static Symbol** grown_capture_lists = NULL;  // compiled routines whose list grew, to pass on
-static int grown_capture_list_count = 0;
-static int grown_capture_list_capacity = 0;
+static PSCAL_THREAD_LOCAL NestedCallCapture* nested_call_captures = NULL;
+static PSCAL_THREAD_LOCAL int nested_call_capture_count = 0;
+static PSCAL_THREAD_LOCAL int nested_call_capture_capacity = 0;
+static PSCAL_THREAD_LOCAL Symbol** fixed_capture_lists = NULL;  // routines a closure literal was emitted for
+static PSCAL_THREAD_LOCAL int fixed_capture_list_count = 0;
+static PSCAL_THREAD_LOCAL int fixed_capture_list_capacity = 0;
+static PSCAL_THREAD_LOCAL Symbol** grown_capture_lists = NULL;  // compiled routines whose list grew, to pass on
+static PSCAL_THREAD_LOCAL int grown_capture_list_count = 0;
+static PSCAL_THREAD_LOCAL int grown_capture_list_capacity = 0;
 
 static bool appendCaptureSymbol(Symbol*** list, int* count, int* capacity, Symbol* sym) {
     for (int i = 0; i < *count; i++) {
@@ -895,24 +897,24 @@ typedef struct {
     char* class_name;
 } PendingGlobalVTableInit;
 
-static PendingGlobalVTableInit* pending_global_vtables = NULL;
-static int pending_global_vtable_count = 0;
+static PSCAL_THREAD_LOCAL PendingGlobalVTableInit* pending_global_vtables = NULL;
+static PSCAL_THREAD_LOCAL int pending_global_vtable_count = 0;
 
-static bool postpone_global_initializers = false;
-static AST** deferred_global_initializers = NULL;
-static int deferred_global_initializer_count = 0;
-static int deferred_global_initializer_capacity = 0;
+static PSCAL_THREAD_LOCAL bool postpone_global_initializers = false;
+static PSCAL_THREAD_LOCAL AST** deferred_global_initializers = NULL;
+static PSCAL_THREAD_LOCAL int deferred_global_initializer_count = 0;
+static PSCAL_THREAD_LOCAL int deferred_global_initializer_capacity = 0;
 
 // Global declarations a C-like frontend left in the program's statement list
 // rather than its declaration section, because there they interleave with
 // executable statements and the order between the two is part of the source's
 // meaning. Their slots are defined up front (see hoistStatementGlobalSlots)
 // and only the initializing store runs at the declaration's own position.
-static AST** ordered_global_slot_decls = NULL;
-static int ordered_global_slot_decl_count = 0;
-static int ordered_global_slot_decl_capacity = 0;
+static PSCAL_THREAD_LOCAL AST** ordered_global_slot_decls = NULL;
+static PSCAL_THREAD_LOCAL int ordered_global_slot_decl_count = 0;
+static PSCAL_THREAD_LOCAL int ordered_global_slot_decl_capacity = 0;
 // Set while such an initializer is emitted at its source position.
-static bool emitting_ordered_global_init = false;
+static PSCAL_THREAD_LOCAL bool emitting_ordered_global_init = false;
 
 // A declaration inside a block of the main program -- an `if` or loop body, a
 // bare `{ }`, the header of a C-style `for` -- has no function frame to hold
@@ -931,15 +933,15 @@ typedef struct {
     AST* scope;       // the block that declared it
 } TopLevelBlockVar;
 
-static TopLevelBlockVar* top_level_block_vars = NULL;
-static int top_level_block_var_count = 0;
-static int top_level_block_var_capacity = 0;
-static AST** top_level_block_scopes = NULL;  // innermost last
-static int top_level_block_depth = 0;
-static int top_level_block_scope_capacity = 0;
+static PSCAL_THREAD_LOCAL TopLevelBlockVar* top_level_block_vars = NULL;
+static PSCAL_THREAD_LOCAL int top_level_block_var_count = 0;
+static PSCAL_THREAD_LOCAL int top_level_block_var_capacity = 0;
+static PSCAL_THREAD_LOCAL AST** top_level_block_scopes = NULL;  // innermost last
+static PSCAL_THREAD_LOCAL int top_level_block_depth = 0;
+static PSCAL_THREAD_LOCAL int top_level_block_scope_capacity = 0;
 // Never reset: modules and the program compile into one chunk, so a slot name
 // must stay unique across every compile in the process.
-static int top_level_block_serial = 0;
+static PSCAL_THREAD_LOCAL int top_level_block_serial = 0;
 
 // Opens `scope` as a block of the main program; returns the mark that
 // endTopLevelBlockScope() unwinds its declarations to.
@@ -973,6 +975,16 @@ static void endTopLevelBlockScope(AST* scope, int mark) {
 static void resetTopLevelBlockScopes(void) {
     endTopLevelBlockScope(NULL, 0);
     top_level_block_depth = 0;
+}
+
+static void freeTopLevelBlockScopes(void) {
+    resetTopLevelBlockScopes();
+    free(top_level_block_vars);
+    top_level_block_vars = NULL;
+    top_level_block_var_capacity = 0;
+    free(top_level_block_scopes);
+    top_level_block_scopes = NULL;
+    top_level_block_scope_capacity = 0;
 }
 
 // True while a declaration compiled now belongs to a block of the main program
@@ -1055,14 +1067,14 @@ static const char* topLevelBlockSlotName(const char* name, AST* ref) {
 // Flag indicating we are compiling a global variable initializer. In that
 // situation vtables have not yet been emitted, so NEW expressions should not
 // attempt to resolve their class vtables immediately.
-static bool compiling_global_var_init = false;
+static PSCAL_THREAD_LOCAL bool compiling_global_var_init = false;
 // Tracks nested NEW expressions when compiling a global initializer so that
 // only the outermost object defers its vtable setup. Nested NEWs must initialize
 // their vtable pointers immediately.
-static int global_init_new_depth = 0;
+static PSCAL_THREAD_LOCAL int global_init_new_depth = 0;
 
-static bool compiler_defined_myself_global = false;
-static int compiler_myself_global_name_idx = -1;
+static PSCAL_THREAD_LOCAL bool compiler_defined_myself_global = false;
+static PSCAL_THREAD_LOCAL int compiler_myself_global_name_idx = -1;
 
 typedef struct {
     int offset;
@@ -1086,7 +1098,7 @@ typedef struct LabelTableState {
     struct LabelTableState* enclosing;
 } LabelTableState;
 
-static LabelTableState* current_label_table = NULL;
+static PSCAL_THREAD_LOCAL LabelTableState* current_label_table = NULL;
 
 static void initLabelTable(LabelTableState* table);
 static void finalizeLabelTable(LabelTableState* table, const char* context_name);
@@ -5190,12 +5202,12 @@ typedef struct {
     char* name;
 } CompilerGlobalVarInfo;
 
-static int compilerGlobalCount = 0;
+static PSCAL_THREAD_LOCAL int compilerGlobalCount = 0;
 
-static CompilerGlobalVarInfo compilerGlobals[MAX_GLOBALS];
+static PSCAL_THREAD_LOCAL CompilerGlobalVarInfo compilerGlobals[MAX_GLOBALS];
 
-static CompilerConstant compilerConstants[MAX_COMPILER_CONSTANTS];
-static int compilerConstantCount = 0;
+static PSCAL_THREAD_LOCAL CompilerConstant compilerConstants[MAX_COMPILER_CONSTANTS];
+static PSCAL_THREAD_LOCAL int compilerConstantCount = 0;
 
 static void initFunctionCompiler(FunctionCompilerState* fc) {
     fc->local_count = 0;
@@ -5465,7 +5477,7 @@ static bool initLoopControlTargetFromAST(AST* node, LoopControlTarget* out) {
 }
 
 static bool pushLoopControlTarget(AST* node) {
-    if (loop_control_depth >= (int)(sizeof(loop_control_stack) / sizeof(loop_control_stack[0]))) {
+    if (loop_control_depth >= LOOP_CONTROL_STACK_SIZE) {
         fprintf(stderr, "Compiler error: Loop control target nesting too deep.\n");
         compiler_had_error = true;
         return false;
@@ -5474,6 +5486,15 @@ static bool pushLoopControlTarget(AST* node) {
     LoopControlTarget target;
     if (!initLoopControlTargetFromAST(node, &target)) {
         return false;
+    }
+
+    if (!loop_control_stack) {
+        loop_control_stack = malloc(sizeof(LoopControlTarget) * LOOP_CONTROL_STACK_SIZE);
+        if (!loop_control_stack) {
+            fprintf(stderr, "Compiler error: Out of memory for loop control targets.\n");
+            compiler_had_error = true;
+            return false;
+        }
     }
 
     loop_control_stack[loop_control_depth++] = target;
@@ -7912,6 +7933,11 @@ void compilerResetState(void) {
     }
     deferred_global_initializer_count = 0;
     deferred_global_initializer_capacity = 0;
+    resetOrderedGlobalSlotDecls();
+    freeTopLevelBlockScopes();
+    free(loop_control_stack);
+    loop_control_stack = NULL;
+    loop_control_depth = 0;
 }
 
 static void compileNode(AST* node, BytecodeChunk* chunk, int current_line_approx) {
@@ -10306,7 +10332,7 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                         // Derive from current function name 'Class.method' if available
                         const char* fname = current_function_compiler->function_symbol->name;
                         const char* dot = fname ? strchr(fname, '.') : NULL;
-                        static char buf[256];
+                        static PSCAL_THREAD_LOCAL char buf[256];
                         if (fname && dot && (dot - fname) < (int)sizeof(buf)) {
                             size_t n = (size_t)(dot - fname);
                             memcpy(buf, fname, n); buf[n] = '\0';

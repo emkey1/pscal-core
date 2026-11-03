@@ -23,6 +23,9 @@ bool pscalFxParseDenyList(const char *csv, EffectMask *out_mask);
  * environment variable, read lazily once on first use, following the
  * PSCAL_VM_SKIP_VERIFY convention (Phase 1e). */
 void pscalFxSetDeniedMask(EffectMask mask);
+/* The --deny mask alone, without PSCAL_VM_DENY: per thread on iOS, so a VM worker
+ * takes it from its ThreadJob. */
+EffectMask pscalFxGetDeniedMask(void);
 EffectMask pscalFxEffectiveDeniedMask(void);
 
 /* True if a deny-list, record, or replay policy is active. The one check the

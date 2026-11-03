@@ -2,9 +2,11 @@
 
 #include <stdlib.h>
 
-static int *g_aether_rewrite_line_map = NULL;
-static int g_aether_rewrite_line_count = 0;
-static int g_aether_rewrite_line_cap = 0;
+#include "core/globals.h"
+
+static PSCAL_THREAD_LOCAL int *g_aether_rewrite_line_map = NULL;
+static PSCAL_THREAD_LOCAL int g_aether_rewrite_line_count = 0;
+static PSCAL_THREAD_LOCAL int g_aether_rewrite_line_cap = 0;
 
 void aetherClearRewriteLineMap(void) {
     free(g_aether_rewrite_line_map);

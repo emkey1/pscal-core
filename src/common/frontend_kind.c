@@ -3,7 +3,12 @@
 #include <stddef.h>  /* NULL: <strings.h> supplies it on macOS but not glibc */
 #include <strings.h>
 
-static FrontendKind gFrontendKind = FRONTEND_KIND_PASCAL;
+#include "core/globals.h"
+
+/* On iOS each run is a thread of one process, and this decides how its VM
+ * behaves as well as how it compiles. A new thread takes its creator's kind
+ * (vprocPthreadCreateShim) and a VM worker takes its run's (ThreadJob). */
+static PSCAL_THREAD_LOCAL FrontendKind gFrontendKind = FRONTEND_KIND_PASCAL;
 
 FrontendKind frontendPushKind(FrontendKind kind) {
     FrontendKind previous = gFrontendKind;

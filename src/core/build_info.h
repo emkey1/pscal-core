@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <string.h>
 
+#include "core/globals.h"
+
 #define PSCAL_STRINGIFY_IMPL(x) #x
 #define PSCAL_STRINGIFY(x) PSCAL_STRINGIFY_IMPL(x)
 
@@ -64,13 +66,13 @@ static inline const char *pscal_normalize_define(const char *raw, char *buffer, 
 }
 
 static inline const char *pscal_program_version_string(void) {
-    static int initialized = 0;
+    static PSCAL_THREAD_LOCAL int initialized = 0;
 #ifdef PSCAL_BUILD_COMMIT
-    static char storage[sizeof(PSCAL_PROGRAM_VERSION_RAW) + sizeof(PSCAL_BUILD_COMMIT) + 1];
+    static PSCAL_THREAD_LOCAL char storage[sizeof(PSCAL_PROGRAM_VERSION_RAW) + sizeof(PSCAL_BUILD_COMMIT) + 1];
 #else
-    static char storage[sizeof(PSCAL_PROGRAM_VERSION_RAW)];
+    static PSCAL_THREAD_LOCAL char storage[sizeof(PSCAL_PROGRAM_VERSION_RAW)];
 #endif
-    static const char *value = NULL;
+    static PSCAL_THREAD_LOCAL const char *value = NULL;
 
     if (!initialized) {
 #ifdef PSCAL_BUILD_COMMIT
@@ -92,9 +94,9 @@ static inline const char *pscal_program_version_string(void) {
 }
 
 static inline const char *pscal_git_tag_string(void) {
-    static int initialized = 0;
-    static char storage[sizeof(PSCAL_GIT_TAG_RAW)];
-    static const char *value = NULL;
+    static PSCAL_THREAD_LOCAL int initialized = 0;
+    static PSCAL_THREAD_LOCAL char storage[sizeof(PSCAL_GIT_TAG_RAW)];
+    static PSCAL_THREAD_LOCAL const char *value = NULL;
 
     if (!initialized) {
         value = pscal_normalize_define(PSCAL_GIT_TAG_RAW, storage, sizeof(storage));

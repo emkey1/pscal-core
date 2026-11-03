@@ -2939,23 +2939,30 @@ static struct {
     int frontendKind;
     BuiltinNameAliasFn resolver;
 } gBuiltinNameAliases[MAX_BUILTIN_NAME_ALIASES];
-static size_t gBuiltinNameAliasCount = 0;
+// Every Aether run registers, and on iOS runs share the process: written under
+// builtin_registry_mutex, and a reader sees only entries already filled in.
+static _Atomic size_t gBuiltinNameAliasCount = 0;
 
 void registerBuiltinNameAlias(int frontendKind, BuiltinNameAliasFn resolver) {
     if (!resolver) {
         return;
     }
-    for (size_t i = 0; i < gBuiltinNameAliasCount; ++i) {
+    pthread_once(&builtin_registry_once, initBuiltinRegistryMutex);
+    pthread_mutex_lock(&builtin_registry_mutex);
+    size_t count = atomic_load_explicit(&gBuiltinNameAliasCount, memory_order_relaxed);
+    for (size_t i = 0; i < count; ++i) {
         if (gBuiltinNameAliases[i].frontendKind == frontendKind &&
             gBuiltinNameAliases[i].resolver == resolver) {
+            pthread_mutex_unlock(&builtin_registry_mutex);
             return;
         }
     }
-    if (gBuiltinNameAliasCount < MAX_BUILTIN_NAME_ALIASES) {
-        gBuiltinNameAliases[gBuiltinNameAliasCount].frontendKind = frontendKind;
-        gBuiltinNameAliases[gBuiltinNameAliasCount].resolver = resolver;
-        gBuiltinNameAliasCount++;
+    if (count < MAX_BUILTIN_NAME_ALIASES) {
+        gBuiltinNameAliases[count].frontendKind = frontendKind;
+        gBuiltinNameAliases[count].resolver = resolver;
+        atomic_store_explicit(&gBuiltinNameAliasCount, count + 1, memory_order_release);
     }
+    pthread_mutex_unlock(&builtin_registry_mutex);
 }
 
 const char* resolveBuiltinNameAlias(const char* name) {
@@ -2963,7 +2970,8 @@ const char* resolveBuiltinNameAlias(const char* name) {
         return NULL;
     }
     int kind = (int)frontendGetKind();
-    for (size_t i = 0; i < gBuiltinNameAliasCount; ++i) {
+    size_t count = atomic_load_explicit(&gBuiltinNameAliasCount, memory_order_acquire);
+    for (size_t i = 0; i < count; ++i) {
         if (gBuiltinNameAliases[i].frontendKind != kind) {
             continue;
         }
@@ -2980,23 +2988,28 @@ static struct {
     int frontendKind;
     BuiltinNameRejectedFn rejected;
 } gBuiltinNameRejecters[MAX_BUILTIN_NAME_REJECTERS];
-static size_t gBuiltinNameRejecterCount = 0;
+static _Atomic size_t gBuiltinNameRejecterCount = 0;  // as gBuiltinNameAliasCount
 
 void registerBuiltinNameRejected(int frontendKind, BuiltinNameRejectedFn rejected) {
     if (!rejected) {
         return;
     }
-    for (size_t i = 0; i < gBuiltinNameRejecterCount; ++i) {
+    pthread_once(&builtin_registry_once, initBuiltinRegistryMutex);
+    pthread_mutex_lock(&builtin_registry_mutex);
+    size_t count = atomic_load_explicit(&gBuiltinNameRejecterCount, memory_order_relaxed);
+    for (size_t i = 0; i < count; ++i) {
         if (gBuiltinNameRejecters[i].frontendKind == frontendKind &&
             gBuiltinNameRejecters[i].rejected == rejected) {
+            pthread_mutex_unlock(&builtin_registry_mutex);
             return;
         }
     }
-    if (gBuiltinNameRejecterCount < MAX_BUILTIN_NAME_REJECTERS) {
-        gBuiltinNameRejecters[gBuiltinNameRejecterCount].frontendKind = frontendKind;
-        gBuiltinNameRejecters[gBuiltinNameRejecterCount].rejected = rejected;
-        gBuiltinNameRejecterCount++;
+    if (count < MAX_BUILTIN_NAME_REJECTERS) {
+        gBuiltinNameRejecters[count].frontendKind = frontendKind;
+        gBuiltinNameRejecters[count].rejected = rejected;
+        atomic_store_explicit(&gBuiltinNameRejecterCount, count + 1, memory_order_release);
     }
+    pthread_mutex_unlock(&builtin_registry_mutex);
 }
 
 bool builtinNameRejectedByFrontend(const char* name) {
@@ -3004,7 +3017,8 @@ bool builtinNameRejectedByFrontend(const char* name) {
         return false;
     }
     int kind = (int)frontendGetKind();
-    for (size_t i = 0; i < gBuiltinNameRejecterCount; ++i) {
+    size_t count = atomic_load_explicit(&gBuiltinNameRejecterCount, memory_order_acquire);
+    for (size_t i = 0; i < count; ++i) {
         if (gBuiltinNameRejecters[i].frontendKind == kind &&
             gBuiltinNameRejecters[i].rejected(name)) {
             return true;

@@ -42,6 +42,7 @@
 #include <mach/thread_info.h>
 #include <mach/thread_act.h>
 #endif
+#include "common/frontend_kind.h"
 #include "common/runtime_tty.h"
 #include "runtime/vproc/tty/ish_compat.h"
 #include "runtime/vproc/tty/pscal_pty.h"
@@ -3224,6 +3225,7 @@ typedef struct {
     int kernel_pid;
     bool detach;
     PSCALRuntimeContext *runtime_ctx;
+    FrontendKind frontend_kind;
     pthread_mutex_t *worker_stop_mu;
     pthread_cond_t *worker_stop_cv;
     bool *worker_stopped;
@@ -8207,6 +8209,7 @@ static void *vprocThreadTrampoline(void *arg) {
     if (ctx) {
         vprocSetShellSelfPid(ctx->shell_self_pid);
         vprocSetKernelPid(ctx->kernel_pid);
+        frontendPushKind(ctx->frontend_kind);
         if (ctx->session_stdio) {
             vprocSessionStdioActivate(ctx->session_stdio);
         }
@@ -8276,6 +8279,7 @@ int vprocPthreadCreateShim(pthread_t *thread,
     ctx->session_stdio = vprocSessionStdioCurrent();
     ctx->shell_self_pid = vprocGetShellSelfPid();
     ctx->kernel_pid = vprocGetKernelPid();
+    ctx->frontend_kind = frontendGetKind();
     ctx->detach = false;
 #if defined(PSCAL_TARGET_IOS)
     if (PSCALRuntimeGetCurrentRuntimeContext) {
@@ -8659,6 +8663,19 @@ int vprocDupAbove(VProc *vp, int fd, int min) {
     return slot;
 }
 
+/* A slot holding a saved stdio number is about to close it. vprocDestroy closes the saved
+ * numbers as well, and by then the number can be anything: when it was the process's poll
+ * wake pipe, later wakeups wrote NULs to whatever had the number next. `dup2(x, 2)` during a
+ * command does this: Aether mutes stderr around its pre-pass, Pascal captures it. */
+static void vprocForgetSavedStdioLocked(VProc *vp, int host_fd) {
+    if (host_fd == vp->stdout_host_fd) {
+        vp->stdout_host_fd = -1;
+    }
+    if (host_fd == vp->stderr_host_fd) {
+        vp->stderr_host_fd = -1;
+    }
+}
+
 int vprocDup2(VProc *vp, int fd, int target) {
     if (!vp || target < 0) {
         errno = EBADF;
@@ -8691,6 +8708,7 @@ int vprocDup2(VProc *vp, int fd, int target) {
             pscal_fd_close(vp->entries[target].pscal_fd);
         } else if (vp->entries[target].kind == VPROC_FD_HOST && vp->entries[target].host_fd >= 0) {
             vprocResourceRemoveLocked(vp, vp->entries[target].host_fd);
+            vprocForgetSavedStdioLocked(vp, vp->entries[target].host_fd);
             vprocHostCloseRaw(vp->entries[target].host_fd);
         }
         vp->entries[target].host_fd = -1;
@@ -8724,6 +8742,7 @@ int vprocDup2(VProc *vp, int fd, int target) {
             (target == STDIN_FILENO) && (vp->entries[target].host_fd == vp->stdin_host_fd);
         if (!preserve_controlling_stdin) {
             vprocResourceRemoveLocked(vp, vp->entries[target].host_fd);
+            vprocForgetSavedStdioLocked(vp, vp->entries[target].host_fd);
             vprocHostCloseRaw(vp->entries[target].host_fd);
         }
         vp->entries[target].host_fd = -1;
@@ -8782,6 +8801,7 @@ int vprocRestoreHostFd(VProc *vp, int target_fd, int host_src) {
     if (vp->entries[target_fd].kind == VPROC_FD_HOST && vp->entries[target_fd].host_fd >= 0 &&
         !(target_fd == STDIN_FILENO && vp->entries[target_fd].host_fd == vp->stdin_host_fd)) {
         vprocResourceRemoveLocked(vp, vp->entries[target_fd].host_fd);
+        vprocForgetSavedStdioLocked(vp, vp->entries[target_fd].host_fd);
         vprocHostCloseRaw(vp->entries[target_fd].host_fd);
     }
     int cloned = vprocCloneFd(host_src);
@@ -8831,6 +8851,9 @@ int vprocClose(VProc *vp, int fd) {
         pthread_mutex_unlock(&vp->mu);
         errno = EBADF;
         return -1;
+    }
+    if (kind == VPROC_FD_HOST) {
+        vprocForgetSavedStdioLocked(vp, host);
     }
     vp->entries[fd].host_fd = -1;
     vp->entries[fd].pscal_fd = NULL;
@@ -9117,6 +9140,7 @@ int vprocSpawnThread(VProc *vp, void *(*start_routine)(void *), void *arg, pthre
     ctx->session_stdio = vprocSessionStdioCurrent();
     ctx->shell_self_pid = vprocGetShellSelfPid();
     ctx->kernel_pid = vprocGetKernelPid();
+    ctx->frontend_kind = frontendGetKind();
     ctx->detach = false;
 #if defined(PSCAL_TARGET_IOS)
     if (PSCALRuntimeGetCurrentRuntimeContext) {
@@ -10419,6 +10443,7 @@ static void vprocCloseAllFdsLocked(VProc *vp) {
         } else if (vp->entries[i].kind == VPROC_FD_HOST &&
                    vp->entries[i].host_fd >= 0) {
             (void)vprocResourceRemoveLocked(vp, vp->entries[i].host_fd);
+            vprocForgetSavedStdioLocked(vp, vp->entries[i].host_fd);
             vprocHostCloseRaw(vp->entries[i].host_fd);
         }
         vp->entries[i].host_fd = -1;

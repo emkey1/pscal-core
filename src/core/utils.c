@@ -472,7 +472,7 @@ const char *builtinPascalTypeName(VarType type) {
 }
 
 const char *tokenTypeToString(TokenType type) {
-    static char unknown_buf[32];
+    static PSCAL_THREAD_LOCAL char unknown_buf[32];
     switch (type) {
         case TOKEN_PROGRAM:       return "PROGRAM";
         case TOKEN_VAR:           return "VAR";
