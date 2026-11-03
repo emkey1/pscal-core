@@ -409,6 +409,7 @@ struct VM_s *shellSwapCurrentVm(struct VM_s *vm);
 void shellRestoreCurrentVm(struct VM_s *vm);
 void shellRuntimeSetLastStatus(int status);
 void shellRuntimeSetLastStatusSticky(int status);
+void shellRuntimeSetPromptStatus(int status);
 bool shellRuntimeHistoryGetEntry(size_t reverse_index, char **out_line);
 bool shellRuntimeExpandHistoryReference(const char *input,
                                         char **out_line,

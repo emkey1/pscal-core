@@ -3514,6 +3514,14 @@ void shellRuntimeSetLastStatusSticky(int status) {
     gShellStatusSticky = true;
 }
 
+/* Each line at the prompt runs in a context of its own, copied from this one and
+ * thrown away after it, so what it left in $? has to be carried back. Only the
+ * value: the line has had its ERR trap and errexit, and a pending one here would be
+ * copied into the next line and run them again. */
+void shellRuntimeSetPromptStatus(int status) {
+    gShellRuntime.last_status = status;
+}
+
 void shellRuntimeRefreshTrapEnabled(void) {
     gShellRuntime.trap_enabled = false;
 #ifdef SIGINT
