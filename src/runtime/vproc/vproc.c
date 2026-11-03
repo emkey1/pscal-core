@@ -3276,6 +3276,7 @@ typedef struct {
     int group_exit_code;
     uint32_t blocked_signals;
     uint32_t pending_signals;
+    uint32_t deferred_signals;
     uint32_t ignored_signals;
     int pending_counts[32];
     int fg_override_pgid;
@@ -4160,6 +4161,14 @@ static void vprocInitEntryDefaultsLocked(VProcTaskEntry *entry, int pid, const V
         entry->ignored_signals = inherit_parent->ignored_signals & ~(vprocSigMask(SIGKILL) | vprocSigMask(SIGSTOP));
         entry->sigchld_blocked = inherit_parent->sigchld_blocked;
         memcpy(entry->actions, inherit_parent->actions, sizeof(entry->actions));
+        /* A shell's trap is its own: like exec, a new vproc goes back to the default. */
+        for (int sig = 1; sig < 32; ++sig) {
+            if (entry->actions[sig].sa_handler == vprocDeferSignal) {
+                sigemptyset(&entry->actions[sig].sa_mask);
+                entry->actions[sig].sa_handler = SIG_DFL;
+                entry->actions[sig].sa_flags = 0;
+            }
+        }
         if (shell_pid > 0 && inherit_parent->pid == shell_pid) {
             int job_sigs[] = { SIGTSTP, SIGTTIN, SIGTTOU };
             size_t sig_count = sizeof(job_sigs) / sizeof(job_sigs[0]);
@@ -4344,6 +4353,10 @@ static void vprocInvokeHandlerLocked(VProcTaskEntry *entry, int sig) {
     }
     struct sigaction sa = vprocGetSigactionLocked(entry, sig);
     if (sa.sa_handler == SIG_IGN || sa.sa_handler == SIG_DFL) {
+        return;
+    }
+    if (sa.sa_handler == vprocDeferSignal) {
+        entry->deferred_signals |= vprocSigMask(sig);
         return;
     }
     int saved_blocked = entry->blocked_signals;
@@ -10225,6 +10238,7 @@ static void vprocClearEntryLocked(VProcTaskEntry *entry) {
     entry->group_exit_code = 0;
     entry->blocked_signals = 0;
     entry->pending_signals = 0;
+    entry->deferred_signals = 0;
     entry->ignored_signals = 0;
     for (int i = 0; i < 32; ++i) {
         entry->pending_counts[i] = 0;
@@ -13561,6 +13575,34 @@ static void vprocDeliverPendingSignalsForCurrent(void) {
     if (exit_current) {
         pthread_exit(NULL);
     }
+}
+
+void vprocDeliverPendingSignals(void) {
+    vprocDeliverPendingSignalsForCurrent();
+}
+
+void vprocDeferSignal(int sig) {
+    (void)sig;
+}
+
+int vprocTakeDeferredSignal(void) {
+    VProc *vp = vprocForThread();
+    if (!vp) {
+        return 0;
+    }
+    int taken = 0;
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(vprocPid(vp));
+    if (entry) {
+        for (int sig = 1; sig < 32 && taken == 0; ++sig) {
+            if (entry->deferred_signals & vprocSigMask(sig)) {
+                entry->deferred_signals &= ~vprocSigMask(sig);
+                taken = sig;
+            }
+        }
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    return taken;
 }
 
 int vprocSigpending(int pid, sigset_t *set) {

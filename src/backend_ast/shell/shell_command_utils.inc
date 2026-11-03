@@ -153,13 +153,16 @@ static bool shellParseAssignment(const char *assignment, char **out_name, const 
 static bool shellApplyAssignmentsPermanently(const ShellCommand *cmd,
                                              const char **out_failed_assignment,
                                              bool *out_invalid_assignment);
-static bool shellApplyAssignmentsTemporary(const ShellCommand *cmd,
-                                           ShellAssignmentBackup **out_backups,
-                                           size_t *out_count,
-                                           const char **out_failed_assignment,
-                                           bool *out_invalid_assignment);
+static bool shellApplyAssignments(const ShellCommand *cmd,
+                                  ShellAssignmentBackup **out_backups,
+                                  size_t *out_count,
+                                  const char **out_failed_assignment,
+                                  bool *out_invalid_assignment,
+                                  bool report_readonly,
+                                  bool for_command);
 static bool shellSubscriptIsNumeric(const char *text);
 static void shellRestoreAssignments(ShellAssignmentBackup *backups, size_t count);
+static const char *shellReadonlyGetErrorName(void);
 static int shellSpawnProcess(VM *vm,
                              const ShellCommand *cmd,
                              int stdin_fd,
@@ -1345,6 +1348,12 @@ static void shellRestoreAssignments(ShellAssignmentBackup *backups, size_t count
         if (backup->had_previous) {
             shellSetTrackedVariable(backup->name, backup->previous_value, backup->previous_was_array);
             shellVariableSetExported(backup->name, backup->was_exported);
+            if (backup->previous_no_value) {
+                ShellLocalVariable *local = shellLocalScopeFind(backup->name);
+                if (local) {
+                    local->no_value = true;
+                }
+            }
         } else {
             shellUnsetTrackedVariable(backup->name);
             if (backup->was_pending_export) {
@@ -1357,11 +1366,28 @@ static void shellRestoreAssignments(ShellAssignmentBackup *backups, size_t count
     free(backups);
 }
 
-static bool shellApplyAssignmentsTemporary(const ShellCommand *cmd,
-                                           ShellAssignmentBackup **out_backups,
-                                           size_t *out_count,
-                                           const char **out_failed_assignment,
-                                           bool *out_invalid_assignment) {
+/* A name that is readonly keeps its value and the rest go ahead, command included. Bash's
+ * error report ends the shell under set -e, whatever the command is part of. */
+static void shellReportReadonlyPrefix(const char *name) {
+    runtimeError(gShellCurrentVm, "%s: readonly variable", name);
+    if (gShellRuntime.errexit_enabled) {
+        shellRuntimeSetLastStatus(gShellRuntime.last_status ? gShellRuntime.last_status : 1);
+        shellRuntimeRequestExit();
+        if (gShellCurrentVm) {
+            gShellCurrentVm->exit_requested = true;
+            gShellCurrentVm->current_builtin_name = "errexit";
+        }
+    }
+}
+
+/* For the length of a command: what shellRestoreAssignments puts back. */
+static bool shellApplyAssignments(const ShellCommand *cmd,
+                                  ShellAssignmentBackup **out_backups,
+                                  size_t *out_count,
+                                  const char **out_failed_assignment,
+                                  bool *out_invalid_assignment,
+                                  bool report_readonly,
+                                  bool for_command) {
     if (out_backups) {
         *out_backups = NULL;
     }
@@ -1442,6 +1468,7 @@ static bool shellApplyAssignmentsTemporary(const ShellCommand *cmd,
             }
             backups[i].had_previous = true;
             backups[i].was_exported = local_entry->exported;
+            backups[i].previous_no_value = local_entry->no_value;
         } else {
             const char *previous = shellSafeGetenv(backups[i].name);
             backups[i].was_exported = shellGlobalIsExported(backups[i].name);
@@ -1461,7 +1488,10 @@ static bool shellApplyAssignmentsTemporary(const ShellCommand *cmd,
             }
         }
         bool set_ok;
-        char *attributed = entry->is_array_literal ? NULL : shellApplyVariableAttributes(backups[i].name, value);
+        /* In front of a command it holds the text as it is: `declare -i n; n=1+1 cmd`. */
+        char *attributed = (entry->is_array_literal || for_command)
+                               ? NULL
+                               : shellApplyVariableAttributes(backups[i].name, value);
         const char *assigned = attributed ? attributed : value;
         if (is_element) {
             set_ok = shellArrayRegistrySetElement(backups[i].name, subscript_text, assigned);
@@ -1470,6 +1500,16 @@ static bool shellApplyAssignmentsTemporary(const ShellCommand *cmd,
         }
         free(attributed);
         free(subscript_text);
+        if (!set_ok && shellReadonlyGetErrorName()) {
+            if (report_readonly) {
+                shellReportReadonlyPrefix(shellReadonlyGetErrorName());
+            }
+            free(backups[i].name);
+            free(backups[i].previous_value);
+            backups[i].name = NULL;
+            backups[i].previous_value = NULL;
+            continue;
+        }
         if (!set_ok) {
             if (out_failed_assignment) {
                 *out_failed_assignment = assignment;
@@ -1478,7 +1518,7 @@ static bool shellApplyAssignmentsTemporary(const ShellCommand *cmd,
             return false;
         }
         /* Whatever the command turns out to be, what it starts sees this. */
-        if (!is_element && !entry->is_array_literal) {
+        if (for_command && !is_element && !entry->is_array_literal) {
             shellVariableSetExported(backups[i].name, true);
         }
     }
@@ -1681,7 +1721,7 @@ static bool shellQuotedMapAppendRepeated(bool track,
 static const char *shellCurrentIfs(void) {
     ShellLocalVariable *local = shellLocalScopeFind("IFS");
     if (local) {
-        return local->value ? local->value : "";
+        return local->no_value ? NULL : (local->value ? local->value : "");
     }
     return shellSafeGetenv("IFS");
 }
@@ -2594,6 +2634,12 @@ static char *shellDefaultVariableValue(const char *name) {
         }
         return NULL;
     }
+    if (strcmp(name, "OPTIND") == 0 || strcmp(name, "OPTERR") == 0) {
+        return strdup("1");
+    }
+    if (strcmp(name, "PS4") == 0) {
+        return strdup("+ ");
+    }
     if ((strcmp(name, "OSTYPE") == 0 || strcmp(name, "HOSTTYPE") == 0 || strcmp(name, "MACHTYPE") == 0) &&
         uname(&info) == 0) {
         char system[80];
@@ -2790,7 +2836,7 @@ static char *shellLookupParameterValueInternal(const char *name,
     bool local_is_array = false;
     if (shellLocalScopeGetCopy(key, &local_value, &local_is_array)) {
         if (out_is_set) {
-            *out_is_set = true;
+            *out_is_set = !shellLocalScopeFind(key)->no_value;
         }
         free(key);
         return local_value ? local_value : strdup("");
@@ -3513,6 +3559,8 @@ static bool shellArrayRegistryInitializeAssociative(const char *name) {
         shellArrayVariableClear(var);
     }
     var->kind = SHELL_ARRAY_KIND_ASSOCIATIVE;
+    /* A new slot holds whatever was there, and a set one here would make it indexed. */
+    var->sparse = false;
     return true;
 }
 

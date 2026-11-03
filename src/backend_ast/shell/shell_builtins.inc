@@ -345,6 +345,11 @@ Value vmBuiltinShellExec(VM *vm, int arg_count, Value *args) {
         }
     }
 #endif
+    /* A trap runs as soon as the command is done, in the function it was in: `kill -USR1 $$`
+     * may be the last thing that function does, or the script. */
+    if (!gShellRuntime.pipeline.active) {
+        shellRuntimeProcessPendingSignals();
+    }
 
 cleanup:
     shellRestoreCurrentVm(previous_vm);
@@ -393,6 +398,9 @@ Value vmBuiltinShellExecBody(VM *vm, int arg_count, Value *args) {
     } else if (!gShellRuntime.pipeline.active) {
         gShellPipeStatus[0] = gShellRuntime.last_status;
         gShellPipeStatusCount = 1;
+    }
+    if (!gShellRuntime.pipeline.active) {
+        shellRuntimeProcessPendingSignals();
     }
 
 cleanup:
@@ -5085,6 +5093,13 @@ Value vmBuiltinShellEval(VM *vm, int arg_count, Value *args) {
     }
 
     if (gShellReturnPending && !exit_requested) {
+        if (shellLocalScopeDepth() == 0 && shellRuntimeIsOutermostScript() && !gShellRuntime.in_subshell) {
+            /* No function around it, and bash goes on. */
+            gShellReturnPending = false;
+            runtimeError(vm, "return: can only `return' from a function or sourced script");
+            shellUpdateStatus(2);
+            return makeVoid();
+        }
         /* `return` in the text: the caller's function ends too. */
         shellUpdateStatus(gShellReturnStatus);
         if (vm) {
@@ -5456,6 +5471,25 @@ static char *shellReadCopyValue(const char *text, bool raw_mode) {
     return copy;
 }
 
+/* Past one field's delimiter: whitespace around it goes with it, so `1 : 2` is two fields. */
+static char *shellReadSkipDelimiter(char *scan, const char *ifs) {
+    if (*scan == '\0') {
+        return scan;
+    }
+    bool white = shellReadIsIFSWhitespaceDelimiter(ifs, *scan);
+    scan++;
+    while (*scan && shellReadIsIFSWhitespaceDelimiter(ifs, *scan)) {
+        scan++;
+    }
+    if (white && *scan && shellReadIsIFSDelimiter(ifs, *scan)) {
+        scan++;
+        while (*scan && shellReadIsIFSWhitespaceDelimiter(ifs, *scan)) {
+            scan++;
+        }
+    }
+    return scan;
+}
+
 static char *shellReadExtractField(char **cursor,
                                    bool last_field,
                                    bool raw_mode,
@@ -5472,15 +5506,6 @@ static char *shellReadExtractField(char **cursor,
         text++;
     }
 
-    if (last_field) {
-        char *value = shellReadCopyValue(text, raw_mode);
-        if (!value) {
-            return NULL;
-        }
-        *cursor = text + strlen(text);
-        return value;
-    }
-
     char *scan = text;
     while (*scan) {
         if (!raw_mode && *scan == '\\') {
@@ -5495,20 +5520,30 @@ static char *shellReadExtractField(char **cursor,
         }
         scan++;
     }
+    char *next = shellReadSkipDelimiter(scan, ifs);
+
+    /* The last name takes the rest of the line, less the IFS whitespace at its end, an
+     * escaped one included. If that rest is one field and what ends it, it gets the field. */
+    if (last_field && *next) {
+        char *end = text;
+        for (char *p = text; *p; ++p) {
+            bool escaped = !raw_mode && *p == '\\' && p[1];
+            if (escaped) {
+                p++;
+            }
+            if (!shellReadIsIFSWhitespaceDelimiter(ifs, *p)) {
+                end = p + 1;
+            }
+        }
+        scan = end;
+        next = text + strlen(text);
+    }
 
     char saved = *scan;
     *scan = '\0';
     char *value = shellReadCopyValue(text, raw_mode);
     *scan = saved;
-    if (saved != '\0') {
-        scan++;
-        if (shellReadIsIFSWhitespaceDelimiter(ifs, saved)) {
-            while (*scan && shellReadIsIFSWhitespaceDelimiter(ifs, *scan)) {
-                scan++;
-            }
-        }
-    }
-    *cursor = scan;
+    *cursor = next;
     return value;
 }
 
@@ -6323,6 +6358,7 @@ Value vmBuiltinShellRead(VM *vm, int arg_count, Value *args) {
         variables[variable_count++] = token;
     }
 
+    bool whole_line = false;
     if (ok && variable_count == 0 && !array_name) {
         variables = (const char **)malloc(sizeof(const char *));
         if (!variables) {
@@ -6331,10 +6367,12 @@ Value vmBuiltinShellRead(VM *vm, int arg_count, Value *args) {
         } else {
             variables[0] = "REPLY";
             variable_count = 1;
+            whole_line = true;
         }
     }
 
-    const char *ifs = shellReadResolveIFS();
+    /* -N and $REPLY take the text as it came: only names split it. */
+    const char *ifs = (read_exact || whole_line) ? "" : shellReadResolveIFS();
 
     ShellReadLineResult read_result = SHELL_READ_LINE_ERROR;
     char *line = NULL;
@@ -7315,20 +7353,114 @@ static void shellDeclarePrintQuoted(const char *value) {
     fputc('"', stdout);
 }
 
-/* declare -p: a line that sets it back. False if it is not set. */
-static bool shellDeclarePrintVariable(const char *name) {
-    const ShellArrayVariable *array_var = shellArrayRegistryFindConst(name);
-    bool is_set = false;
-    char *value = shellLookupParameterValueInternal(name, strlen(name), &is_set);
-    if (!array_var && !is_set) {
-        free(value);
-        if (shellExportIsPending(name)) {
-            printf("declare -x %s\n", name);
+/* Control characters only: the rest of a value prints as it is. */
+static bool shellValueHasControlChar(const char *value) {
+    for (const char *cursor = value; *cursor; ++cursor) {
+        unsigned char c = (unsigned char)*cursor;
+        if (c < 0x20 || c == 0x7f) {
             return true;
         }
-        return false;
     }
-    char flags[8];
+    return false;
+}
+
+static char *shellAnsiQuoteValue(const char *value) {
+    char *quoted = (char *)malloc(strlen(value) * 4 + 4);
+    if (!quoted) {
+        return NULL;
+    }
+    char *out = quoted;
+    *out++ = '$';
+    *out++ = '\'';
+    for (const char *cursor = value; *cursor; ++cursor) {
+        unsigned char c = (unsigned char)*cursor;
+        const char *escapes = "\033E\aa\bb\ff\nn\rr\tt\vv\\\\''";
+        const char *found = NULL;
+        for (const char *e = escapes; *e && !found; e += 2) {
+            found = (unsigned char)*e == c ? e : NULL;
+        }
+        if (found) {
+            *out++ = '\\';
+            *out++ = found[1];
+        } else if (c < 0x20 || c == 0x7f) {
+            out += sprintf(out, "\\%03o", c);
+        } else {
+            *out++ = (char)c;
+        }
+    }
+    *out++ = '\'';
+    *out = '\0';
+    return quoted;
+}
+
+/* A value as `set` shows it: quoted only if the shell would read something into it. */
+static char *shellSetQuoteValue(const char *value) {
+    if (shellValueHasControlChar(value)) {
+        return shellAnsiQuoteValue(value);
+    }
+    bool metas = false;
+    size_t quotes = 0;
+    for (const char *cursor = value; *cursor; ++cursor) {
+        if (strchr(" \"\\|&;()<>!{}*[?]^$`", *cursor)) {
+            metas = true;
+        } else if (*cursor == '\'') {
+            metas = true;
+            quotes++;
+        } else if (*cursor == '~' && (cursor == value || cursor[-1] == '=' || cursor[-1] == ':')) {
+            metas = true;
+        } else if (*cursor == '#' && cursor == value) {
+            metas = true;
+        }
+    }
+    if (!metas) {
+        return strdup(value);
+    }
+    char *quoted = (char *)malloc(strlen(value) + quotes * 3 + 3);
+    if (!quoted) {
+        return NULL;
+    }
+    char *out = quoted;
+    *out++ = '\'';
+    for (const char *cursor = value; *cursor; ++cursor) {
+        if (*cursor == '\'') {
+            memcpy(out, "'\\''", 4);
+            out += 4;
+        } else {
+            *out++ = *cursor;
+        }
+    }
+    *out++ = '\'';
+    *out = '\0';
+    return quoted;
+}
+
+static void shellDeclarePrintArrayValues(const ShellArrayVariable *array_var) {
+    fputc('(', stdout);
+    for (size_t i = 0; i < array_var->count; ++i) {
+        const char *element = array_var->values[i] ? array_var->values[i] : "";
+        if (i > 0) {
+            fputc(' ', stdout);
+        }
+        if (array_var->keys && array_var->keys[i]) {
+            printf("[%s]=", array_var->keys[i]);
+        } else {
+            printf("[%zu]=", i);
+        }
+        if (shellValueHasControlChar(element)) {
+            char *quoted = shellAnsiQuoteValue(element);
+            if (quoted) {
+                fputs(quoted, stdout);
+                free(quoted);
+            }
+        } else {
+            shellDeclarePrintQuoted(element);
+        }
+    }
+    fputc(')', stdout);
+}
+
+/* The attributes declare -p shows for a name, and declare's listings choose by. */
+static size_t shellDeclareFlags(const char *name, const ShellArrayVariable *array_var, char *flags) {
     size_t count = 0;
     if (array_var) {
         flags[count++] = (array_var->kind == SHELL_ARRAY_KIND_ASSOCIATIVE && !array_var->sparse) ? 'A' : 'a';
@@ -7345,26 +7477,31 @@ static bool shellDeclarePrintVariable(const char *name) {
     if (shellVariableHasAttribute(name, SHELL_VAR_ATTR_UPPER)) {
         flags[count++] = 'u';
     }
-    if (!array_var && is_set && shellVariableIsExported(name)) {
+    if (!array_var && shellVariableIsExported(name)) {
         flags[count++] = 'x';
     }
     flags[count] = '\0';
+    return count;
+}
+
+/* declare -p: a line that sets it back. False if it is not there. */
+static bool shellDeclarePrintVariable(const char *name) {
+    bool is_set = false;
+    char *value = shellLookupParameterValueInternal(name, strlen(name), &is_set);
+    const ShellArrayVariable *array_var = shellArrayRegistryFindConst(name);
+    /* Declared with no value yet. */
+    bool declared = shellExportIsPending(name) || shellLocalScopeFind(name) != NULL;
+    if (!array_var && !is_set && !declared) {
+        free(value);
+        return false;
+    }
+    char flags[8];
+    size_t count = shellDeclareFlags(name, array_var, flags);
     printf("declare -%s %s", count ? flags : "-", name);
     if (array_var) {
-        fputs("=(", stdout);
-        for (size_t i = 0; i < array_var->count; ++i) {
-            if (i > 0) {
-                fputc(' ', stdout);
-            }
-            if (array_var->keys && array_var->keys[i]) {
-                printf("[%s]=", array_var->keys[i]);
-            } else {
-                printf("[%zu]=", i);
-            }
-            shellDeclarePrintQuoted(array_var->values[i] ? array_var->values[i] : "");
-        }
-        fputc(')', stdout);
-    } else {
+        fputc('=', stdout);
+        shellDeclarePrintArrayValues(array_var);
+    } else if (is_set) {
         fputc('=', stdout);
         shellDeclarePrintQuoted(value);
     }
@@ -7373,33 +7510,97 @@ static bool shellDeclarePrintVariable(const char *name) {
     return true;
 }
 
-static void shellDeclarePrintAll(void) {
-    size_t env_count = 0;
-    while (environ && environ[env_count]) {
-        env_count++;
-    }
-    char **names = (char **)calloc(env_count ? env_count : 1, sizeof(char *));
-    if (!names) {
-        return;
-    }
+static void shellExportListAdd(char ***names, size_t *count, size_t *capacity, const char *name, size_t len);
+
+/* Bash's byte order. A name it has set by the time a script starts counts if it has a value
+ * here, though nothing in the environment holds it. */
+static char **shellVariableNamesSorted(size_t *out_count) {
+    static const char *const kShellOwnVariables[] = {
+        "BASH_VERSINFO", "BASH_VERSION", "EUID", "HOSTNAME", "HOSTTYPE", "IFS", "MACHTYPE", "OPTERR", "OPTIND",
+        "OSTYPE", "PPID", "PS4", "PWD", "UID", "_"
+    };
+    char **names = NULL;
     size_t count = 0;
-    for (size_t i = 0; i < env_count; ++i) {
-        const char *eq = strchr(environ[i], '=');
-        if (eq) {
-            names[count] = strndup(environ[i], (size_t)(eq - environ[i]));
-            if (names[count]) {
-                count++;
+    size_t capacity = 0;
+    for (char **env = environ; env && *env; ++env) {
+        const char *eq = strchr(*env, '=');
+        if (eq && strncmp(*env, "EXSH_LAST_STATUS=", 17) != 0) {
+            shellExportListAdd(&names, &count, &capacity, *env, (size_t)(eq - *env));
+        }
+    }
+    SHELL_EXPORT_LOCK();
+    const ShellNameSet *pending = &shellExportFlagsCurrent()->pending;
+    for (size_t i = 0; i < pending->count; ++i) {
+        shellExportListAdd(&names, &count, &capacity, pending->names[i], strlen(pending->names[i]));
+    }
+    SHELL_EXPORT_UNLOCK();
+    for (size_t depth = 0; depth < gShellLocalScopeDepth; ++depth) {
+        const ShellLocalScopeFrame *frame = &gShellLocalScopeStack[depth];
+        for (size_t i = 0; i < frame->count; ++i) {
+            if (frame->variables[i].name) {
+                shellExportListAdd(&names, &count, &capacity, frame->variables[i].name,
+                                   strlen(frame->variables[i].name));
             }
         }
     }
-    qsort(names, count, sizeof(char *), shellParamCompareStrings);
+    for (size_t i = 0; i < sizeof(kShellOwnVariables) / sizeof(kShellOwnVariables[0]); ++i) {
+        const char *name = kShellOwnVariables[i];
+        bool is_set = false;
+        free(shellLookupParameterValueInternal(name, strlen(name), &is_set));
+        if (is_set) {
+            shellExportListAdd(&names, &count, &capacity, name, strlen(name));
+        }
+    }
+    for (size_t i = 0; i < gShellArrayVarCount; ++i) {
+        if (gShellArrayVars[i].name) {
+            shellExportListAdd(&names, &count, &capacity, gShellArrayVars[i].name, strlen(gShellArrayVars[i].name));
+        }
+    }
+    if (count > 1) {
+        qsort(names, count, sizeof(char *), shellParamCompareStrings);
+    }
+    *out_count = count;
+    return names;
+}
+
+/* declare -p: all of them. With attribute letters, those that have any of them. */
+static void shellDeclarePrintAll(const char *wanted) {
+    size_t count = 0;
+    char **names = shellVariableNamesSorted(&count);
     for (size_t i = 0; i < count; ++i) {
-        if (strcmp(names[i], "EXSH_LAST_STATUS") != 0) {
+        char flags[8];
+        shellDeclareFlags(names[i], shellArrayRegistryFindConst(names[i]), flags);
+        if (!wanted || strpbrk(flags, wanted)) {
             shellDeclarePrintVariable(names[i]);
         }
         free(names[i]);
     }
     free(names);
+}
+
+/* `set` and `declare` alone, one line each that sets it back. What has no value stays out. */
+static void shellSetPrintAll(void) {
+    size_t count = 0;
+    char **names = shellVariableNamesSorted(&count);
+    for (size_t i = 0; i < count; ++i) {
+        const char *name = names[i];
+        bool is_set = false;
+        char *value = shellLookupParameterValueInternal(name, strlen(name), &is_set);
+        const ShellArrayVariable *array_var = shellArrayRegistryFindConst(name);
+        if (array_var) {
+            printf("%s=", name);
+            shellDeclarePrintArrayValues(array_var);
+            fputc('\n', stdout);
+        } else if (is_set && value) {
+            char *quoted = shellSetQuoteValue(value);
+            printf("%s=%s\n", name, quoted ? quoted : "");
+            free(quoted);
+        }
+        free(value);
+        free(names[i]);
+    }
+    free(names);
+    fflush(stdout);
 }
 
 static void shellDeclarePrintFunctions(void) {
@@ -7518,6 +7719,42 @@ Value vmBuiltinShellDeclare(VM *vm, int arg_count, Value *args) {
         index++;
     }
 
+    /* No names: `declare` is `set`, and an attribute asks for those that have it. */
+    char wanted_flags[8] = "";
+    if (ok && index >= arg_count && !functions_mode && exit_status == 0 && !global_scope) {
+        size_t wanted = 0;
+        if (associative) {
+            wanted_flags[wanted++] = 'A';
+        }
+        if (indexed_array) {
+            wanted_flags[wanted++] = 'a';
+        }
+        if (integer_attribute) {
+            wanted_flags[wanted++] = 'i';
+        }
+        if (set_attributes & SHELL_VAR_ATTR_LOWER) {
+            wanted_flags[wanted++] = 'l';
+        }
+        if (mark_readonly) {
+            wanted_flags[wanted++] = 'r';
+        }
+        if (set_attributes & SHELL_VAR_ATTR_UPPER) {
+            wanted_flags[wanted++] = 'u';
+        }
+        if (mark_exported) {
+            wanted_flags[wanted++] = 'x';
+        }
+        wanted_flags[wanted] = '\0';
+        if (wanted > 0) {
+            print_mode = true;
+        } else if (!print_mode && !mark_unexported && !clear_attributes) {
+            shellSetPrintAll();
+            gShellRuntime.local_scope_active = false;
+            shellUpdateStatus(0);
+            return makeVoid();
+        }
+    }
+
     if (ok && (print_mode || functions_mode)) {
         int print_status = 0;
         bool printed_any = false;
@@ -7542,7 +7779,7 @@ Value vmBuiltinShellDeclare(VM *vm, int arg_count, Value *args) {
             if (functions_mode) {
                 shellDeclarePrintFunctions();
             } else {
-                shellDeclarePrintAll();
+                shellDeclarePrintAll(wanted_flags[0] ? wanted_flags : NULL);
             }
         }
         fflush(stdout);
@@ -7571,9 +7808,20 @@ Value vmBuiltinShellDeclare(VM *vm, int arg_count, Value *args) {
         {
             char *attribute_name = strndup(spec, eq ? (size_t)(eq - spec) : strlen(spec));
             if (attribute_name) {
-                shellVariableSetAttribute(attribute_name,
-                                          set_attributes | (integer_attribute ? SHELL_VAR_ATTR_INTEGER : 0u),
-                                          clear_attributes);
+                unsigned attributes_on = set_attributes | (integer_attribute ? SHELL_VAR_ATTR_INTEGER : 0u);
+                if (use_local_scope && (attributes_on || clear_attributes)) {
+                    ShellLocalScopeFrame *top = &gShellLocalScopeStack[gShellLocalScopeDepth - 1];
+                    ShellLocalVariable *local = shellLocalScopeFrameFind(top, attribute_name);
+                    if (!local && shellLocalScopeSetOnCurrentFrame(attribute_name, "", false)) {
+                        local = shellLocalScopeFrameFind(top, attribute_name);
+                        local->no_value = true;
+                    }
+                    if (local) {
+                        local->attributes = (local->attributes & ~clear_attributes) | attributes_on;
+                    }
+                } else if (!use_local_scope) {
+                    shellVariableSetAttribute(attribute_name, attributes_on, clear_attributes);
+                }
                 /* A local is not there yet: see the end of this loop's two branches. */
                 if (!use_local_scope) {
                     if (mark_exported) {
@@ -7602,6 +7850,9 @@ Value vmBuiltinShellDeclare(VM *vm, int arg_count, Value *args) {
                     } else if (setenv(spec, "", 1) != 0) {
                         runtimeError(vm, "declare: unable to set '%s'", spec);
                         ok = false;
+                    } else {
+                        /* Its copy there is the shell's own, also while a local hides the array. */
+                        shellExportMarkUnexported(spec);
                     }
                 }
             } else {
@@ -9785,6 +10036,11 @@ static void shellSetPrintOptions(bool as_table) {
 }
 
 Value vmBuiltinShellSet(VM *vm, int arg_count, Value *args) {
+    if (arg_count == 0) {
+        shellSetPrintAll();
+        shellUpdateStatus(0);
+        return makeVoid();
+    }
     bool ok = true;
     bool parsing_options = true;
     bool replace_positional = false;
@@ -10128,9 +10384,24 @@ Value vmBuiltinShellLocal(VM *vm, int arg_count, Value *args) {
         return makeVoid();
     }
 
-    /* No arguments: just enable local scope for the current function frame. */
+    /* No arguments: what this function has made. */
     if (arg_count == 0) {
-        gShellRuntime.local_scope_active = true;
+        const ShellLocalScopeFrame *frame = &gShellLocalScopeStack[gShellLocalScopeDepth - 1];
+        char **names = (char **)calloc(frame->count ? frame->count : 1, sizeof(char *));
+        size_t count = 0;
+        for (size_t i = 0; names && i < frame->count; ++i) {
+            if (frame->variables[i].name) {
+                names[count++] = frame->variables[i].name;
+            }
+        }
+        if (count > 1) {
+            qsort(names, count, sizeof(char *), shellParamCompareStrings);
+        }
+        for (size_t i = 0; i < count; ++i) {
+            shellDeclarePrintVariable(names[i]);
+        }
+        free(names);
+        fflush(stdout);
         shellUpdateStatus(0);
         return makeVoid();
     }
@@ -10207,6 +10478,15 @@ Value vmBuiltinShellLocal(VM *vm, int arg_count, Value *args) {
         if (literal) {
             value++;
         }
+        /* One already in this function keeps its value. */
+        ShellLocalVariable *already = shellLocalScopeFrameFind(&gShellLocalScopeStack[gShellLocalScopeDepth - 1], name);
+        if (!eq && already) {
+            if (mark_exported || mark_unexported) {
+                already->exported = mark_exported;
+            }
+            free(name);
+            continue;
+        }
         char *coerced = NULL;
         if (!literal && integer_attribute) {
             long long number = 0;
@@ -10232,6 +10512,9 @@ Value vmBuiltinShellLocal(VM *vm, int arg_count, Value *args) {
         }
         ShellLocalVariable *local = shellLocalScopeFind(name);
         local->no_value = !eq;
+        local->attributes = (integer_attribute ? SHELL_VAR_ATTR_INTEGER : 0u) |
+                            (lower_attribute ? SHELL_VAR_ATTR_LOWER : 0u) |
+                            (upper_attribute ? SHELL_VAR_ATTR_UPPER : 0u);
         if (mark_exported || mark_unexported) {
             local->exported = mark_exported;
         }
@@ -12068,8 +12351,25 @@ Value vmBuiltinShellKill(VM *vm, int arg_count, Value *args) {
             if (!any) {
                 rc = shellJobControlSendPgid(pgid, signal_number);
             }
-        } else {
+        }
+#if defined(PSCAL_TARGET_IOS)
+        /* To itself, with a trap waiting: Ctrl-C's route through the vproc would not get there. */
+        else if (target_pid == getpid() && signal_number > 0 && signal_number < NSIG &&
+                 shellRuntimeGetSignalTrapAction(signal_number) == SHELL_TRAP_ACTION_COMMAND) {
+            gShellTrapSignalsPending[signal_number] = 1;
+        }
+#endif
+        else {
             rc = shellJobControlSendPid(target_pid, signal_number);
+#if !defined(PSCAL_TARGET_IOS)
+            /* A thread of this process may be the one that takes it, a moment from now. */
+            if (rc == 0 && target_pid == getpid() && signal_number > 0 && signal_number < NSIG &&
+                shellRuntimeGetSignalTrapAction(signal_number) == SHELL_TRAP_ACTION_COMMAND) {
+                for (int waited = 0; waited < 200 && !gShellPendingSignals[signal_number]; ++waited) {
+                    usleep(1000);
+                }
+            }
+#endif
         }
         if (rc != 0) {
             fprintf(stderr, "kill: (%ld) %s\n", pid_value, strerror(errno));

@@ -2402,6 +2402,9 @@ typedef struct {
     int param_count;
     char cwd[PATH_MAX];
     pid_t dollar_pid;
+    struct ShellVariableAttribute *attributes;
+    size_t attribute_count;
+    bool ifs_unset;
 } ShellBodyState;
 
 /* What a thread started by a subshell takes from it, beyond the vproc every new thread
@@ -2481,6 +2484,7 @@ typedef struct {
     bool previous_was_array;
     bool was_exported;
     bool was_pending_export;
+    bool previous_no_value;
 } ShellAssignmentBackup;
 
 static bool shellGlobalIsExported(const char *name);
@@ -2492,8 +2496,14 @@ typedef struct {
     bool is_array_literal;
     /* A local exports on its own: the global of that name keeps its own state. */
     bool exported;
-    /* `local x`: declared, with no value yet to give a child. */
+    /* `local x`, or `unset x` in the function that made it: no value, and any outer one
+     * stays hidden until the function returns. */
     bool no_value;
+    /* An array of that name is waiting behind it. */
+    bool shadows_array;
+    bool shadows_associative;
+    /* declare -i, -l and -u on it. */
+    unsigned attributes;
 } ShellLocalVariable;
 
 typedef struct ShellLocalScopeFrame {
@@ -2513,6 +2523,9 @@ static void shellLocalVariableDispose(ShellLocalVariable *var) {
     var->is_array_literal = false;
     var->exported = false;
     var->no_value = false;
+    var->shadows_array = false;
+    var->shadows_associative = false;
+    var->attributes = 0;
 }
 
 static void shellLocalScopeFrameReset(ShellLocalScopeFrame *frame) {
@@ -2656,9 +2669,14 @@ static void shellLocalScopePop(void) {
     ShellLocalScopeFrame *frame = &gShellLocalScopeStack[gShellLocalScopeDepth - 1];
     for (size_t i = 0; i < frame->count; ++i) {
         ShellLocalVariable *var = &frame->variables[i];
-        if (var->name && var->is_array_literal) {
+        if (var->name && (var->is_array_literal || var->shadows_array)) {
             shellArrayRegistryRemove(var->name);
             shellArrayRegistryRestoreVisibleValue(var->name, frame);
+            /* Its text says what it is unless it has nothing in it. */
+            const ShellArrayVariable *restored = shellArrayRegistryFindConst(var->name);
+            if (var->shadows_associative && restored && restored->kind != SHELL_ARRAY_KIND_ASSOCIATIVE) {
+                shellArrayRegistryInitializeAssociative(var->name);
+            }
         }
     }
     shellLocalScopeFrameReset(frame);
@@ -2679,6 +2697,7 @@ static bool shellLocalScopeSetOnCurrentFrame(const char *name, const char *value
     if (!existing) {
         /* A local of an exported name stays exported, as under bash. */
         ShellLocalVariable *outer = shellLocalScopeFind(name);
+        const ShellArrayVariable *shadowed = shellArrayRegistryFindConst(name);
         bool exported = shellVariableAllExportEnabled() ||
                         (outer ? outer->exported : shellGlobalIsExported(name));
         if (!shellLocalScopeEnsureCapacity(frame, frame->count + 1)) {
@@ -2693,6 +2712,10 @@ static bool shellLocalScopeSetOnCurrentFrame(const char *name, const char *value
         existing->value = NULL;
         existing->is_array_literal = false;
         existing->exported = exported;
+        existing->no_value = false;
+        existing->shadows_array = shadowed != NULL;
+        existing->shadows_associative = shadowed && shadowed->kind == SHELL_ARRAY_KIND_ASSOCIATIVE && !shadowed->sparse;
+        existing->attributes = 0;
         created_new = true;
     }
     char *copy = strdup(value ? value : "");
@@ -2772,6 +2795,19 @@ static bool shellLocalScopeUnset(const char *name) {
                 if (was_array) {
                     shellArrayRegistryRemove(var->name);
                 }
+                /* In the function that made it, the name stays local: what is outside
+                 * comes back only when the function returns. From a function it called,
+                 * it goes, and the next one out shows. */
+                if (depth == gShellLocalScopeDepth) {
+                    free(var->value);
+                    var->value = NULL;
+                    var->shadows_array = var->shadows_array || was_array;
+                    var->is_array_literal = false;
+                    var->exported = false;
+                    var->no_value = true;
+                    var->attributes = 0;
+                    return true;
+                }
                 shellLocalVariableDispose(var);
                 if (i + 1 < frame->count) {
                     memmove(&frame->variables[i], &frame->variables[i + 1],
@@ -2784,6 +2820,8 @@ static bool shellLocalScopeUnset(const char *name) {
                     frame->variables[frame->count].is_array_literal = false;
                     frame->variables[frame->count].exported = false;
                     frame->variables[frame->count].no_value = false;
+                    frame->variables[frame->count].shadows_array = false;
+                    frame->variables[frame->count].attributes = 0;
                 }
                 if (was_array) {
                     shellArrayRegistryRestoreVisibleValue(name, NULL);
@@ -3202,7 +3240,7 @@ static bool shellVariableIsExported(const char *name) {
 #define SHELL_VAR_ATTR_INTEGER 1u
 #define SHELL_VAR_ATTR_LOWER 2u
 #define SHELL_VAR_ATTR_UPPER 4u
-typedef struct {
+typedef struct ShellVariableAttribute {
     char *name;
     unsigned flags;
 } ShellVariableAttribute;
@@ -3210,6 +3248,11 @@ static PSCAL_THREAD_LOCAL ShellVariableAttribute *gShellVariableAttributes = NUL
 static PSCAL_THREAD_LOCAL size_t gShellVariableAttributeCount = 0;
 
 static bool shellVariableHasAttribute(const char *name, unsigned flag) {
+    /* A local has its own, and takes none from what it hides. */
+    ShellLocalVariable *local = shellLocalScopeFind(name);
+    if (local) {
+        return (local->attributes & flag) != 0;
+    }
     for (size_t i = 0; i < gShellVariableAttributeCount; ++i) {
         if (strcmp(gShellVariableAttributes[i].name, name) == 0) {
             return (gShellVariableAttributes[i].flags & flag) != 0;
@@ -3246,7 +3289,7 @@ static bool shellArithmeticEvaluateText(const char *text, int depth, long long *
 
 /* The value after a variable's attributes, or NULL if they leave it as it is. */
 static char *shellApplyVariableAttributes(const char *name, const char *value) {
-    if (gShellVariableAttributeCount == 0) {
+    if (gShellVariableAttributeCount == 0 && gShellLocalScopeDepth == 0) {
         return NULL;
     }
     if (shellVariableHasAttribute(name, SHELL_VAR_ATTR_INTEGER)) {
@@ -3274,6 +3317,13 @@ static char *shellApplyVariableAttributes(const char *name, const char *value) {
 }
 static PSCAL_THREAD_LOCAL VM *gShellCurrentVm = NULL;
 static volatile sig_atomic_t gShellPendingSignals[NSIG] = {0};
+static _Thread_local uint64_t gShellSignalTrapsRunning = 0;
+#if defined(PSCAL_TARGET_IOS)
+/* Shells share the process there, and a nested one the thread: what is sent waits on the
+ * vproc it went to, and what is here is what this thread's shell has taken from its own.
+ * Ctrl-C and the like keep their process-wide flag. */
+static _Thread_local volatile sig_atomic_t gShellTrapSignalsPending[NSIG] = {0};
+#endif
 void shellResetJobIds(void) {
     gShellRuntimeDefault.job_next_id = 1;
     if (SC()) {
@@ -3629,8 +3679,14 @@ static void shellRuntimeExecuteTrap(const char *command, const char *label) {
     opts.quiet = true;
     opts.exit_on_signal = shellRuntimeExitOnSignal();
     opts.suppress_warnings = true;
+    /* Like eval: the locals and loops it broke into are its own. */
+    opts.share_runtime_context = true;
     const char *frontend = shellRuntimeGetArg0();
     opts.frontend_path = frontend ? frontend : "exsh";
+    ShellPipelineContext *caller_pipeline = &gShellRuntime.pipeline;
+    ShellPipelineContext saved_pipeline = *caller_pipeline;
+    memset(caller_pipeline, 0, sizeof(*caller_pipeline));
+    caller_pipeline->pgid = -1;
 
     bool saved_exit_requested = gShellExitRequested;
     bool saved_break_requested = gShellRuntime.break_requested;
@@ -3678,6 +3734,8 @@ static void shellRuntimeExecuteTrap(const char *command, const char *label) {
     if (can_run || shellSymbolTableScopeIsActive()) {
         status = shellRunSource(command, label ? label : "<trap>", &opts, &exit_requested);
     }
+    shellResetPipeline();
+    *caller_pipeline = saved_pipeline;
 
     if (scope_pushed) {
         shellSymbolTableScopePop(&table_scope);
@@ -3689,6 +3747,9 @@ static void shellRuntimeExecuteTrap(const char *command, const char *label) {
 
     if (exit_requested) {
         shellRuntimeRequestExit();
+        if (current_vm) {
+            current_vm->exit_requested = true;
+        }
     }
 
     bool trap_exit_requested = gShellExitRequested;
@@ -3829,7 +3890,40 @@ void shellRuntimeRunSignalTrap(int signo) {
     }
     char label[32];
     snprintf(label, sizeof(label), "<trap-%d>", signo);
-    shellRuntimeExecuteTrap(entry->command, label);
+    int status_before = gShellRuntime.last_status;
+    bool errexit_before = gShellRuntime.errexit_pending;
+    /* Another signal's trap may break into this one. Its own waits until this one is done. */
+    uint64_t own_bit = (uint64_t)1 << (signo % 64);
+    bool nested = gShellTrapExecuting;
+    gShellSignalTrapsRunning |= own_bit;
+    gShellTrapExecuting = false;
+    gShellReturnPending = false;
+    /* The text outlives this call even if the trap changes itself. */
+    char *command = strdup(entry->command);
+    shellRuntimeExecuteTrap(command, label);
+    free(command);
+    gShellTrapExecuting = nested;
+    gShellSignalTrapsRunning &= ~own_bit;
+    /* `return` in the text ends the function it broke into, as under eval. */
+    if (gShellReturnPending && !gShellExitRequested) {
+        if (shellLocalScopeDepth() == 0 && shellRuntimeIsOutermostScript() && !gShellRuntime.in_subshell) {
+            gShellReturnPending = false;
+            runtimeError(gShellCurrentVm, "return: can only `return' from a function or sourced script");
+            gShellRuntime.last_status = status_before;
+            return;
+        }
+        shellUpdateStatus(gShellReturnStatus);
+        if (gShellCurrentVm) {
+            gShellCurrentVm->exit_requested = true;
+            gShellCurrentVm->current_builtin_name = "return";
+        }
+        return;
+    }
+    /* Otherwise $? is what it was, unless that was the end of the shell. */
+    if (!gShellExitRequested) {
+        gShellRuntime.last_status = status_before;
+        gShellRuntime.errexit_pending = errexit_before;
+    }
 }
 
 static void shellRuntimeRunDebugTrap(void) {
@@ -4125,6 +4219,14 @@ bool shellRuntimeSetSignalTrap(int signo, ShellTrapAction action, const char *co
 
     if (action == SHELL_TRAP_ACTION_COMMAND) {
         sa.sa_handler = shellSignalHandler;
+#if defined(PSCAL_TARGET_IOS)
+        if (signo == SIGCHLD) {
+            /* Every applet there has a vproc, echo's in a trap too, so this would mean nothing. */
+            sa.sa_handler = SIG_DFL;
+        } else if (signo != SIGINT && signo != SIGQUIT && signo != SIGTSTP) {
+            sa.sa_handler = vprocDeferSignal;
+        }
+#endif
         sa.sa_flags |= SA_RESTART;
     } else if (action == SHELL_TRAP_ACTION_IGNORE) {
         sa.sa_handler = SIG_IGN;
@@ -4968,6 +5070,15 @@ static ShellRuntimeState *shellRuntimeCreateProgramContext(void) {
     if (!ctx) {
         return NULL;
     }
+    /* What is ignored stays so, as across an exec. */
+    for (int signo = 1; signo < NSIG; ++signo) {
+        if (ctx->signal_traps[signo].action == SHELL_TRAP_ACTION_COMMAND) {
+            shellTrapClearEntry(&ctx->signal_traps[signo]);
+        }
+    }
+    if (ctx->exit_trap.action == SHELL_TRAP_ACTION_COMMAND) {
+        shellTrapClearEntry(&ctx->exit_trap);
+    }
     for (size_t i = 0; i < ctx->array_var_count; ++i) {
         shellArrayVariableClear(&ctx->array_vars[i]);
     }
@@ -5109,6 +5220,9 @@ void shellRuntimeContextInheritLocals(ShellRuntimeState *ctx, size_t skip_top) {
             copy->is_array_literal = var->is_array_literal;
             copy->exported = var->exported;
             copy->no_value = var->no_value;
+            copy->shadows_array = var->shadows_array;
+            copy->shadows_associative = var->shadows_associative;
+            copy->attributes = var->attributes;
             if (copy->name) {
                 dst->count++;
             }

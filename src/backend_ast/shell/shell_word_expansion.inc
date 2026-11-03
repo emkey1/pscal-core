@@ -1087,16 +1087,17 @@ static void shellHandleSignalCommon(int signo, bool from_status) {
         if (!from_status && (signo == SIGINT || stop_request)) {
             dispatched = shellJobControlDispatchForegroundSignal(signo);
         }
-        if (gShellCurrentVm && !stop_request) {
+        /* With a trap the script goes on after it, unless the trap ends it. */
+        if (gShellCurrentVm && !stop_request && !command_trap) {
             gShellCurrentVm->exit_requested = true;
             gShellCurrentVm->current_builtin_name = "signal";
         }
 
-        if (!gShellRuntime.job_control_enabled && !stop_request) {
+        if (!gShellRuntime.job_control_enabled && !stop_request && !command_trap) {
             shellRuntimeRequestExit();
         }
 
-        if (gShellLoopStackSize > 0 && !stop_request) {
+        if (gShellLoopStackSize > 0 && !stop_request && !command_trap) {
             gShellRuntime.break_requested = true;
             gShellRuntime.break_requested_levels = (int)gShellLoopStackSize;
             shellLoopRequestBreakLevels((int)gShellLoopStackSize);
@@ -1163,12 +1164,32 @@ static void shellHandleStatusSignal(int signo) {
 }
 
 void shellRuntimeProcessPendingSignals(void) {
-    for (int signo = 1; signo < NSIG; ++signo) {
-        if (!gShellPendingSignals[signo]) {
-            continue;
+#if defined(PSCAL_TARGET_IOS)
+    /* What another thread sent waits in this vproc's table. */
+    vprocDeliverPendingSignals();
+    for (int taken = vprocTakeDeferredSignal(); taken > 0; taken = vprocTakeDeferredSignal()) {
+        gShellTrapSignalsPending[taken] = 1;
+    }
+#endif
+    bool again = true;
+    while (again) {
+        again = false;
+        for (int signo = 1; signo < NSIG; ++signo) {
+            bool pending = gShellPendingSignals[signo];
+#if defined(PSCAL_TARGET_IOS)
+            pending = pending || gShellTrapSignalsPending[signo];
+#endif
+            /* One sent by its own trap comes when that trap is done. */
+            if (!pending || (gShellSignalTrapsRunning & ((uint64_t)1 << (signo % 64)))) {
+                continue;
+            }
+            gShellPendingSignals[signo] = 0;
+#if defined(PSCAL_TARGET_IOS)
+            gShellTrapSignalsPending[signo] = 0;
+#endif
+            shellHandlePendingSignal(signo);
+            again = true;
         }
-        gShellPendingSignals[signo] = 0;
-        shellHandlePendingSignal(signo);
     }
 }
 
@@ -1806,28 +1827,32 @@ bool shellRuntimeExpandHistoryReference(const char *input,
 }
 
 #if defined(PSCAL_TARGET_IOS)
+static VmBuiltinFn shellIOSFrontendHandler(const char *name) {
+    if (strcasecmp(name, "clike") == 0) {
+        return vmBuiltinShellClike;
+    } else if (strcasecmp(name, "pascal") == 0) {
+        return vmBuiltinShellPascal;
+    } else if (strcasecmp(name, "rea") == 0) {
+        return vmBuiltinShellRea;
+    } else if (strcasecmp(name, "aether") == 0) {
+        return vmBuiltinShellAether;
+    } else if (strcasecmp(name, "pscalvm") == 0) {
+        return vmBuiltinShellPscalVm;
+    } else if (strcasecmp(name, "pscaljson2bc") == 0) {
+        return vmBuiltinShellPscalJson2bc;
+    } else if (strcasecmp(name, "exsh") == 0 || strcasecmp(name, "sh") == 0) {
+        return vmBuiltinShellExshTool;
+    }
+    return NULL;
+}
+
 static bool shellDispatchIOSFrontendBuiltin(VM *vm, ShellCommand *cmd) {
     if (!cmd || !cmd->argv || !cmd->argv[0]) {
         return false;
     }
     char lookup_buf[PATH_MAX];
     const char *name = shellCommandLookupName(cmd->argv[0], lookup_buf, sizeof(lookup_buf));
-    VmBuiltinFn handler = NULL;
-    if (strcasecmp(name, "clike") == 0) {
-        handler = vmBuiltinShellClike;
-    } else if (strcasecmp(name, "pascal") == 0) {
-        handler = vmBuiltinShellPascal;
-    } else if (strcasecmp(name, "rea") == 0) {
-        handler = vmBuiltinShellRea;
-    } else if (strcasecmp(name, "aether") == 0) {
-        handler = vmBuiltinShellAether;
-    } else if (strcasecmp(name, "pscalvm") == 0) {
-        handler = vmBuiltinShellPscalVm;
-    } else if (strcasecmp(name, "pscaljson2bc") == 0) {
-        handler = vmBuiltinShellPscalJson2bc;
-    } else if (strcasecmp(name, "exsh") == 0 || strcasecmp(name, "sh") == 0) {
-        handler = vmBuiltinShellExshTool;
-    }
+    VmBuiltinFn handler = shellIOSFrontendHandler(name);
     if (!handler) {
         return false;
     }
@@ -2129,6 +2154,13 @@ static void shellSubshellResetState(pid_t dollar_pid) {
 }
 
 #if defined(PSCAL_TARGET_IOS)
+static void shellVariableAttributesFree(ShellVariableAttribute *attributes, size_t count) {
+    for (size_t i = 0; i < count; ++i) {
+        free(attributes[i].name);
+    }
+    free(attributes);
+}
+
 static void shellBodyStateFree(ShellBodyState *state) {
     if (!state) {
         return;
@@ -2140,6 +2172,7 @@ static void shellBodyStateFree(ShellBodyState *state) {
     if (state->params) {
         shellFreeParameterArray(state->params, state->param_count);
     }
+    shellVariableAttributesFree(state->attributes, state->attribute_count);
     free(state);
 }
 
@@ -2178,6 +2211,24 @@ static ShellBodyState *shellBodyStateCapture(void) {
         state->cwd[0] = '\0';
     }
     state->dollar_pid = shellRuntimeDollarPid();
+    /* A thread's own, and the stage's thread is another. */
+    state->ifs_unset = gShellIfsUnset;
+    if (gShellVariableAttributeCount > 0) {
+        state->attributes = (ShellVariableAttribute *)calloc(gShellVariableAttributeCount, sizeof(ShellVariableAttribute));
+        if (!state->attributes) {
+            shellBodyStateFree(state);
+            return NULL;
+        }
+        for (size_t i = 0; i < gShellVariableAttributeCount; ++i) {
+            state->attributes[i].name = strdup(gShellVariableAttributes[i].name);
+            state->attributes[i].flags = gShellVariableAttributes[i].flags;
+            state->attribute_count = i + 1;
+            if (!state->attributes[i].name) {
+                shellBodyStateFree(state);
+                return NULL;
+            }
+        }
+    }
     return state;
 }
 
@@ -2189,6 +2240,9 @@ typedef struct {
     int saved_param_count;
     bool saved_params_owned;
     mode_t saved_umask;
+    ShellVariableAttribute *saved_attributes;
+    size_t saved_attribute_count;
+    bool saved_ifs_unset;
 } ShellBodyScope;
 
 static void shellBodyScopeEnter(ShellBodyState *state, ShellBodyScope *scope) {
@@ -2216,6 +2270,14 @@ static void shellBodyScopeEnter(ShellBodyState *state, ShellBodyScope *scope) {
     gParamCount = state->param_count;
     gShellPositionalOwned = (state->params != NULL);
     state->params = NULL;
+    scope->saved_attributes = gShellVariableAttributes;
+    scope->saved_attribute_count = gShellVariableAttributeCount;
+    gShellVariableAttributes = state->attributes;
+    gShellVariableAttributeCount = state->attribute_count;
+    state->attributes = NULL;
+    state->attribute_count = 0;
+    scope->saved_ifs_unset = gShellIfsUnset;
+    gShellIfsUnset = state->ifs_unset;
     (void)vprocConsumeClosedPipe();
 }
 
@@ -2229,6 +2291,10 @@ static void shellBodyScopeLeave(ShellBodyState *state, const ShellBodyScope *sco
     gParamValues = scope->saved_params;
     gParamCount = scope->saved_param_count;
     gShellPositionalOwned = scope->saved_params_owned;
+    shellVariableAttributesFree(gShellVariableAttributes, gShellVariableAttributeCount);
+    gShellVariableAttributes = scope->saved_attributes;
+    gShellVariableAttributeCount = scope->saved_attribute_count;
+    gShellIfsUnset = scope->saved_ifs_unset;
     vprocEnvActivate(scope->previous_env);
     vprocSetSubshellPid(scope->previous_subshell_pid);
     shellRuntimeActivateContext(scope->previous_ctx);
@@ -2309,7 +2375,7 @@ static bool shellStageNeedsOwnState(const ShellCommand *cmd) {
     const char *name = shellCommandLookupName(cmd->argv[0], lookup_buf, sizeof(lookup_buf));
     /* These ask about the shell's variables, a function's locals among them. */
     static const char *const about_variables[] = {"export", "declare", "typeset", "readonly", "local", "unset",
-                                                  "read", "getopts"};
+                                                  "read", "getopts", "set"};
     for (size_t i = 0; i < sizeof(about_variables) / sizeof(about_variables[0]); ++i) {
         if (strcmp(name, about_variables[i]) == 0) {
             return true;
@@ -3860,7 +3926,7 @@ static bool shellAddArg(ShellCommand *cmd, const char *arg, bool *saw_command_wo
     }
 
     if ((cmd->argc == 0 && !has_command && strcmp(text, "[[") == 0) ||
-        (cmd->argc > 0 && strcmp(cmd->argv[0], "[[") == 0)) {
+        (cmd->argc > 0 && !at_assignment && strcmp(cmd->argv[0], "[[") == 0)) {
         cmd->disable_field_splitting = true;
         return shellAddDoubleBracketWord(cmd, text, flags, meta, meta_len, saw_command_word);
     }

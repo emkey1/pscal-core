@@ -319,6 +319,13 @@ int vprocPollShim(struct pollfd *fds, nfds_t nfds, int timeout);
 int vprocSelectShim(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout);
 pid_t vprocWaitPidShim(pid_t pid, int *status_out, int options);
 int vprocKillShim(pid_t pid, int sig);
+/* Runs this thread's vproc's handlers for what other threads have sent it. */
+void vprocDeliverPendingSignals(void);
+/* As a handler: only notes the signal on the vproc it was sent to, whichever thread sent it,
+ * and a vproc made from that one starts with the default. */
+void vprocDeferSignal(int sig);
+/* What was noted on this thread's vproc, a signal at a time; 0 when there is none. */
+int vprocTakeDeferredSignal(void);
 pid_t vprocGetPidShim(void);
 pid_t vprocGetPpidShim(void);
 pid_t vprocGetpgrpShim(void);
@@ -712,6 +719,9 @@ static inline int vprocOpenShim(const char *path, int flags, ...) {
 }
 static inline pid_t vprocWaitPidShim(pid_t pid, int *status_out, int options) { return waitpid(pid, status_out, options); }
 static inline int vprocKillShim(pid_t pid, int sig) { return kill(pid, sig); }
+static inline void vprocDeliverPendingSignals(void) {}
+static inline void vprocDeferSignal(int sig) { (void)sig; }
+static inline int vprocTakeDeferredSignal(void) { return 0; }
 static inline pid_t vprocGetPidShim(void) { return getpid(); }
 static inline pid_t vprocGetPpidShim(void) { return getppid(); }
 static inline pid_t vprocGetpgrpShim(void) { return getpgrp(); }

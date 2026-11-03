@@ -690,10 +690,9 @@ static void shellEnvironmentAddCommandValues(const ShellCommand *cmd) {
         if (eq && !cmd->assignments[i].is_array_literal) {
             char *name = strndup(text, (size_t)(eq - text));
             if (name) {
-                if (!strchr(name, '[')) {
-                    char *attributed = shellApplyVariableAttributes(name, eq + 1);
-                    setenv(name, attributed ? attributed : eq + 1, 1);
-                    free(attributed);
+                /* A readonly one was refused. Attributes do not reach a prefix. */
+                if (!strchr(name, '[') && !shellReadonlyContains(name)) {
+                    setenv(name, eq + 1, 1);
                 }
                 free(name);
             }
@@ -823,10 +822,11 @@ static char *shellStageFindExecutable(const ShellCommand *cmd) {
 #endif
 
 /* exec's own search reads the environment, where a PATH that is local or not exported
- * will not be. Call before shellEnvironmentForChild. False means no such program. */
-static bool shellLookupForExec(const char *name, char **out_found) {
+ * will not be, nor any PATH for `exec -c`. Call before shellEnvironmentForChild. False
+ * means no such program. */
+static bool shellLookupForExec(const char *name, char **out_found, bool always_search) {
     *out_found = NULL;
-    if (strchr(name, '/') || (!shellExportIsHidden("PATH") && !shellLocalScopeFind("PATH"))) {
+    if (strchr(name, '/') || (!always_search && !shellExportIsHidden("PATH") && !shellLocalScopeFind("PATH"))) {
         return true;
     }
 #if defined(PSCAL_TARGET_IOS)
@@ -876,13 +876,14 @@ static void shellTraceCommand(const ShellCommand *cmd) {
     bool is_set = false;
     char *prompt = shellLookupParameterValueInternal("PS4", 3, &is_set);
     fputs((is_set && prompt) ? prompt : "+ ", stderr);
-    free(prompt);
     bool first = true;
+    /* An assignment gets a line of its own. */
+    const char *line_prompt = (is_set && prompt) ? prompt : "+ ";
     for (size_t i = 0; i < cmd->assignment_count; ++i) {
         const char *text = cmd->assignments[i].text;
         const char *eq = text ? strchr(text, '=') : NULL;
         if (!first) {
-            fputc(' ', stderr);
+            fputs(line_prompt, stderr);
         }
         first = false;
         if (eq) {
@@ -893,6 +894,16 @@ static void shellTraceCommand(const ShellCommand *cmd) {
                 shellTraceWord(eq + 1);
             }
         }
+        fputc('\n', stderr);
+    }
+    if (cmd->argc == 0 && !first) {
+        free(prompt);
+        fflush(stderr);
+        return;
+    }
+    if (!first) {
+        fputs(line_prompt, stderr);
+        first = true;
     }
     bool double_bracket = cmd->argc > 0 && cmd->argv[0] && strcmp(cmd->argv[0], "__shell_double_bracket") == 0;
     for (size_t i = 0; i < cmd->argc; ++i) {
@@ -910,7 +921,57 @@ static void shellTraceCommand(const ShellCommand *cmd) {
         fputs(" ]]", stderr);
     }
     fputc('\n', stderr);
+    free(prompt);
     fflush(stderr);
+}
+
+/* While a command's prefixes are expanded, those already done are set: `A=1 B=$A cmd`. Then
+ * it is all put back, and the command sets them for itself. Silent: it reports a failure. */
+typedef struct {
+    ShellAssignmentBackup **items;
+    size_t count;
+    size_t shown;
+} ShellPrefixView;
+
+static void shellPrefixViewCatchUp(ShellPrefixView *view, const ShellCommand *cmd) {
+    while (view->shown < cmd->assignment_count) {
+        ShellCommand one;
+        memset(&one, 0, sizeof(one));
+        one.assignments = &cmd->assignments[view->shown++];
+        one.assignment_count = 1;
+        ShellAssignmentBackup *backup = NULL;
+        size_t count = 0;
+        /* With no command they are plain variables, attributes and all, and what a substitution
+         * starts does not get them. */
+        if (!shellApplyAssignments(&one, &backup, &count, NULL, NULL, false, cmd->argc > 0) || !backup) {
+            continue;
+        }
+        ShellAssignmentBackup **items =
+            (ShellAssignmentBackup **)realloc(view->items, (view->count + 1) * sizeof(*items));
+        if (!items) {
+            shellRestoreAssignments(backup, count);
+            continue;
+        }
+        view->items = items;
+        view->items[view->count++] = backup;
+    }
+}
+
+static void shellPrefixViewRestore(ShellPrefixView *view) {
+    while (view->count > 0) {
+        shellRestoreAssignments(view->items[--view->count], 1);
+    }
+    free(view->items);
+    view->items = NULL;
+}
+
+static bool shellWordIsAssignment(const char *arg) {
+    const char *text = NULL;
+    const char *meta = NULL;
+    size_t meta_len = 0;
+    uint8_t flags = 0;
+    return strncmp(arg, "redir:", 6) != 0 && shellDecodeWordSpec(arg, &text, &flags, &meta, &meta_len) &&
+           (flags & SHELL_WORD_FLAG_ASSIGNMENT) != 0;
 }
 
 static void shellHashRecordExecution(const char *name);
@@ -939,6 +1000,9 @@ static bool shellBuildCommand(VM *vm, int arg_count, Value *args, ShellCommand *
     if (redir_dbg) {
         fprintf(stderr, "[redir-build] arg_count=%d meta=%s\n", arg_count, AS_STRING(meta));
     }
+    /* Prefix assignments come last: the command's words do not see them. */
+    int first_prefix = 0;
+    int last_prefix = 0;
     for (int i = 1; i < arg_count; ++i) {
         Value v = args[i];
         if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
@@ -948,6 +1012,11 @@ static bool shellBuildCommand(VM *vm, int arg_count, Value *args, ShellCommand *
         }
         if (redir_dbg) {
             fprintf(stderr, "[redir-build]   arg[%d]=%s\n", i, AS_STRING(v));
+        }
+        if (!saw_command_word && shellWordIsAssignment(AS_STRING(v))) {
+            first_prefix = first_prefix ? first_prefix : i;
+            last_prefix = i;
+            continue;
         }
         if (strncmp(AS_STRING(v), "redir:", 6) == 0) {
             if (!shellAddRedirection(out_cmd, AS_STRING(v))) {
@@ -961,9 +1030,30 @@ static bool shellBuildCommand(VM *vm, int arg_count, Value *args, ShellCommand *
                 shellFreeCommand(out_cmd);
                 return false;
             }
+            /* Even one that expands to nothing: `$empty A=1` runs a command named A=1. */
+            saw_command_word = true;
         }
         if (gShellExpansionFailed) {
             /* Reported already, and the command does not run. */
+            shellFreeCommand(out_cmd);
+            return false;
+        }
+    }
+    if (first_prefix > 0) {
+        ShellPrefixView view = {0};
+        bool added = true;
+        for (int i = first_prefix; i <= last_prefix && added && !gShellExpansionFailed; ++i) {
+            if (shellWordIsAssignment(AS_STRING(args[i]))) {
+                bool no_command = false;
+                shellPrefixViewCatchUp(&view, out_cmd);
+                added = shellAddArg(out_cmd, AS_STRING(args[i]), &no_command);
+            }
+        }
+        shellPrefixViewRestore(&view);
+        if (!added) {
+            runtimeError(vm, "shell exec: unable to add argument");
+        }
+        if (!added || gShellExpansionFailed) {
             shellFreeCommand(out_cmd);
             return false;
         }
@@ -1623,7 +1713,7 @@ static int shellSpawnProcess(VM *vm,
             int err = 0;
 #if !defined(PSCAL_TARGET_IOS)
             char *exec_found = NULL;
-            bool exec_lookup_ok = shellLookupForExec(cmd->argv[0], &exec_found);
+            bool exec_lookup_ok = shellLookupForExec(cmd->argv[0], &exec_found, false);
 #endif
             shellEnvironmentForChild(cmd);
 #if defined(PSCAL_TARGET_IOS)
@@ -3081,8 +3171,6 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd) {
                 shellJobControlRestoreForeground();
             }
 
-            shellRuntimeProcessPendingSignals();
-
             if (stopped_job) {
                 ShellJob *job = NULL;
                 if (tail_cmd) {
@@ -3198,7 +3286,6 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd) {
                 shellHandleStatusSignal(final_status - 128);
             }
         }
-        shellRuntimeProcessPendingSignals();
 
         if (!ctx->background && job_control &&
             shellStatusRepresentsStopSignal(final_status, NULL)) {
@@ -3280,8 +3367,6 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd) {
         if (!ctx->background && final_status >= 128 && final_status < 128 + NSIG) {
             shellHandleStatusSignal(final_status - 128);
         }
-
-        shellRuntimeProcessPendingSignals();
 
             if (stopped_job) {
                 ShellJob *job = NULL;
@@ -5611,6 +5696,62 @@ static void shellExitUnlessInteractive(VM *vm, const char *reason) {
     }
 }
 
+#if defined(PSCAL_TARGET_IOS)
+/* What bash would find as a file. Nothing execs here, and a program is whatever runs in its
+ * place: an applet, a frontend, a script, or a builtin that hosts also have as a file. */
+static bool shellProgramExists(const char *name) {
+    char resolved[PATH_MAX];
+    if (strchr(name, '/')) {
+        return shellResolveExecutableCandidate(name, resolved, sizeof(resolved));
+    }
+    if (smallclueFindApplet(name) || shellIOSFrontendHandler(name)) {
+        return true;
+    }
+    static const char *const kShellProgramBuiltins[] = {"echo", "false", "kill", "printf", "pwd", "sleep", "test", "true", "["};
+    for (size_t i = 0; i < sizeof(kShellProgramBuiltins) / sizeof(kShellProgramBuiltins[0]); ++i) {
+        if (strcmp(name, kShellProgramBuiltins[i]) == 0 && shellIsRuntimeBuiltin(name)) {
+            return true;
+        }
+    }
+    return shellResolveExecutionPath(name, resolved, sizeof(resolved));
+}
+
+static bool shellEnvEntryNone(const char *entry, void *arg) {
+    (void)entry;
+    (void)arg;
+    return false;
+}
+
+#endif
+
+/* exec's options: false if they are wrong, reported. */
+static bool shellExecParseOptions(VM *vm, char ***argv, const char **out_arg0, bool *out_clear_env, bool *out_login) {
+    for (char **cursor = *argv; cursor[0] && cursor[0][0] == '-' && cursor[0][1]; ) {
+        if (strcmp(cursor[0], "--") == 0) {
+            *argv = cursor + 1;
+            return true;
+        }
+        const char *flag = cursor[0] + 1;
+        cursor++;
+        for (; *flag; ++flag) {
+            if (*flag == 'c') {
+                *out_clear_env = true;
+            } else if (*flag == 'l') {
+                *out_login = true;
+            } else if (*flag == 'a' && (flag[1] || cursor[0])) {
+                *out_arg0 = flag[1] ? flag + 1 : *cursor++;
+                break;
+            } else {
+                runtimeError(vm, *flag == 'a' ? "exec: -a: option requires an argument" : "exec: -%c: invalid option", *flag);
+                shellUpdateStatus(2);
+                return false;
+            }
+        }
+        *argv = cursor;
+    }
+    return true;
+}
+
 static bool shellExecuteExecBuiltin(VM *vm, ShellCommand *cmd) {
     if (!shellCommandIsExecBuiltin(cmd)) {
         return false;
@@ -5621,12 +5762,24 @@ static bool shellExecuteExecBuiltin(VM *vm, ShellCommand *cmd) {
         return true;
     }
 
-    if (cmd->argc <= 1) {
-        ShellExecRedirBackup *backups = NULL;
-        size_t backup_count = 0;
-        if (!shellApplyExecRedirections(cmd, &backups, &backup_count)) {
-            return true;
-        }
+    ShellExecRedirBackup *backups = NULL;
+    size_t backup_count = 0;
+    if (!shellApplyExecRedirections(cmd, &backups, &backup_count)) {
+        return true;
+    }
+
+    char **argv = &cmd->argv[1];
+    const char *arg0 = NULL;
+    bool clear_env = false;
+    bool login = false;
+    if (cmd->argc > 1 && !shellExecParseOptions(vm, &argv, &arg0, &clear_env, &login)) {
+        shellRestoreExecRedirections(backups, backup_count);
+        shellFreeExecRedirBackups(backups, backup_count);
+        return true;
+    }
+
+    /* Only redirections: they stay. */
+    if (cmd->argc <= 1 || !argv[0]) {
         shellFreeExecRedirBackups(backups, backup_count);
 #if defined(PSCAL_TARGET_IOS)
         for (size_t i = 0; i < cmd->redir_count; ++i) {
@@ -5639,14 +5792,7 @@ static bool shellExecuteExecBuiltin(VM *vm, ShellCommand *cmd) {
         return true;
     }
 
-    ShellExecRedirBackup *backups = NULL;
-    size_t backup_count = 0;
-    if (!shellApplyExecRedirections(cmd, &backups, &backup_count)) {
-        return true;
-    }
-
-    char **argv = &cmd->argv[1];
-    if (!argv || !argv[0] || argv[0][0] == '\0') {
+    if (argv[0][0] == '\0') {
         runtimeError(vm, "exec: expected command");
         shellRestoreExecRedirections(backups, backup_count);
         shellFreeExecRedirBackups(backups, backup_count);
@@ -5654,39 +5800,86 @@ static bool shellExecuteExecBuiltin(VM *vm, ShellCommand *cmd) {
         return true;
     }
 
+#if defined(PSCAL_TARGET_IOS)
+    /* The program runs as a call, and when it is done so is this shell, as if it had been
+     * replaced: no EXIT trap. */
+    if (shellProgramExists(argv[0])) {
+        ShellCommand program;
+        memset(&program, 0, sizeof(program));
+        program.argv = argv;
+        program.argc = cmd->argc - (size_t)(argv - cmd->argv);
+        program.ignore_functions = true;
+        program.pipeline_index = -1;
+        program.assignments = cmd->assignments;
+        program.assignment_count = cmd->assignment_count;
+        program.line = cmd->line;
+        program.column = cmd->column;
+        if (clear_env) {
+            program.program_env = vprocEnvCaptureFiltered(shellEnvEntryNone, NULL);
+        }
+        /* As any stage, or a subshell's `cat < f` stops itself for reading in the background. */
+        vprocSetPipelineStage(true);
+        shellRunBuiltinInProcess(vm, &program, -1, -1, -1, false);
+        vprocSetPipelineStage(false);
+        shellFreeExecRedirBackups(backups, backup_count);
+        int status = gShellRuntime.last_status;
+        shellRuntimeSetExitTrap(SHELL_TRAP_ACTION_DEFAULT, NULL);
+        shellUpdateStatus(status);
+        shellRuntimeRequestExit();
+        if (vm) {
+            vm->exit_requested = true;
+            vm->current_builtin_name = "exec";
+        }
+        return true;
+    }
+    int err = ENOENT;
+#else
     /* Not in a child here: a failed exec has to find everything as it was. */
     PscalEnvSnapshot exec_env = {0};
     bool have_exec_env = pscalEnvSnapshotTake(&exec_env);
     char *exec_found = NULL;
-    bool exec_lookup_ok = shellLookupForExec(argv[0], &exec_found);
-    shellEnvironmentForChild(cmd);
-#if defined(PSCAL_TARGET_IOS)
-    char exec_path[PATH_MAX];
-    const char *resolved_exec = exec_found ? exec_found : argv[0];
-    if (shellResolveExecutionPath(resolved_exec, exec_path, sizeof(exec_path))) {
-        resolved_exec = exec_path;
-    }
-    int err = ENOENT;
-    if (exec_lookup_ok) {
-        execv(resolved_exec, argv);
-        err = errno;
-        if ((err == ENOENT || err == EACCES) && strcmp(resolved_exec, argv[0]) != 0) {
-            execvp(argv[0], argv);
-            err = errno;
+    bool exec_lookup_ok = shellLookupForExec(argv[0], &exec_found, clear_env);
+    if (clear_env) {
+        while (environ && environ[0]) {
+            const char *eq = strchr(environ[0], '=');
+            char *name = eq ? strndup(environ[0], (size_t)(eq - environ[0])) : strdup(environ[0]);
+            if (!name || unsetenv(name) != 0) {
+                free(name);
+                break;
+            }
+            free(name);
         }
+    } else {
+        shellEnvironmentForChild(cmd);
     }
-#else
+    /* -a names it, and -l puts a dash on what it is called. */
+    char *original = argv[0];
+    const char *shown = arg0 ? arg0 : original;
+    const char *slash = arg0 ? NULL : strrchr(shown, '/');
+    char *login_name = NULL;
+    if (login && asprintf(&login_name, "-%s", slash ? slash + 1 : shown) < 0) {
+        login_name = NULL;
+    }
+    if (arg0 || login_name) {
+        argv[0] = login_name ? login_name : (char *)arg0;
+    }
     int err = ENOENT;
     if (exec_lookup_ok) {
-        execvp(exec_found ? exec_found : argv[0], argv);
+        execvp(exec_found ? exec_found : original, argv);
         err = errno;
     }
-#endif
+    argv[0] = original;
+    free(login_name);
     free(exec_found);
     if (have_exec_env) {
         (void)pscalEnvSnapshotRestore(&exec_env);
     }
-    runtimeError(vm, "exec: %s: %s", argv[0], strerror(err));
+#endif
+    if (err == ENOENT && !strchr(argv[0], '/')) {
+        runtimeError(vm, "exec: %s: not found", argv[0]);
+    } else {
+        runtimeError(vm, "exec: %s: %s", argv[0], strerror(err));
+    }
     shellRestoreExecRedirections(backups, backup_count);
     shellFreeExecRedirBackups(backups, backup_count);
     shellUpdateStatus((err == ENOENT) ? 127 : 126);
@@ -5779,7 +5972,8 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
             force_pipeline_builtin = true;
             /*
              * Job-control builtins must execute in the shell context so fg/bg/wait
-             * can manage and wait on the shell's real job table directly.
+             * can manage and wait on the shell's real job table directly. A trap's
+             * handler belongs to the shell's vproc, not to one made for this command.
              */
             const char *canonical = shellBuiltinCanonicalName(cmd_name);
             if (canonical &&
@@ -5788,7 +5982,8 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
                  strcmp(canonical, "jobs") == 0 ||
                  strcmp(canonical, "kill") == 0 ||
                  strcmp(canonical, "wait") == 0 ||
-                 strcmp(canonical, "disown") == 0)) {
+                 strcmp(canonical, "disown") == 0 ||
+                 strcmp(canonical, "trap") == 0)) {
                 force_pipeline_builtin = false;
             }
         }
@@ -5876,6 +6071,9 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
                     runtimeError(vm, "shell exec: invalid assignment '%s'",
                                  failed_assignment ? failed_assignment : "<assignment>");
                     shellUpdateStatus(1);
+                } else if (shellReadonlyGetErrorName()) {
+                    runtimeError(vm, "%s: readonly variable", shellReadonlyGetErrorName());
+                    shellUpdateStatus(1);
                 } else {
                     runtimeError(vm, "shell exec: failed to apply assignment '%s': %s",
                                  failed_assignment ? failed_assignment : "<assignment>",
@@ -5938,8 +6136,8 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
         }
     }
     if (cmd->assignment_count > 0) {
-        if (!shellApplyAssignmentsTemporary(cmd, &assignment_backups, &assignment_backup_count,
-                                            &failed_assignment, &invalid_assignment)) {
+        if (!shellApplyAssignments(cmd, &assignment_backups, &assignment_backup_count,
+                                   &failed_assignment, &invalid_assignment, true, true)) {
             if (invalid_assignment) {
                 runtimeError(vm, "shell exec: invalid assignment '%s'",
                              failed_assignment ? failed_assignment : "<assignment>");
@@ -5964,6 +6162,16 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
     }
     if (localizes_assignments) {
         gShellRuntime.local_scope_active = previous_local_scope_flag;
+    }
+    /* A readonly name in the prefix under set -e: nothing more runs. */
+    if (assignments_applied && gShellExitRequested) {
+        shellRestoreAssignments(assignment_backups, assignment_backup_count);
+        if (ctx->active) {
+            shellAbortPipeline();
+        }
+        shellFreeCommand(cmd);
+        shellScalarCacheInvalidate();
+        return makeVoid();
     }
 
     int stdin_fd = -1;
@@ -6244,7 +6452,6 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
             if (!cmd->background && status >= 128 && status < 128 + NSIG) {
                 shellHandleStatusSignal(status - 128);
             }
-            shellRuntimeProcessPendingSignals();
             if (stopped && job_control) {
                 pid_t job_pids[1];
                 job_pids[0] = child;
