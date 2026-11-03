@@ -691,6 +691,26 @@ Value vmHostShellScopeIsReady(VM *vm) {
                        !gShellSubshellStack[gShellSubshellStackSize - 1].failed);
 }
 
+/* A body's own redirections are final: nothing runs after them, not even its EXIT trap,
+ * so what they replaced is let go of now. A saved copy would keep the caller's stdout open
+ * for as long as the body runs, and whoever reads that pipe would wait for a background job
+ * that sent its output elsewhere. A host runs a body in a forked child. On iOS the redirections
+ * of a worker reach only the slots of its own vproc, which end with it; other threads
+ * also change the process's descriptors, and those must be put back. */
+static void shellDropFinalRedirBackups(const char *meta, ShellExecRedirBackup **backups, size_t *count) {
+    if (!meta || !strstr(meta, "final=1")) {
+        return;
+    }
+#if defined(PSCAL_TARGET_IOS)
+    if (!gShellBackgroundWorkerActive) {
+        return;
+    }
+#endif
+    shellFreeExecRedirBackups(*backups, *count);
+    *backups = NULL;
+    *count = 0;
+}
+
 /* The redirections of a compound command, around its whole body. A redirection
  * that fails reports the error and fails the command, without running the body
  * and without ending the script. */
@@ -726,6 +746,8 @@ Value vmBuiltinShellSubshell(VM *vm, int arg_count, Value *args) {
         shellFlushStandardStreams();
         if (!shellApplyExecRedirections(&cmd, &backups, &backup_count)) {
             ok = false;
+        } else {
+            shellDropFinalRedirBackups(meta, &backups, &backup_count);
         }
     }
     if (cmd.redirs) {
@@ -1165,6 +1187,7 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
                 ok = false;
                 frame->skip_body = true;
             } else {
+                shellDropFinalRedirBackups(meta, &redir_backups, &redir_backup_count);
                 frame->redirs_active = true;
                 frame->redir_backups = redir_backups;
                 frame->redir_backup_count = redir_backup_count;
