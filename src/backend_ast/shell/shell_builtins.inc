@@ -3954,12 +3954,12 @@ static int __attribute__((unused)) shellSpawnToolProcess(const char *tool_name, 
     return 1;
 }
 
-static Value shellRunToolBuiltin(VM *vm,
-                                 const char *tool_name,
-                                 ShellToolEntryFn entry,
-                                 FrontendKind target_kind,
-                                 int arg_count,
-                                 Value *args) {
+static Value shellRunToolInEnvironment(VM *vm,
+                                       const char *tool_name,
+                                       ShellToolEntryFn entry,
+                                       FrontendKind target_kind,
+                                       int arg_count,
+                                       Value *args) {
     if (getenv("PSCALI_PIPE_DEBUG")) {
         fprintf(stderr, "[tool-dispatch] name=%s argc=%d\n", tool_name ? tool_name : "<null>", arg_count + 1);
     }
@@ -4341,6 +4341,35 @@ extern int dascal_main(int argc, char *argv[]);
 extern int pscald_main(int argc, char *argv[]);
 extern int pscalasm_main(int argc, char *argv[]);
 #endif
+
+/* A frontend is a program, with an environment of its own on iOS. */
+static Value shellRunToolBuiltin(VM *vm,
+                                 const char *tool_name,
+                                 ShellToolEntryFn entry,
+                                 FrontendKind target_kind,
+                                 int arg_count,
+                                 Value *args) {
+#if defined(PSCAL_TARGET_IOS)
+    ShellProgramEnvScope program_env;
+    shellProgramEnvEnter(&program_env, NULL);
+    /* A shell runs right here with no process of its own, so it needs what a new one has. */
+    bool is_shell = target_kind == FRONTEND_KIND_SHELL;
+    ShellProgramScope program_scope;
+    if (is_shell) {
+        shellProgramScopeEnter(&program_scope);
+    }
+    Value result = shellRunToolInEnvironment(vm, tool_name, entry, target_kind, arg_count, args);
+    int status = gShellRuntime.last_status;
+    if (is_shell) {
+        shellProgramScopeLeave(&program_scope);
+    }
+    shellProgramEnvLeave(&program_env);
+    shellUpdateStatus(status);
+    return result;
+#else
+    return shellRunToolInEnvironment(vm, tool_name, entry, target_kind, arg_count, args);
+#endif
+}
 
 Value vmBuiltinShellPascal(VM *vm, int arg_count, Value *args) {
     return shellRunToolBuiltin(vm, "pascal", pascal_main, FRONTEND_KIND_PASCAL, arg_count, args);
@@ -6754,7 +6783,12 @@ Value vmBuiltinShellSetenv(VM *vm, int arg_count, Value *args) {
     if (arg_count == 0) {
         if (environ) {
             for (char **env = environ; *env; ++env) {
-                puts(*env);
+                const char *eq = strchr(*env, '=');
+                char *name = strndup(*env, eq ? (size_t)(eq - *env) : strlen(*env));
+                if (name && !shellExportIsHidden(name) && !shellArrayRegistryFindConst(name)) {
+                    puts(*env);
+                }
+                free(name);
             }
         }
         shellUpdateStatus(0);
@@ -6794,7 +6828,7 @@ Value vmBuiltinShellSetenv(VM *vm, int arg_count, Value *args) {
         shellUpdateStatus(1);
         return makeVoid();
     }
-    shellExportMarkExported(AS_STRING(args[0]));
+    shellVariableSetExported(AS_STRING(args[0]), true);
     shellUpdateStatus(0);
     return makeVoid();
 }
@@ -7212,6 +7246,10 @@ static bool shellDeclarePrintVariable(const char *name) {
     char *value = shellLookupParameterValueInternal(name, strlen(name), &is_set);
     if (!array_var && !is_set) {
         free(value);
+        if (shellExportIsPending(name)) {
+            printf("declare -x %s\n", name);
+            return true;
+        }
         return false;
     }
     char flags[8];
@@ -7231,7 +7269,7 @@ static bool shellDeclarePrintVariable(const char *name) {
     if (shellVariableHasAttribute(name, SHELL_VAR_ATTR_UPPER)) {
         flags[count++] = 'u';
     }
-    if (!array_var && is_set && shellSafeGetenv(name) && !shellNameSetContains(&gShellUnexported, name)) {
+    if (!array_var && is_set && shellVariableIsExported(name)) {
         flags[count++] = 'x';
     }
     flags[count] = '\0';
@@ -7460,10 +7498,13 @@ Value vmBuiltinShellDeclare(VM *vm, int arg_count, Value *args) {
                 shellVariableSetAttribute(attribute_name,
                                           set_attributes | (integer_attribute ? SHELL_VAR_ATTR_INTEGER : 0u),
                                           clear_attributes);
-                if (mark_exported) {
-                    shellExportMarkExported(attribute_name);
-                } else if (mark_unexported) {
-                    shellExportMarkUnexported(attribute_name);
+                /* A local is not there yet: see the end of this loop's two branches. */
+                if (!use_local_scope) {
+                    if (mark_exported) {
+                        shellVariableSetExported(attribute_name, true);
+                    } else if (mark_unexported) {
+                        shellVariableSetExported(attribute_name, false);
+                    }
                 }
                 free(attribute_name);
             }
@@ -7489,9 +7530,20 @@ Value vmBuiltinShellDeclare(VM *vm, int arg_count, Value *args) {
                 }
             } else {
                 if (use_local_scope) {
-                    if (!shellLocalScopeSetOnCurrentFrame(spec, "", false)) {
-                        runtimeError(vm, "declare: out of memory");
-                        ok = false;
+                    /* One already in this function keeps its value. */
+                    ShellLocalVariable *local =
+                        shellLocalScopeFrameFind(&gShellLocalScopeStack[gShellLocalScopeDepth - 1], spec);
+                    if (!local) {
+                        if (shellLocalScopeSetOnCurrentFrame(spec, "", false)) {
+                            local = shellLocalScopeFind(spec);
+                            local->no_value = true;
+                        } else {
+                            runtimeError(vm, "declare: out of memory");
+                            ok = false;
+                        }
+                    }
+                    if (local && (mark_exported || mark_unexported)) {
+                        local->exported = mark_exported;
                     }
                 } else {
                     // Without an assignment, bash preserves the current value of global
@@ -7646,6 +7698,9 @@ Value vmBuiltinShellDeclare(VM *vm, int arg_count, Value *args) {
                     free(name);
                     ok = false;
                     break;
+                }
+                if (mark_exported || mark_unexported) {
+                    shellLocalScopeFind(name)->exported = mark_exported;
                 }
             } else if (!shellSetTrackedVariable(name, value_to_store, array_literal)) {
                 const char *readonly = shellReadonlyGetErrorName();
@@ -8488,16 +8543,7 @@ Value vmBuiltinShellExport(VM *vm, int arg_count, Value *args) {
                 return makeVoid();
             }
         }
-        if (remove_export) {
-            shellExportMarkUnexported(name);
-        } else {
-            /* A local's value has to be where a child can find it. */
-            ShellLocalVariable *local = shellLocalScopeFind(name);
-            if (local && local->value) {
-                setenv(name, local->value, 1);
-            }
-            shellExportMarkExported(name);
-        }
+        shellVariableSetExported(name, !remove_export);
         free(name);
     }
 
@@ -9483,61 +9529,77 @@ static int shellCompareEnvStrings(const void *lhs, const void *rhs) {
     return strcmp(*a, *b);
 }
 
-static void shellPrintExportEntry(const char *entry) {
-    if (!entry) {
-        return;
+static void shellPrintExportEntry(const char *name, const char *value) {
+    printf("declare -x %s", name);
+    if (value) {
+        fputc('=', stdout);
+        shellDeclarePrintQuoted(value);
     }
-    const char *eq = strchr(entry, '=');
-    if (!eq) {
-        printf("declare -x %s\n", entry);
-        return;
-    }
-    size_t name_len = (size_t)(eq - entry);
-    const char *value = eq + 1;
-    char *name = strndup(entry, name_len);
-    bool hidden = !name || shellNameSetContains(&gShellUnexported, name) || strcmp(name, "EXSH_LAST_STATUS") == 0;
-    free(name);
-    if (hidden) {
-        return;
-    }
-    printf("declare -x %.*s=\"", (int)name_len, entry);
-    for (const char *cursor = value; *cursor; ++cursor) {
-        unsigned char ch = (unsigned char)*cursor;
-        if (ch == '"' || ch == '\\') {
-            putchar('\\');
+    fputc('\n', stdout);
+}
+
+static void shellExportListAdd(char ***names, size_t *count, size_t *capacity, const char *name, size_t len) {
+    for (size_t i = 0; i < *count; ++i) {
+        if (strlen((*names)[i]) == len && strncmp((*names)[i], name, len) == 0) {
+            return;
         }
-        putchar(ch);
     }
-    printf("\"\n");
+    if (*count == *capacity) {
+        size_t grown = *capacity ? *capacity * 2 : 64;
+        char **resized = (char **)realloc(*names, grown * sizeof(char *));
+        if (!resized) {
+            return;
+        }
+        *names = resized;
+        *capacity = grown;
+    }
+    char *copy = strndup(name, len);
+    if (copy) {
+        (*names)[(*count)++] = copy;
+    }
 }
 
 static void shellExportPrintEnvironment(void) {
-    if (!environ) {
-        return;
-    }
-    size_t env_count = 0;
-    while (environ[env_count]) {
-        env_count++;
-    }
-    if (env_count == 0) {
-        return;
-    }
-
-    char **sorted = (char **)malloc(env_count * sizeof(char *));
-    if (sorted) {
-        for (size_t i = 0; i < env_count; ++i) {
-            sorted[i] = environ[i];
-        }
-        qsort(sorted, env_count, sizeof(char *), shellCompareEnvStrings);
-        for (size_t i = 0; i < env_count; ++i) {
-            shellPrintExportEntry(sorted[i]);
-        }
-        free(sorted);
-    } else {
-        for (char **env = environ; *env; ++env) {
-            shellPrintExportEntry(*env);
+    char **names = NULL;
+    size_t count = 0;
+    size_t capacity = 0;
+    for (char **env = environ; env && *env; ++env) {
+        const char *eq = strchr(*env, '=');
+        if (eq) {
+            shellExportListAdd(&names, &count, &capacity, *env, (size_t)(eq - *env));
         }
     }
+    SHELL_EXPORT_LOCK();
+    const ShellNameSet *pending = &shellExportFlagsCurrent()->pending;
+    for (size_t i = 0; i < pending->count; ++i) {
+        shellExportListAdd(&names, &count, &capacity, pending->names[i], strlen(pending->names[i]));
+    }
+    SHELL_EXPORT_UNLOCK();
+    for (size_t depth = 0; depth < gShellLocalScopeDepth; ++depth) {
+        const ShellLocalScopeFrame *frame = &gShellLocalScopeStack[depth];
+        for (size_t i = 0; i < frame->count; ++i) {
+            if (frame->variables[i].name && frame->variables[i].exported) {
+                shellExportListAdd(&names, &count, &capacity, frame->variables[i].name,
+                                   strlen(frame->variables[i].name));
+            }
+        }
+    }
+    if (count > 1) {
+        qsort(names, count, sizeof(char *), shellCompareEnvStrings);
+    }
+    for (size_t i = 0; i < count; ++i) {
+        const char *name = names[i];
+        if (strcmp(name, "EXSH_LAST_STATUS") != 0 && !shellArrayRegistryFindConst(name)) {
+            ShellLocalVariable *local = shellLocalScopeFind(name);
+            if (local && local->exported) {
+                shellPrintExportEntry(name, local->no_value ? NULL : local->value);
+            } else if (shellGlobalIsExported(name)) {
+                shellPrintExportEntry(name, shellSafeGetenv(name));
+            }
+        }
+        free(names[i]);
+    }
+    free(names);
 }
 
 static bool shellParseReturnStatus(const char *text, int *out_status) {
@@ -10004,6 +10066,7 @@ Value vmBuiltinShellLocal(VM *vm, int arg_count, Value *args) {
     bool upper_attribute = false;
     bool mark_readonly = false;
     bool mark_exported = false;
+    bool mark_unexported = false;
     for (int i = 0; i < arg_count && ok; ++i) {
         Value v = args[i];
         if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
@@ -10024,7 +10087,7 @@ Value vmBuiltinShellLocal(VM *vm, int arg_count, Value *args) {
                     case 'l': lower_attribute = on; break;
                     case 'u': upper_attribute = on; break;
                     case 'r': mark_readonly = on; break;
-                    case 'x': mark_exported = on; break;
+                    case 'x': mark_exported = on; mark_unexported = !on; break;
                     case 'a':
                     case 'A':
                     case 'n':
@@ -10091,9 +10154,10 @@ Value vmBuiltinShellLocal(VM *vm, int arg_count, Value *args) {
             ok = false;
             break;
         }
-        if (mark_exported) {
-            setenv(name, coerced ? coerced : value, 1);
-            shellExportMarkExported(name);
+        ShellLocalVariable *local = shellLocalScopeFind(name);
+        local->no_value = !eq;
+        if (mark_exported || mark_unexported) {
+            local->exported = mark_exported;
         }
         if (mark_readonly) {
             (void)shellReadonlyAdd(name);

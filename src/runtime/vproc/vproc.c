@@ -3224,6 +3224,7 @@ typedef struct {
     int shell_self_pid;
     int kernel_pid;
     bool detach;
+    VProcEnv *env;
     PSCALRuntimeContext *runtime_ctx;
     FrontendKind frontend_kind;
     pthread_mutex_t *worker_stop_mu;
@@ -8212,6 +8213,15 @@ bool vprocTerminateSessionById(uint64_t session_id) {
     return true;
 }
 
+/* Runs on pthread_exit too: exit() in a tool thread is one. */
+static void vprocThreadEnvCleanup(void *arg) {
+    VProcEnv *env = (VProcEnv *)arg;
+    if (env) {
+        vprocEnvActivate(NULL);
+        vprocEnvRelease(env);
+    }
+}
+
 static void *vprocThreadTrampoline(void *arg) {
     VProcThreadStartCtx *ctx = (VProcThreadStartCtx *)arg;
 
@@ -8255,10 +8265,17 @@ static void *vprocThreadTrampoline(void *arg) {
         vprocRegisterThread(vp, pthread_self());
     }
 
+    /* A thread of a program reads the program's environment, as its creator does. */
+    VProcEnv *thread_env = ctx ? ctx->env : NULL;
+    if (thread_env) {
+        vprocEnvActivate(thread_env);
+    }
     void *res = NULL;
+    pthread_cleanup_push(vprocThreadEnvCleanup, thread_env);
     if (ctx && ctx->start_routine) {
         res = ctx->start_routine(ctx->arg);
     }
+    pthread_cleanup_pop(1);
 
     if (vp_activated) {
         /* Threads share the owning vproc; do not mark the process as exited on
@@ -8309,6 +8326,7 @@ int vprocPthreadCreateShim(pthread_t *thread,
     ctx->kernel_pid = vprocGetKernelPid();
     ctx->frontend_kind = frontendGetKind();
     ctx->detach = false;
+    ctx->env = vprocEnvRetain(vprocEnvCurrent());
 #if defined(PSCAL_TARGET_IOS)
     if (PSCALRuntimeGetCurrentRuntimeContext) {
         ctx->runtime_ctx = PSCALRuntimeGetCurrentRuntimeContext();
@@ -8323,6 +8341,7 @@ int vprocPthreadCreateShim(pthread_t *thread,
     }
     int rc = vprocHostPthreadCreateRaw(thread, attr, vprocThreadTrampoline, ctx);
     if (rc != 0) {
+        vprocEnvRelease(ctx->env);
         free(ctx);
         errno = rc;
     }
@@ -14186,6 +14205,8 @@ struct VProcEnv {
     void **retired;
     size_t retired_count;
     size_t retired_capacity;
+    void *attachment;
+    void (*free_attachment)(void *);
 };
 
 static _Thread_local VProcEnv *gVprocEnvTls = NULL;
@@ -14246,6 +14267,10 @@ static ssize_t vprocEnvFindLocked(const VProcEnv *env, const char *name, size_t 
 }
 
 VProcEnv *vprocEnvCapture(void) {
+    return vprocEnvCaptureFiltered(NULL, NULL);
+}
+
+VProcEnv *vprocEnvCaptureFiltered(bool (*keep)(const char *entry, void *arg), void *arg) {
     VProcEnv *env = (VProcEnv *)calloc(1, sizeof(VProcEnv));
     if (!env) {
         return NULL;
@@ -14262,6 +14287,9 @@ VProcEnv *vprocEnvCapture(void) {
         return NULL;
     }
     for (size_t i = 0; i < count; ++i) {
+        if (keep && !keep(source[i], arg)) {
+            continue;
+        }
         char *copy = strdup(source[i]);
         if (!copy) {
             vprocEnvRelease(env);
@@ -14294,8 +14322,22 @@ void vprocEnvRelease(VProcEnv *env) {
     free(env->retired);
     free(env->view);
     free(env->caps);
+    if (env->free_attachment) {
+        env->free_attachment(env->attachment);
+    }
     pthread_mutex_destroy(&env->mu);
     free(env);
+}
+
+void *vprocEnvAttachment(VProcEnv *env) {
+    return env ? env->attachment : NULL;
+}
+
+void vprocEnvSetAttachment(VProcEnv *env, void *data, void (*free_data)(void *)) {
+    if (env) {
+        env->attachment = data;
+        env->free_attachment = free_data;
+    }
 }
 
 VProcEnv *vprocEnvCurrent(void) {

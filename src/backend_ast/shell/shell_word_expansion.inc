@@ -864,6 +864,10 @@ static void shellFreeCommand(ShellCommand *cmd) {
         shellBodyStateFree(cmd->body_state);
         cmd->body_state = NULL;
     }
+    vprocEnvRelease(cmd->program_env);
+    cmd->program_env = NULL;
+    free(cmd->program_path);
+    cmd->program_path = NULL;
 #endif
 }
 
@@ -2129,6 +2133,11 @@ static ShellBodyState *shellBodyStateCapture(void) {
         shellBodyStateFree(state);
         return NULL;
     }
+    shellRuntimeContextInheritLocals(state->ctx, 0);
+    ShellExportFlags *flags = shellExportFlagsSnapshot();
+    if (flags) {
+        vprocEnvSetAttachment(state->env, flags, shellExportFlagsFree);
+    }
     if (gParamCount > 0 && gParamValues) {
         state->params = (char **)calloc((size_t)gParamCount, sizeof(char *));
         if (!state->params) {
@@ -2262,6 +2271,31 @@ static bool shellStageRunsShellCode(const ShellCommand *cmd) {
         return true;
     }
     return strcmp(name, "eval") == 0 || strcmp(name, "source") == 0 || strcmp(name, ".") == 0;
+}
+
+static bool shellCommandIsFrontendToolName(const char *name);
+
+/* A builtin on a stage's thread would read the shell's environment, which keeps what the
+ * command set for itself only until the shell's thread goes on. */
+static bool shellStageNeedsOwnState(const ShellCommand *cmd) {
+    if (shellStageRunsShellCode(cmd)) {
+        return true;
+    }
+    if (!cmd || cmd->body || cmd->argc == 0 || !cmd->argv || !cmd->argv[0]) {
+        return false;
+    }
+    char lookup_buf[PATH_MAX];
+    const char *name = shellCommandLookupName(cmd->argv[0], lookup_buf, sizeof(lookup_buf));
+    /* These ask about the shell's variables, a function's locals among them. */
+    static const char *const about_variables[] = {"export", "declare", "typeset", "readonly", "local", "unset",
+                                                  "read", "getopts"};
+    for (size_t i = 0; i < sizeof(about_variables) / sizeof(about_variables[0]); ++i) {
+        if (strcmp(name, about_variables[i]) == 0) {
+            return true;
+        }
+    }
+    return cmd->assignment_count > 0 && shellIsRuntimeBuiltin(name) && !shellCommandIsFrontendToolName(name) &&
+           !smallclueFindApplet(name);
 }
 
 static bool shellRunShellCodeStage(VM *vm, ShellCommand *cmd) {

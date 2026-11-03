@@ -256,6 +256,11 @@ char *vprocShellGetcwdShim(char *buffer, size_t size);
  * session shell's directory. */
 typedef struct VProcEnv VProcEnv;
 VProcEnv *vprocEnvCapture(void);
+/* A copy of only the entries keep says yes to, so one left out costs nothing. */
+VProcEnv *vprocEnvCaptureFiltered(bool (*keep)(const char *entry, void *arg), void *arg);
+/* What the shell knows about this environment's names. Freed with it. */
+void *vprocEnvAttachment(VProcEnv *env);
+void vprocEnvSetAttachment(VProcEnv *env, void *data, void (*free_data)(void *));
 VProcEnv *vprocEnvRetain(VProcEnv *env);
 void vprocEnvRelease(VProcEnv *env);
 VProcEnv *vprocEnvCurrent(void);

@@ -560,7 +560,6 @@ typedef struct {
     struct pscal_fd **pscal_pipe_read;
     struct pscal_fd **pscal_pipe_write;
     struct pscal_fd **pscal_pipe_write_hold;
-    struct ShellDeferredAssignments *deferred_assignments;
 #endif
 } ShellPipelineContext;
 
@@ -2420,6 +2419,10 @@ typedef struct {
     ShellCompiledFunction *body;
 #if defined(PSCAL_TARGET_IOS)
     ShellBodyState *body_state;
+    /* What it gets if it turns out to be a program, and the file that would be: taken while
+     * the shell's thread launched it, when what the command sets for itself is in place. */
+    VProcEnv *program_env;
+    char *program_path;
 #endif
 } ShellCommand;
 
@@ -2461,20 +2464,21 @@ typedef struct {
     char *previous_value;
     bool had_previous;
     bool previous_was_array;
+    bool was_exported;
+    bool was_pending_export;
 } ShellAssignmentBackup;
 
-#if defined(PSCAL_TARGET_IOS)
-typedef struct ShellDeferredAssignments {
-    struct ShellDeferredAssignments *next;
-    ShellAssignmentBackup *backups;
-    size_t count;
-} ShellDeferredAssignments;
-#endif
+static bool shellGlobalIsExported(const char *name);
+static bool shellVariableAllExportEnabled(void);
 
 typedef struct {
     char *name;
     char *value;
     bool is_array_literal;
+    /* A local exports on its own: the global of that name keeps its own state. */
+    bool exported;
+    /* `local x`: declared, with no value yet to give a child. */
+    bool no_value;
 } ShellLocalVariable;
 
 typedef struct ShellLocalScopeFrame {
@@ -2492,6 +2496,8 @@ static void shellLocalVariableDispose(ShellLocalVariable *var) {
     var->name = NULL;
     var->value = NULL;
     var->is_array_literal = false;
+    var->exported = false;
+    var->no_value = false;
 }
 
 static void shellLocalScopeFrameReset(ShellLocalScopeFrame *frame) {
@@ -2656,6 +2662,10 @@ static bool shellLocalScopeSetOnCurrentFrame(const char *name, const char *value
     ShellLocalVariable *existing = shellLocalScopeFrameFind(frame, name);
     bool created_new = false;
     if (!existing) {
+        /* A local of an exported name stays exported, as under bash. */
+        ShellLocalVariable *outer = shellLocalScopeFind(name);
+        bool exported = shellVariableAllExportEnabled() ||
+                        (outer ? outer->exported : shellGlobalIsExported(name));
         if (!shellLocalScopeEnsureCapacity(frame, frame->count + 1)) {
             return false;
         }
@@ -2667,6 +2677,7 @@ static bool shellLocalScopeSetOnCurrentFrame(const char *name, const char *value
         }
         existing->value = NULL;
         existing->is_array_literal = false;
+        existing->exported = exported;
         created_new = true;
     }
     char *copy = strdup(value ? value : "");
@@ -2681,6 +2692,7 @@ static bool shellLocalScopeSetOnCurrentFrame(const char *name, const char *value
     free(existing->value);
     existing->value = copy;
     existing->is_array_literal = is_array_literal;
+    existing->no_value = false;
     if (is_array_literal) {
         const char *text = existing->value ? existing->value : "";
         shellArrayRegistryAssignFromText(existing->name, text);
@@ -2702,6 +2714,10 @@ static bool shellLocalScopeAssignExisting(const char *name, const char *value, b
     free(existing->value);
     existing->value = copy;
     existing->is_array_literal = is_array_literal;
+    existing->no_value = false;
+    if (shellVariableAllExportEnabled()) {
+        existing->exported = true;
+    }
     return true;
 }
 
@@ -2751,6 +2767,8 @@ static bool shellLocalScopeUnset(const char *name) {
                     frame->variables[frame->count].name = NULL;
                     frame->variables[frame->count].value = NULL;
                     frame->variables[frame->count].is_array_literal = false;
+                    frame->variables[frame->count].exported = false;
+                    frame->variables[frame->count].no_value = false;
                 }
                 if (was_array) {
                     shellArrayRegistryRestoreVisibleValue(name, NULL);
@@ -2907,6 +2925,10 @@ static __thread int gShellSavedStdFds[3] = { -1, -1, -1 };
 
 #define gShellRuntime (*shellGetContext())
 
+static bool shellVariableAllExportEnabled(void) {
+    return gShellRuntime.allexport_enabled;
+}
+
 static unsigned long gShellStatusVersion = 0;
 static PSCAL_THREAD_LOCAL bool gShellStatusSticky = false;
 
@@ -2937,16 +2959,30 @@ static PSCAL_THREAD_LOCAL char **gShellFunctionNames = NULL;
 static PSCAL_THREAD_LOCAL size_t gShellFunctionNameCount = 0;
 static PSCAL_THREAD_LOCAL size_t gShellFunctionNameCapacity = 0;
 
-/* Every shell variable lives in the process environment, so a child would see them all.
- * These are the ones bash would keep to itself; a child drops them before it execs. */
+/* Every shell variable lives in the environment, so a program would see them all. These
+ * are the ones bash would keep to itself. They belong to the environment they describe: a
+ * process has one, and on iOS so does each subshell and each program, which have no
+ * process of their own. */
 typedef struct {
     char **names;
     size_t count;
     size_t capacity;
 } ShellNameSet;
-static PSCAL_THREAD_LOCAL ShellNameSet gShellUnexported = {0};
-/* `export x` before x has a value. */
-static PSCAL_THREAD_LOCAL ShellNameSet gShellExportPending = {0};
+typedef struct {
+    ShellNameSet unexported;
+    /* `export x` before x has a value. */
+    ShellNameSet pending;
+} ShellExportFlags;
+static ShellExportFlags gShellProcessExportFlags = {{0}};
+#if defined(PSCAL_TARGET_IOS)
+/* A stage's thread shares its shell's environment, and a builtin there may ask. */
+static pthread_mutex_t gShellExportMutex = PTHREAD_MUTEX_INITIALIZER;
+#define SHELL_EXPORT_LOCK() pthread_mutex_lock(&gShellExportMutex)
+#define SHELL_EXPORT_UNLOCK() pthread_mutex_unlock(&gShellExportMutex)
+#else
+#define SHELL_EXPORT_LOCK() ((void)0)
+#define SHELL_EXPORT_UNLOCK() ((void)0)
+#endif
 
 static bool shellNameSetContains(const ShellNameSet *set, const char *name) {
     for (size_t i = 0; i < set->count; ++i) {
@@ -2987,29 +3023,166 @@ static bool shellNameSetRemove(ShellNameSet *set, const char *name) {
     return false;
 }
 
-static void shellExportNoteNewVariable(const char *name) {
-    if (strcmp(name, "PWD") == 0 || strcmp(name, "OLDPWD") == 0) {
+static void shellNameSetClear(ShellNameSet *set) {
+    for (size_t i = 0; i < set->count; ++i) {
+        free(set->names[i]);
+    }
+    free(set->names);
+    memset(set, 0, sizeof(*set));
+}
+
+static void shellNameSetCopy(ShellNameSet *dst, const ShellNameSet *src) {
+    for (size_t i = 0; i < src->count; ++i) {
+        shellNameSetAdd(dst, src->names[i]);
+    }
+}
+
+static void shellExportFlagsFree(void *data) {
+    ShellExportFlags *flags = (ShellExportFlags *)data;
+    if (flags) {
+        shellNameSetClear(&flags->unexported);
+        shellNameSetClear(&flags->pending);
+        free(flags);
+    }
+}
+
+/* Under SHELL_EXPORT_LOCK. */
+static ShellExportFlags *shellExportFlagsCurrent(void) {
+#if defined(PSCAL_TARGET_IOS)
+    VProcEnv *env = vprocEnvCurrent();
+    if (env) {
+        ShellExportFlags *flags = (ShellExportFlags *)vprocEnvAttachment(env);
+        if (!flags) {
+            flags = (ShellExportFlags *)calloc(1, sizeof(ShellExportFlags));
+            if (flags) {
+                vprocEnvSetAttachment(env, flags, shellExportFlagsFree);
+            }
+        }
+        if (flags) {
+            return flags;
+        }
+    }
+#endif
+    return &gShellProcessExportFlags;
+}
+
+/* What this environment says now, for shellExportFlagsRestore. */
+static ShellExportFlags *shellExportFlagsSnapshot(void) {
+    ShellExportFlags *copy = (ShellExportFlags *)calloc(1, sizeof(ShellExportFlags));
+    if (copy) {
+        SHELL_EXPORT_LOCK();
+        ShellExportFlags *flags = shellExportFlagsCurrent();
+        shellNameSetCopy(&copy->unexported, &flags->unexported);
+        shellNameSetCopy(&copy->pending, &flags->pending);
+        SHELL_EXPORT_UNLOCK();
+    }
+    return copy;
+}
+
+/* A shell that starts in this environment has exported all of it. */
+static void shellExportFlagsClearCurrent(void) {
+    SHELL_EXPORT_LOCK();
+    ShellExportFlags *flags = shellExportFlagsCurrent();
+    shellNameSetClear(&flags->unexported);
+    shellNameSetClear(&flags->pending);
+    SHELL_EXPORT_UNLOCK();
+}
+
+static void shellExportFlagsRestore(ShellExportFlags *snapshot) {
+    if (!snapshot) {
         return;
     }
-    if (!shellNameSetRemove(&gShellExportPending, name)) {
-        shellNameSetAdd(&gShellUnexported, name);
+    SHELL_EXPORT_LOCK();
+    ShellExportFlags *flags = shellExportFlagsCurrent();
+    ShellExportFlags previous = *flags;
+    *flags = *snapshot;
+    *snapshot = previous;
+    SHELL_EXPORT_UNLOCK();
+    shellExportFlagsFree(snapshot);
+}
+
+static bool shellExportIsHidden(const char *name) {
+    SHELL_EXPORT_LOCK();
+    bool hidden = shellNameSetContains(&shellExportFlagsCurrent()->unexported, name);
+    SHELL_EXPORT_UNLOCK();
+    return hidden;
+}
+
+static bool shellExportIsPending(const char *name) {
+    SHELL_EXPORT_LOCK();
+    bool pending = shellNameSetContains(&shellExportFlagsCurrent()->pending, name);
+    SHELL_EXPORT_UNLOCK();
+    return pending;
+}
+
+/* The global of that name, whatever a local may hide it with. */
+static bool shellGlobalIsExported(const char *name) {
+    if (shellSafeGetenv(name)) {
+        return !shellExportIsHidden(name);
     }
+    return shellExportIsPending(name);
+}
+
+static void shellExportNoteNewVariable(const char *name) {
+    SHELL_EXPORT_LOCK();
+    ShellExportFlags *flags = shellExportFlagsCurrent();
+    if (!shellNameSetRemove(&flags->pending, name)) {
+        shellNameSetAdd(&flags->unexported, name);
+    }
+    SHELL_EXPORT_UNLOCK();
 }
 
 static void shellExportMarkExported(const char *name) {
-    if (!shellNameSetRemove(&gShellUnexported, name)) {
-        shellNameSetAdd(&gShellExportPending, name);
+    bool is_set = shellSafeGetenv(name) != NULL;
+    SHELL_EXPORT_LOCK();
+    ShellExportFlags *flags = shellExportFlagsCurrent();
+    if (!shellNameSetRemove(&flags->unexported, name) && !is_set) {
+        shellNameSetAdd(&flags->pending, name);
     }
+    SHELL_EXPORT_UNLOCK();
 }
 
 static void shellExportMarkUnexported(const char *name) {
-    shellNameSetRemove(&gShellExportPending, name);
-    shellNameSetAdd(&gShellUnexported, name);
+    bool is_set = shellSafeGetenv(name) != NULL;
+    SHELL_EXPORT_LOCK();
+    ShellExportFlags *flags = shellExportFlagsCurrent();
+    shellNameSetRemove(&flags->pending, name);
+    if (is_set) {
+        shellNameSetAdd(&flags->unexported, name);
+    }
+    SHELL_EXPORT_UNLOCK();
 }
 
 static void shellExportForget(const char *name) {
-    shellNameSetRemove(&gShellExportPending, name);
-    shellNameSetRemove(&gShellUnexported, name);
+    SHELL_EXPORT_LOCK();
+    ShellExportFlags *flags = shellExportFlagsCurrent();
+    shellNameSetRemove(&flags->pending, name);
+    shellNameSetRemove(&flags->unexported, name);
+    SHELL_EXPORT_UNLOCK();
+}
+
+/* A new shell exports these two whatever they hold, as bash does, and OLDPWD before it
+ * has a value. */
+void shellRuntimeInitExports(void) {
+    shellExportMarkExported("PWD");
+    shellExportMarkExported("OLDPWD");
+}
+
+/* export, declare -x and the like act on what the name means here. */
+static void shellVariableSetExported(const char *name, bool exported) {
+    ShellLocalVariable *local = shellLocalScopeFind(name);
+    if (local) {
+        local->exported = exported;
+    } else if (exported) {
+        shellExportMarkExported(name);
+    } else {
+        shellExportMarkUnexported(name);
+    }
+}
+
+static bool shellVariableIsExported(const char *name) {
+    ShellLocalVariable *local = shellLocalScopeFind(name);
+    return local ? local->exported : shellGlobalIsExported(name);
 }
 
 /* declare -i, -l and -u stay with the name. */
@@ -4693,10 +4866,138 @@ ShellRuntimeState *shellRuntimeCreateContext(void) {
     return ctx;
 }
 
+/* For a shell started as a command where nothing execs: what a new process would not have
+ * had is gone, and what it defines goes when it does. The caller activates it. */
+static ShellRuntimeState *shellRuntimeCreateProgramContext(void) {
+    ShellRuntimeState *ctx = shellRuntimeCreateContext();
+    if (!ctx) {
+        return NULL;
+    }
+    for (size_t i = 0; i < ctx->array_var_count; ++i) {
+        shellArrayVariableClear(&ctx->array_vars[i]);
+    }
+    free(ctx->array_vars);
+    ctx->array_vars = NULL;
+    ctx->array_var_count = 0;
+    ctx->array_var_capacity = 0;
+    for (size_t i = 0; i < ctx->readonly_var_count; ++i) {
+        free(ctx->readonly_vars[i].name);
+    }
+    free(ctx->readonly_vars);
+    ctx->readonly_vars = NULL;
+    ctx->readonly_var_count = 0;
+    ctx->readonly_var_capacity = 0;
+    ctx->local_scope_active = false;
+    ctx->pipeline_subshell_active = false;
+    ctx->allexport_enabled = false;
+    for (size_t i = 0; i < ctx->private_function_count; ++i) {
+        free(ctx->private_functions[i].name);
+        free(ctx->private_functions[i].parameter_metadata);
+    }
+    free(ctx->private_functions);
+    ctx->private_functions = NULL;
+    ctx->private_function_count = 0;
+    for (size_t i = 0; i < ctx->private_alias_count; ++i) {
+        free(ctx->private_aliases[i].name);
+        free(ctx->private_aliases[i].value);
+    }
+    free(ctx->private_aliases);
+    ctx->private_aliases = NULL;
+    ctx->private_alias_count = 0;
+    free(ctx->private_options);
+    ctx->private_options = NULL;
+    ctx->has_private_tables = false;
+    shellCopyDefinitionTables(ctx, NULL, 0, NULL, 0, gShellOptionTable);
+    return ctx;
+}
+
+typedef struct {
+    ShellRuntimeState *ctx;
+    ShellRuntimeState *previous;
+    ShellVariableAttribute *attributes;
+    size_t attribute_count;
+} ShellProgramScope;
+
+static void shellProgramScopeEnter(ShellProgramScope *scope) {
+    scope->ctx = shellRuntimeCreateProgramContext();
+    scope->previous = scope->ctx ? shellRuntimeActivateContext(scope->ctx) : NULL;
+    scope->attributes = gShellVariableAttributes;
+    scope->attribute_count = gShellVariableAttributeCount;
+    gShellVariableAttributes = NULL;
+    gShellVariableAttributeCount = 0;
+}
+
+static void shellProgramScopeLeave(ShellProgramScope *scope) {
+    if (scope->ctx) {
+        shellRuntimeActivateContext(scope->previous);
+        shellRuntimeDestroyContext(scope->ctx);
+        scope->ctx = NULL;
+    }
+    for (size_t i = 0; i < gShellVariableAttributeCount; ++i) {
+        free(gShellVariableAttributes[i].name);
+    }
+    free(gShellVariableAttributes);
+    gShellVariableAttributes = scope->attributes;
+    gShellVariableAttributeCount = scope->attribute_count;
+}
+
+/* A subshell sees the locals of the function it was started in, and what it does to them
+ * stays its own. What it sets beyond those goes to its environment: nothing here is a
+ * local just because a frame is there. skip_top leaves out frames that only mark it. */
+void shellRuntimeContextInheritLocals(ShellRuntimeState *ctx, size_t skip_top) {
+    const ShellRuntimeState *from = shellRuntimeCurrentContext();
+    if (!ctx || !from) {
+        return;
+    }
+    ctx->local_scope_active = false;
+    ctx->pipeline_subshell_active = false;
+    if (from->local_scope_depth <= skip_top) {
+        return;
+    }
+    size_t depth = from->local_scope_depth - skip_top;
+    ctx->local_scope_stack = (ShellLocalScopeFrame *)calloc(depth, sizeof(ShellLocalScopeFrame));
+    if (!ctx->local_scope_stack) {
+        return;
+    }
+    ctx->local_scope_capacity = depth;
+    ctx->local_scope_depth = depth;
+    for (size_t d = 0; d < depth; ++d) {
+        const ShellLocalScopeFrame *src = &from->local_scope_stack[d];
+        ShellLocalScopeFrame *dst = &ctx->local_scope_stack[d];
+        if (src->count == 0) {
+            continue;
+        }
+        dst->variables = (ShellLocalVariable *)calloc(src->count, sizeof(ShellLocalVariable));
+        if (!dst->variables) {
+            continue;
+        }
+        dst->capacity = src->count;
+        for (size_t i = 0; i < src->count; ++i) {
+            const ShellLocalVariable *var = &src->variables[i];
+            ShellLocalVariable *copy = &dst->variables[dst->count];
+            copy->name = var->name ? strdup(var->name) : NULL;
+            copy->value = var->value ? strdup(var->value) : NULL;
+            copy->is_array_literal = var->is_array_literal;
+            copy->exported = var->exported;
+            copy->no_value = var->no_value;
+            if (copy->name) {
+                dst->count++;
+            }
+        }
+    }
+}
+
 void shellRuntimeDestroyContext(ShellRuntimeState *ctx) {
     if (!ctx || ctx == &gShellRuntimeDefault) {
         return;
     }
+    for (size_t d = 0; d < ctx->local_scope_depth; ++d) {
+        shellLocalScopeFrameReset(&ctx->local_scope_stack[d]);
+    }
+    free(ctx->local_scope_stack);
+    ctx->local_scope_stack = NULL;
+    ctx->local_scope_depth = 0;
+    ctx->local_scope_capacity = 0;
     for (size_t i = 0; i < ctx->private_function_count; ++i) {
         free(ctx->private_functions[i].name);
         free(ctx->private_functions[i].parameter_metadata);

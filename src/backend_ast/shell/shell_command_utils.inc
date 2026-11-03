@@ -562,6 +562,7 @@ static char *shellRunCommandSubstitution(const char *command) {
     bool previous_local_scope_flag = gShellRuntime.local_scope_active;
     bool previous_pipeline_flag = gShellRuntime.pipeline_subshell_active;
     PscalEnvSnapshot env_snapshot = {0};
+    ShellExportFlags *export_snapshot = NULL;
     bool runtime_state_overridden = false;
     bool saved_exit_requested = gShellExitRequested;
     bool saved_expansion_failed = gShellExpansionFailed;
@@ -781,9 +782,11 @@ static char *shellRunCommandSubstitution(const char *command) {
         }
         runtime_state_overridden = true;
         (void)pscalEnvSnapshotTake(&env_snapshot);
+        export_snapshot = shellExportFlagsSnapshot();
         ShellCwdScope cwd_scope;
         shellCwdScopeEnter(&cwd_scope);
         opts.first_line = gShellCurrentCommandLine;
+        opts.inherit_locals = true;
         status = shellRunSource(source, "<command-substitution>", &opts, &exit_requested);
         shellCwdScopeLeave(&cwd_scope);
     }
@@ -935,6 +938,7 @@ substitution_finish:
     }
 
     (void)pscalEnvSnapshotRestore(&env_snapshot);
+    shellExportFlagsRestore(export_snapshot);
 
     if (!result) {
         result = strdup("");
@@ -1343,8 +1347,12 @@ static void shellRestoreAssignments(ShellAssignmentBackup *backups, size_t count
         }
         if (backup->had_previous) {
             shellSetTrackedVariable(backup->name, backup->previous_value, backup->previous_was_array);
+            shellVariableSetExported(backup->name, backup->was_exported);
         } else {
             shellUnsetTrackedVariable(backup->name);
+            if (backup->was_pending_export) {
+                shellExportMarkExported(backup->name);
+            }
         }
         free(backup->name);
         free(backup->previous_value);
@@ -1436,8 +1444,11 @@ static bool shellApplyAssignmentsTemporary(const ShellCommand *cmd,
                 return false;
             }
             backups[i].had_previous = true;
+            backups[i].was_exported = local_entry->exported;
         } else {
             const char *previous = shellSafeGetenv(backups[i].name);
+            backups[i].was_exported = shellGlobalIsExported(backups[i].name);
+            backups[i].was_pending_export = shellExportIsPending(backups[i].name);
             if (previous) {
                 backups[i].previous_value = strdup(previous);
                 if (!backups[i].previous_value) {
@@ -1468,6 +1479,10 @@ static bool shellApplyAssignmentsTemporary(const ShellCommand *cmd,
             }
             shellRestoreAssignments(backups, i + 1);
             return false;
+        }
+        /* Whatever the command turns out to be, what it starts sees this. */
+        if (!is_element && !entry->is_array_literal) {
+            shellVariableSetExported(backups[i].name, true);
         }
     }
     if (out_backups) {

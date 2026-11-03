@@ -551,6 +551,10 @@ static int shellTryRunScriptFallback(VM *vm, const ShellCommand *cmd) {
     char *frontend_path = shellRuntimeGetArg0() ? strdup(shellRuntimeGetArg0()) : NULL;
     opts.frontend_path = frontend_path ? frontend_path : "exsh";
 
+    /* A script run as a command starts over: what it inherits is the environment. */
+    shellExportFlagsClearCurrent();
+    ShellProgramScope program_scope;
+    shellProgramScopeEnter(&program_scope);
     shellRuntimeSetArg0(cmd->argv[0]);
     bool exit_requested = false;
     /* A script run as a command has a directory of its own. */
@@ -559,7 +563,11 @@ static int shellTryRunScriptFallback(VM *vm, const ShellCommand *cmd) {
     int status = shellRunSource(source, cmd->argv[0], &opts, &exit_requested);
     shellCwdScopeLeave(&cwd_scope);
     free(source);
-    shellRuntimeSetArg0(frontend_path);
+    bool had_program_ctx = program_scope.ctx != NULL;
+    shellProgramScopeLeave(&program_scope);
+    if (!had_program_ctx) {
+        shellRuntimeSetArg0(frontend_path);
+    }
     free(frontend_path);
 
     if (replaced_params) {
@@ -653,16 +661,16 @@ static void shellPatchCombinedRedirectTokens(ShellCommand *cmd) {
     }
 }
 
-/* In the child, about to exec: what bash would have left out goes, and what is set for
- * this command only is in, which also covers a prefix on a local. */
-static void shellEnvironmentForChild(const ShellCommand *cmd) {
-    for (size_t i = 0; i < gShellUnexported.count; ++i) {
-        unsetenv(gShellUnexported.names[i]);
-    }
-    /* Arrays are never exported. */
-    for (size_t i = 0; i < gShellArrayVarCount; ++i) {
-        if (gShellArrayVars[i].name) {
-            unsetenv(gShellArrayVars[i].name);
+/* What only the shell knows goes into a program's environment: exported locals, outermost
+ * first so an inner one wins, and what is set for this command only. */
+static void shellEnvironmentAddCommandValues(const ShellCommand *cmd) {
+    for (size_t depth = 0; depth < gShellLocalScopeDepth; ++depth) {
+        const ShellLocalScopeFrame *frame = &gShellLocalScopeStack[depth];
+        for (size_t i = 0; i < frame->count; ++i) {
+            const ShellLocalVariable *var = &frame->variables[i];
+            if (var->name && var->value && var->exported && !var->no_value && !var->is_array_literal) {
+                setenv(var->name, var->value, 1);
+            }
         }
     }
     for (size_t i = 0; cmd && i < cmd->assignment_count; ++i) {
@@ -680,6 +688,155 @@ static void shellEnvironmentForChild(const ShellCommand *cmd) {
             }
         }
     }
+}
+
+/* In the child, about to exec: what bash would have left out goes. No lock: another
+ * thread's lock does not survive into a child. */
+static void shellEnvironmentForChild(const ShellCommand *cmd) {
+    const ShellNameSet *unexported = &shellExportFlagsCurrent()->unexported;
+    for (size_t i = 0; i < unexported->count; ++i) {
+        unsetenv(unexported->names[i]);
+    }
+    /* Arrays are never exported. */
+    for (size_t i = 0; i < gShellArrayVarCount; ++i) {
+        if (gShellArrayVars[i].name) {
+            unsetenv(gShellArrayVars[i].name);
+        }
+    }
+    shellEnvironmentAddCommandValues(cmd);
+}
+
+#if defined(PSCAL_TARGET_IOS)
+/* Nothing execs here: a program is a call on a thread, reading the environment through
+ * the getenv macros. So it gets one of its own, built as a child's would be, and what it
+ * sets there goes no further. */
+static bool shellEnvEntryIsExported(const char *entry, void *arg) {
+    const ShellNameSet *unexported = (const ShellNameSet *)arg;
+    const char *eq = strchr(entry, '=');
+    size_t len = eq ? (size_t)(eq - entry) : strlen(entry);
+    /* Every builtin on a stage's thread rewrites this one, so it is not copied: see below. */
+    if (strncmp(entry, "EXSH_LAST_STATUS=", 17) == 0) {
+        return false;
+    }
+    for (size_t i = 0; i < unexported->count; ++i) {
+        const char *name = unexported->names[i];
+        if (strncmp(entry, name, len) == 0 && name[len] == '\0') {
+            return false;
+        }
+    }
+    for (size_t i = 0; i < gShellArrayVarCount; ++i) {
+        const char *name = gShellArrayVars[i].name;
+        if (name && strncmp(entry, name, len) == 0 && name[len] == '\0') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static VProcEnv *shellProgramEnvCapture(const ShellCommand *cmd) {
+    SHELL_EXPORT_LOCK();
+    VProcEnv *env = vprocEnvCaptureFiltered(shellEnvEntryIsExported, &shellExportFlagsCurrent()->unexported);
+    SHELL_EXPORT_UNLOCK();
+    if (env) {
+        VProcEnv *previous = vprocEnvActivate(env);
+        char status[16];
+        snprintf(status, sizeof(status), "%d", gShellRuntime.last_status);
+        setenv("EXSH_LAST_STATUS", status, 1);
+        shellEnvironmentAddCommandValues(cmd);
+        vprocEnvActivate(previous);
+    }
+    return env;
+}
+
+typedef struct {
+    VProcEnv *env;
+    VProcEnv *previous;
+} ShellProgramEnvScope;
+
+/* A stage's, taken while the shell's thread launched it. The first program on this thread
+ * uses it: by the time the stage gets there the shell may have moved on. */
+static _Thread_local VProcEnv *gShellStageProgramEnv = NULL;
+
+static void shellProgramEnvEnter(ShellProgramEnvScope *scope, const ShellCommand *cmd) {
+    scope->env = gShellStageProgramEnv;
+    gShellStageProgramEnv = NULL;
+    if (!scope->env) {
+        scope->env = shellProgramEnvCapture(cmd);
+    }
+    scope->previous = scope->env ? vprocEnvActivate(scope->env) : NULL;
+}
+
+static void shellProgramEnvLeave(ShellProgramEnvScope *scope) {
+    if (scope->env) {
+        vprocEnvActivate(scope->previous);
+        vprocEnvRelease(scope->env);
+        scope->env = NULL;
+    }
+}
+
+/* For an applet, called from smallclue. */
+void *shellRuntimeProgramEnvEnter(void) {
+    ShellProgramEnvScope *scope = (ShellProgramEnvScope *)malloc(sizeof(ShellProgramEnvScope));
+    if (scope) {
+        shellProgramEnvEnter(scope, NULL);
+    }
+    return scope;
+}
+
+void shellRuntimeProgramEnvLeave(void *scope) {
+    if (scope) {
+        shellProgramEnvLeave((ShellProgramEnvScope *)scope);
+        free(scope);
+    }
+}
+
+static void shellStageCaptureState(ShellCommand *stage, const ShellCommand *cmd, size_t stage_count) {
+    if (stage_count > 1 && shellStageNeedsOwnState(stage)) {
+        stage->body_state = shellBodyStateCapture();
+    }
+    if (!stage->body && !stage->body_state) {
+        stage->program_env = shellProgramEnvCapture(cmd);
+        char lookup_buf[PATH_MAX];
+        const char *name = cmd->argv && cmd->argv[0] ? shellCommandLookupName(cmd->argv[0], lookup_buf, sizeof(lookup_buf)) : NULL;
+        if (name && !shellIsRuntimeBuiltin(name) && !smallclueFindApplet(name)) {
+            stage->program_path = shellFindExecutableOnPath(cmd->argv[0]);
+        }
+    }
+}
+
+/* What PATH found while the stage was launched: it may not be the shell's any more, or
+ * one this thread can read. */
+static char *shellStageFindExecutable(const ShellCommand *cmd) {
+    return cmd->program_path ? strdup(cmd->program_path) : shellFindExecutableOnPath(cmd->argv[0]);
+}
+#endif
+
+/* exec's own search reads the environment, where a PATH that is local or not exported
+ * will not be. Call before shellEnvironmentForChild. False means no such program. */
+static bool shellLookupForExec(const char *name, char **out_found) {
+    *out_found = NULL;
+    if (strchr(name, '/') || (!shellExportIsHidden("PATH") && !shellLocalScopeFind("PATH"))) {
+        return true;
+    }
+#if defined(PSCAL_TARGET_IOS)
+    *out_found = shellFindExecutableOnPath(name);
+#else
+    char *path = shellLookupParameterValue("PATH", strlen("PATH"));
+    for (const char *cursor = path ? path : ""; cursor && !*out_found;) {
+        const char *next = strchr(cursor, ':');
+        int dir_len = next ? (int)(next - cursor) : (int)strlen(cursor);
+        char candidate[PATH_MAX];
+        struct stat st;
+        int len = snprintf(candidate, sizeof(candidate), "%.*s%s%s", dir_len, cursor, dir_len ? "/" : "", name);
+        if (len > 0 && (size_t)len < sizeof(candidate) && stat(candidate, &st) == 0 && S_ISREG(st.st_mode) &&
+            access(candidate, X_OK) == 0) {
+            *out_found = strdup(candidate);
+        }
+        cursor = next ? next + 1 : NULL;
+    }
+    free(path);
+#endif
+    return *out_found != NULL;
 }
 
 /* set -x: a word needs quotes if the shell would read anything into it. */
@@ -1440,6 +1597,7 @@ static int shellSpawnProcess(VM *vm,
             if (resolved) {
                 shebang_path = resolved;
             }
+            shellEnvironmentForChild(cmd);
             int shebang_status = shellMaybeExecShebangTool(shebang_path, cmd->argv);
             if (resolved) {
                 free(resolved);
@@ -1449,6 +1607,10 @@ static int shellSpawnProcess(VM *vm,
             }
 #endif
             int err = 0;
+#if !defined(PSCAL_TARGET_IOS)
+            char *exec_found = NULL;
+            bool exec_lookup_ok = shellLookupForExec(cmd->argv[0], &exec_found);
+#endif
             shellEnvironmentForChild(cmd);
 #if defined(PSCAL_TARGET_IOS)
             char exec_path[PATH_MAX];
@@ -1463,8 +1625,12 @@ static int shellSpawnProcess(VM *vm,
                 err = errno;
             }
 #else
-            execvp(cmd->argv[0], cmd->argv);
-            err = errno;
+            if (exec_lookup_ok) {
+                execvp(exec_found ? exec_found : cmd->argv[0], cmd->argv);
+                err = errno;
+            } else {
+                err = ENOENT;
+            }
 #endif
 #if defined(PSCAL_TARGET_IOS)
             int script_status = shellTryRunScriptFallback(vm ? vm : gShellCurrentVm, cmd);
@@ -2193,6 +2359,10 @@ static ShellCommand *shellCloneCommandForBackground(const ShellCommand *src) {
 #if defined(PSCAL_TARGET_IOS)
     dst->body_state = src->body_state;
     ((ShellCommand *)src)->body_state = NULL;
+    dst->program_env = src->program_env;
+    ((ShellCommand *)src)->program_env = NULL;
+    dst->program_path = src->program_path;
+    ((ShellCommand *)src)->program_path = NULL;
 #endif
     return dst;
 }
@@ -2888,42 +3058,12 @@ static void shellPipelineSessionSnapshotStdStreams(ShellPipelineContext *ctx) {
 }
 #endif
 
-#if defined(PSCAL_TARGET_IOS)
-/* Stages are threads of one process, so the only place a stage can read `X=1 cmd`
- * from is the process environment, and it reads it whenever it gets there. The
- * assignment stays until the pipeline ends, which also shows it to the stages
- * launched after it. */
-static bool shellPipelineDeferAssignments(ShellPipelineContext *ctx,
-                                          ShellAssignmentBackup *backups,
-                                          size_t count) {
-    ShellDeferredAssignments *entry = (ShellDeferredAssignments *)malloc(sizeof(*entry));
-    if (!entry) {
-        return false;
-    }
-    entry->next = ctx->deferred_assignments;
-    entry->backups = backups;
-    entry->count = count;
-    ctx->deferred_assignments = entry;
-    return true;
-}
-
-static void shellPipelineRestoreDeferredAssignments(ShellPipelineContext *ctx) {
-    while (ctx->deferred_assignments) {
-        ShellDeferredAssignments *entry = ctx->deferred_assignments;
-        ctx->deferred_assignments = entry->next;
-        shellRestoreAssignments(entry->backups, entry->count);
-        free(entry);
-    }
-}
-#endif
-
 static void shellResetPipeline(void) {
     ShellPipelineContext *ctx = &gShellRuntime.pipeline;
     if (!ctx->active) {
         return;
     }
 #if defined(PSCAL_TARGET_IOS)
-    shellPipelineRestoreDeferredAssignments(ctx);
     shellPipelineSessionRestoreStdStreams(ctx);
     shellPipelineSessionCloseSpool(ctx);
     ctx->in_process = false;
@@ -4285,7 +4425,10 @@ static bool shellDispatchSmallclueAppletInProcess(VM *vm, ShellCommand *cmd) {
         }
     }
 
+    ShellProgramEnvScope program_env;
+    shellProgramEnvEnter(&program_env, cmd);
     sc_status = smallclueDispatchApplet(applet, argc, argv_copy);
+    shellProgramEnvLeave(&program_env);
     if (scoped) {
         vprocCommandScopeEnd(&vproc_scope, sc_status);
     }
@@ -4413,6 +4556,12 @@ static int shellRunBuiltinInProcess(VM *vm,
     if (applied_redirs) {
         cmd->redir_count = 0;
     }
+#if defined(PSCAL_TARGET_IOS)
+    if (cmd && cmd->program_env) {
+        gShellStageProgramEnv = cmd->program_env;
+        cmd->program_env = NULL;
+    }
+#endif
     bool builtin_ran = shellInvokeBuiltin(vm, cmd);
     if (cmd) {
         cmd->redir_count = applied_redir_count;
@@ -4486,7 +4635,7 @@ static int shellRunBuiltinInProcess(VM *vm,
             }
         }
         const char *shebang_path = cmd->argv[0];
-        char *resolved = shellFindExecutableOnPath(cmd->argv[0]);
+        char *resolved = shellStageFindExecutable(cmd);
         if (resolved) {
             shebang_path = resolved;
         }
@@ -4496,7 +4645,19 @@ static int shellRunBuiltinInProcess(VM *vm,
                 prev_ctx = shellRuntimeActivateContext(shebang_ctx);
             }
         }
+        /* Only for a script: a stage's environment is for whatever program it turns out to be. */
+        ShellProgramEnvScope shebang_env;
+        ShellProgramScope shebang_scope;
+        bool has_shebang = shellPathHasShebang(shebang_path);
+        if (has_shebang) {
+            shellProgramEnvEnter(&shebang_env, cmd);
+            shellProgramScopeEnter(&shebang_scope);
+        }
         int shebang_status = shellMaybeExecShebangTool(shebang_path, cmd->argv);
+        if (has_shebang) {
+            shellProgramScopeLeave(&shebang_scope);
+            shellProgramEnvLeave(&shebang_env);
+        }
         if (shebang_ctx) {
             shellRuntimeActivateContext(prev_ctx);
             shellRuntimeDestroyContext(shebang_ctx);
@@ -4638,8 +4799,13 @@ static int shellRunBuiltinInProcess(VM *vm,
                             }
                         }
 #endif
+#if defined(PSCAL_TARGET_IOS)
+                        ShellProgramEnvScope program_env;
+                        shellProgramEnvEnter(&program_env, cmd);
+#endif
                         sc_status = smallclueDispatchApplet(applet, argc, argv_copy);
 #if defined(PSCAL_TARGET_IOS)
+                        shellProgramEnvLeave(&program_env);
                         const char *dbg = getenv("SMALLCLUE_DEBUG");
                         if (dbg && *dbg) {
                             fprintf(stderr, "[smallclue] dispatched applet pid=%d pgid=%d\n",
@@ -4670,7 +4836,7 @@ static int shellRunBuiltinInProcess(VM *vm,
             const char *orig0 = cmd->argv ? cmd->argv[0] : NULL;
             const char *temp0 = orig0;
             if (orig0 && strchr(orig0, '/') == NULL) {
-                resolved = shellFindExecutableOnPath(orig0);
+                resolved = shellStageFindExecutable(cmd);
                 if (resolved) {
                     temp0 = resolved;
                 }
@@ -4679,7 +4845,10 @@ static int shellRunBuiltinInProcess(VM *vm,
             if (temp0) {
                 char *saved0 = cmd->argv[0];
                 cmd->argv[0] = (char *)temp0;
+                ShellProgramEnvScope program_env;
+                shellProgramEnvEnter(&program_env, cmd);
                 fb_status = shellTryRunScriptFallback(vm ? vm : gShellCurrentVm, cmd);
+                shellProgramEnvLeave(&program_env);
                 cmd->argv[0] = saved0;
             }
             if (resolved) free(resolved);
@@ -4701,6 +4870,10 @@ static int shellRunBuiltinInProcess(VM *vm,
     status = gShellRuntime.last_status;
 
 cleanup:
+#if defined(PSCAL_TARGET_IOS)
+    vprocEnvRelease(gShellStageProgramEnv);
+    gShellStageProgramEnv = NULL;
+#endif
     if (tool_dbg && pipe_dbg && status == 127) {
         fprintf(stderr, "[run-builtin] exiting with status=127 cmd=%s apply_exec_redirs=%d stdin_fd=%d stdout_fd=%d stderr_fd=%d\n",
                 (cmd && cmd->argv && cmd->argv[0]) ? cmd->argv[0] : "<nil>",
@@ -5347,9 +5520,7 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
             shellAbortPipeline();
             return false;
         }
-        if (ctx->stage_count > 1 && shellStageRunsShellCode(cloned)) {
-            cloned->body_state = shellBodyStateCapture();
-        }
+        shellStageCaptureState(cloned, cmd, ctx->stage_count);
         worker->vm = vm;
         worker->cmd = cloned;
         worker->vp = vp;
@@ -5462,6 +5633,7 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
                 return false;
             }
 
+            shellStageCaptureState(cloned, cmd, 1);
             bg_ctx->vm = vm;
             bg_ctx->cmd = cloned;
             bg_ctx->synthetic_pid = -1;
@@ -5545,9 +5717,7 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
             ? PSCALRuntimeGetCurrentRuntimeContext()
             : NULL;
         tctx->link = shellThreadLinkCapture();
-        if (ctx->stage_count > 1 && shellStageRunsShellCode(cloned)) {
-            cloned->body_state = shellBodyStateCapture();
-        }
+        shellStageCaptureState(cloned, cmd, ctx->stage_count);
 #endif
         if (async_tail) {
             ShellPipelineContext *ctx_clone = shellCloneSingleStagePipelineContext(ctx);
@@ -5716,23 +5886,38 @@ static bool shellExecuteExecBuiltin(VM *vm, ShellCommand *cmd) {
         return true;
     }
 
+    /* Not in a child here: a failed exec has to find everything as it was. */
+    PscalEnvSnapshot exec_env = {0};
+    bool have_exec_env = pscalEnvSnapshotTake(&exec_env);
+    char *exec_found = NULL;
+    bool exec_lookup_ok = shellLookupForExec(argv[0], &exec_found);
     shellEnvironmentForChild(cmd);
 #if defined(PSCAL_TARGET_IOS)
     char exec_path[PATH_MAX];
-    const char *resolved_exec = argv[0];
-    if (shellResolveExecutionPath(argv[0], exec_path, sizeof(exec_path))) {
+    const char *resolved_exec = exec_found ? exec_found : argv[0];
+    if (shellResolveExecutionPath(resolved_exec, exec_path, sizeof(exec_path))) {
         resolved_exec = exec_path;
     }
-    execv(resolved_exec, argv);
-    int err = errno;
-    if ((err == ENOENT || err == EACCES) && strcmp(resolved_exec, argv[0]) != 0) {
-        execvp(argv[0], argv);
+    int err = ENOENT;
+    if (exec_lookup_ok) {
+        execv(resolved_exec, argv);
         err = errno;
+        if ((err == ENOENT || err == EACCES) && strcmp(resolved_exec, argv[0]) != 0) {
+            execvp(argv[0], argv);
+            err = errno;
+        }
     }
 #else
-    execvp(argv[0], argv);
-    int err = errno;
+    int err = ENOENT;
+    if (exec_lookup_ok) {
+        execvp(exec_found ? exec_found : argv[0], argv);
+        err = errno;
+    }
 #endif
+    free(exec_found);
+    if (have_exec_env) {
+        (void)pscalEnvSnapshotRestore(&exec_env);
+    }
     runtimeError(vm, "exec: %s: %s", argv[0], strerror(err));
     shellRestoreExecRedirections(backups, backup_count);
     shellFreeExecRedirBackups(backups, backup_count);
@@ -5748,6 +5933,34 @@ static bool shellExecuteExecBuiltin(VM *vm, ShellCommand *cmd) {
         shellExitUnlessInteractive(vm, "exec");
     }
     return true;
+}
+
+/* `PATH=/bin export PATH`: export, readonly, local and declare -x act on the variable the
+ * prefix made, and it stays, still exported. Any other prefix ends with its command. */
+static void shellFinishAssignments(const ShellCommand *cmd, ShellAssignmentBackup *backups, size_t count) {
+    char lookup_buf[PATH_MAX];
+    const char *name = (cmd && cmd->argc > 1 && !cmd->background && gShellRuntime.pipeline.stage_count <= 1)
+                           ? shellCommandLookupName(cmd->argv[0], lookup_buf, sizeof(lookup_buf))
+                           : NULL;
+    const char *canonical = name ? shellBuiltinCanonicalName(name) : NULL;
+    bool keep = canonical && (strcmp(canonical, "export") == 0 || strcmp(canonical, "readonly") == 0 ||
+                              strcmp(canonical, "local") == 0);
+    if (canonical && (strcmp(canonical, "declare") == 0 || strcmp(canonical, "typeset") == 0)) {
+        for (size_t j = 1; j < cmd->argc; ++j) {
+            keep = keep || (cmd->argv[j][0] == '-' && strchr(cmd->argv[j], 'x'));
+        }
+    }
+    for (size_t i = 0; keep && i < count; ++i) {
+        for (size_t j = 1; backups[i].name && j < cmd->argc; ++j) {
+            if (strcmp(cmd->argv[j], backups[i].name) == 0) {
+                free(backups[i].name);
+                free(backups[i].previous_value);
+                backups[i].name = NULL;
+                backups[i].previous_value = NULL;
+            }
+        }
+    }
+    shellRestoreAssignments(backups, count);
 }
 
 static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
@@ -5992,7 +6205,7 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
         if (ctx->stage_count == 1 && shellCommandIsExecBuiltin(cmd)) {
             shellExecuteExecBuiltin(vm, cmd);
             if (assignments_applied) {
-                shellRestoreAssignments(assignment_backups, assignment_backup_count);
+                shellFinishAssignments(cmd, assignment_backups, assignment_backup_count);
                 assignments_applied = false;
                 assignment_backups = NULL;
                 assignment_backup_count = 0;
@@ -6024,7 +6237,7 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
                 shellVprocLabelScopeEnd(&label_scope);
                 if (ran_builtin) {
                     if (assignments_applied) {
-                        shellRestoreAssignments(assignment_backups, assignment_backup_count);
+                        shellFinishAssignments(cmd, assignment_backups, assignment_backup_count);
                         assignments_applied = false;
                         assignment_backups = NULL;
                         assignment_backup_count = 0;
@@ -6045,7 +6258,7 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
             bool ran_builtin = !cmd->body && shellInvokeBuiltin(vm, cmd);
             if (ran_builtin) {
                 if (assignments_applied) {
-                    shellRestoreAssignments(assignment_backups, assignment_backup_count);
+                    shellFinishAssignments(cmd, assignment_backups, assignment_backup_count);
                     assignments_applied = false;
                     assignment_backups = NULL;
                     assignment_backup_count = 0;
@@ -6066,7 +6279,7 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
         size_t idx = stage_pos;
         if (idx >= ctx->stage_count) {
             if (assignments_applied) {
-                shellRestoreAssignments(assignment_backups, assignment_backup_count);
+                shellFinishAssignments(cmd, assignment_backups, assignment_backup_count);
             }
             assignment_backups = NULL;
             assignment_backup_count = 0;
@@ -6100,11 +6313,9 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
                                                                stage_pos,
                                                                pipeline_head,
                                                                pipeline_tail);
+            /* A stage on another thread took what it needs while it was launched. */
             if (assignments_applied) {
-                if (!stage_ok || !ctx->active || ctx->background ||
-                    !shellPipelineDeferAssignments(ctx, assignment_backups, assignment_backup_count)) {
-                    shellRestoreAssignments(assignment_backups, assignment_backup_count);
-                }
+                shellFinishAssignments(cmd, assignment_backups, assignment_backup_count);
                 assignments_applied = false;
                 assignment_backups = NULL;
                 assignment_backup_count = 0;
@@ -6131,7 +6342,7 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
         if (shellCommandIsExecBuiltin(cmd)) {
             shellExecuteExecBuiltin(vm, cmd);
             if (assignments_applied) {
-                shellRestoreAssignments(assignment_backups, assignment_backup_count);
+                shellFinishAssignments(cmd, assignment_backups, assignment_backup_count);
                 assignments_applied = false;
                 assignment_backups = NULL;
                 assignment_backup_count = 0;
@@ -6154,7 +6365,7 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
 #endif
             if (ran_builtin) {
                 if (assignments_applied) {
-                    shellRestoreAssignments(assignment_backups, assignment_backup_count);
+                    shellFinishAssignments(cmd, assignment_backups, assignment_backup_count);
                     assignments_applied = false;
                     assignment_backups = NULL;
                     assignment_backup_count = 0;
@@ -6192,7 +6403,7 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
                                       &child,
                                       ignore_job_signals);
     if (assignments_applied) {
-        shellRestoreAssignments(assignment_backups, assignment_backup_count);
+        shellFinishAssignments(cmd, assignment_backups, assignment_backup_count);
         assignments_applied = false;
         assignment_backups = NULL;
         assignment_backup_count = 0;
