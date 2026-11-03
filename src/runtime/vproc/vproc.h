@@ -238,6 +238,9 @@ bool vprocGetStopUnsupported(int pid);
 void vprocSetShellPromptReadActive(int pid, bool active);
 bool vprocShellPromptReadActive(int pid);
 void vprocSetPipelineStage(bool active);
+/* Did the interrupt key end this thread's reads of the terminal? Asking clears it,
+ * so the next command reads again. */
+bool vprocTakeTerminalInterrupted(void);
 int vprocSetForegroundPgid(int sid, int fg_pgid);
 int vprocGetForegroundPgid(int sid);
 int vprocNextJobIdSeed(void);
@@ -357,6 +360,7 @@ typedef struct VProcSessionInput {
     bool eof;
     bool reader_active;
     bool interrupt_pending;
+    bool interrupt_key;   /* interrupt_pending is there for the interrupt key */
     bool stop_requested;
     /* End-of-file keys not yet read, oldest first: how many queued bytes come
      * before each. Each one reads as 0 bytes, once, and input goes on after it. */

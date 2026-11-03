@@ -5102,6 +5102,12 @@ static int shellPipelineRunStage(VM *vm,
         pthread_cleanup_pop(0);
 #endif
     }
+#if defined(PSCAL_TARGET_IOS)
+    /* The interrupt key ended its input, so it ended as if that were all it had. */
+    if (vprocTakeTerminalInterrupted() && status < 128) {
+        status = 128 + SIGINT;
+    }
+#endif
 
     bool stderr_shared_with_stdout =
         (stderr_pscal && stdout_pscal && stderr_pscal == stdout_pscal);

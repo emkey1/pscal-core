@@ -3318,6 +3318,8 @@ static void vprocUnregisterThreadByPid(int pid, pthread_t tid);
 static void vprocRegisterStartedThread(int pid, pthread_t tid);
 static void vprocScratchTlsCleanupCurrentThread(void);
 static __thread bool gVprocPipelineStage = false;
+static __thread bool gVprocInterruptKeyRead = false;
+static __thread bool gVprocTerminalInterrupted = false;
 typedef void (*VprocStopWaitHookFn)(void);
 static __thread VprocStopWaitHookFn gVprocStopWaitBeforeHook = NULL;
 static __thread VprocStopWaitHookFn gVprocStopWaitAfterHook = NULL;
@@ -5959,6 +5961,7 @@ static void *vprocSessionInputThread(void *arg) {
                     input->eof_mark_count = 0;
                 }
                 input->interrupt_pending = true;
+                input->interrupt_key = (sig == SIGINT);
                 pthread_cond_broadcast(&input->cv);
                 pthread_mutex_unlock(&input->mu);
                 pscal_fd_poll_wakeup(NULL, POLLIN);
@@ -6139,6 +6142,7 @@ static VProcSessionInput *vprocSessionInputEnsure(VProcSessionStdio *session, in
         input->len = 0;
         input->eof_mark_count = 0;
         input->interrupt_pending = false;
+        input->interrupt_key = false;
     }
     if (!input->reader_active &&
         (session->stdin_host_fd >= 0 || has_pscal_fd)) {
@@ -6292,6 +6296,8 @@ static ssize_t vprocSessionReadInput(VProcSessionStdio *session, void *buf, size
         }
         if (input->interrupt_pending) {
             input->interrupt_pending = false;
+            gVprocInterruptKeyRead = input->interrupt_key;
+            input->interrupt_key = false;
             pthread_mutex_unlock(&input->mu);
             (void)vprocWaitIfStopped(vprocCurrent());
             errno = EINTR;
@@ -9705,6 +9711,12 @@ void vprocSetPipelineStage(bool active) {
     gVprocPipelineStage = active;
 }
 
+bool vprocTakeTerminalInterrupted(void) {
+    bool interrupted = gVprocTerminalInterrupted;
+    gVprocTerminalInterrupted = false;
+    return interrupted;
+}
+
 int vprocGetPgid(int pid) {
     if (pid == 0) {
         pid = vprocGetPidShim();
@@ -12696,6 +12708,7 @@ void vprocSessionStdioDestroy(VProcSessionStdio *stdio_ctx) {
         input->eof_mark_count = 0;
         input->eof = true;
         input->interrupt_pending = false;
+        input->interrupt_key = false;
         pthread_cond_broadcast(&input->cv);
         pthread_mutex_unlock(&input->mu);
     }
@@ -12796,6 +12809,7 @@ void vprocSessionStdioRefresh(VProcSessionStdio *stdio_ctx, int kernel_pid) {
         input->eof_mark_count = 0;
         input->eof = false;
         input->interrupt_pending = false;
+        input->interrupt_key = false;
         pthread_cond_broadcast(&input->cv);
         pthread_mutex_unlock(&input->mu);
     }
@@ -13899,6 +13913,26 @@ static bool vprocSessionFdIsTerminal(VProcSessionStdio *session, struct pscal_fd
     return pscal_fd->tty && session->pty_slave && session->pty_slave->tty == pscal_fd->tty;
 }
 
+/* The interrupt key, at the shell's own prompt, where the reader took it for a signal
+ * to the foreground. The shell has that signal blocked, so it would only wait, and
+ * the line being edited would run together with the next one. */
+static bool vprocPromptTakesInterruptKey(void) {
+    int pid = vprocGetPidShim();
+    if (!vprocShellPromptReadActive(pid)) {
+        return false;
+    }
+    sigset_t pending;
+    sigemptyset(&pending);
+    if (vprocSigpending(pid, &pending) == 0 && sigismember(&pending, SIGINT)) {
+        sigset_t watch;
+        sigemptyset(&watch);
+        sigaddset(&watch, SIGINT);
+        int signo = 0;
+        (void)vprocSigwait(pid, &watch, &signo);
+    }
+    return true;
+}
+
 ssize_t vprocReadShim(int fd, void *buf, size_t count) {
     vprocDeliverPendingSignalsForCurrent();
     VProc *vp = vprocForThread();
@@ -13923,8 +13957,29 @@ ssize_t vprocReadShim(int fd, void *buf, size_t count) {
                 }
             }
             bool nonblocking = (pscal_fd->flags & O_NONBLOCK) != 0;
+            const bool line_mode = gVprocPipelineStage && vprocTtyInLineMode(pscal_fd);
             pscal_fd_close(pscal_fd);
-            return vprocSessionReadInputShimMode(buf, count, nonblocking);
+            /* The interrupt key, where a command takes the terminal as it comes.
+             * Every read loop stops at the end of its input, and an applet on
+             * the shell's thread has no other way out: nothing can kill it, and
+             * many loops only read again on EINTR. The shell turns this into the
+             * status of a command the key ended. */
+            if (line_mode && gVprocTerminalInterrupted) {
+                return 0;
+            }
+            gVprocInterruptKeyRead = false;
+            ssize_t res = vprocSessionReadInputShimMode(buf, count, nonblocking);
+            if (res < 0 && errno == EINTR && gVprocInterruptKeyRead) {
+                if (line_mode) {
+                    gVprocTerminalInterrupted = true;
+                    return 0;
+                }
+                if (vprocPromptTakesInterruptKey()) {
+                    *(unsigned char *)buf = 0x03;
+                    return 1;
+                }
+            }
+            return res;
         }
         if (gVprocPipelineStage &&
             vprocVprocDebugEnabled() &&

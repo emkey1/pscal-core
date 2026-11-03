@@ -33,6 +33,76 @@ extern int PSCALRuntimeSetTabStartupCommand(const char *command);
 #include <pthread.h>
 #include <sys/ioctl.h>
 #include <setjmp.h>
+static bool shellToolTcgetattr(int fd, struct termios *termios) {
+    if (!termios) {
+        return false;
+    }
+#if defined(PSCAL_TARGET_IOS)
+    if (vprocIoctlShim(fd, TIOCGETA, termios) == 0) {
+        return true;
+    }
+#ifdef TCGETS
+    if (vprocIoctlShim(fd, TCGETS, termios) == 0) {
+        return true;
+    }
+#endif
+#endif
+    return tcgetattr(fd, termios) == 0;
+}
+
+/* In the app a tool's terminal runs in line mode, and part of a line typed while it
+ * ran is still waiting there, on its way to the next prompt. */
+#if defined(PSCAL_TARGET_IOS)
+#define SHELL_TOOL_RESTORE_ACTION TCSADRAIN
+#else
+#define SHELL_TOOL_RESTORE_ACTION TCSAFLUSH
+#endif
+
+static bool shellToolTcsetattr(int fd, int action, const struct termios *termios) {
+    if (!termios) {
+        return false;
+    }
+#if defined(PSCAL_TARGET_IOS)
+    /* Not an int: TIOCSETAW has its top bit set, and would arrive sign-extended. */
+    unsigned long cmd = 0;
+#if defined(TCSETS)
+    switch (action) {
+        case TCSANOW:
+            cmd = TCSETS;
+            break;
+        case TCSADRAIN:
+            cmd = TCSETSW;
+            break;
+        case TCSAFLUSH:
+            cmd = TCSETSF;
+            break;
+        default:
+            cmd = 0;
+            break;
+    }
+#elif defined(TIOCSETA)
+    switch (action) {
+        case TCSANOW:
+            cmd = TIOCSETA;
+            break;
+        case TCSADRAIN:
+            cmd = TIOCSETAW;
+            break;
+        case TCSAFLUSH:
+            cmd = TIOCSETAF;
+            break;
+        default:
+            cmd = 0;
+            break;
+    }
+#endif
+    if (cmd != 0 && vprocIoctlShim(fd, cmd, (void *)termios) == 0) {
+        return true;
+    }
+#endif
+    return tcsetattr(fd, action, termios) == 0;
+}
+
 #ifdef PSCAL_TARGET_IOS
 #include <signal.h>
 #include <dirent.h>
@@ -71,75 +141,6 @@ typedef struct {
     int saved_fds[3];
     bool saved_valid[3];
 } ShellStdFdBackup;
-
-static bool shellToolTcgetattr(int fd, struct termios *termios) {
-    if (!termios) {
-        return false;
-    }
-#if defined(PSCAL_TARGET_IOS)
-    if (vprocIoctlShim(fd, TIOCGETA, termios) == 0) {
-        return true;
-    }
-#ifdef TCGETS
-    if (vprocIoctlShim(fd, TCGETS, termios) == 0) {
-        return true;
-    }
-#endif
-#endif
-    return tcgetattr(fd, termios) == 0;
-}
-
-/* In the app a tool's terminal runs in line mode, and part of a line typed while it
- * ran is still waiting there, on its way to the next prompt. */
-#if defined(PSCAL_TARGET_IOS)
-#define SHELL_TOOL_RESTORE_ACTION TCSADRAIN
-#else
-#define SHELL_TOOL_RESTORE_ACTION TCSAFLUSH
-#endif
-
-static bool shellToolTcsetattr(int fd, int action, const struct termios *termios) {
-    if (!termios) {
-        return false;
-    }
-#if defined(PSCAL_TARGET_IOS)
-    int cmd = 0;
-#if defined(TCSETS)
-    switch (action) {
-        case TCSANOW:
-            cmd = TCSETS;
-            break;
-        case TCSADRAIN:
-            cmd = TCSETSW;
-            break;
-        case TCSAFLUSH:
-            cmd = TCSETSF;
-            break;
-        default:
-            cmd = 0;
-            break;
-    }
-#elif defined(TIOCSETA)
-    switch (action) {
-        case TCSANOW:
-            cmd = TIOCSETA;
-            break;
-        case TCSADRAIN:
-            cmd = TIOCSETAW;
-            break;
-        case TCSAFLUSH:
-            cmd = TIOCSETAF;
-            break;
-        default:
-            cmd = 0;
-            break;
-    }
-#endif
-    if (cmd != 0 && vprocIoctlShim(fd, cmd, (void *)termios) == 0) {
-        return true;
-    }
-#endif
-    return tcsetattr(fd, action, termios) == 0;
-}
 
 static void shellSaveSignalState(ShellSignalBackup *backup) {
     if (!backup) {
@@ -5294,6 +5295,22 @@ Value vmBuiltinShellReturn(VM *vm, int arg_count, Value *args) {
     return makeVoid();
 }
 
+#if defined(PSCAL_TARGET_IOS)
+static bool shellReadTakeInterrupt(void) {
+    int pid = vprocGetPidShim();
+    sigset_t pending;
+    sigemptyset(&pending);
+    if (pid <= 0 || vprocSigpending(pid, &pending) != 0 || !sigismember(&pending, SIGINT)) {
+        return false;
+    }
+    sigset_t watch;
+    sigemptyset(&watch);
+    sigaddset(&watch, SIGINT);
+    int signo = 0;
+    return vprocSigwait(pid, &watch, &signo) == 0;
+}
+#endif
+
 /* Up to a delimiter (-1 for none) or a number of bytes (-1 for no limit). */
 static ShellReadLineResult shellReadUntil(int fd, int delimiter, long limit, double timeout, char **out_line,
                                           size_t *out_length) {
@@ -5322,6 +5339,13 @@ static ShellReadLineResult shellReadUntil(int fd, int delimiter, long limit, dou
         ssize_t n = read(fd, &ch, 1);
         if (n < 0) {
             if (errno == EINTR) {
+#if defined(PSCAL_TARGET_IOS)
+                /* Out of line mode (read -n) the key does not end the read. */
+                if (shellReadTakeInterrupt()) {
+                    free(buffer);
+                    return SHELL_READ_LINE_INTERRUPTED;
+                }
+#endif
                 continue;
             }
             free(buffer);
@@ -6123,6 +6147,7 @@ Value vmBuiltinShellRead(VM *vm, int arg_count, Value *args) {
     bool parsing_options = true;
     bool ok = true;
     bool raw_mode = false;
+    bool read_silent = false;
     int read_delim = '\n';
     long read_chars = -1;
     bool read_exact = false;
@@ -6174,6 +6199,8 @@ Value vmBuiltinShellRead(VM *vm, int arg_count, Value *args) {
                             raw_mode = true;
                             break;
                         case 's':
+                            read_silent = true;
+                            break;
                         case 'e':
                             break;
                         case 'p':
@@ -6307,7 +6334,27 @@ Value vmBuiltinShellRead(VM *vm, int arg_count, Value *args) {
             shellUpdateStatus(ready > 0 ? 0 : 1);
             return makeVoid();
         }
+        /* At a terminal: -s takes the echo away, and a read that does not end at
+         * the end of a line gets the keys as they come. */
+        const bool read_keys = read_chars >= 0 || read_delim != '\n';
+        struct termios read_saved;
+        bool read_termios_changed = false;
+        if ((read_silent || read_keys) && shellToolTcgetattr(read_fd, &read_saved)) {
+            struct termios read_termios = read_saved;
+            if (read_silent) {
+                read_termios.c_lflag &= ~(tcflag_t)ECHO;
+            }
+            if (read_keys) {
+                read_termios.c_lflag &= ~(tcflag_t)ICANON;
+                read_termios.c_cc[VMIN] = 1;
+                read_termios.c_cc[VTIME] = 0;
+            }
+            read_termios_changed = shellToolTcsetattr(read_fd, TCSADRAIN, &read_termios);
+        }
         read_result = shellReadUntil(read_fd, read_exact ? -1 : read_delim, read_chars, read_timeout, &line, &line_length);
+        if (read_termios_changed) {
+            shellToolTcsetattr(read_fd, TCSADRAIN, &read_saved);
+        }
         if (read_result == SHELL_READ_LINE_OK && !read_exact && line_length > 0 &&
             (unsigned char)line[line_length - 1] == (unsigned char)read_delim) {
             line[--line_length] = '\0';
@@ -6413,6 +6460,8 @@ Value vmBuiltinShellRead(VM *vm, int arg_count, Value *args) {
     bool ended_early = read_result == SHELL_READ_LINE_OK && read_chars < 0 && !read_saw_delimiter;
     if (read_result == SHELL_READ_LINE_TIMEOUT) {
         shellUpdateStatus(128 + SIGALRM);
+    } else if (read_result == SHELL_READ_LINE_INTERRUPTED) {
+        shellUpdateStatus(128 + SIGINT);
     } else if (!ok || !assign_ok || read_result != SHELL_READ_LINE_OK || ended_early) {
         shellUpdateStatus(1);
     } else {

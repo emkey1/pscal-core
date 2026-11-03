@@ -567,6 +567,11 @@ canon_wake:
                 if (echo && SHOULD_ECHOCTL(ch)) {
                     const char shown[2] = {'^', (char)(ch ^ '\100')};
                     tty_echo(tty, shown, sizeof(shown));
+                    /* What it ends is reading this line, and no shell here adds
+                     * the newline a dead child would get. */
+                    if (ch == cc[VINTR_]) {
+                        tty_echo(tty, "\r\n", 2);
+                    }
                 }
                 goto canon_wake;
             } else {
