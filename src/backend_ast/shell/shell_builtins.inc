@@ -688,9 +688,14 @@ size_t shellRuntimeRedirectScopeDepth(void) {
 }
 
 /* return and exit stop a chunk before it reaches a scope's mode=leave, so the
- * caller of the chunk closes what was left open. */
+ * caller of the chunk closes what was left open. Each restores what the one inside it
+ * replaced, so a loop started inside a scope ends first. */
 void shellRuntimeUnwindRedirectScopes(size_t depth) {
     while (gShellSubshellStackSize > depth) {
+        while (!gShellExitRequested && gShellLoopStackSize > 0 &&
+               shellLoopTop()->scope_depth >= gShellSubshellStackSize) {
+            shellLoopPopFrameFlushed();
+        }
         ShellSubshellFrame frame = shellSubshellStackPop();
         shellSubshellFrameClose(&frame);
     }
@@ -850,6 +855,7 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
         return result;
     }
 
+    frame->scope_depth = gShellSubshellStackSize;
     frame->skip_body = parent_skip;
     frame->keep_status = parent_skip;
     frame->break_pending = false;
@@ -4939,7 +4945,14 @@ Value vmBuiltinShellSource(VM *vm, int arg_count, Value *args) {
         gShellSourceNameCount++;
         source_name_pushed = true;
     }
+    int condition_depth = gShellConditionDepth;
+    size_t loop_depth = gShellLoopStackSize;
+    size_t case_depth = gShellCaseStack.count;
     int status = shellRunSource(source, path, &opts, &exit_requested);
+    shellUnwindChunk(loop_depth, case_depth);
+    if (gShellReturnPending) {
+        gShellConditionDepth = condition_depth;
+    }
     gShellReturnPending = false;
     if (pipeline_saved) {
         shellResetPipeline();
@@ -5047,7 +5060,10 @@ Value vmBuiltinShellEval(VM *vm, int arg_count, Value *args) {
     int status = EXIT_FAILURE;
     if (can_run || shellSymbolTableScopeIsActive()) {
         opts.first_line = gShellCurrentCommandLine;
+        size_t loop_depth = gShellLoopStackSize;
+        size_t case_depth = gShellCaseStack.count;
         status = shellRunSource(script, "<eval>", &opts, &exit_requested);
+        shellUnwindChunk(loop_depth, case_depth);
     }
     if (pipeline_saved) {
         shellResetPipeline();
@@ -5291,7 +5307,6 @@ Value vmBuiltinShellReturn(VM *vm, int arg_count, Value *args) {
     }
 
     shellUpdateStatus(status);
-    shellRuntimeAbandonConditionEvaluation();
     /* An eval runs its text in a VM of its own, and has to pass this on. */
     gShellReturnPending = true;
     gShellReturnStatus = status;

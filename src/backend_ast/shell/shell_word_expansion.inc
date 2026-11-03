@@ -1954,6 +1954,9 @@ static bool shellInvokeFunction(VM *vm, ShellCommand *cmd) {
     bool frame_pushed = false;
     InterpretResult result = INTERPRET_OK;
     size_t redirect_scope_depth = shellRuntimeRedirectScopeDepth();
+    size_t loop_depth = gShellLoopStackSize;
+    size_t case_depth = gShellCaseStack.count;
+    int condition_depth = gShellConditionDepth;
     /* The pipeline that called the function is still the shell's: its negation and status
      * apply when the call returns, whatever the body's pipelines do. A stage's context may
      * be in use by the stages beside it, and those keep it. */
@@ -2016,6 +2019,11 @@ static bool shellInvokeFunction(VM *vm, ShellCommand *cmd) {
 
     result = interpretBytecode(invoke_vm, &compiled->chunk,
                                globalSymbols, constGlobalSymbols, procedure_table, 0);
+    if (gShellReturnPending) {
+        /* It may have left a condition of its own. One the call is in still holds:
+         * `set -e; if f; then` ignores a failure inside f. */
+        gShellConditionDepth = condition_depth;
+    }
     gShellReturnPending = false;
     if (result != INTERPRET_OK && !gShellExitRequested) {
         shellUpdateStatus(1);
@@ -2038,6 +2046,7 @@ static bool shellInvokeFunction(VM *vm, ShellCommand *cmd) {
 
 invoke_cleanup:
     shellRuntimeUnwindRedirectScopes(redirect_scope_depth);
+    shellUnwindChunk(loop_depth, case_depth);
     if (pipeline_saved) {
         shellResetPipeline();
         *caller_pipeline = saved_pipeline;

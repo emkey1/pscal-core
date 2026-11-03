@@ -2841,6 +2841,7 @@ typedef struct ShellLoopFrame {
     size_t redir_backup_capacity;
     int status; /* the loop's status: its last body command's, 0 if the body never ran */
     bool keep_status; /* started while skipping, so nothing ran and nothing changes */
+    size_t scope_depth; /* redirection scopes open when it started */
 } ShellLoopFrame;
 
 #define gShellLoopStack (SC()->loop_stack)
@@ -6021,6 +6022,7 @@ static ShellLoopFrame *shellLoopPushFrame(ShellLoopKind kind) {
     frame.redir_backups = NULL;
     frame.redir_backup_count = 0;
     frame.redir_backup_capacity = 0;
+    frame.scope_depth = 0;
     gShellLoopStack[gShellLoopStackSize++] = frame;
     return &gShellLoopStack[gShellLoopStackSize - 1];
 }
@@ -6496,6 +6498,30 @@ static void shellCaseStackPop(void) {
         free(gShellCaseStack.items);
         gShellCaseStack.items = NULL;
         gShellCaseStack.capacity = 0;
+    }
+}
+
+static void shellLoopPopFrameFlushed(void) {
+    ShellLoopFrame *frame = shellLoopTop();
+    if (frame && frame->redirs_active) {
+        shellFlushStandardStreams();
+    }
+    shellLoopPopFrame();
+}
+
+/* return stops a chunk before it reaches __shell_loop_end or __shell_case_end, so the caller
+ * of the chunk ends what was left open. A frame left on the stack is the one the loop around
+ * it goes on to advance, and that loop then never ends. exit leaves the loops alone: their
+ * redirections are still in place when the EXIT trap runs, as under bash. */
+static void shellUnwindChunk(size_t loop_depth, size_t case_depth) {
+    while (gShellCaseStack.count > case_depth) {
+        shellCaseStackPop();
+    }
+    if (gShellExitRequested) {
+        return;
+    }
+    while (gShellLoopStackSize > loop_depth) {
+        shellLoopPopFrameFlushed();
     }
 }
 
