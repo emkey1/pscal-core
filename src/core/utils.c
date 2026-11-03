@@ -3648,6 +3648,44 @@ Token *copyToken(const Token *orig_token) { // Renamed parameter to avoid confli
 }
 
 /* Free a token */
+static PSCAL_THREAD_LOCAL Token **gTokenArena = NULL;
+static PSCAL_THREAD_LOCAL size_t gTokenArenaCount = 0;
+static PSCAL_THREAD_LOCAL size_t gTokenArenaCapacity = 0;
+
+/* See core/token_arena.h. */
+Token *tokenArenaTrack(Token *token) {
+    if (token && gTokenArenaCount == gTokenArenaCapacity) {
+        size_t capacity = gTokenArenaCapacity ? gTokenArenaCapacity * 2 : 256;
+        Token **items = realloc(gTokenArena, sizeof(Token *) * capacity);
+        if (!items) {
+            return token; /* Not recorded: it outlives the run, which is harmless. */
+        }
+        gTokenArena = items;
+        gTokenArenaCapacity = capacity;
+    }
+    if (token) {
+        gTokenArena[gTokenArenaCount++] = token;
+    }
+    return token;
+}
+
+size_t tokenArenaMark(void) {
+    return gTokenArenaCount;
+}
+
+void freeToken(Token *token);
+
+void tokenArenaRelease(size_t mark) {
+    while (gTokenArenaCount > mark) {
+        freeToken(gTokenArena[--gTokenArenaCount]);
+    }
+    if (mark == 0) {
+        free(gTokenArena);
+        gTokenArena = NULL;
+        gTokenArenaCapacity = 0;
+    }
+}
+
 void freeToken(Token *token) {
     if (!token) return;
     if (token->value) {
@@ -3658,6 +3696,7 @@ void freeToken(Token *token) {
 }
 
 void freeProcedureTable(void) {
+    freeScopeTables();
     if (!procedure_table) {
         return;
     }

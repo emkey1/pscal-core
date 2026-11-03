@@ -68,6 +68,18 @@ struct SymbolTable_s {
 };
 typedef struct SymbolTable_s HashTable;
 
+/* The tables createScopeTable has made on this thread. See symbol.c. */
+typedef struct {
+    HashTable **items;
+    int count;
+    int capacity;
+} ScopeTableList;
+HashTable *createScopeTable(void);
+void freeScopeTables(void);
+/* A frontend run inline, inside another's, keeps its own list. */
+ScopeTableList scopeTablesDetach(void);
+void scopeTablesAttach(ScopeTableList list);
+
 // --- Include globals.h AFTER defining Symbol and HashTable ---
 // This allows functions in symbol.c (prototyped below) to use macros
 // or externs from globals.h if necessary.

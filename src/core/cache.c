@@ -2242,7 +2242,7 @@ static HashTable* findProcedureScope(HashTable* table,
         }
     }
     if (!parent->type_def->symbol_table) {
-        HashTable* nested = createHashTable();
+        HashTable* nested = createScopeTable();
         if (!nested) {
             return NULL;
         }

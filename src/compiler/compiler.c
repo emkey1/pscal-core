@@ -8520,7 +8520,7 @@ static void compileNode(AST* node, BytecodeChunk* chunk, int current_line_approx
                 if (node->left->symbol_table) {
                     tbl = (HashTable*)node->left->symbol_table;
                 } else {
-                    tbl = createHashTable();
+                    tbl = createScopeTable();
                     node->left->symbol_table = (Symbol*)tbl;
                 }
                 current_class_const_table = tbl;

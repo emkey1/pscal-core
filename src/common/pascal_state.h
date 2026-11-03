@@ -17,6 +17,7 @@ typedef struct {
     Symbol *current_function_symbol;
     HashTable *procedure_table;
     HashTable *current_procedure_table;
+    ScopeTableList scope_tables;
     TypeEntry *type_table;
     int gCurrentTextColor;
     int gCurrentTextBackground;

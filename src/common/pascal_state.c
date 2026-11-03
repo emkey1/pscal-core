@@ -27,6 +27,7 @@ void pascalPushGlobalState(PascalGlobalState *state) {
     state->procedure_table = procedure_table;
     state->current_procedure_table = current_procedure_table;
     state->type_table = type_table;
+    state->scope_tables = scopeTablesDetach();
 
     globalSymbols = NULL;
     constGlobalSymbols = NULL;
@@ -100,6 +101,7 @@ void pascalPopGlobalState(PascalGlobalState *state) {
     int accumulated_semantic_errors = pascal_semantic_error_count;
     int accumulated_parser_errors = pascal_parser_error_count;
 
+    scopeTablesAttach(state->scope_tables);
     restoreHashTable(&globalSymbols, state->globalSymbols);
     restoreHashTable(&constGlobalSymbols, state->constGlobalSymbols);
     restoreHashTable(&localSymbols, state->localSymbols);

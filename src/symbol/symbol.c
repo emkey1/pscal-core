@@ -848,8 +848,49 @@ void popLocalEnv(void) {
 // --- Scoped Procedure Table Management ---
 
 /** Pushes a new procedure table onto the scope stack and returns it. */
+/* A routine's local table and a record's constants hang off an AST node through symbol_table,
+ * and every copy of that node shares the pointer, so no node can own one. They live as long
+ * as the run's procedure table, and a frontend on iOS shares the process with what follows it. */
+static PSCAL_THREAD_LOCAL ScopeTableList gScopeTables = { NULL, 0, 0 };
+
+HashTable *createScopeTable(void) {
+    HashTable *table = createHashTable();
+    if (gScopeTables.count == gScopeTables.capacity) {
+        int capacity = gScopeTables.capacity ? gScopeTables.capacity * 2 : 32;
+        HashTable **items = realloc(gScopeTables.items, sizeof(HashTable *) * (size_t)capacity);
+        if (!items) {
+            return table; /* Not recorded: it outlives the run, which is harmless. */
+        }
+        gScopeTables.items = items;
+        gScopeTables.capacity = capacity;
+    }
+    gScopeTables.items[gScopeTables.count++] = table;
+    return table;
+}
+
+void freeScopeTables(void) {
+    for (int i = 0; i < gScopeTables.count; ++i) {
+        freeHashTable(gScopeTables.items[i]);
+    }
+    free(gScopeTables.items);
+    gScopeTables.items = NULL;
+    gScopeTables.count = 0;
+    gScopeTables.capacity = 0;
+}
+
+ScopeTableList scopeTablesDetach(void) {
+    ScopeTableList detached = gScopeTables;
+    gScopeTables = (ScopeTableList){ NULL, 0, 0 };
+    return detached;
+}
+
+void scopeTablesAttach(ScopeTableList list) {
+    freeScopeTables();
+    gScopeTables = list;
+}
+
 HashTable *pushProcedureTable(void) {
-    HashTable *new_table = createHashTable();
+    HashTable *new_table = createScopeTable();
     new_table->parent = current_procedure_table;
     current_procedure_table = new_table;
     return new_table;
