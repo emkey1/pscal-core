@@ -5663,6 +5663,26 @@ static VProcSessionInput *vprocSessionInputRecoverStuck(VProcSessionStdio *sessi
     return replacement;
 }
 
+static bool vprocTtyInLineMode(struct pscal_fd *pscal_fd) {
+    if (!pscal_fd || !pscal_fd->tty) {
+        return false;
+    }
+    lock(&pscal_fd->tty->lock);
+    bool line_mode = (pscal_fd->tty->termios.lflags & ICANON_) != 0;
+    unlock(&pscal_fd->tty->lock);
+    return line_mode;
+}
+
+static void vprocSessionInputMarkEof(VProcSessionInput *input) {
+    pthread_mutex_lock(&input->mu);
+    if (input->eof_mark_count < VPROC_SESSION_EOF_MARKS) {
+        input->eof_mark[input->eof_mark_count++] = input->len;
+        pthread_cond_broadcast(&input->cv);
+    }
+    pthread_mutex_unlock(&input->mu);
+    pscal_fd_poll_wakeup(NULL, POLLIN);
+}
+
 static void *vprocSessionInputThread(void *arg) {
     VProcSessionInputCtx *ctx = (VProcSessionInputCtx *)arg;
     if (!ctx || !ctx->session) {
@@ -5749,6 +5769,10 @@ static void *vprocSessionInputThread(void *arg) {
         } else {
             r = pscal_fd->ops->read(pscal_fd, &ch, 1);
             if (r <= 0) {
+                if (r == 0 && input && pscalTtyTakeEofKey(pscal_fd)) {
+                    vprocSessionInputMarkEof(input);
+                    continue;
+                }
                 if (r == 0 && session && session->pty_active &&
                     (pscal_fd == session->stdin_pscal_fd ||
                      pscal_fd == session->pty_slave)) {
@@ -5918,6 +5942,7 @@ static void *vprocSessionInputThread(void *arg) {
                 pscal_fd_poll_wakeup(NULL, POLLIN);
             }
             if (input && !buffered_control_byte) {
+                const bool line_mode = vprocTtyInLineMode(pscal_fd);
                 if (!vprocSessionInputLockWithTimeout(input, 200, "reader.ctrl.interrupt")) {
                     VProcSessionInput *replacement =
                             vprocSessionInputRecoverStuck(session, input, "reader.ctrl.interrupt");
@@ -5925,6 +5950,13 @@ static void *vprocSessionInputThread(void *arg) {
                         input = replacement;
                     }
                     continue;
+                }
+                /* As a terminal flushes its input on these keys in line mode:
+                 * lines typed ahead must not run after what was interrupted. */
+                if (line_mode) {
+                    input->off = 0;
+                    input->len = 0;
+                    input->eof_mark_count = 0;
                 }
                 input->interrupt_pending = true;
                 pthread_cond_broadcast(&input->cv);
@@ -6105,6 +6137,7 @@ static VProcSessionInput *vprocSessionInputEnsure(VProcSessionStdio *session, in
         input->eof = false;
         input->off = 0;
         input->len = 0;
+        input->eof_mark_count = 0;
         input->interrupt_pending = false;
     }
     if (!input->reader_active &&
@@ -6212,6 +6245,8 @@ static ssize_t vprocSessionReadInput(VProcSessionStdio *session, void *buf, size
     }
     VProcSessionInput *input = session->input;
     const bool tool_dbg = vprocToolDebugEnabled();
+    const bool prompt_reader = vprocShellPromptReadActive(session->shell_pid);
+    const bool line_mode = vprocTtyInLineMode(session->pty_slave);
     if (tool_dbg) {
         if (!vprocSessionInputLockWithTimeout(input, 200, "read.debug")) {
             VProcSessionInput *replacement = vprocSessionInputRecoverStuck(session, input, "read.debug");
@@ -6244,20 +6279,37 @@ static ssize_t vprocSessionReadInput(VProcSessionStdio *session, void *buf, size
             return -1;
         }
     }
-    if (nonblocking && input->len == 0 && !input->eof && !input->interrupt_pending) {
-        pthread_mutex_unlock(&input->mu);
-        errno = EAGAIN;
-        return -1;
-    }
-    while (input->len == 0 && !input->eof && !input->interrupt_pending) {
-        vprocCondWait(&input->cv, &input->mu);
-    }
-    if (input->interrupt_pending) {
-        input->interrupt_pending = false;
-        pthread_mutex_unlock(&input->mu);
-        (void)vprocWaitIfStopped(vprocCurrent());
-        errno = EINTR;
-        return -1;
+    for (;;) {
+        if (nonblocking && input->len == 0 && !input->eof && !input->interrupt_pending &&
+            input->eof_mark_count == 0) {
+            pthread_mutex_unlock(&input->mu);
+            errno = EAGAIN;
+            return -1;
+        }
+        while (input->len == 0 && !input->eof && !input->interrupt_pending &&
+               input->eof_mark_count == 0) {
+            vprocCondWait(&input->cv, &input->mu);
+        }
+        if (input->interrupt_pending) {
+            input->interrupt_pending = false;
+            pthread_mutex_unlock(&input->mu);
+            (void)vprocWaitIfStopped(vprocCurrent());
+            errno = EINTR;
+            return -1;
+        }
+        if (input->eof_mark_count == 0 || input->eof_mark[0] != 0) {
+            break;
+        }
+        /* The end-of-file key, now that the input before it has gone. One
+         * typed after its command ended means nothing to the prompt, which
+         * would take it as the end of the session. */
+        input->eof_mark_count--;
+        memmove(input->eof_mark, input->eof_mark + 1,
+                input->eof_mark_count * sizeof(input->eof_mark[0]));
+        if (!prompt_reader) {
+            pthread_mutex_unlock(&input->mu);
+            return 0;
+        }
     }
     if (input->len == 0 && input->eof) {
         if (tool_dbg) {
@@ -6267,11 +6319,25 @@ static ssize_t vprocSessionReadInput(VProcSessionStdio *session, void *buf, size
         return 0;
     }
     size_t to_copy = (count < input->len) ? count : input->len;
+    if (input->eof_mark_count > 0 && to_copy > input->eof_mark[0]) {
+        to_copy = input->eof_mark[0];
+    }
+    if (line_mode) {
+        /* One line per read, as a terminal gives: what is typed ahead of the
+         * next line belongs to whoever reads next, not to this read's buffer. */
+        const unsigned char *newline = memchr(input->buf + input->off, '\n', to_copy);
+        if (newline) {
+            to_copy = (size_t)(newline - (input->buf + input->off)) + 1;
+        }
+    }
     memcpy(buf, input->buf + input->off, to_copy);
     input->off += to_copy;
     input->len -= to_copy;
     if (input->len == 0) {
         input->off = 0;
+    }
+    for (size_t i = 0; i < input->eof_mark_count; ++i) {
+        input->eof_mark[i] -= to_copy;
     }
     pthread_mutex_unlock(&input->mu);
     return (ssize_t)to_copy;
@@ -12544,6 +12610,7 @@ int vprocSessionStdioInitWithPty(VProcSessionStdio *stdio_ctx,
     stdio_ctx->stderr_pscal_fd = pscal_fd_retain(pty_slave);
     stdio_ctx->pty_active = true;
     stdio_ctx->control_bytes_passthrough = false;
+    pscalTtySetSessionReader(pty_slave);
     vprocIoTrace("[vproc-io] stdio init session=%llu master=%p slave=%p",
                  (unsigned long long)session_id,
                  (void *)pty_master,
@@ -12626,6 +12693,7 @@ void vprocSessionStdioDestroy(VProcSessionStdio *stdio_ctx) {
         input->stop_requested = true;
         input->off = 0;
         input->len = 0;
+        input->eof_mark_count = 0;
         input->eof = true;
         input->interrupt_pending = false;
         pthread_cond_broadcast(&input->cv);
@@ -12725,6 +12793,7 @@ void vprocSessionStdioRefresh(VProcSessionStdio *stdio_ctx, int kernel_pid) {
         input->stop_requested = true;
         input->off = 0;
         input->len = 0;
+        input->eof_mark_count = 0;
         input->eof = false;
         input->interrupt_pending = false;
         pthread_cond_broadcast(&input->cv);
@@ -13818,25 +13887,44 @@ static void vprocPscalFdCloseCancelled(void *fd) {
     pscal_fd_close((struct pscal_fd *)fd);
 }
 
+/* Is this descriptor the session's terminal? Another open of it (/dev/tty,
+ * /dev/pts/N) counts, since the keys it would read are the same ones. */
+static bool vprocSessionFdIsTerminal(VProcSessionStdio *session, struct pscal_fd *pscal_fd) {
+    if (!session || !pscal_fd || vprocSessionStdioIsDefault(session)) {
+        return false;
+    }
+    if (session->stdin_pscal_fd == pscal_fd || session->pty_slave == pscal_fd) {
+        return true;
+    }
+    return pscal_fd->tty && session->pty_slave && session->pty_slave->tty == pscal_fd->tty;
+}
+
 ssize_t vprocReadShim(int fd, void *buf, size_t count) {
     vprocDeliverPendingSignalsForCurrent();
     VProc *vp = vprocForThread();
     struct pscal_fd *pscal_fd = NULL;
     int host = vprocResolveFdForShim(vp, fd, 1, &pscal_fd);
     if (pscal_fd) {
-        if (!gVprocPipelineStage) {
-            VProcSessionStdio *session = vprocSessionStdioCurrent();
-            if (session &&
-                !vprocSessionStdioIsDefault(session) &&
-                (session->stdin_pscal_fd == pscal_fd ||
-                 session->pty_slave == pscal_fd)) {
-                /* Foreground tools may poll/read a dup() of stdin instead of
-                 * fd 0 directly (OpenSSH does this). A background session-input
-                 * reader thread already drains this PTY stream, so route reads
-                 * via the shared session queue to avoid competing consumers. */
-                pscal_fd_close(pscal_fd);
-                return vprocSessionReadInputShimMode(buf, count, false);
+        VProcSessionStdio *session = vprocSessionStdioCurrent();
+        if (vprocSessionFdIsTerminal(session, pscal_fd)) {
+            /* Whatever reads the terminal, a dup() of stdin as in OpenSSH or a
+             * plain `cat`: a reader thread already drains this PTY stream, so
+             * read the session's queue. Reading the PTY as well would give
+             * each key to one of the two, and the ones the thread took would
+             * come out later, at whatever read next. */
+            if (gVprocPipelineStage) {
+                int err = pscalTtyCheckBackgroundRead(pscal_fd);
+                if (err < 0) {
+                    pscal_fd_close(pscal_fd);
+                    if (err == _EINTR) {
+                        vprocDeliverPendingSignalsForCurrent();
+                    }
+                    return vprocSetCompatErrno(err);
+                }
             }
+            bool nonblocking = (pscal_fd->flags & O_NONBLOCK) != 0;
+            pscal_fd_close(pscal_fd);
+            return vprocSessionReadInputShimMode(buf, count, nonblocking);
         }
         if (gVprocPipelineStage &&
             vprocVprocDebugEnabled() &&
@@ -15321,6 +15409,19 @@ static void vprocWinsizeToHost(const struct winsize_ *src, struct winsize *dst) 
     dst->ws_ypixel = (unsigned short)src->ypixel;
 }
 
+/* A request in Linux's numbers, on a host that has numbers of its own, wants
+ * Linux's struct, which is the terminal's own (smallclue's stty tries it first,
+ * for iSH-AOK). The host's struct is twice the size and overruns the caller's. */
+static bool vprocIoctlWantsKernelTermios(unsigned long request) {
+#ifdef TIOCGETA
+    return request == TCGETS_ || request == TCSETS_ ||
+           request == TCSETSW_ || request == TCSETSF_;
+#else
+    (void)request;
+    return false;
+#endif
+}
+
 static int vprocIoctlTranslate(unsigned long cmd) {
     switch (cmd) {
 #ifdef TIOCGWINSZ
@@ -15533,6 +15634,10 @@ int vprocIoctlShim(int fd, unsigned long request, ...) {
                         res = _EINVAL;
                         break;
                     }
+                    if (vprocIoctlWantsKernelTermios(request)) {
+                        res = pscal_fd->ops->ioctl(pscal_fd, cmd, (void *)arg_val);
+                        break;
+                    }
                     struct termios_ termios;
                     res = pscal_fd->ops->ioctl(pscal_fd, cmd, &termios);
                     if (res == 0) {
@@ -15545,6 +15650,10 @@ int vprocIoctlShim(int fd, unsigned long request, ...) {
                 case TCSETSF_: {
                     if (!arg_val) {
                         res = _EINVAL;
+                        break;
+                    }
+                    if (vprocIoctlWantsKernelTermios(request)) {
+                        res = pscal_fd->ops->ioctl(pscal_fd, cmd, (void *)arg_val);
                         break;
                     }
                     struct termios_ termios;
@@ -15753,14 +15862,8 @@ static short vprocSessionInputPollEvents(VProcSessionStdio *session,
                                          int logical_fd,
                                          struct pscal_fd *pscal_fd,
                                          short requested_events) {
-    if (!session || !pscal_fd || gVprocPipelineStage) {
-        return 0;
-    }
     (void)logical_fd;
-    if (vprocSessionStdioIsDefault(session)) {
-        return 0;
-    }
-    if (!(session->stdin_pscal_fd == pscal_fd || session->pty_slave == pscal_fd)) {
+    if (!vprocSessionFdIsTerminal(session, pscal_fd)) {
         return 0;
     }
 
@@ -15787,7 +15890,7 @@ static short vprocSessionInputPollEvents(VProcSessionStdio *session,
 
     short ready = 0;
     pthread_mutex_lock(&input->mu);
-    bool has_data = input->len > 0;
+    bool has_data = input->len > 0 || input->eof_mark_count > 0;
     bool is_eof = input->eof;
     bool has_interrupt = input->interrupt_pending;
     pthread_mutex_unlock(&input->mu);

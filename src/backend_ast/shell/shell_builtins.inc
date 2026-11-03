@@ -89,6 +89,14 @@ static bool shellToolTcgetattr(int fd, struct termios *termios) {
     return tcgetattr(fd, termios) == 0;
 }
 
+/* In the app a tool's terminal runs in line mode, and part of a line typed while it
+ * ran is still waiting there, on its way to the next prompt. */
+#if defined(PSCAL_TARGET_IOS)
+#define SHELL_TOOL_RESTORE_ACTION TCSADRAIN
+#else
+#define SHELL_TOOL_RESTORE_ACTION TCSAFLUSH
+#endif
+
 static bool shellToolTcsetattr(int fd, int action, const struct termios *termios) {
     if (!termios) {
         return false;
@@ -3308,7 +3316,7 @@ static int shellRunToolInlineWithRestore(ShellToolEntryFn entry,
     if (manage_process_state) {
         shellRestoreStandardFds(&fd_backup, dbg);
         if (stdin_termios_valid) {
-            shellToolTcsetattr(STDIN_FILENO, TCSAFLUSH, &stdin_termios);
+            shellToolTcsetattr(STDIN_FILENO, SHELL_TOOL_RESTORE_ACTION, &stdin_termios);
         }
         shellCloseVprocStreams();
         if (dbg) {
@@ -3811,7 +3819,7 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
         if (!use_shell_context) {
             int status = entry(argc, argv);
             if (stdin_termios_valid) {
-                shellToolTcsetattr(STDIN_FILENO, TCSAFLUSH, &stdin_termios);
+                shellToolTcsetattr(STDIN_FILENO, SHELL_TOOL_RESTORE_ACTION, &stdin_termios);
             }
             free(context);
             return status;
@@ -3822,7 +3830,7 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
         shellRuntimeActivateContext(prev);
         shellRuntimeDestroyContext(ctx);
         if (stdin_termios_valid) {
-            shellToolTcsetattr(STDIN_FILENO, TCSAFLUSH, &stdin_termios);
+            shellToolTcsetattr(STDIN_FILENO, SHELL_TOOL_RESTORE_ACTION, &stdin_termios);
         }
         free(context);
         return status;
@@ -3835,7 +3843,7 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
         pthread_join(context->worker_thread, NULL);
         pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
         if (stdin_termios_valid) {
-            shellToolTcsetattr(STDIN_FILENO, TCSAFLUSH, &stdin_termios);
+            shellToolTcsetattr(STDIN_FILENO, SHELL_TOOL_RESTORE_ACTION, &stdin_termios);
         }
         int waiter_failed_status = context->status;
         free(context);
@@ -3891,7 +3899,7 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
     pthread_join(waiter_thread, NULL);
     pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
     if (stdin_termios_valid) {
-        shellToolTcsetattr(STDIN_FILENO, TCSAFLUSH, &stdin_termios);
+        shellToolTcsetattr(STDIN_FILENO, SHELL_TOOL_RESTORE_ACTION, &stdin_termios);
     }
     if (out_frontend_reset) {
         *out_frontend_reset = context->frontend_reset_done;

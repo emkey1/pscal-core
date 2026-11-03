@@ -230,6 +230,8 @@ struct tty *tty_alloc(struct tty_driver *driver, int type, int num) {
     tty->ever_opened = false;
     tty->session = 0;
     tty->fg_group = 0;
+    tty->session_reader = false;
+    tty->eof_key_reads = 0;
     list_init(&tty->fds);
 
     tty->termios.iflags = ICRNL_ | IXON_;
@@ -390,6 +392,8 @@ static int tty_close(struct pscal_fd *fd) {
     }
     return 0;
 }
+
+static size_t tty_canon_size(struct tty *tty);
 
 static void tty_input_wakeup(struct tty *tty) {
     notify(&tty->produced);
@@ -552,9 +556,29 @@ canon_wake:
                 }
                 echo = false;
                 tty_input_wakeup(tty);
+            } else if (tty->session_reader && !(lflags & ISIG_) &&
+                       (ch == cc[VINTR_] || ch == cc[VSUSP_])) {
+                /* With ISIG this key would go now and take the waiting input
+                 * with it. Here the session's reader sends the signal, so hand
+                 * it over at once instead of leaving it behind the line. */
+                if (!(lflags & NOFLSH_)) {
+                    tty->bufsize = 0;
+                }
+                if (echo && SHOULD_ECHOCTL(ch)) {
+                    const char shown[2] = {'^', (char)(ch ^ '\100')};
+                    tty_echo(tty, shown, sizeof(shown));
+                }
+                goto canon_wake;
             } else {
                 if (!tty_send_input_signal(tty, ch, &queue)) {
 no_special:
+                    /* A line longer than the buffer can never reach a reader,
+                     * and waiting for one would hang whoever writes the keys.
+                     * Drop what does not fit and keep room to end the line. */
+                    if (tty->bufsize + 1 >= sizeof(tty->buf) &&
+                        tty_canon_size(tty) == (size_t)-1) {
+                        continue;
+                    }
                     err = tty_push_char(tty, ch, /*flag*/false, blocking);
                     if (err < 0) {
                         done_size--;
@@ -592,6 +616,7 @@ no_special:
                 break;
             }
             assert(tty->bufsize < sizeof(tty->buf));
+            tty->buf_flag[tty->bufsize] = false;
             tty->buf[tty->bufsize++] = input[i];
             if (tty->bufsize == 1) {
                 tty_input_wakeup(tty);
@@ -673,6 +698,45 @@ static int tty_signal_if_background(struct tty *tty, pid_t_ current_pgid, int si
     return _EINTR;
 }
 
+/* Say this terminal has a session reader, for tty_input. */
+void pscalTtySetSessionReader(struct pscal_fd *fd) {
+    if (!fd || !fd->tty) {
+        return;
+    }
+    lock(&fd->tty->lock);
+    fd->tty->session_reader = true;
+    unlock(&fd->tty->lock);
+}
+
+/* Was a read of 0 bytes the end-of-file key? A read also gives 0 with VMIN=0
+ * and after a hangup, and only the key is an end of file to whoever reads next. */
+bool pscalTtyTakeEofKey(struct pscal_fd *fd) {
+    if (!fd || !fd->tty) {
+        return false;
+    }
+    struct tty *tty = fd->tty;
+    lock(&tty->lock);
+    bool taken = tty->eof_key_reads > 0;
+    if (taken) {
+        tty->eof_key_reads--;
+    }
+    unlock(&tty->lock);
+    return taken;
+}
+
+/* The check a read of the terminal makes, for one served from the session's
+ * queue: a background job does not take the foreground's keys. */
+int pscalTtyCheckBackgroundRead(struct pscal_fd *fd) {
+    if (!fd || !fd->tty) {
+        return 0;
+    }
+    struct tty *tty = fd->tty;
+    lock(&tty->lock);
+    int err = tty_signal_if_background(tty, (pid_t_)pscalTtyCurrentPgid(), SIGTTIN_);
+    unlock(&tty->lock);
+    return err;
+}
+
 static ssize_t tty_read(struct pscal_fd *fd, void *buf, size_t bufsize) {
     if (bufsize == 0) {
         return 0;
@@ -711,7 +775,11 @@ static ssize_t tty_read(struct pscal_fd *fd, void *buf, size_t bufsize) {
         }
     }
 
-    bool canonical = (tty->termios.lflags & ICANON_) && tty->driver != &pty_master;
+    bool canonical;
+recheck_mode:
+    /* A read that is already waiting follows a change of mode: the session's
+     * reader waits here all the time, while commands switch the mode around it. */
+    canonical = (tty->termios.lflags & ICANON_) && tty->driver != &pty_master;
     if (canonical) {
         size_t canon_size;
         while ((canon_size = tty_canon_size(tty)) == (size_t)-1) {
@@ -730,9 +798,15 @@ static ssize_t tty_read(struct pscal_fd *fd, void *buf, size_t bufsize) {
             if (err < 0) {
                 goto error;
             }
+            if (!(tty->termios.lflags & ICANON_)) {
+                goto recheck_mode;
+            }
         }
         if (tty->buf[canon_size - 1] == '\0') {
             canon_size--;
+            if (canon_size == 0) {
+                tty->eof_key_reads++;
+            }
         }
 
         if (bufsize > canon_size) {
@@ -774,6 +848,9 @@ static ssize_t tty_read(struct pscal_fd *fd, void *buf, size_t bufsize) {
             if (err == _EINTR) {
                 goto error;
             }
+            if (tty->driver != &pty_master && (tty->termios.lflags & ICANON_)) {
+                goto recheck_mode;
+            }
         }
     }
 
@@ -784,8 +861,11 @@ static ssize_t tty_read(struct pscal_fd *fd, void *buf, size_t bufsize) {
     if (bufsize > tty->bufsize) {
         bufsize = tty->bufsize;
     }
+    /* An end-of-file key after part of a line is used up by handing that part
+     * over. After a whole line it still has its own read of 0 to come. */
+    bool ended_line = bufsize > 0 && tty->buf_flag[bufsize - 1];
     tty_read_into_buf(tty, buf, bufsize);
-    if (tty->bufsize > 0 && tty->buf[0] == '\0' && tty->buf_flag[0]) {
+    if (!ended_line && tty->bufsize > 0 && tty->buf[0] == '\0' && tty->buf_flag[0]) {
         char dummy;
         tty_read_into_buf(tty, &dummy, 1);
     }
@@ -989,9 +1069,14 @@ static int tty_mode_ioctl(struct tty *in_tty, int cmd, void *arg) {
             notify(&tty->consumed);
             /* fallthrough */
         case TCSETSW_:
-        case TCSETS_:
+        case TCSETS_: {
+            dword_t was_lflags = tty->termios.lflags;
             tty->termios = *(struct termios_ *)arg;
+            if ((was_lflags ^ tty->termios.lflags) & ICANON_) {
+                notify(&tty->produced);
+            }
             break;
+        }
         case TIOCGWINSZ_:
             *(struct winsize_ *)arg = tty->winsize;
             break;

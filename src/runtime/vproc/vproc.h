@@ -358,6 +358,11 @@ typedef struct VProcSessionInput {
     bool reader_active;
     bool interrupt_pending;
     bool stop_requested;
+    /* End-of-file keys not yet read, oldest first: how many queued bytes come
+     * before each. Each one reads as 0 bytes, once, and input goes on after it. */
+#define VPROC_SESSION_EOF_MARKS 8
+    size_t eof_mark[VPROC_SESSION_EOF_MARKS];
+    size_t eof_mark_count;
 } VProcSessionInput;
 
 typedef struct VProcSessionStdio {

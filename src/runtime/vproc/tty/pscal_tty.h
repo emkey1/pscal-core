@@ -120,6 +120,11 @@ struct tty {
     struct tty_driver *driver;
     bool hung_up;
     bool ever_opened;
+    /* A session's reader thread drains this terminal and turns Ctrl-C and
+     * Ctrl-Z into signals, so a line being typed must not hold those back. */
+    bool session_reader;
+    /* End-of-file keys a read gave back as 0 bytes, not yet taken. */
+    unsigned eof_key_reads;
 
 #define TTY_BUF_SIZE 4096
     char buf[TTY_BUF_SIZE];
@@ -173,5 +178,8 @@ ssize_t tty_input(struct tty *tty, const char *input, size_t len, bool blocking)
 void tty_set_winsize(struct tty *tty, struct winsize_ winsize);
 void tty_hangup(struct tty *tty);
 void pscalTtyDropSession(pid_t_ sid);
+void pscalTtySetSessionReader(struct pscal_fd *fd);
+bool pscalTtyTakeEofKey(struct pscal_fd *fd);
+int pscalTtyCheckBackgroundRead(struct pscal_fd *fd);
 
 extern const struct pscal_fd_ops pscal_tty_fd_ops;
