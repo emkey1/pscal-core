@@ -8053,7 +8053,8 @@ static bool shellCommandCollectInfo(const char *name,
     ShellCommandResult *results = NULL;
     size_t count = 0;
 
-    ShellAlias *alias = shellFindAlias(name);
+    /* These callers ask what would run, so an alias counts only while aliases expand. */
+    ShellAlias *alias = shellShoptOptionEnabled("expand_aliases") ? shellFindAlias(name) : NULL;
     if (alias) {
         const char *value = alias->value ? alias->value : "";
         if (!shellCommandAppendResult(&results, &count, SHELL_COMMAND_RESULT_ALIAS, value)) {
@@ -8182,12 +8183,26 @@ static void shellCommandPrintVerbose(const char *name, const ShellCommandResult 
     }
 }
 
+/* In a form that can be read back. Only `alias` itself puts `--` before a name starting with -. */
+static void shellPrintAliasDefinition(const char *name, const char *value, bool guard_dash) {
+    printf("alias %s%s='", guard_dash && name[0] == '-' ? "-- " : "", name);
+    const char *rest = value ? value : "";
+    const char *quote;
+    while ((quote = strchr(rest, '\'')) != NULL) {
+        printf("%.*s'\\''", (int)(quote - rest), rest);
+        rest = quote + 1;
+    }
+    printf("%s'\n", rest);
+}
+
 static void shellCommandPrintShort(const char *name, const ShellCommandResult *result) {
     if (!name || !result) {
         return;
     }
     if (result->kind == SHELL_COMMAND_RESULT_FILE) {
         printf("%s\n", result->detail ? result->detail : "");
+    } else if (result->kind == SHELL_COMMAND_RESULT_ALIAS) {
+        shellPrintAliasDefinition(name, result->detail, false);
     } else {
         printf("%s\n", name);
     }
@@ -9208,7 +9223,7 @@ Value vmBuiltinShellType(VM *vm, int arg_count, Value *args) {
     bool list_all = false;
     bool print_type = false;
     bool print_path = false;
-    bool use_default_path = false;
+    bool force_path = false;
     bool skip_functions = false;
     int first_name = arg_count;
 
@@ -9242,7 +9257,7 @@ Value vmBuiltinShellType(VM *vm, int arg_count, Value *args) {
                             break;
                         case 'P':
                             print_path = true;
-                            use_default_path = true;
+                            force_path = true;
                             break;
                         default:
                             shellReportRecoverableError(vm, true, "type: -%c: invalid option", *opt);
@@ -9276,7 +9291,7 @@ Value vmBuiltinShellType(VM *vm, int arg_count, Value *args) {
         const char *name = AS_STRING(args[i]);
         ShellCommandResult *results = NULL;
         size_t count = 0;
-        if (!shellCommandCollectInfo(name, collect_all_paths, use_default_path, &results, &count)) {
+        if (!shellCommandCollectInfo(name, collect_all_paths, false, &results, &count)) {
             runtimeError(vm, "type: out of memory");
             shellUpdateStatus(1);
             return makeVoid();
@@ -9305,17 +9320,21 @@ Value vmBuiltinShellType(VM *vm, int arg_count, Value *args) {
         }
 
         if (print_path) {
-            bool printed = false;
+            /* -p names the file that would run, so nothing when something else comes first.
+             * -P looks only for a file. */
+            bool found = !force_path;
             for (size_t j = 0; j < count; ++j) {
                 if (results[j].kind == SHELL_COMMAND_RESULT_FILE) {
                     printf("%s\n", results[j].detail ? results[j].detail : "");
-                    printed = true;
+                    found = true;
                     if (!list_all) {
                         break;
                     }
+                } else if (!force_path && !list_all) {
+                    break;
                 }
             }
-            if (!printed) {
+            if (!found) {
                 overall_ok = false;
                 shellUpdateStatus(1);
             }
@@ -10750,9 +10769,10 @@ static const ShellHelpTopic kShellHelpTopics[] = {
         "Describe how the shell interprets names.",
         "type [-af] [-p|-P] [-t] name ...",
         "Without options prints the first match for each NAME. -t prints only the"
-        " classification (alias, function, builtin, or file). -p prints the first"
-        " executable path, -P forces the default PATH, -a includes every"
-        " result discovered during lookup, and -f leaves out functions.",
+        " classification (alias, function, builtin, or file). -p prints the path of"
+        " the file that would run, if a file would, -P searches PATH for a file"
+        " whatever else NAME is, -a includes every result discovered during lookup,"
+        " and -f leaves out functions. An alias counts only while aliases expand.",
         NULL,
         0
     },
@@ -10976,16 +10996,8 @@ Value vmBuiltinShellHelp(VM *vm, int arg_count, Value *args) {
     return makeVoid();
 }
 
-/* In a form that can be read back. */
 static void shellPrintAlias(const ShellAlias *alias) {
-    printf("alias %s%s='", alias->name[0] == '-' ? "-- " : "", alias->name);
-    const char *rest = alias->value ? alias->value : "";
-    const char *quote;
-    while ((quote = strchr(rest, '\'')) != NULL) {
-        printf("%.*s'\\''", (int)(quote - rest), rest);
-        rest = quote + 1;
-    }
-    printf("%s'\n", rest);
+    shellPrintAliasDefinition(alias->name, alias->value, true);
 }
 
 static int shellCompareAliasNames(const void *lhs, const void *rhs) {

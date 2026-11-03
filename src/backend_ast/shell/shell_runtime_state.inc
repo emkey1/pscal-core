@@ -3904,17 +3904,28 @@ bool shellRuntimeSetSignalTrap(int signo, ShellTrapAction action, const char *co
     return true;
 }
 
+/* Posix mode expands aliases. Leaving it goes back to what this kind of shell starts with. */
+static void shellRuntimeApplyPosixMode(bool enabled) {
+    if (enabled != gShellRuntime.posix_mode) {
+        ShellOptionEntry *aliases = shellShoptFindOption("expand_aliases");
+        if (aliases) {
+            aliases->enabled = enabled || gShellInteractiveMode;
+        }
+    }
+    gShellRuntime.posix_mode = enabled;
+}
+
 static void shellRuntimeInitialisePosixMode(void) __attribute__((constructor));
 
 static void shellRuntimeInitialisePosixMode(void) {
     const char *posix_env = shellSafeGetenv("POSIXLY_CORRECT");
     if (posix_env) {
-        gShellRuntime.posix_mode = true;
+        shellRuntimeApplyPosixMode(true);
     }
 }
 
 void shellRuntimeSetPosixMode(bool enabled) {
-    gShellRuntime.posix_mode = enabled;
+    shellRuntimeApplyPosixMode(enabled);
     if (enabled) {
         const char *current = shellSafeGetenv("POSIXLY_CORRECT");
         if (!current) {
