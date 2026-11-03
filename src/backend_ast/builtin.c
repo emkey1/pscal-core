@@ -290,7 +290,8 @@ static FILE *vmVprocStreamOpen(int std_fd,
     }
 #endif
     if (dup_fd < 0) {
-        dup_fd = dup(host_fd);
+        /* Not dup, whose shim takes a slot, or vprocHostDup: the FILE owns this one. */
+        dup_fd = fcntl(host_fd, F_DUPFD, 0);
     }
     if (dup_fd < 0) {
         return vmVprocStreamFallback(std_fd);
@@ -298,7 +299,7 @@ static FILE *vmVprocStreamOpen(int std_fd,
 
     FILE *fp = fdopen(dup_fd, mode);
     if (!fp) {
-        close(dup_fd);
+        vprocHostClose(dup_fd);
         return vmVprocStreamFallback(std_fd);
     }
     if (buf_mode >= 0) {
@@ -370,14 +371,14 @@ static bool vmStreamTargetsSharedStdin(FILE *stream) {
     VProc *vp = vprocCurrent();
     if (vp) {
         int translated = vprocTranslateFd(vp, STDIN_FILENO);
-        if (translated >= 0 && vmFdMatchesFileIdentity(fd, translated)) {
+        if (translated >= 0 && vmFdMatchesFileIdentity(fd, vprocTagHostFd(translated))) {
             return true;
         }
     }
     VProcSessionStdio *session = vprocSessionStdioCurrent();
     if (session && !vprocSessionStdioIsDefault(session) &&
         session->stdin_host_fd >= 0 &&
-        vmFdMatchesFileIdentity(fd, session->stdin_host_fd)) {
+        vmFdMatchesFileIdentity(fd, vprocTagHostFd(session->stdin_host_fd))) {
         return true;
     }
 #endif
@@ -5288,7 +5289,11 @@ static void vmSignalHandler(int signum) {
         atomic_store(&g_vm_sigint_seen, 1);
         if (g_vm_sigint_pipe[1] >= 0) {
             char c = 'i';
+#if defined(PSCAL_TARGET_IOS)
+            (void)vprocHostWrite(g_vm_sigint_pipe[1], &c, 1);
+#else
             (void)write(g_vm_sigint_pipe[1], &c, 1);
+#endif
         }
         return;
     }

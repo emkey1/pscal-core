@@ -1273,6 +1273,7 @@ static void shellHistoryRewriteFileTail(size_t keep) {
     if (written < 0 || (size_t)written >= sizeof(tmp_path)) {
         return;
     }
+    /* mkstemp gives a host descriptor, not a slot. */
     int tmp_fd = mkstemp(tmp_path);
     if (tmp_fd < 0) {
         return;
@@ -1286,11 +1287,11 @@ static void shellHistoryRewriteFileTail(size_t keep) {
         if (!entry) {
             continue;
         }
-        (void)write(tmp_fd, entry, strlen(entry));
-        (void)write(tmp_fd, "\n", 1);
+        (void)vprocHostWrite(tmp_fd, entry, strlen(entry));
+        (void)vprocHostWrite(tmp_fd, "\n", 1);
     }
-    fsync(tmp_fd);
-    close(tmp_fd);
+    vprocHostFsync(tmp_fd);
+    vprocHostClose(tmp_fd);
     if (rename(tmp_path, path) != 0) {
         unlink(tmp_path);
     } else {

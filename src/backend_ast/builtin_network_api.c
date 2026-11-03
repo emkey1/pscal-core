@@ -17,6 +17,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/select.h>
+#include <poll.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -31,6 +32,7 @@
 #include "common/pscal_hosts.h"
 #include "common/frontend_kind.h"
 #include "common/path_virtualization.h"
+#include "runtime/vproc/vproc.h"
 
 static Value httpAsyncTaskValue(int id, VM* vm, uint32_t generation);
 static TaskObj* httpAsyncTaskArg(VM* vm, Value v, TaskObj* scratch);
@@ -262,18 +264,29 @@ static bool socketConsumeInterrupt(VM *vm) {
 }
 
 #ifndef _WIN32
+/* A socket's number is a host descriptor (vprocSocketShim), so a slot of that number must
+ * not answer for it. select's shim would look for one, and a tag does not fit in an fd_set. */
+static int socketPollOne(int fd, short events, int timeout_ms, short *revents) {
+    struct pollfd pfd;
+    pfd.fd = vprocTagHostFd(fd);
+    pfd.events = events;
+    pfd.revents = 0;
+    int res = poll(&pfd, 1, timeout_ms);
+    if (res > 0 && (pfd.revents & POLLNVAL)) {
+        errno = EBADF;
+        return -1;
+    }
+    *revents = pfd.revents;
+    return res;
+}
+
 static int socketWaitReadable(VM *vm, int fd) {
     for (;;) {
         if (socketConsumeInterrupt(vm)) {
             return -1;
         }
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(fd, &rfds);
-        struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 200000;
-        int res = select(fd + 1, &rfds, NULL, NULL, &tv);
+        short revents = 0;
+        int res = socketPollOne(fd, POLLIN, 200, &revents);
         if (res > 0) {
             return 0;
         }
@@ -2048,7 +2061,7 @@ Value vmBuiltinSocketClose(VM* vm, int arg_count, Value* args) {
     int r = closesocket(s);
     if (r != 0) setSocketError(WSAGetLastError());
 #else
-    int r = close(s);
+    int r = close(vprocTagHostFd(s));
     if (r != 0) setSocketError(errno);
 #endif
     if (r != 0) return makeInt(-1);
@@ -2539,6 +2552,8 @@ Value vmBuiltinSocketPoll(VM* vm, int arg_count, Value* args) {
     int s = (int)AS_INTEGER(args[0]);
     int timeout = (int)AS_INTEGER(args[1]);
     int flags = (int)AS_INTEGER(args[2]);
+    int out = 0;
+#ifdef _WIN32
     fd_set rfds, wfds;
     FD_ZERO(&rfds); FD_ZERO(&wfds);
     if (flags & 1) FD_SET(s, &rfds);
@@ -2548,17 +2563,31 @@ Value vmBuiltinSocketPoll(VM* vm, int arg_count, Value* args) {
     tv.tv_usec = (timeout % 1000) * 1000;
     int r = select(s+1, &rfds, &wfds, NULL, &tv);
     if (r < 0) {
-#ifdef _WIN32
         setSocketError(WSAGetLastError());
-#else
-        setSocketError(errno);
-#endif
         return makeInt(-1);
     }
     if (r == 0) return makeInt(0);
-    int out = 0;
     if (FD_ISSET(s, &rfds)) out |= 1;
     if (FD_ISSET(s, &wfds)) out |= 2;
+#else
+    if (timeout < 0) {
+        setSocketError(EINVAL);
+        return makeInt(-1);
+    }
+    short events = 0;
+    if (flags & 1) events |= POLLIN;
+    if (flags & 2) events |= POLLOUT;
+    short revents = 0;
+    int r = socketPollOne(s, events, timeout, &revents);
+    if (r < 0) {
+        setSocketError(errno);
+        return makeInt(-1);
+    }
+    if (r == 0) return makeInt(0);
+    /* As select says: a socket that has failed or hung up is ready, and the call fails. */
+    if ((flags & 1) && (revents & (POLLIN | POLLHUP | POLLERR))) out |= 1;
+    if ((flags & 2) && (revents & (POLLOUT | POLLHUP | POLLERR))) out |= 2;
+#endif
     g_socket_last_error = 0;
     return makeInt(out);
 }

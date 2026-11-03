@@ -273,7 +273,8 @@ static FILE *shellVprocStreamOpen(int std_fd,
     }
 #endif
     if (dup_fd < 0) {
-        dup_fd = dup(host_fd);
+        /* Not dup, whose shim takes a slot, or vprocHostDup: the FILE owns this one. */
+        dup_fd = fcntl(host_fd, F_DUPFD, 0);
     }
     if (dup_fd < 0) {
         return shellVprocStreamFallback(std_fd);
@@ -281,7 +282,7 @@ static FILE *shellVprocStreamOpen(int std_fd,
 
     FILE *fp = fdopen(dup_fd, mode);
     if (!fp) {
-        close(dup_fd);
+        vprocHostClose(dup_fd);
         return shellVprocStreamFallback(std_fd);
     }
     if (buf_mode >= 0) {

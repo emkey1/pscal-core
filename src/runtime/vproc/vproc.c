@@ -8967,11 +8967,19 @@ void vprocIsolationLeave(VProcIsolationDomain domain) {
 /* A stdio stream's descriptor is a host fd, not a slot in the vproc table, so a
  * shim given fileno(fp) as it stands answers EBADF, or worse, uses whichever
  * slot has that number. vprocFilenoShim marks the fd so the shims use it as a
- * host fd. */
+ * host fd, and so does vprocTagHostFd for a socket and the like. */
 #define VPROC_HOST_FD_TAG 0x40000000
 
 static inline bool vprocFdIsTaggedHost(int fd) {
     return fd >= 0 && (fd & VPROC_HOST_FD_TAG) != 0;
+}
+
+int vprocTagHostFd(int fd) {
+    /* With no vproc the shims pass every fd straight to the host. */
+    if (fd < 0 || !vprocForThread()) {
+        return fd;
+    }
+    return fd | VPROC_HOST_FD_TAG;
 }
 
 int vprocTranslateFd(VProc *vp, int fd) {
@@ -13933,12 +13941,11 @@ static int shimTranslate(int fd, int allow_real) {
 
 int vprocFilenoShim(FILE *stream) {
     int fd = (fileno)(stream);
-    /* The standard streams' numbers are slots already, and with no vproc the
-     * shims pass every fd straight to the host. */
-    if (fd < 0 || stream == stdin || stream == stdout || stream == stderr || !vprocForThread()) {
+    /* The standard streams' numbers are slots already. */
+    if (stream == stdin || stream == stdout || stream == stderr) {
         return fd;
     }
-    return fd | VPROC_HOST_FD_TAG;
+    return vprocTagHostFd(fd);
 }
 
 int vprocFtruncateShim(int fd, off_t length) {
@@ -14668,7 +14675,9 @@ int vprocCloseShim(int fd) {
     if (!vp) {
         return vprocHostClose(fd);
     }
-    if (vprocHasFd(vp, fd)) {
+    if (vprocFdIsTaggedHost(fd)) {
+        fd &= ~VPROC_HOST_FD_TAG;
+    } else if (vprocHasFd(vp, fd)) {
         return vprocClose(vp, fd);
     }
 
@@ -16469,6 +16478,10 @@ int vprocPollShim(struct pollfd *fds, nfds_t nfds, int timeout) {
     for (nfds_t i = 0; i < nfds; ++i) {
         host_index[i] = -1;
         if (fds[i].fd < 0) {
+            continue;
+        }
+        if (vprocFdIsTaggedHost(fds[i].fd)) {
+            host_index[i] = fds[i].fd & ~VPROC_HOST_FD_TAG;
             continue;
         }
         if ((size_t)fds[i].fd >= vp->capacity) {

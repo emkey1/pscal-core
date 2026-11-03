@@ -134,6 +134,10 @@ off_t vprocHostLseek(int fd, off_t offset, int whence);
 int vprocHostFsync(int fd);
 /* Close a host descriptor without routing through the shim table. */
 int vprocHostClose(int fd);
+/* A host descriptor as the shims should take it, where they would look for a slot of
+ * that number. poll, close, fstat, ioctl and the other shims that translate honour it.
+ * It does not fit in an fd_set. close still wants a number this vproc holds. */
+int vprocTagHostFd(int fd);
 /* Read from a host descriptor without routing through the shim table. */
 ssize_t vprocHostRead(int fd, void *buf, size_t count);
 /* Write to a host descriptor without routing through the shim table. */
@@ -614,6 +618,7 @@ static inline int vprocHostPipeUnowned(int pipefd[2]) { return pipe(pipefd); }
 static inline off_t vprocHostLseek(int fd, off_t offset, int whence) { return lseek(fd, offset, whence); }
 static inline int vprocHostFsync(int fd) { return fsync(fd); }
 static inline int vprocHostClose(int fd) { return close(fd); }
+static inline int vprocTagHostFd(int fd) { return fd; }
 static inline ssize_t vprocHostRead(int fd, void *buf, size_t count) { return read(fd, buf, count); }
 static inline ssize_t vprocHostWrite(int fd, const void *buf, size_t count) { return write(fd, buf, count); }
 static inline int vprocHostPoll(struct pollfd *fds, nfds_t nfds, int timeout) { return poll(fds, nfds, timeout); }

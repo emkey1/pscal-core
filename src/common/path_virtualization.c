@@ -676,7 +676,7 @@ FILE *pscalPathVirtualized_fopen(const char *path, const char *mode) {
         FILE *stream = fdopen(fd, mode);
         if (!stream) {
             int saved_errno = errno;
-            close(fd);
+            vprocHostClose(fd);
             errno = saved_errno;
         }
         return stream;

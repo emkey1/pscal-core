@@ -3750,8 +3750,6 @@ static bool shellDupOntoTarget(VProc *vp, int src_fd, int target_fd, bool dbg, c
         }
         if (!skip_host_dup && host_src < 0 && src_fd >= 0) {
             hrc = dup2(src_fd, target_fd);
-        } else if (!skip_host_dup && host_src >= 0 && hrc < 0) {
-            hrc = dup2(host_src, target_fd);
         }
         if (!skip_host_dup && hrc >= 0 && vrc < 0) {
             /* If host dup succeeded but vproc dup failed, re-sync vproc's fd
