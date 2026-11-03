@@ -464,40 +464,39 @@ static bool shellCommandSubstitutionStartReader(ShellCommandSubReadContext *ctx,
 
 typedef struct {
     int *saved_stdout;
-    int *saved_mapped_stdout;
-    int *mapped_stdout_fd;
     bool *stdout_redirected;
-    bool *mapped_stdout_redirected;
 #if defined(PSCAL_TARGET_IOS)
     VProc **active_vp;
     struct pscal_fd **saved_stdout_pscal;
+    int *saved_slot_stdout;
 #endif
     ShellCommandSubReadContext *reader;
 } ShellCommandSubStdout;
 
 /* Puts stdout back, host fd 1 included: it is the whole process's. */
 static void shellCommandSubstitutionRestoreStdout(const ShellCommandSubStdout *state) {
-    if (*state->mapped_stdout_redirected && *state->saved_mapped_stdout >= 0) {
-        vprocHostDup2(*state->saved_mapped_stdout, *state->mapped_stdout_fd);
-        *state->mapped_stdout_redirected = false;
-    }
-    if (*state->saved_mapped_stdout >= 0) {
-        vprocHostClose(*state->saved_mapped_stdout);
-        *state->saved_mapped_stdout = -1;
-    }
     if (*state->stdout_redirected) {
         vprocHostDup2(*state->saved_stdout, STDOUT_FILENO);
 #if defined(PSCAL_TARGET_IOS)
         if (*state->active_vp) {
             if (*state->saved_stdout_pscal) {
                 (void)vprocAdoptPscalFd(*state->active_vp, STDOUT_FILENO, *state->saved_stdout_pscal);
+            } else if (*state->saved_slot_stdout >= 0) {
+                (void)vprocRestoreHostFd(*state->active_vp, STDOUT_FILENO, *state->saved_slot_stdout);
             } else {
-                (void)vprocRestoreHostFd(*state->active_vp, STDOUT_FILENO, STDOUT_FILENO);
+                /* The slot was closed, and now has the pipe. */
+                (void)vprocClose(*state->active_vp, STDOUT_FILENO);
             }
         }
 #endif
         *state->stdout_redirected = false;
     }
+#if defined(PSCAL_TARGET_IOS)
+    if (*state->saved_slot_stdout >= 0) {
+        vprocHostClose(*state->saved_slot_stdout);
+        *state->saved_slot_stdout = -1;
+    }
+#endif
     if (*state->saved_stdout >= 0) {
         vprocHostClose(*state->saved_stdout);
         *state->saved_stdout = -1;
@@ -588,13 +587,11 @@ static char *shellRunCommandSubstitution(const char *command) {
 
     int pipes[2] = {-1, -1};
     int saved_stdout = -1;
-    int mapped_stdout_fd = -1;
-    int saved_mapped_stdout = -1;
     bool stdout_redirected = false;
-    bool mapped_stdout_redirected = false;
 #if defined(PSCAL_TARGET_IOS)
     VProc *active_vp = NULL;
     struct pscal_fd *saved_stdout_pscal = NULL;
+    int saved_slot_stdout = -1;
 #endif
 
     ShellRunOptions opts;
@@ -675,11 +672,11 @@ static char *shellRunCommandSubstitution(const char *command) {
     active_vp = vprocCurrent();
     if (active_vp) {
         saved_stdout_pscal = vprocGetPscalFd(active_vp, STDOUT_FILENO);
+        /* Slot 1 is not host fd 1: `( ... ) > f` moves only the slot. */
         int translated = vprocTranslateFd(active_vp, STDOUT_FILENO);
-        if (translated >= 0 && translated != STDOUT_FILENO) {
-            mapped_stdout_fd = translated;
-            saved_mapped_stdout = vprocHostDup(mapped_stdout_fd);
-            if (saved_mapped_stdout < 0) {
+        if (translated >= 0) {
+            saved_slot_stdout = vprocHostDup(translated);
+            if (saved_slot_stdout < 0) {
                 vprocHostClose(pipes[0]);
                 vprocHostClose(pipes[1]);
                 pipes[0] = pipes[1] = -1;
@@ -700,10 +697,12 @@ static char *shellRunCommandSubstitution(const char *command) {
         pipes[0] = pipes[1] = -1;
         vprocHostClose(saved_stdout);
         saved_stdout = -1;
-        if (saved_mapped_stdout >= 0) {
-            vprocHostClose(saved_mapped_stdout);
-            saved_mapped_stdout = -1;
+#if defined(PSCAL_TARGET_IOS)
+        if (saved_slot_stdout >= 0) {
+            vprocHostClose(saved_slot_stdout);
+            saved_slot_stdout = -1;
         }
+#endif
         fprintf(stderr, "exsh: command substitution: failed to redirect stdout: %s\n", strerror(err));
         result = strdup("");
         result_length = 0;
@@ -717,39 +716,6 @@ static char *shellRunCommandSubstitution(const char *command) {
     }
 #endif
 
-#if defined(PSCAL_TARGET_IOS)
-    if (mapped_stdout_fd >= 0) {
-        if (vprocHostDup2(pipes[1], mapped_stdout_fd) < 0) {
-            int err = errno;
-            vprocHostDup2(saved_stdout, STDOUT_FILENO);
-#if defined(PSCAL_TARGET_IOS)
-            if (active_vp) {
-                if (saved_stdout_pscal) {
-                    /* Restore original PSCAL-backed stdout mapping. */
-                    (void)vprocAdoptPscalFd(active_vp, STDOUT_FILENO, saved_stdout_pscal);
-                } else {
-                    /* Restore shim stdout from the now-restored host fd 1. */
-                    (void)vprocRestoreHostFd(active_vp, STDOUT_FILENO, STDOUT_FILENO);
-                }
-            }
-#endif
-            vprocHostClose(saved_stdout);
-            saved_stdout = -1;
-            vprocHostClose(pipes[0]);
-            vprocHostClose(pipes[1]);
-            pipes[0] = pipes[1] = -1;
-            if (saved_mapped_stdout >= 0) {
-                vprocHostClose(saved_mapped_stdout);
-                saved_mapped_stdout = -1;
-            }
-            fprintf(stderr, "exsh: command substitution: failed to redirect mapped stdout: %s\n", strerror(err));
-            result = strdup("");
-            result_length = 0;
-            goto substitution_finish;
-        }
-        mapped_stdout_redirected = true;
-    }
-#endif
     vprocHostClose(pipes[1]);
     pipes[1] = -1;
 
@@ -778,13 +744,11 @@ static char *shellRunCommandSubstitution(const char *command) {
 
     ShellCommandSubStdout stdout_state = {
         .saved_stdout = &saved_stdout,
-        .saved_mapped_stdout = &saved_mapped_stdout,
-        .mapped_stdout_fd = &mapped_stdout_fd,
         .stdout_redirected = &stdout_redirected,
-        .mapped_stdout_redirected = &mapped_stdout_redirected,
 #if defined(PSCAL_TARGET_IOS)
         .active_vp = &active_vp,
         .saved_stdout_pscal = &saved_stdout_pscal,
+        .saved_slot_stdout = &saved_slot_stdout,
 #endif
         .reader = reader,
     };
