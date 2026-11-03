@@ -7974,13 +7974,18 @@ int vprocAdoptPscalFd(VProc *vp, int target_fd, struct pscal_fd *pscal_fd) {
 }
 
 /* An entry closing its host fd takes any saved stdio number with it. Otherwise
- * vprocDestroy closes that number again, and by then it may be another command's. */
+ * vprocDestroy closes that number again, and by then it may be anything: another command's
+ * descriptor, a later stage's stdout (`ls x 2>&1 | wc -l | cat` printed nothing, status 0),
+ * or the process's poll wake pipe, whose wakeups then wrote NULs to whatever had the number
+ * next. Any `dup2(x, 2)` during a command does this: Aether mutes stderr around its pre-pass,
+ * Pascal captures it. */
 static void vprocForgetSavedStdioLocked(VProc *vp, int host_fd) {
     if (host_fd < 0) {
         return;
     }
     if (host_fd == vp->stdin_host_fd) {
         vp->stdin_host_fd = -1;
+        vp->stdin_from_session = false;
     }
     if (host_fd == vp->stdout_host_fd) {
         vp->stdout_host_fd = -1;
@@ -8680,19 +8685,6 @@ int vprocDupAbove(VProc *vp, int fd, int min) {
     return slot;
 }
 
-/* A slot holding a saved stdio number is about to close it. vprocDestroy closes the saved
- * numbers as well, and by then the number can be anything: when it was the process's poll
- * wake pipe, later wakeups wrote NULs to whatever had the number next. `dup2(x, 2)` during a
- * command does this: Aether mutes stderr around its pre-pass, Pascal captures it. */
-static void vprocForgetSavedStdioLocked(VProc *vp, int host_fd) {
-    if (host_fd == vp->stdout_host_fd) {
-        vp->stdout_host_fd = -1;
-    }
-    if (host_fd == vp->stderr_host_fd) {
-        vp->stderr_host_fd = -1;
-    }
-}
-
 int vprocDup2(VProc *vp, int fd, int target) {
     if (!vp || target < 0) {
         errno = EBADF;
@@ -8868,9 +8860,6 @@ int vprocClose(VProc *vp, int fd) {
         pthread_mutex_unlock(&vp->mu);
         errno = EBADF;
         return -1;
-    }
-    if (kind == VPROC_FD_HOST) {
-        vprocForgetSavedStdioLocked(vp, host);
     }
     vp->entries[fd].host_fd = -1;
     vp->entries[fd].pscal_fd = NULL;
