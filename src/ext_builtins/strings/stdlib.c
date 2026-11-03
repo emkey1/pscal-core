@@ -26,6 +26,7 @@
 #include "core/utils.h"
 #include "core/globals.h"
 #include "backend_ast/builtin.h"
+#include "common/path_virtualization.h"
 
 /* ------------------------------------------------------------------ */
 /* Argument helpers                                                    */

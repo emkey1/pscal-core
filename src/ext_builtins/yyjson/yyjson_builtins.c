@@ -1,6 +1,7 @@
 #include "core/utils.h"
 #include "backend_ast/builtin.h"
 #include "third_party/yyjson/yyjson.h"
+#include "common/path_virtualization.h"
 
 #include <pthread.h>
 #include <stdlib.h>
@@ -339,8 +340,9 @@ static Value vmBuiltinYyjsonReadFile(struct VM_s *vm, int arg_count, Value *args
         return makeInt(YYJSON_UNUSED_HANDLE);
     }
     const char *path = AS_STRING(args[0]) ? AS_STRING(args[0]) : "";
+    char host_path[PATH_MAX];
     yyjson_read_err err;
-    yyjson_doc *doc = yyjson_read_file(path, 0, NULL, &err);
+    yyjson_doc *doc = yyjson_read_file(pscalPathVirtualized_hostPath(path, host_path), 0, NULL, &err);
     if (!doc) {
         runtimeError(vm, "YyjsonReadFile failed at position %zu: %s", err.pos, err.msg ? err.msg : "unknown error");
         return makeInt(YYJSON_UNUSED_HANDLE);
@@ -365,8 +367,9 @@ static Value vmBuiltinAetherTryToonReadFile(struct VM_s *vm, int arg_count, Valu
         return makeInt(YYJSON_UNUSED_HANDLE);
     }
     const char *path = AS_STRING(args[0]) ? AS_STRING(args[0]) : "";
+    char host_path[PATH_MAX];
     yyjson_read_err err;
-    yyjson_doc *doc = yyjson_read_file(path, 0, NULL, &err);
+    yyjson_doc *doc = yyjson_read_file(pscalPathVirtualized_hostPath(path, host_path), 0, NULL, &err);
     bool ok = doc != NULL;
     if (!doc) doc = yyjson_read("null", 4, 0);
     if (!doc) {

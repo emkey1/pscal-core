@@ -3,6 +3,7 @@
 #include "audio.h"
 #include "core/globals.h" // For EXIT_FAILURE_HANDLER
 #include "core/utils.h" // For EXIT_FAILURE_HANDLER
+#include "common/path_virtualization.h"
 #include <pscal_paths.h>
 #include <limits.h>
 #include <stdio.h>
@@ -27,7 +28,8 @@ static Mix_Chunk* audioTryLoadChunk(const char* candidate, char* resolved, size_
     if (!candidate || candidate[0] == '\0') {
         return NULL;
     }
-    Mix_Chunk* chunk = Mix_LoadWAV(candidate);
+    char host_path[PATH_MAX];
+    Mix_Chunk* chunk = Mix_LoadWAV(pscalPathVirtualized_hostPath(candidate, host_path));
     if (!chunk) {
         return NULL;
     }

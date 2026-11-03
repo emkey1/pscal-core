@@ -4247,6 +4247,7 @@ void pathTruncateProvisionDev(const char *prefix) {
         { "null", "/dev/null" },
         { "zero", "/dev/zero" },
         { "random", "/dev/random" },
+        { "urandom", "/dev/urandom" },
         { "ptmx", "/dev/null" }
     };
     for (size_t i = 0; i < sizeof(links) / sizeof(links[0]); ++i) {
@@ -4514,7 +4515,8 @@ bool pathTruncateExpand(const char *input_path, char *out, size_t out_size) {
     /* Device nodes: leave untouched so they resolve to the real device. */
     if (strcmp(input_path, "/dev/null") == 0 ||
         strcmp(input_path, "/dev/zero") == 0 ||
-        strcmp(input_path, "/dev/random") == 0) {
+        strcmp(input_path, "/dev/random") == 0 ||
+        strcmp(input_path, "/dev/urandom") == 0) {
         bool res = pathTruncateCopyString(input_path, out, out_size);
         pathTruncateUnlock();
         return res;

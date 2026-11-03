@@ -30,6 +30,7 @@
 #include "vm/string_sentinels.h"
 #include "common/pscal_hosts.h"
 #include "common/frontend_kind.h"
+#include "common/path_virtualization.h"
 
 static Value httpAsyncTaskValue(int id, VM* vm, uint32_t generation);
 static TaskObj* httpAsyncTaskArg(VM* vm, Value v, TaskObj* scratch);

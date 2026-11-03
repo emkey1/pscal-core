@@ -18,11 +18,9 @@
 
 #include "core/utils.h"
 #include "common/path_truncate.h"
-#if defined(PSCAL_TARGET_IOS)
 #define PATH_VIRTUALIZATION_NO_MACROS 1
 #include "common/path_virtualization.h"
 #undef PATH_VIRTUALIZATION_NO_MACROS
-#endif
 #include "vm/vm.h"
 #include "sdl_ios_dispatch.h"
 static void sdlLogEvent(const char *label, const SDL_Event *event);
@@ -2116,7 +2114,8 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinLoadimagetotexture) {
     int free_slot = findFreeTextureID();
     if (free_slot == -1) { runtimeError(vm, "No free texture slots available for LoadImageToTexture."); return makeInt(-1); }
 
-    SDL_Surface* surface = IMG_Load(filePath);
+    char host_path[PATH_MAX];
+    SDL_Surface* surface = IMG_Load(pscalPathVirtualized_hostPath(filePath, host_path));
     if (!surface) {
         runtimeError(vm, "Failed to load image '%s': %s", filePath, IMG_GetError());
         return makeInt(-1);

@@ -2022,6 +2022,7 @@ typedef struct {
     pthread_mutex_t stop_mu;
     pthread_cond_t stop_cv;
     ShellThreadLink link;
+    char shell_cwd[PATH_MAX];
 } ShellInProcessWorkerCtx;
 
 typedef struct {
@@ -2911,11 +2912,8 @@ static void *shellInProcessWorkerMain(void *arg) {
      * Keep worker path resolution aligned with the parent shell session.
      * This prevents reused worker threads from carrying stale cwd between tabs.
      */
-    {
-        char shell_cwd[PATH_MAX];
-        if (vprocShellGetcwdShim(shell_cwd, sizeof(shell_cwd)) != NULL) {
-            (void)vprocChdirShim(shell_cwd);
-        }
+    if (ctx->shell_cwd[0] != '\0') {
+        (void)vprocChdirShim(ctx->shell_cwd);
     }
 #endif
 
@@ -5538,6 +5536,10 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
         worker->shell_pid = shell_pid;
         worker->kernel_pid = vprocGetKernelPid();
         worker->link = shellThreadLinkCapture();
+        /* Asked here: a shell run as a command owns its directory on this thread only. */
+        if (vprocShellGetcwdShim(worker->shell_cwd, sizeof(worker->shell_cwd)) == NULL) {
+            worker->shell_cwd[0] = '\0';
+        }
 
         pthread_attr_t attr;
         pthread_attr_init(&attr);

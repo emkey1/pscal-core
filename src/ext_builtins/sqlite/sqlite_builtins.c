@@ -1,6 +1,7 @@
 #include "core/utils.h"
 #include "backend_ast/builtin.h"
 #include "ext_builtins/registry.h"
+#include "common/path_virtualization.h"
 
 #include <sqlite3.h>
 
@@ -115,6 +116,11 @@ static Value vmSqliteOpen(struct VM_s *vm, int arg_count, Value *args) {
         return makeInt(-1);
     }
     const char *path = AS_STRING(args[0]) ? AS_STRING(args[0]) : ":memory:";
+    /* ":memory:" and "file:" URIs are sqlite's own names, not paths. */
+    char host_path[PATH_MAX];
+    if (path[0] != ':' && strncmp(path, "file:", 5) != 0) {
+        path = pscalPathVirtualized_hostPath(path, host_path);
+    }
     sqlite3 *db = NULL;
     int rc = sqlite3_open(path, &db);
     if (rc != SQLITE_OK) {

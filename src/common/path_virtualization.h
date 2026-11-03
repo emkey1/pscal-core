@@ -1,12 +1,18 @@
 #pragma once
 
+#include <limits.h>
 #include <stddef.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#if defined(PSCAL_TARGET_IOS)
+#if !defined(PSCAL_TARGET_IOS)
+static inline const char *pscalPathVirtualized_hostPath(const char *path, char expanded[PATH_MAX]) {
+    (void)expanded;
+    return path;
+}
+#else
 #include <dirent.h>
 #include <glob.h>
 #include <stdio.h>
@@ -34,6 +40,9 @@ int pscalPathVirtualized_glob(const char *pattern,
 int pscalPathVirtualized_symlink(const char *target, const char *linkpath);
 ssize_t pscalPathVirtualized_readlink(const char *path, char *buf, size_t size);
 char *pscalPathVirtualized_realpath(const char *path, char *resolved_path);
+/* For a library that opens the file itself, which the macros below cannot reach: the host
+ * path to hand it. A relative path starts from the vproc's directory, not the process's. */
+const char *pscalPathVirtualized_hostPath(const char *path, char expanded[PATH_MAX]);
 
 #if !defined(PATH_VIRTUALIZATION_NO_MACROS)
 #define chdir(path) pscalPathVirtualized_chdir(path)

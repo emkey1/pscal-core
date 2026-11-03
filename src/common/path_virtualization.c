@@ -161,7 +161,9 @@ static FILE *vprocFdopenCompat(int fd, const char *mode) {
                        vprocStreamClose);
     if (!fp) {
         vprocCloseShim(fd);
+        return NULL;
     }
+    vprocStreamSkipFlushAll(fp);
     return fp;
 }
 #endif /* PSCAL_TARGET_IOS */
@@ -567,6 +569,13 @@ static const char *pathVirtualizedPrepare(const char *path, char expanded[PATH_M
     const char *resolved_path = pathVirtualizedResolveAgainstVirtualCwd(path, resolved, sizeof(resolved));
     const char *target = pathVirtualizedExpand(resolved_path, expanded, PATH_MAX);
     return target ? target : path;
+}
+
+const char *pscalPathVirtualized_hostPath(const char *path, char expanded[PATH_MAX]) {
+    if (pathVirtualizedIsVprocDevicePath(path) || !pathVirtualizationActive()) {
+        return path;
+    }
+    return pathVirtualizedPrepare(path, expanded);
 }
 
 static int pathVirtualizedOpenHost(const char *path, int oflag, mode_t mode, bool has_mode) {

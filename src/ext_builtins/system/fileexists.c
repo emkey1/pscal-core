@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include "core/utils.h"
 #include "backend_ast/builtin.h"
+#include "common/path_virtualization.h"
 
 static Value vmBuiltinFileExists(struct VM_s* vm, int arg_count, Value* args) {
     if (arg_count != 1) {

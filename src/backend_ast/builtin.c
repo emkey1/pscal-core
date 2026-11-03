@@ -51,9 +51,8 @@ bool shellRuntimeIsSharedFileStream(FILE *stream) {
 
 #if defined(PSCAL_TARGET_IOS)
 #include "runtime/vproc/vproc.h"
-#define PATH_VIRTUALIZATION_NO_MACROS 1
+/* A program's file builtins follow the vproc's directory and take the app's absolute paths. */
 #include "common/path_virtualization.h"
-#undef PATH_VIRTUALIZATION_NO_MACROS
 #if defined(__APPLE__)
 extern VProcSessionStdio *PSCALRuntimeGetCurrentRuntimeStdio(void) __attribute__((weak_import));
 #else
@@ -10259,22 +10258,14 @@ static int dosMkdirParents(const char *path) {
     for (; *p; p++) {
         if (*p != '/') continue;
         *p = '\0';
-#if defined(PSCAL_TARGET_IOS)
-        if (pscalPathVirtualized_mkdir(tmp, 0777) != 0 && errno != EEXIST) {
-#else
         if (mkdir(tmp, 0777) != 0 && errno != EEXIST) {
-#endif
             rc = -1;
             break;
         }
         *p = '/';
     }
     if (rc == 0) {
-#if defined(PSCAL_TARGET_IOS)
-        if (pscalPathVirtualized_mkdir(tmp, 0777) != 0 && errno != EEXIST) {
-#else
         if (mkdir(tmp, 0777) != 0 && errno != EEXIST) {
-#endif
             rc = -1;
         }
     }
@@ -10313,11 +10304,7 @@ Value vmBuiltinDosMkdir(VM* vm, int arg_count, Value* args) {
         if (parents) {
             rc = dosMkdirParents(path);
         } else {
-#if defined(PSCAL_TARGET_IOS)
-            rc = pscalPathVirtualized_mkdir(path, 0777);
-#else
             rc = mkdir(path, 0777);
-#endif
         }
         if (rc != 0 && errno != EEXIST) {
             last_err = errno ? errno : EIO;
@@ -10335,12 +10322,7 @@ Value vmBuiltinDosRmdir(VM* vm, int arg_count, Value* args) {
         runtimeError(vm, "dosRmdir expects 1 string argument.");
         return makeInt(errno);
     }
-    int rc = -1;
-#if defined(PSCAL_TARGET_IOS)
-    rc = pscalPathVirtualized_rmdir(AS_STRING(args[0]));
-#else
-    rc = rmdir(AS_STRING(args[0]));
-#endif
+    int rc = rmdir(AS_STRING(args[0]));
     return makeInt(rc == 0 ? 0 : errno);
 }
 

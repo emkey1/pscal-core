@@ -8,6 +8,7 @@
 
 #include "core/utils.h"
 #include "backend_ast/builtin.h"
+#include "common/path_virtualization.h"
 
 static Value vmBuiltinGetCurrentDir(struct VM_s* vm, int arg_count, Value* args) {
     (void)args;
