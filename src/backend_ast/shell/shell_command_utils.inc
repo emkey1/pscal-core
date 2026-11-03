@@ -340,13 +340,13 @@ static bool shellParseCommandMetadata(const char *meta, size_t meta_len,
     return true;
 }
 
-/* The longest the reader waits for output before it checks whether the command has
- * ended. Output and end of file wake it at once, so this only delays the end of a
- * command that left something holding the write end. The wait starts at 1 ms and
- * doubles: a short command is seen to end soon after, a long quiet one costs few
- * wakeups. */
+/* The longest the reader waits for output before it checks whether it should go on
+ * waiting. Output and end of file wake it at once, so this only delays noticing an
+ * interrupt or, on iOS, that the last job has ended. The wait starts at 1 ms and
+ * doubles: a long quiet command costs few wakeups. */
 #define SHELL_COMMAND_SUB_MAX_WAIT_MS 64
-/* Where the read end lives on a host, well above what a script names for itself. */
+/* Where the read end and the saved stdout live on a host, well above what a script
+ * names for itself. */
 #define SHELL_COMMAND_SUB_READ_FD_MIN 64
 
 typedef struct {
@@ -356,8 +356,31 @@ typedef struct {
     size_t capacity;
     int error;
     bool command_done;
+    /* As bash does, read on after the command ends: a job it left behind can still
+     * write. A host has nothing else holding the write end by then. On iOS this is only
+     * set while such a job runs, because a thread's cached stream can hold a copy for
+     * as long as the thread lives, and nothing would ever end the read. */
+    bool wait_for_eof;
+    bool stop_on_sigint;
+    bool stop_on_sigquit;
     bool abandoned;
+    bool finished;
 } ShellCommandSubReadContext;
+
+/* The shell cannot act on an interrupt while it sits in the join, so a read that may
+ * last as long as a background job has to give up for it. A trap waits, as under bash. */
+static bool shellCommandSubstitutionShouldGiveUp(const ShellCommandSubReadContext *ctx) {
+    if (__atomic_load_n(&ctx->abandoned, __ATOMIC_ACQUIRE) || pscalRuntimeSigintPending()) {
+        return true;
+    }
+#if !defined(PSCAL_TARGET_IOS)
+    if ((ctx->stop_on_sigint && gShellPendingSignals[SIGINT]) ||
+        (ctx->stop_on_sigquit && gShellPendingSignals[SIGQUIT])) {
+        return true;
+    }
+#endif
+    return false;
+}
 
 static void shellCommandSubstitutionDrain(ShellCommandSubReadContext *ctx) {
     if (!ctx || ctx->fd < 0) {
@@ -398,7 +421,10 @@ static void shellCommandSubstitutionDrain(ShellCommandSubReadContext *ctx) {
         } else if (errno == EINTR) {
             continue;
         } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            if (!__atomic_load_n(&ctx->command_done, __ATOMIC_ACQUIRE)) {
+            bool wait_on = !__atomic_load_n(&ctx->command_done, __ATOMIC_ACQUIRE) ||
+                           (__atomic_load_n(&ctx->wait_for_eof, __ATOMIC_ACQUIRE) &&
+                            !shellCommandSubstitutionShouldGiveUp(ctx));
+            if (wait_on) {
                 struct pollfd wait_fd = {.fd = ctx->fd, .events = POLLIN, .revents = 0};
                 (void)vprocHostPoll(&wait_fd, 1, wait_ms);
                 if (wait_ms < SHELL_COMMAND_SUB_MAX_WAIT_MS) {
@@ -406,8 +432,8 @@ static void shellCommandSubstitutionDrain(ShellCommandSubReadContext *ctx) {
                 }
                 continue;
             }
-            /* Command substitution output is complete once execution returns.
-             * Avoid blocking forever on leaked write-end descriptors. */
+            /* Nothing is left that may still write. What is in the pipe gets a moment
+             * to arrive. */
             int max_spins = saw_data ? 4 : 20;
             if (idle_spins < max_spins) {
                 ++idle_spins;
@@ -437,6 +463,7 @@ static void *shellCommandSubstitutionReaderMain(void *arg) {
     sigfillset(&all_signals);
     (void)pthread_sigmask(SIG_SETMASK, &all_signals, NULL);
     shellCommandSubstitutionDrain(ctx);
+    __atomic_store_n(&ctx->finished, true, __ATOMIC_RELEASE);
     if (__atomic_load_n(&ctx->abandoned, __ATOMIC_ACQUIRE)) {
         pthread_detach(pthread_self());
         vprocHostClose(ctx->fd);
@@ -483,6 +510,11 @@ static void shellCommandSubstitutionRestoreStdout(const ShellCommandSubStdout *s
     if (*state->stdout_redirected) {
         if (*state->saved_stdout >= 0) {
             vprocHostDup2(*state->saved_stdout, STDOUT_FILENO);
+#if !defined(PSCAL_TARGET_IOS)
+        } else {
+            /* It was closed, and now has the pipe. */
+            vprocHostClose(STDOUT_FILENO);
+#endif
         }
 #if defined(PSCAL_TARGET_IOS)
         if (*state->active_vp) {
@@ -525,6 +557,181 @@ static void shellCommandSubstitutionAbandon(void *arg) {
     __atomic_store_n(&ctx->abandoned, true, __ATOMIC_RELEASE);
     __atomic_store_n(&ctx->command_done, true, __ATOMIC_RELEASE);
 }
+
+/* `exec 3> f` in a substitution: the first copy of a descriptor is the one to go back to.
+ * Returns false when this shell should keep the redirection after all. */
+static bool shellCommandSubKeepExecBackups(ShellExecRedirBackup *backups, size_t count) {
+    ShellCommandSubFrame *frame = gShellCommandSubFrame;
+    if (!frame) {
+        return false;
+    }
+#if defined(PSCAL_TARGET_IOS)
+    /* The last stage of a pipeline runs on this thread under a vproc of its own. */
+    if (frame->vp != vprocCurrent()) {
+        return false;
+    }
+#endif
+    for (size_t i = 0; i < count; ++i) {
+        bool known = false;
+        for (size_t j = 0; j < frame->exec_backup_count; ++j) {
+            known = known || frame->exec_backups[j].target_fd == backups[i].target_fd;
+        }
+        if (!known && frame->exec_backup_count == frame->exec_backup_capacity) {
+            size_t capacity = frame->exec_backup_capacity ? frame->exec_backup_capacity * 2 : 4;
+            ShellExecRedirBackup *resized =
+                (ShellExecRedirBackup *)realloc(frame->exec_backups, capacity * sizeof(ShellExecRedirBackup));
+            if (!resized) {
+                known = true;
+            } else {
+                frame->exec_backups = resized;
+                frame->exec_backup_capacity = capacity;
+            }
+        }
+        if (known) {
+            ShellExecRedirBackup *single = (ShellExecRedirBackup *)malloc(sizeof(ShellExecRedirBackup));
+            if (single) {
+                *single = backups[i];
+                shellFreeExecRedirBackups(single, 1);
+            }
+        } else {
+            frame->exec_backups[frame->exec_backup_count++] = backups[i];
+        }
+    }
+    free(backups);
+    return true;
+}
+
+static void shellCommandSubRecordJob(const pid_t *pids, size_t count) {
+    ShellCommandSubFrame *frame = gShellCommandSubFrame;
+    if (!frame) {
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        if (frame->job_pid_count == frame->job_pid_capacity) {
+            size_t capacity = frame->job_pid_capacity ? frame->job_pid_capacity * 2 : 4;
+            pid_t *resized = (pid_t *)realloc(frame->job_pids, capacity * sizeof(pid_t));
+            if (!resized) {
+                return;
+            }
+            frame->job_pids = resized;
+            frame->job_pid_capacity = capacity;
+        }
+        frame->job_pids[frame->job_pid_count++] = pids[i];
+    }
+}
+
+/* What the jobs of finished substitutions left behind. The job tables they were on went
+ * with the substitution, and a subshell's children would not be this shell's to wait for
+ * anyway, but here they are, and they would stay zombies. */
+static PSCAL_THREAD_LOCAL pid_t *gShellCommandSubOrphans = NULL;
+static PSCAL_THREAD_LOCAL size_t gShellCommandSubOrphanCount = 0;
+
+static void shellCommandSubReapOrphans(void) {
+    size_t kept = 0;
+    for (size_t i = 0; i < gShellCommandSubOrphanCount; ++i) {
+        int status = 0;
+        pid_t res = vprocWaitPidShim(gShellCommandSubOrphans[i], &status, WNOHANG);
+        if (res == 0 || (res < 0 && errno == EINTR)) {
+            gShellCommandSubOrphans[kept++] = gShellCommandSubOrphans[i];
+        }
+    }
+    gShellCommandSubOrphanCount = kept;
+}
+
+static void shellCommandSubAddOrphan(pid_t pid) {
+    pid_t *resized = (pid_t *)realloc(gShellCommandSubOrphans, (gShellCommandSubOrphanCount + 1) * sizeof(pid_t));
+    if (!resized) {
+        return;
+    }
+    gShellCommandSubOrphans = resized;
+    gShellCommandSubOrphans[gShellCommandSubOrphanCount++] = pid;
+}
+
+static void shellCommandSubAdoptJobs(ShellCommandSubFrame *frame) {
+    for (size_t i = 0; i < frame->job_pid_count; ++i) {
+        shellCommandSubAddOrphan(frame->job_pids[i]);
+    }
+    free(frame->job_pids);
+    frame->job_pids = NULL;
+    frame->job_pid_count = 0;
+    frame->job_pid_capacity = 0;
+    shellCommandSubReapOrphans();
+}
+
+#if defined(PSCAL_TARGET_IOS)
+/* Reaping here is fine: nothing else can wait for them once the substitution's job table
+ * is gone. A job this vproc cannot wait for counts as ended, which is what the read did
+ * before it waited for any job. So does a stopped one: nothing here will resume it. */
+static bool shellCommandSubJobsRunning(ShellCommandSubFrame *frame) {
+    size_t kept = 0;
+    for (size_t i = 0; i < frame->job_pid_count; ++i) {
+        int status = 0;
+        pid_t res = vprocWaitPidShim(frame->job_pids[i], &status, WNOHANG | WUNTRACED);
+        if (res == 0 || (res < 0 && errno == EINTR)) {
+            frame->job_pids[kept++] = frame->job_pids[i];
+        } else if (res > 0 && WIFSTOPPED(status)) {
+            shellCommandSubAddOrphan(frame->job_pids[i]);
+        }
+    }
+    frame->job_pid_count = kept;
+    return kept > 0;
+}
+
+/* The reader sees an interrupt that comes through the runtime's flag. One can also be
+ * queued for this shell's vproc or, at a host's terminal, for the process, where SIGINT
+ * stays blocked. That one is taken here, or the next tool's catcher would find it. */
+static bool shellCommandSubInterruptPending(void) {
+    sigset_t pending;
+    if (sigpending(&pending) == 0 && sigismember(&pending, SIGINT)) {
+        return true;
+    }
+    if ((sigpending)(&pending) == 0 && sigismember(&pending, SIGINT)) {
+        sigset_t only;
+        int signo = 0;
+        sigemptyset(&only);
+        sigaddset(&only, SIGINT);
+        (void)sigwait(&only, &signo);
+        return true;
+    }
+    return false;
+}
+#else
+/* A forked child goes on as a subshell. What the substitutions around it saved is not
+ * its own: holding on to a copy of a pipe's write end would keep the reader from seeing
+ * its end of file. */
+static void shellCommandSubForgetFrames(void) {
+    for (ShellCommandSubFrame *frame = gShellCommandSubFrame; frame; frame = frame->outer) {
+        if (frame->read_fd >= 0) {
+            close(frame->read_fd);
+        }
+        if (frame->saved_stdout >= 0) {
+            close(frame->saved_stdout);
+        }
+        for (size_t i = 0; i < frame->exec_backup_count; ++i) {
+            if (frame->exec_backups[i].saved_valid && frame->exec_backups[i].saved_fd >= 0) {
+                close(frame->exec_backups[i].saved_fd);
+            }
+        }
+    }
+    gShellCommandSubFrame = NULL;
+    gShellCommandSubOrphanCount = 0;
+}
+
+/* Moves one end of the pipe up to where the saved stdout lives. False if there is no
+ * room, with the end left where it was. */
+static bool shellCommandSubMoveFdHigh(int *fd) {
+    int high = fcntl(*fd, F_DUPFD_CLOEXEC, SHELL_COMMAND_SUB_READ_FD_MIN);
+    if (high < 0) {
+        high = fcntl(*fd, F_DUPFD_CLOEXEC, 3);
+    }
+    if (high < 0) {
+        return false;
+    }
+    vprocHostClose(*fd);
+    *fd = high;
+    return true;
+}
+#endif
 
 /* A pipe holds only so much, and nothing reads it until this returns. A bigger body
  * goes in an unlinked file. Returns a descriptor to read it from, or -1. */
@@ -598,12 +805,17 @@ static char *shellRunCommandSubstitution(const char *command) {
 
     int pipes[2] = {-1, -1};
     int saved_stdout = -1;
+    bool stdout_was_closed = false;
     bool stdout_redirected = false;
 #if defined(PSCAL_TARGET_IOS)
     VProc *active_vp = NULL;
     struct pscal_fd *saved_stdout_pscal = NULL;
     int saved_slot_stdout = -1;
 #endif
+    ShellCommandSubFrame frame;
+    memset(&frame, 0, sizeof(frame));
+    frame.read_fd = -1;
+    frame.saved_stdout = -1;
 
     ShellRunOptions opts;
     ShellSymbolTableScope table_scope;
@@ -703,8 +915,24 @@ static char *shellRunCommandSubstitution(const char *command) {
     } else
 #endif
     {
+#if defined(PSCAL_TARGET_IOS)
         saved_stdout = vprocHostDup(STDOUT_FILENO);
-        if (saved_stdout < 0) {
+#else
+        /* The command shares this process's descriptors: `cmd 3> f` or `exec 3> f` would
+         * replace a low number while the reader is on it. On iOS those numbers are vproc
+         * slots, and nothing there is ever exec'd. The pipe moves first because a closed
+         * stdout gave it that very number, which would pass for the stdout to put back. */
+        if (shellCommandSubMoveFdHigh(&pipes[0]) && shellCommandSubMoveFdHigh(&pipes[1])) {
+            /* Out of reach of `exec 4> f` in the command, and of anything it starts: a job
+             * with its output elsewhere must not keep the outer stdout open. */
+            saved_stdout = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, SHELL_COMMAND_SUB_READ_FD_MIN);
+            if (saved_stdout < 0) {
+                saved_stdout = fcntl(STDOUT_FILENO, F_DUPFD_CLOEXEC, 3);
+            }
+            stdout_was_closed = saved_stdout < 0 && errno == EBADF;
+        }
+#endif
+        if (saved_stdout < 0 && !stdout_was_closed) {
             vprocHostClose(pipes[0]);
             vprocHostClose(pipes[1]);
             pipes[0] = pipes[1] = -1;
@@ -750,19 +978,19 @@ static char *shellRunCommandSubstitution(const char *command) {
     reader->fd = pipes[0];
     pipes[0] = -1;
 #if !defined(PSCAL_TARGET_IOS)
-    /* The command shares this process's descriptors: `cmd 3> f` or `exec 3> f` would
-     * replace a low number while the reader is on it. On iOS those numbers are vproc
-     * slots, and nothing there is ever exec'd. */
-    int high_read_fd = fcntl(reader->fd, F_DUPFD, SHELL_COMMAND_SUB_READ_FD_MIN);
-    if (high_read_fd >= 0) {
-        vprocHostClose(reader->fd);
-        reader->fd = high_read_fd;
-    }
-    (void)fcntl(reader->fd, F_SETFD, FD_CLOEXEC);
+    reader->wait_for_eof = true;
 #endif
     reader_started = shellCommandSubstitutionStartReader(reader, &reader_thread);
 
     pthread_cleanup_push(shellCommandSubstitutionAbandon, &stdout_state);
+
+    frame.outer = gShellCommandSubFrame;
+    frame.read_fd = reader->fd;
+    frame.saved_stdout = saved_stdout;
+#if defined(PSCAL_TARGET_IOS)
+    frame.vp = vprocCurrent();
+#endif
+    gShellCommandSubFrame = &frame;
 
     memset(&opts, 0, sizeof(opts));
     opts.no_cache = 1;
@@ -851,13 +1079,35 @@ static char *shellRunCommandSubstitution(const char *command) {
     }
 
     shellFlushStandardStreams();
+    gShellCommandSubFrame = frame.outer;
+    /* Its `exec 3> f` ends here, as a subshell's would. Left open, a copy of the write
+     * end would keep the reader waiting on this very thread. */
+    shellRestoreExecRedirections(frame.exec_backups, frame.exec_backup_count);
+    shellFreeExecRedirBackups(frame.exec_backups, frame.exec_backup_count);
+    frame.exec_backups = NULL;
+    frame.exec_backup_count = 0;
     /* On iOS this thread's stdout stream has its own copy of the write end, which
      * would stay open until stdout is next used: no end of file for the reader. */
     shellInvalidateVprocStreamForFd(STDOUT_FILENO);
 
     shellCommandSubstitutionRestoreStdout(&stdout_state);
 
+#if !defined(PSCAL_TARGET_IOS)
+    reader->stop_on_sigint = shellRuntimeGetSignalTrapAction(SIGINT) != SHELL_TRAP_ACTION_COMMAND;
+    reader->stop_on_sigquit = shellRuntimeGetSignalTrapAction(SIGQUIT) != SHELL_TRAP_ACTION_COMMAND;
+#else
+    __atomic_store_n(&reader->wait_for_eof, frame.job_pid_count > 0, __ATOMIC_RELEASE);
+#endif
     __atomic_store_n(&reader->command_done, true, __ATOMIC_RELEASE);
+#if defined(PSCAL_TARGET_IOS)
+    if (reader_started) {
+        while (!__atomic_load_n(&reader->finished, __ATOMIC_ACQUIRE) && shellCommandSubJobsRunning(&frame) &&
+               !shellCommandSubInterruptPending()) {
+            usleep(2000);
+        }
+    }
+    __atomic_store_n(&reader->wait_for_eof, false, __ATOMIC_RELEASE);
+#endif
     if (reader_started) {
         pthread_join(reader_thread, NULL);
     } else {
@@ -866,6 +1116,7 @@ static char *shellRunCommandSubstitution(const char *command) {
     }
 
     pthread_cleanup_pop(0);
+    shellCommandSubAdoptJobs(&frame);
 
     if (reader->fd >= 0) {
         vprocHostClose(reader->fd);

@@ -824,7 +824,10 @@ static void shellStageCaptureState(ShellCommand *stage, const ShellCommand *cmd,
         stage->body_state = shellBodyStateCapture();
     }
     if (!stage->body && !stage->body_state) {
-        stage->program_env = shellProgramEnvCapture(cmd);
+        /* exec -c in a substitution has chosen one. */
+        if (!stage->program_env) {
+            stage->program_env = shellProgramEnvCapture(cmd);
+        }
         char lookup_buf[PATH_MAX];
         const char *name = cmd->argv && cmd->argv[0] ? shellCommandLookupName(cmd->argv[0], lookup_buf, sizeof(lookup_buf)) : NULL;
         if (name && !shellIsRuntimeBuiltin(name) && !smallclueFindApplet(name)) {
@@ -837,6 +840,31 @@ static void shellStageCaptureState(ShellCommand *stage, const ShellCommand *cmd,
  * one this thread can read. */
 static char *shellStageFindExecutable(const ShellCommand *cmd) {
     return cmd->program_path ? strdup(cmd->program_path) : shellFindExecutableOnPath(cmd->argv[0]);
+}
+#endif
+
+#if !defined(PSCAL_TARGET_IOS)
+/* exec -c. */
+static void shellEnvironmentClear(void) {
+    while (environ && environ[0]) {
+        const char *eq = strchr(environ[0], '=');
+        char *name = eq ? strndup(environ[0], (size_t)(eq - environ[0])) : strdup(environ[0]);
+        if (!name || unsetenv(name) != 0) {
+            free(name);
+            break;
+        }
+        free(name);
+    }
+}
+
+/* What exec's options call the program, or NULL if they do not: -a names it, and -l puts a
+ * dash on what it is called, path and all. */
+static char *shellExecShownName(const char *program, const char *arg0, bool login) {
+    if (!login) {
+        return arg0 ? strdup(arg0) : NULL;
+    }
+    char *name = NULL;
+    return asprintf(&name, "-%s", arg0 ? arg0 : program) < 0 ? NULL : name;
 }
 #endif
 
@@ -1732,7 +1760,7 @@ static int shellSpawnProcess(VM *vm,
             int err = 0;
 #if !defined(PSCAL_TARGET_IOS)
             char *exec_found = NULL;
-            bool exec_lookup_ok = shellLookupForExec(cmd->argv[0], &exec_found, false);
+            bool exec_lookup_ok = shellLookupForExec(cmd->argv[0], &exec_found, cmd->exec_clear_env);
 #endif
             shellEnvironmentForChild(cmd);
 #if defined(PSCAL_TARGET_IOS)
@@ -1748,12 +1776,20 @@ static int shellSpawnProcess(VM *vm,
                 err = errno;
             }
 #else
+            if (cmd->exec_clear_env) {
+                shellEnvironmentClear();
+            }
+            char *exec_program = cmd->argv[0];
+            if (cmd->exec_arg0) {
+                cmd->argv[0] = cmd->exec_arg0;
+            }
             if (exec_lookup_ok) {
-                execvp(exec_found ? exec_found : cmd->argv[0], cmd->argv);
+                execvp(exec_found ? exec_found : exec_program, cmd->argv);
                 err = errno;
             } else {
                 err = ENOENT;
             }
+            cmd->argv[0] = exec_program;
 #endif
 #if defined(PSCAL_TARGET_IOS)
             int script_status = shellTryRunScriptFallback(vm ? vm : gShellCurrentVm, cmd);
@@ -1964,8 +2000,9 @@ static void shellPrintJobStarted(const ShellJob *job, pid_t pid) {
     if (pid <= 0) {
         return;
     }
-    /* As under bash: a prompt announces its own jobs, on stderr, and a subshell announces none. */
-    if (!shellRuntimeIsInteractive() || gShellRuntime.in_subshell) {
+    /* As under bash: a prompt announces its own jobs, on stderr, and a subshell or a substitution
+     * announces none. */
+    if (!shellRuntimeIsInteractive() || gShellRuntime.in_subshell || gShellCommandSubFrame) {
         return;
     }
     size_t job_id = job ? job->id : 0;
@@ -2843,6 +2880,13 @@ static void shellPipelineSessionSnapshotStdStreams(ShellPipelineContext *ctx) {
         return;
     }
     shellPipelineSessionCloseStdStreams(ctx);
+    /* A worker's redirections reach only its own slots, so it has nothing to put back. It
+     * would be putting back the shell's descriptors as they were when it looked: a pipe of
+     * a substitution that has ended, a copy of which keeps that substitution's reader
+     * waiting until now. */
+    if (gShellBackgroundWorkerActive) {
+        return;
+    }
     PIPE_STDIN_FD(ctx) = vprocHostDup(STDIN_FILENO);
     PIPE_STDOUT_FD(ctx) = vprocHostDup(STDOUT_FILENO);
     PIPE_STDERR_FD(ctx) = vprocHostDup(STDERR_FILENO);
@@ -3498,13 +3542,25 @@ static bool shellEnsureExecRedirBackup(int target_fd,
     int source_fd = target_fd;
     if (want_vproc_restore) {
         VProcSessionStdio *session_stdio = vprocSessionStdioCurrent();
+        int session_fd = -1;
         if (session_stdio && !vprocSessionStdioIsDefault(session_stdio)) {
             if (target_fd == STDIN_FILENO) {
-                source_fd = session_stdio->stdin_host_fd;
+                session_fd = session_stdio->stdin_host_fd;
             } else if (target_fd == STDOUT_FILENO) {
-                source_fd = session_stdio->stdout_host_fd;
+                session_fd = session_stdio->stdout_host_fd;
             } else if (target_fd == STDERR_FILENO) {
-                source_fd = session_stdio->stderr_host_fd;
+                session_fd = session_stdio->stderr_host_fd;
+            }
+        }
+        if (session_fd >= 0) {
+            source_fd = session_fd;
+        } else if (vp_mutated) {
+            /* Not the host's own number: that is the whole app's, and a substitution moves
+             * only the slot. A pty session, the app's, has no host descriptors of its own,
+             * so it comes here too. */
+            int host_src = vprocTranslateFd(vp_mutated, target_fd);
+            if (host_src >= 0) {
+                source_fd = host_src;
             }
         }
         backup.use_vproc = true;
@@ -5231,8 +5287,12 @@ static bool shellCommandRedirectsStdin(const ShellCommand *cmd) {
  * thread never touches the vproc that started it: that one may end before the thread first
  * runs, as `( cmd & )` and `eval "cmd &"` do. */
 static VProc *shellBackgroundStageCreateVProc(ShellBackgroundStageCtx *ctx, const ShellCommand *cmd) {
-    /* A simple command's stdin is /dev/null unless it redirects stdin. A compound command keeps its own. */
-    VProc *vp = shellCreateVProcForStage((cmd->body || shellCommandRedirectsStdin(cmd)) ? -1 : -2,
+    /* A simple command's stdin is /dev/null unless it redirects stdin. A compound command keeps
+     * its own, unless that is the terminal and it is in a substitution: with no job control
+     * there, it would stop holding the pipe. */
+    bool keeps_stdin = shellCommandRedirectsStdin(cmd) ||
+                       (cmd->body && !(gShellCommandSubFrame && isatty(STDIN_FILENO)));
+    VProc *vp = shellCreateVProcForStage(keeps_stdin ? -1 : -2,
                                          -1,
                                          -1,
                                          pscalRuntimeDetectWindowCols(),
@@ -5749,7 +5809,7 @@ static bool shellEnvEntryNone(const char *entry, void *arg) {
 
 #endif
 
-/* exec's options: false if they are wrong, reported. */
+/* exec's options: false if they are wrong, which is reported unless vm is NULL. */
 static bool shellExecParseOptions(VM *vm, char ***argv, const char **out_arg0, bool *out_clear_env, bool *out_login) {
     for (char **cursor = *argv; cursor[0] && cursor[0][0] == '-' && cursor[0][1]; ) {
         if (strcmp(cursor[0], "--") == 0) {
@@ -5767,8 +5827,10 @@ static bool shellExecParseOptions(VM *vm, char ***argv, const char **out_arg0, b
                 *out_arg0 = flag[1] ? flag + 1 : *cursor++;
                 break;
             } else {
-                runtimeError(vm, *flag == 'a' ? "exec: -a: option requires an argument" : "exec: -%c: invalid option", *flag);
-                shellUpdateStatus(2);
+                if (vm) {
+                    runtimeError(vm, *flag == 'a' ? "exec: -a: option requires an argument" : "exec: -%c: invalid option", *flag);
+                    shellUpdateStatus(2);
+                }
                 return false;
             }
         }
@@ -5805,6 +5867,10 @@ static bool shellExecuteExecBuiltin(VM *vm, ShellCommand *cmd) {
 
     /* Only redirections: they stay. */
     if (cmd->argc <= 1 || !argv[0]) {
+        if (shellCommandSubKeepExecBackups(backups, backup_count)) {
+            shellUpdateStatus(0);
+            return true;
+        }
         shellFreeExecRedirBackups(backups, backup_count);
 #if defined(PSCAL_TARGET_IOS)
         for (size_t i = 0; i < cmd->redir_count; ++i) {
@@ -5865,28 +5931,14 @@ static bool shellExecuteExecBuiltin(VM *vm, ShellCommand *cmd) {
     char *exec_found = NULL;
     bool exec_lookup_ok = shellLookupForExec(argv[0], &exec_found, clear_env);
     if (clear_env) {
-        while (environ && environ[0]) {
-            const char *eq = strchr(environ[0], '=');
-            char *name = eq ? strndup(environ[0], (size_t)(eq - environ[0])) : strdup(environ[0]);
-            if (!name || unsetenv(name) != 0) {
-                free(name);
-                break;
-            }
-            free(name);
-        }
+        shellEnvironmentClear();
     } else {
         shellEnvironmentForChild(cmd);
     }
-    /* -a names it, and -l puts a dash on what it is called. */
     char *original = argv[0];
-    const char *shown = arg0 ? arg0 : original;
-    const char *slash = arg0 ? NULL : strrchr(shown, '/');
-    char *login_name = NULL;
-    if (login && asprintf(&login_name, "-%s", slash ? slash + 1 : shown) < 0) {
-        login_name = NULL;
-    }
-    if (arg0 || login_name) {
-        argv[0] = login_name ? login_name : (char *)arg0;
+    char *shown = shellExecShownName(original, arg0, login);
+    if (shown) {
+        argv[0] = shown;
     }
     int err = ENOENT;
     if (exec_lookup_ok) {
@@ -5894,7 +5946,7 @@ static bool shellExecuteExecBuiltin(VM *vm, ShellCommand *cmd) {
         err = errno;
     }
     argv[0] = original;
-    free(login_name);
+    free(shown);
     free(exec_found);
     if (have_exec_env) {
         (void)pscalEnvSnapshotRestore(&exec_env);
@@ -5949,6 +6001,59 @@ static void shellFinishAssignments(const ShellCommand *cmd, ShellAssignmentBacku
     shellRestoreAssignments(backups, count);
 }
 
+/* `exec cmd` must not replace the process when this shell is only part of one: a
+ * substitution runs in the shell's process. */
+static bool shellExecRunsAsCommand(const ShellCommand *cmd) {
+    return gShellCommandSubFrame && shellCommandIsExecBuiltin(cmd) && cmd->argc > 1 && !cmd->background;
+}
+
+static Value shellRunExpandedCommand(VM *vm, ShellCommand *cmd);
+
+/* The command runs as any other does, and then the substitution ends, as it would have. */
+static Value shellRunExecAsCommand(VM *vm, ShellCommand *cmd) {
+    ShellPipelineContext *ctx = &gShellRuntime.pipeline;
+    /* A stage has a shell of its own to end. */
+    bool ends_shell = !ctx->active || ctx->stage_count <= 1;
+    while (shellExecRunsAsCommand(cmd)) {
+        char **argv = &cmd->argv[1];
+        const char *arg0 = NULL;
+        bool clear_env = false;
+        bool login = false;
+        /* Wrong options or no program: the builtin reports under its redirections, or keeps them. */
+        if (!shellExecParseOptions(NULL, &argv, &arg0, &clear_env, &login) || !argv[0] || !argv[0][0]) {
+            return shellRunExpandedCommand(vm, cmd);
+        }
+#if defined(PSCAL_TARGET_IOS)
+        if (clear_env) {
+            vprocEnvRelease(cmd->program_env);
+            cmd->program_env = vprocEnvCaptureFiltered(shellEnvEntryNone, NULL);
+        }
+#else
+        cmd->exec_clear_env = cmd->exec_clear_env || clear_env;
+        if (arg0 || login) {
+            free(cmd->exec_arg0);
+            cmd->exec_arg0 = shellExecShownName(argv[0], arg0, login);
+        }
+#endif
+        size_t skip = (size_t)(argv - cmd->argv);
+        for (size_t i = 0; i < skip; ++i) {
+            free(cmd->argv[i]);
+        }
+        memmove(cmd->argv, argv, (cmd->argc - skip + 1) * sizeof(char *));
+        cmd->argc -= skip;
+    }
+    cmd->ignore_functions = true;
+    Value result = shellRunExpandedCommand(vm, cmd);
+    if (ends_shell) {
+        shellRuntimeRequestExit();
+        if (vm) {
+            vm->exit_requested = true;
+            vm->current_builtin_name = "exec";
+        }
+    }
+    return result;
+}
+
 static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
     if (!cmd) {
         shellScalarCacheInvalidate();
@@ -5969,6 +6074,13 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
         shellScalarCacheInvalidate();
         return makeVoid();
     }
+    if (shellExecRunsAsCommand(cmd)) {
+        return shellRunExecAsCommand(vm, cmd);
+    }
+    return shellRunExpandedCommand(vm, cmd);
+}
+
+static Value shellRunExpandedCommand(VM *vm, ShellCommand *cmd) {
     ShellPipelineContext *ctx = &gShellRuntime.pipeline;
     /* A stage or background job with no command word, like `x=1 | cat` or `> f &`, runs
      * apart from the shell as any other does: it holds its pipe ends, and its assignments
@@ -6396,6 +6508,14 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
                               (!gShellRuntime.job_control_enabled
                                );
 
+    /* A substitution has no job control, whatever shell it is in. At a prompt this command
+     * would stop on the terminal, and hold the substitution's pipe for as long as it did. */
+    int terminal_stand_in = -1;
+    if (background_execution && gShellCommandSubFrame && stdin_fd < 0 && isatty(STDIN_FILENO)) {
+        terminal_stand_in = open("/dev/null", O_RDONLY);
+        stdin_fd = terminal_stand_in;
+    }
+
     int spawn_err = shellSpawnProcess(vm,
                                       cmd,
                                       stdin_fd,
@@ -6403,6 +6523,9 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
                                       stderr_fd,
                                       &child,
                                       ignore_job_signals);
+    if (terminal_stand_in >= 0) {
+        close(terminal_stand_in);
+    }
     if (assignments_applied) {
         shellFinishAssignments(cmd, assignment_backups, assignment_backup_count);
         assignments_applied = false;

@@ -5288,6 +5288,10 @@ Value vmBuiltinShellExecCommand(VM *vm, int arg_count, Value *args) {
         cmd.argv[cmd.argc] = NULL;
     }
 
+    /* `command exec cmd` and `builtin exec cmd` come this way. */
+    if (ok && shellExecRunsAsCommand(&cmd)) {
+        return shellRunExecAsCommand(vm, &cmd);
+    }
     if (ok) {
         if (!shellExecuteExecBuiltin(vm, &cmd)) {
             shellUpdateStatus(1);
@@ -5867,7 +5871,6 @@ Value vmBuiltinShellPrintf(VM *vm, int arg_count, Value *args) {
                 }
 
                 char fmtbuf[32];
-                char buf[256];
                 size_t pos = 0;
                 fmtbuf[pos++] = '%';
                 consumed_conversion = true;
@@ -6005,16 +6008,16 @@ Value vmBuiltinShellPrintf(VM *vm, int arg_count, Value *args) {
                     } else if (mod_h) {
                         iv = (short)iv;
                     }
+                    /* No fixed buffer anywhere here: a width can be any size. */
                     if (width_from_arg && precision_from_arg) {
-                        snprintf(buf, sizeof(buf), fmtbuf, width_value, precision_value, iv);
+                        fprintf(out, fmtbuf, width_value, precision_value, iv);
                     } else if (width_from_arg) {
-                        snprintf(buf, sizeof(buf), fmtbuf, width_value, iv);
+                        fprintf(out, fmtbuf, width_value, iv);
                     } else if (precision_from_arg) {
-                        snprintf(buf, sizeof(buf), fmtbuf, precision_value, iv);
+                        fprintf(out, fmtbuf, precision_value, iv);
                     } else {
-                        snprintf(buf, sizeof(buf), fmtbuf, iv);
+                        fprintf(out, fmtbuf, iv);
                     }
-                    fputs(buf, out);
                     break;
                 }
                 case 'u':
@@ -6034,15 +6037,14 @@ Value vmBuiltinShellPrintf(VM *vm, int arg_count, Value *args) {
                         uv = (unsigned short)uv;
                     }
                     if (width_from_arg && precision_from_arg) {
-                        snprintf(buf, sizeof(buf), fmtbuf, width_value, precision_value, uv);
+                        fprintf(out, fmtbuf, width_value, precision_value, uv);
                     } else if (width_from_arg) {
-                        snprintf(buf, sizeof(buf), fmtbuf, width_value, uv);
+                        fprintf(out, fmtbuf, width_value, uv);
                     } else if (precision_from_arg) {
-                        snprintf(buf, sizeof(buf), fmtbuf, precision_value, uv);
+                        fprintf(out, fmtbuf, precision_value, uv);
                     } else {
-                        snprintf(buf, sizeof(buf), fmtbuf, uv);
+                        fprintf(out, fmtbuf, uv);
                     }
-                    fputs(buf, out);
                     break;
                 }
                 case 'f':
@@ -6060,15 +6062,14 @@ Value vmBuiltinShellPrintf(VM *vm, int arg_count, Value *args) {
                         ok = false;
                     }
                     if (width_from_arg && precision_from_arg) {
-                        snprintf(buf, sizeof(buf), fmtbuf, width_value, precision_value, dv);
+                        fprintf(out, fmtbuf, width_value, precision_value, dv);
                     } else if (width_from_arg) {
-                        snprintf(buf, sizeof(buf), fmtbuf, width_value, dv);
+                        fprintf(out, fmtbuf, width_value, dv);
                     } else if (precision_from_arg) {
-                        snprintf(buf, sizeof(buf), fmtbuf, precision_value, dv);
+                        fprintf(out, fmtbuf, precision_value, dv);
                     } else {
-                        snprintf(buf, sizeof(buf), fmtbuf, dv);
+                        fprintf(out, fmtbuf, dv);
                     }
-                    fputs(buf, out);
                     break;
                 }
                 case 'c': {
@@ -6086,15 +6087,14 @@ Value vmBuiltinShellPrintf(VM *vm, int arg_count, Value *args) {
                         }
                     }
                     if (width_from_arg && precision_from_arg) {
-                        snprintf(buf, sizeof(buf), format, width_value, precision_value, ch);
+                        fprintf(out, format, width_value, precision_value, ch);
                     } else if (width_from_arg) {
-                        snprintf(buf, sizeof(buf), format, width_value, ch);
+                        fprintf(out, format, width_value, ch);
                     } else if (precision_from_arg) {
-                        snprintf(buf, sizeof(buf), format, precision_value, ch);
+                        fprintf(out, format, precision_value, ch);
                     } else {
-                        snprintf(buf, sizeof(buf), format, ch);
+                        fprintf(out, format, ch);
                     }
-                    fputs(buf, out);
                     break;
                 }
                 case 'b':
@@ -6134,7 +6134,6 @@ Value vmBuiltinShellPrintf(VM *vm, int arg_count, Value *args) {
                             format = safe_fmt;
                         }
                     }
-                    /* No fixed buffer here: a %s can be any length. */
                     if (width_from_arg && precision_from_arg) {
                         fprintf(out, format, width_value, precision_value, sv);
                     } else if (width_from_arg) {
@@ -6159,29 +6158,27 @@ Value vmBuiltinShellPrintf(VM *vm, int arg_count, Value *args) {
                         ok = false;
                     }
                     if (width_from_arg && precision_from_arg) {
-                        snprintf(buf, sizeof(buf), fmtbuf, width_value, precision_value, (void *)(uintptr_t)pv);
+                        fprintf(out, fmtbuf, width_value, precision_value, (void *)(uintptr_t)pv);
                     } else if (width_from_arg) {
-                        snprintf(buf, sizeof(buf), fmtbuf, width_value, (void *)(uintptr_t)pv);
+                        fprintf(out, fmtbuf, width_value, (void *)(uintptr_t)pv);
                     } else if (precision_from_arg) {
-                        snprintf(buf, sizeof(buf), fmtbuf, precision_value, (void *)(uintptr_t)pv);
+                        fprintf(out, fmtbuf, precision_value, (void *)(uintptr_t)pv);
                     } else {
-                        snprintf(buf, sizeof(buf), fmtbuf, (void *)(uintptr_t)pv);
+                        fprintf(out, fmtbuf, (void *)(uintptr_t)pv);
                     }
-                    fputs(buf, out);
                     break;
                 }
                 default: {
                     const char *sv = arg_text ? arg_text : "";
                     if (width_from_arg && precision_from_arg) {
-                        snprintf(buf, sizeof(buf), fmtbuf, width_value, precision_value, sv);
+                        fprintf(out, fmtbuf, width_value, precision_value, sv);
                     } else if (width_from_arg) {
-                        snprintf(buf, sizeof(buf), fmtbuf, width_value, sv);
+                        fprintf(out, fmtbuf, width_value, sv);
                     } else if (precision_from_arg) {
-                        snprintf(buf, sizeof(buf), fmtbuf, precision_value, sv);
+                        fprintf(out, fmtbuf, precision_value, sv);
                     } else {
-                        snprintf(buf, sizeof(buf), fmtbuf, sv);
+                        fprintf(out, fmtbuf, sv);
                     }
-                    fputs(buf, out);
                     break;
                 }
             }
@@ -12640,6 +12637,15 @@ Value vmBuiltinShellBg(VM *vm, int arg_count, Value *args) {
     return makeVoid();
 }
 
+static bool shellHasOwnJob(void) {
+    for (size_t i = 0; i < gShellJobCount; ++i) {
+        if (!gShellJobs[i].disowned && !gShellJobs[i].inherited) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* wait -n: a job that already ended and nothing has reported, or else the next to end. */
 static void shellWaitForNextJob(void) {
     for (;;) {
@@ -12653,7 +12659,7 @@ static void shellWaitForNextJob(void) {
                 return;
             }
         }
-        if (shellJobVisibleCount() == 0) {
+        if (!shellHasOwnJob()) {
             shellUpdateStatus(127);
             return;
         }
@@ -12719,7 +12725,7 @@ static int shellWaitForOperand(Value spec) {
         for (size_t j = 0; !by_id && !found && j < job->pid_count; ++j) {
             found = job->pids[j] == (pid_t)target;
         }
-        if (!found) {
+        if (!found || job->inherited) {
             continue;
         }
         if (job->disowned) {
@@ -12776,7 +12782,7 @@ Value vmBuiltinShellWait(VM *vm, int arg_count, Value *args) {
             bool found = false;
             for (size_t i = gShellJobCount; i > 0; --i) {
                 ShellJob *job = &gShellJobs[i - 1];
-                if (!job->disowned) {
+                if (!job->disowned && !job->inherited) {
                     index = i - 1;
                     found = true;
                     break;

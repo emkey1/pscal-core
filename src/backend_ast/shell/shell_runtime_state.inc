@@ -514,6 +514,9 @@ typedef struct ShellJob {
     bool running;
     bool stopped;
     bool disowned;
+    /* A substitution's copy of its shell's job. It is listed and can be killed, as under bash,
+     * but it is the shell's to wait for: reaping it here left the shell's `wait` hanging. */
+    bool inherited;
     int last_status;
     char *command;
 } ShellJob;
@@ -2447,6 +2450,10 @@ typedef struct {
      * the shell's thread launched it, when what the command sets for itself is in place. */
     VProcEnv *program_env;
     char *program_path;
+#else
+    /* What a substitution's exec asked of its program: -a or -l, and -c. */
+    char *exec_arg0;
+    bool exec_clear_env;
 #endif
 } ShellCommand;
 
@@ -2855,6 +2862,29 @@ typedef struct {
      * was saved, and an entry that was closed before goes back to closed. */
     bool slot_only;
 } ShellExecRedirBackup;
+
+/* A command substitution runs in the shell's own process, because `tid=$(builtin
+ * ThreadSpawnBuiltin ...)` needs the thread to live here. So what a subshell would take
+ * with it when it ends has to be put back by hand. One of these for each substitution
+ * running on this thread, innermost first. */
+typedef struct ShellCommandSubFrame {
+    struct ShellCommandSubFrame *outer;
+    int read_fd;
+    int saved_stdout;
+    /* `exec 3> f` in there lasts until the substitution ends. */
+    ShellExecRedirBackup *exec_backups;
+    size_t exec_backup_count;
+    size_t exec_backup_capacity;
+    /* Background jobs started in there, which are no job of the shell's afterwards. */
+    pid_t *job_pids;
+    size_t job_pid_count;
+    size_t job_pid_capacity;
+#if defined(PSCAL_TARGET_IOS)
+    VProc *vp;
+#endif
+} ShellCommandSubFrame;
+
+static PSCAL_THREAD_LOCAL ShellCommandSubFrame *gShellCommandSubFrame = NULL;
 
 static void shellRestoreExecRedirections(ShellExecRedirBackup *backups, size_t count);
 static void shellFreeExecRedirBackups(ShellExecRedirBackup *backups, size_t count);
@@ -4971,6 +5001,7 @@ ShellRuntimeState *shellRuntimeCreateContext(void) {
                 dst->running = src->running;
                 dst->stopped = src->stopped;
                 dst->disowned = src->disowned;
+                dst->inherited = src->inherited || gShellCommandSubFrame != NULL;
                 dst->last_status = src->last_status;
                 if (src->pid_count > 0 && src->pids) {
                     dst->pids = (pid_t *)calloc(src->pid_count, sizeof(pid_t));

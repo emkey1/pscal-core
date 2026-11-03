@@ -868,6 +868,9 @@ static void shellFreeCommand(ShellCommand *cmd) {
     cmd->program_env = NULL;
     free(cmd->program_path);
     cmd->program_path = NULL;
+#else
+    free(cmd->exec_arg0);
+    cmd->exec_arg0 = NULL;
 #endif
 }
 
@@ -2139,6 +2142,9 @@ static void shellSubshellResetState(pid_t dollar_pid) {
     shellTrapClearEntry(&gShellReturnTrap);
     memset((void *)gShellPendingSignals, 0, sizeof(gShellPendingSignals));
     gShellRuntime.in_subshell = true;
+#if !defined(PSCAL_TARGET_IOS)
+    shellCommandSubForgetFrames();
+#endif
 #if defined(PSCAL_TARGET_IOS)
     if (!gShellRuntime.has_private_tables) {
         pthread_mutex_lock(&gShellFunctionTableMutex);
@@ -2668,6 +2674,7 @@ static void shellFreeJob(ShellJob *job) {
     job->running = false;
     job->stopped = false;
     job->disowned = false;
+    job->inherited = false;
     job->last_status = 0;
 }
 
@@ -2775,10 +2782,11 @@ static void shellFinishedJobsReported(void) {
 static ShellJob *shellFindJobByPid(pid_t pid);
 #endif
 
-/* A subshell numbers the jobs it started, and so does a shell started as a command. The session's
- * others are not its to wait for, and a stamp on its own would have the shell above mirror them. */
+/* A subshell numbers the jobs it started, and so do a substitution and a shell started as a
+ * command. The session's others are not its to wait for, and a stamp on its own would have the
+ * shell above mirror them. */
 static bool shellNumbersItsOwnJobs(void) {
-    return gShellRuntime.in_subshell || gShellRuntime.started_as_command;
+    return gShellRuntime.in_subshell || gShellCommandSubFrame || gShellRuntime.started_as_command;
 }
 
 static size_t shellAllocateJobId(void) {
@@ -2989,8 +2997,13 @@ static ShellJob *shellRegisterJob(pid_t pgid, const pid_t *pids, size_t pid_coun
     job->running = true;
     job->stopped = false;
     job->disowned = false;
+    job->inherited = false;
     job->last_status = 0;
     job->command = summary;
+    /* One mirrored from the vproc table may be anyone's. */
+    if (cmd) {
+        shellCommandSubRecordJob(pids, pid_count);
+    }
     return job;
 }
 
@@ -3048,6 +3061,7 @@ static bool shellJobContinue(ShellJob *job, bool prefer_group) {
 
 static int shellCollectJobs(void) {
     bool prompt_dbg = false;
+    shellCommandSubReapOrphans();
 #if defined(PSCAL_TARGET_IOS)
     int shell_pid = 0;
     int current_sid = 0;
@@ -3065,8 +3079,9 @@ static int shellCollectJobs(void) {
     }
     shell_pid = vprocGetShellSelfPid();
     current_sid = (shell_pid > 0) ? vprocGetSid(shell_pid) : 0;
-    /* A subshell's jobs are the ones it started, not its shell's that run beside it. So
-     * are those of a shell started as a command, which would also collect the caller's. */
+    /* A subshell's jobs are the ones it started, not its shell's that run beside it. So are a
+     * substitution's, and those of a shell started as a command, which would also collect the
+     * caller's. */
     size_t snap_cap = shellNumbersItsOwnJobs() ? 0 : vprocSnapshot(NULL, 0);
     if (snap_cap > 0) {
             VProcSnapshot *snaps = (VProcSnapshot *)calloc(snap_cap, sizeof(VProcSnapshot));
@@ -3147,6 +3162,10 @@ static int shellCollectJobs(void) {
     for (size_t i = 0; i < gShellJobCount;) {
         ShellJob *job = &gShellJobs[i];
         bool job_active = false;
+        if (job->inherited) {
+            ++i;
+            continue;
+        }
         if (prompt_dbg) {
             fprintf(stderr,
                     "[jobs] scan job[%zu] id=%zu pgid=%d stopped=%d running=%d pid_count=%zu\n",
