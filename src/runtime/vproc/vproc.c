@@ -2013,6 +2013,7 @@ struct VProc {
     int stdout_host_fd;
     int stderr_host_fd;
     bool stdin_from_session;
+    pthread_t creator;
     VProcWinsize winsize;
     int pid;
     char cwd[PATH_MAX];
@@ -2431,6 +2432,29 @@ static bool vprocInprocPipeShouldDestroy(VprocInprocPipe *pipe) {
     return destroy;
 }
 
+/* `kill` cancels a job's threads, and a condition wait is a cancellation point that takes the
+ * mutex back before the thread's cleanup handlers run. Without a handler to let go of it, the
+ * thread dies holding the mutex, or deadlocks on it in its own cleanup. */
+static void vprocCondWaitCancelled(void *mu) {
+    pthread_mutex_unlock((pthread_mutex_t *)mu);
+}
+
+static int vprocCondWait(pthread_cond_t *cv, pthread_mutex_t *mu) {
+    int rc;
+    pthread_cleanup_push(vprocCondWaitCancelled, mu);
+    rc = pthread_cond_wait(cv, mu);
+    pthread_cleanup_pop(0);
+    return rc;
+}
+
+static int vprocCondTimedWait(pthread_cond_t *cv, pthread_mutex_t *mu, const struct timespec *deadline) {
+    int rc;
+    pthread_cleanup_push(vprocCondWaitCancelled, mu);
+    rc = pthread_cond_timedwait(cv, mu, deadline);
+    pthread_cleanup_pop(0);
+    return rc;
+}
+
 /* Bound the cond wait so blocking pipe I/O periodically rechecks for a pending
  * virtualized signal. We cannot interrupt a pthread_cond_wait with a host
  * signal the way iSH interrupts real_poll_wait with SIGUSR1, so a short
@@ -2444,6 +2468,34 @@ static void vprocInprocPipeWaitDeadline(struct timespec *ts) {
         ts->tv_sec += 1;
         ts->tv_nsec -= 1000000000L;
     }
+}
+
+typedef struct {
+    VprocInprocPipe *pipe;
+    int *waiters;
+} VprocInprocPipeWaiter;
+
+static void vprocInprocPipeWaitCancelled(void *arg) {
+    VprocInprocPipeWaiter *waiter = (VprocInprocPipeWaiter *)arg;
+    VprocInprocPipe *pipe = waiter->pipe;
+    (*waiter->waiters)--;
+    pipe->active_ops--;
+    bool destroy = vprocInprocPipeShouldDestroy(pipe);
+    pthread_mutex_unlock(&pipe->mu);
+    if (destroy) {
+        vprocInprocPipeFree(pipe);
+    }
+}
+
+static void vprocInprocPipeWait(VprocInprocPipe *pipe, pthread_cond_t *cond, int *waiters) {
+    VprocInprocPipeWaiter waiter = { pipe, waiters };
+    struct timespec ts;
+    vprocInprocPipeWaitDeadline(&ts);
+    (*waiters)++;
+    pthread_cleanup_push(vprocInprocPipeWaitCancelled, &waiter);
+    pthread_cond_timedwait(cond, &pipe->mu, &ts);
+    pthread_cleanup_pop(0);
+    (*waiters)--;
 }
 
 static ssize_t vprocInprocPipeRead(struct pscal_fd *fd, void *buf, size_t bufsize) {
@@ -2467,11 +2519,7 @@ static ssize_t vprocInprocPipeRead(struct pscal_fd *fd, void *buf, size_t bufsiz
             }
             return _EAGAIN;
         }
-        pipe->wait_readers++;
-        struct timespec ts;
-        vprocInprocPipeWaitDeadline(&ts);
-        pthread_cond_timedwait(&pipe->cond_read, &pipe->mu, &ts);
-        pipe->wait_readers--;
+        vprocInprocPipeWait(pipe, &pipe->cond_read, &pipe->wait_readers);
         if (pipe->count == 0 && !pipe->write_closed &&
             vprocCurrentHasInterruptingSignal()) {
             pipe->active_ops--;
@@ -2538,11 +2586,7 @@ static ssize_t vprocInprocPipeWrite(struct pscal_fd *fd, const void *buf, size_t
             }
             return _EAGAIN;
         }
-        pipe->wait_writers++;
-        struct timespec ts;
-        vprocInprocPipeWaitDeadline(&ts);
-        pthread_cond_timedwait(&pipe->cond_write, &pipe->mu, &ts);
-        pipe->wait_writers--;
+        vprocInprocPipeWait(pipe, &pipe->cond_write, &pipe->wait_writers);
         if (pipe->count == pipe->cap && !pipe->read_closed &&
             vprocCurrentHasInterruptingSignal()) {
             pipe->active_ops--;
@@ -3122,6 +3166,19 @@ static bool vprocRegistryContains(const VProc *vp) {
 
 /* For a pointer that may be freed: only its address is compared until the registry has it,
  * and the pid tells it from a newer vproc at the same address. */
+static bool vprocRegistryHoldsOwn(const VProc *vp) {
+    bool found = false;
+    pthread_mutex_lock(&gVProcRegistryMu);
+    for (size_t i = 0; i < gVProcRegistryCount; ++i) {
+        if (gVProcRegistry[i] == vp) {
+            found = pthread_equal(vp->creator, pthread_self());
+            break;
+        }
+    }
+    pthread_mutex_unlock(&gVProcRegistryMu);
+    return found;
+}
+
 static bool vprocRegistryHoldsPid(const VProc *vp, int pid) {
     bool found = false;
     pthread_mutex_lock(&gVProcRegistryMu);
@@ -4018,9 +4075,9 @@ static int vprocWaitUntilTimerOrSignalLocked(VProcTaskEntry *entry,
         }
     }
     if (!wait_abs) {
-        return pthread_cond_wait(&gVProcTasks.cv, &gVProcTasks.mu);
+        return vprocCondWait(&gVProcTasks.cv, &gVProcTasks.mu);
     }
-    int rc = pthread_cond_timedwait(&gVProcTasks.cv, &gVProcTasks.mu, wait_abs);
+    int rc = vprocCondTimedWait(&gVProcTasks.cv, &gVProcTasks.mu, wait_abs);
     if (rc == ETIMEDOUT && timeout_hit) {
         *timeout_hit = true;
     }
@@ -4556,7 +4613,7 @@ bool vprocWaitIfStopped(VProc *vp) {
             struct timespec deadline;
             if (clock_gettime(CLOCK_REALTIME, &deadline) == 0) {
                 deadline.tv_sec += 1;
-                int wait_rc = pthread_cond_timedwait(&gVProcTasks.cv, &gVProcTasks.mu, &deadline);
+                int wait_rc = vprocCondTimedWait(&gVProcTasks.cv, &gVProcTasks.mu, &deadline);
                 if (wait_rc == ETIMEDOUT && entry && entry->stopped && !entry->exited) {
                     uint64_t now_ns = vprocNowMonoNs();
                     if (now_ns >= last_log_ns + 1000000000ull) {
@@ -4572,10 +4629,10 @@ bool vprocWaitIfStopped(VProc *vp) {
                     }
                 }
             } else {
-                pthread_cond_wait(&gVProcTasks.cv, &gVProcTasks.mu);
+                vprocCondWait(&gVProcTasks.cv, &gVProcTasks.mu);
             }
         } else {
-            pthread_cond_wait(&gVProcTasks.cv, &gVProcTasks.mu);
+            vprocCondWait(&gVProcTasks.cv, &gVProcTasks.mu);
         }
         if (entry->pid != pid) {
             entry = vprocTaskFindLocked(pid);
@@ -6193,7 +6250,7 @@ static ssize_t vprocSessionReadInput(VProcSessionStdio *session, void *buf, size
         return -1;
     }
     while (input->len == 0 && !input->eof && !input->interrupt_pending) {
-        pthread_cond_wait(&input->cv, &input->mu);
+        vprocCondWait(&input->cv, &input->mu);
     }
     if (input->interrupt_pending) {
         input->interrupt_pending = false;
@@ -6585,7 +6642,11 @@ struct pscal_fd *vprocGetPscalFd(VProc *vp, int fd) {
     return res;
 }
 
+/* Callers hold vp->mu, and fcntl is a cancellation point. A thread cancelled here would die
+ * holding the lock that the next vprocSnapshot waits for, with the task table locked. */
 static int vprocCloneFd(int source_fd) {
+    int cancel_state = PTHREAD_CANCEL_ENABLE;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
     int duped = fcntl(source_fd, F_DUPFD_CLOEXEC, 0);
     if (duped < 0 && errno == EINVAL) {
         duped = fcntl(source_fd, F_DUPFD, 0);
@@ -6596,6 +6657,9 @@ static int vprocCloneFd(int source_fd) {
     if (duped >= 0) {
         fcntl(duped, F_SETFD, FD_CLOEXEC);
     }
+    int saved_errno = errno;
+    pthread_setcancelstate(cancel_state, NULL);
+    errno = saved_errno;
     return duped;
 }
 
@@ -7249,7 +7313,7 @@ static ssize_t vprocLocationPscalRead(struct pscal_fd *fd, void *buf, size_t buf
             pthread_mutex_unlock(&gLocationDevice.mu);
             return _EAGAIN;
         }
-        pthread_cond_wait(&gLocationDevice.cond, &gLocationDevice.mu);
+        vprocCondWait(&gLocationDevice.cond, &gLocationDevice.mu);
     }
     if (!gLocationDevice.enabled) {
         pthread_mutex_unlock(&gLocationDevice.mu);
@@ -7745,6 +7809,7 @@ VProc *vprocCreate(const VProcOptions *opts) {
     if (!vp) {
         return NULL;
     }
+    vp->creator = pthread_self();
     
     // Initialize mutex before use
     if (pthread_mutex_init(&vp->mu, NULL) != 0) {
@@ -8265,6 +8330,30 @@ static void vprocThreadEnvCleanup(void *arg) {
     }
 }
 
+/* A kill or an exit() unwinds a thread past the code that ends the vprocs it made for itself:
+ * command scopes, and the stages a shell runs on its own thread. They would stay in the task
+ * table and keep their descriptors, so the reader of `sh -c 'sleep 30' | cat` would wait for
+ * ever once that shell is killed in the sleep. A vproc made by another thread and activated
+ * here has an owner that ends it, and the session's shell is ended by its session. */
+void vprocEndAbandoned(VProc *keep) {
+    int shell_pid = vprocGetShellSelfPid();
+    while (gVProcCurrent != keep && (gVProcCurrent || gVProcStackDepth > 0)) {
+        VProc *vp = gVProcCurrent;
+        vprocDeactivate();
+        if (vp && vprocRegistryHoldsOwn(vp) && vp->pid != shell_pid) {
+            int pid = vp->pid;
+            vprocMarkExit(vp, 128 + SIGTERM);
+            vprocDiscard(pid);
+            vprocDestroy(vp);
+        }
+    }
+}
+
+static void vprocEndAllAbandoned(void *unused) {
+    (void)unused;
+    vprocEndAbandoned(NULL);
+}
+
 static void *vprocThreadTrampoline(void *arg) {
     VProcThreadStartCtx *ctx = (VProcThreadStartCtx *)arg;
 
@@ -8317,9 +8406,11 @@ static void *vprocThreadTrampoline(void *arg) {
     }
     void *res = NULL;
     pthread_cleanup_push(vprocThreadEnvCleanup, thread_env);
+    pthread_cleanup_push(vprocEndAllAbandoned, NULL);
     if (ctx && ctx->start_routine) {
         res = ctx->start_routine(ctx->arg);
     }
+    pthread_cleanup_pop(0);
     pthread_cleanup_pop(1);
 
     if (vp_activated) {
@@ -8404,7 +8495,7 @@ int vprocIsolationEnter(VProcIsolationDomain domain) {
     pthread_mutex_lock(&lock->mu);
     while (lock->depth > 0 &&
            (!lock->owner_valid || !pthread_equal(lock->owner, self))) {
-        pthread_cond_wait(&lock->cv, &lock->mu);
+        vprocCondWait(&lock->cv, &lock->mu);
     }
     if (lock->depth == 0) {
         lock->owner = self;
@@ -10137,7 +10228,7 @@ pid_t vprocWaitPidShim(pid_t pid, int *status_out, int options) {
             return 0;
         }
 
-        pthread_cond_wait(&gVProcTasks.cv, &gVProcTasks.mu);
+        vprocCondWait(&gVProcTasks.cv, &gVProcTasks.mu);
     }
 }
 
@@ -12572,7 +12663,7 @@ void vprocSessionStdioDestroy(VProcSessionStdio *stdio_ctx) {
     if (input) {
         pthread_mutex_lock(&input->mu);
         while (input->reader_active) {
-            pthread_cond_wait(&input->cv, &input->mu);
+            vprocCondWait(&input->cv, &input->mu);
         }
         pthread_mutex_unlock(&input->mu);
         pthread_mutex_destroy(&input->mu);
@@ -12654,7 +12745,7 @@ void vprocSessionStdioRefresh(VProcSessionStdio *stdio_ctx, int kernel_pid) {
     if (input) {
         pthread_mutex_lock(&input->mu);
         while (input->reader_active) {
-            pthread_cond_wait(&input->cv, &input->mu);
+            vprocCondWait(&input->cv, &input->mu);
         }
         input->reader_fd = -1;
         pthread_mutex_unlock(&input->mu);
@@ -12664,7 +12755,8 @@ void vprocSessionStdioRefresh(VProcSessionStdio *stdio_ctx, int kernel_pid) {
 
 void vprocSetJobId(int pid, int job_id) {
     pthread_mutex_lock(&gVProcTasks.mu);
-    VProcTaskEntry *entry = vprocTaskEnsureSlotLocked(pid);
+    /* The job table clears these for a job it has reaped. That must not bring the pid back. */
+    VProcTaskEntry *entry = job_id ? vprocTaskEnsureSlotLocked(pid) : vprocTaskFindLocked(pid);
     if (entry) {
         entry->job_id = job_id;
     }
@@ -12686,7 +12778,7 @@ void vprocSetCommandLabel(int pid, const char *label) {
     char thread_name[16];
     bool rename_thread = false;
     pthread_mutex_lock(&gVProcTasks.mu);
-    VProcTaskEntry *entry = vprocTaskEnsureSlotLocked(pid);
+    VProcTaskEntry *entry = label ? vprocTaskEnsureSlotLocked(pid) : vprocTaskFindLocked(pid);
     if (entry) {
         free(entry->label);
         entry->label = NULL;
@@ -13536,6 +13628,9 @@ ssize_t vprocSnapshotFds(int pid, VProcFdSnapshot *out, size_t capacity) {
         return -1;
     }
     ssize_t count = -1;
+    /* fcntl is a cancellation point, and a thread killed there would keep both locks. */
+    int cancel_state = PTHREAD_CANCEL_ENABLE;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
     pthread_mutex_lock(&gVProcRegistryMu);
     for (size_t i = 0; i < gVProcRegistryCount; ++i) {
         VProc *vp = gVProcRegistry[i];
@@ -13572,6 +13667,7 @@ ssize_t vprocSnapshotFds(int pid, VProcFdSnapshot *out, size_t capacity) {
         }
     }
     free(pscal_fds);
+    pthread_setcancelstate(cancel_state, NULL);
     return count;
 }
 
@@ -13717,6 +13813,11 @@ int PSCALRuntimeGetSessionWinsize(uint64_t session_id, int *cols_out, int *rows_
 static int gVprocPipelineReadLogCount = 0;
 static int gVprocPipelineWriteLogCount = 0;
 
+/* The reference a read or write holds: left behind, the end it refers to would never close. */
+static void vprocPscalFdCloseCancelled(void *fd) {
+    pscal_fd_close((struct pscal_fd *)fd);
+}
+
 ssize_t vprocReadShim(int fd, void *buf, size_t count) {
     vprocDeliverPendingSignalsForCurrent();
     VProc *vp = vprocForThread();
@@ -13744,7 +13845,10 @@ ssize_t vprocReadShim(int fd, void *buf, size_t count) {
             fprintf(stderr, "[vproc-read] fd=%d using pscal=%p count=%zu\n",
                     fd, (void *)pscal_fd, count);
         }
-        ssize_t res = pscal_fd->ops->read(pscal_fd, buf, count);
+        ssize_t res;
+        pthread_cleanup_push(vprocPscalFdCloseCancelled, pscal_fd);
+        res = pscal_fd->ops->read(pscal_fd, buf, count);
+        pthread_cleanup_pop(0);
         pscal_fd_close(pscal_fd);
         if (res < 0) {
             if ((int)res == _EINTR) {
@@ -13809,7 +13913,10 @@ ssize_t vprocWriteShim(int fd, const void *buf, size_t count) {
             fprintf(stderr, "[vproc-write] fd=%d using pscal=%p count=%zu\n",
                     fd, (void *)pscal_fd, count);
         }
-        ssize_t res = pscal_fd->ops->write(pscal_fd, buf, count);
+        ssize_t res;
+        pthread_cleanup_push(vprocPscalFdCloseCancelled, pscal_fd);
+        res = pscal_fd->ops->write(pscal_fd, buf, count);
+        pthread_cleanup_pop(0);
         pscal_fd_close(pscal_fd);
         if (res < 0) {
             if ((int)res == _EINTR) {

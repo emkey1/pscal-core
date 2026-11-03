@@ -10,13 +10,27 @@ void cond_destroy(cond_t *cond) {
     pthread_cond_destroy(&cond->cond);
 }
 
+static void cond_wait_cancelled(void *mu) {
+    /* A condition wait takes the mutex back before a cancelled thread's handlers run. */
+    pthread_mutex_unlock((pthread_mutex_t *)mu);
+}
+
+static int cond_wait_until(cond_t *cond, lock_t *lock, const struct timespec *deadline) {
+    int rc;
+    pthread_cleanup_push(cond_wait_cancelled, &lock->m);
+    rc = deadline ? pthread_cond_timedwait(&cond->cond, &lock->m, deadline)
+                  : pthread_cond_wait(&cond->cond, &lock->m);
+    pthread_cleanup_pop(0);
+    return rc;
+}
+
 static int cond_wait_internal(cond_t *cond, lock_t *lock, struct timespec *timeout) {
     if (!timeout) {
-        return pthread_cond_wait(&cond->cond, &lock->m);
+        return cond_wait_until(cond, lock, NULL);
     }
     struct timespec abs_timeout;
     if (clock_gettime(CLOCK_REALTIME, &abs_timeout) != 0) {
-        return pthread_cond_wait(&cond->cond, &lock->m);
+        return cond_wait_until(cond, lock, NULL);
     }
     abs_timeout.tv_sec += timeout->tv_sec;
     abs_timeout.tv_nsec += timeout->tv_nsec;
@@ -24,7 +38,7 @@ static int cond_wait_internal(cond_t *cond, lock_t *lock, struct timespec *timeo
         abs_timeout.tv_sec += 1;
         abs_timeout.tv_nsec -= 1000000000L;
     }
-    return pthread_cond_timedwait(&cond->cond, &lock->m, &abs_timeout);
+    return cond_wait_until(cond, lock, &abs_timeout);
 }
 
 int wait_for(cond_t *cond, lock_t *lock, struct timespec *timeout) {

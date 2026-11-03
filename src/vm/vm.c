@@ -10386,6 +10386,9 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
     uint8_t instruction_val;
     for (;;) {
 #if defined(PSCAL_TARGET_IOS)
+        /* `kill` cancels a job's thread, and a loop that makes no calls has no other place to
+         * stop. Between instructions it holds no lock. */
+        pthread_testcancel();
         if (vmIsRootExecutor(vm)) {
             if (vprocWaitIfStopped(vprocCurrent())) {
                 if (vmIosDebugEnabled()) {

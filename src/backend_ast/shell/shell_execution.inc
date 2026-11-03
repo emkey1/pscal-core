@@ -2109,11 +2109,21 @@ static void shellFinalizeStageVproc(VProc *vp, int status) {
     shellFinalizeStageVprocEx(vp, status, false);
 }
 
+/* The thread running this stage was cancelled with the stage's job. Nothing else would end the
+ * stage or close what it holds, such as the write end of a pipe. */
+static void shellInlineStageCancelled(void *arg) {
+    vprocEndAbandoned((VProc *)arg);
+    vprocDeactivate();
+    shellFinalizeStageVproc((VProc *)arg, 128 + SIGKILL);
+}
+
 static void shellInProcessWorkerCleanup(void *arg) {
     ShellInProcessWorkerCtx *ctx = (ShellInProcessWorkerCtx *)arg;
     if (!ctx) {
         return;
     }
+    /* This also runs on the normal way out, where a kill could stop it half done. */
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
     pthread_mutex_destroy(&ctx->stop_mu);
     pthread_cond_destroy(&ctx->stop_cv);
 
@@ -2223,16 +2233,11 @@ static void shellInProcessBackgroundCancelCleanup(void *arg) {
     gShellCurrentBuiltinBackground = ctx->prev_bg_flag;
 
     if (ctx->vp) {
-        int cancel_pid = vprocPid(ctx->vp);
+        vprocEndAbandoned(ctx->vp);
         vprocDeactivate();
-        if (cancel_pid > 0) {
-            /* Cancellation bypasses the normal stage-finalize path; explicitly
-             * retire the synthetic task entry so stale pids/threads do not
-             * linger in the vproc table. */
-            vprocMarkExit(ctx->vp, 128 + SIGKILL);
-            vprocDiscard(cancel_pid);
-        }
-        vprocDestroy(ctx->vp);
+        /* `wait` asks for the status, and this thread can get here before it does. The job
+         * table reaps it, as on the normal way out. A signal's status is already recorded. */
+        shellFinalizeStageVprocEx(ctx->vp, 128 + SIGKILL, true);
         ctx->vp = NULL;
     }
     if (ctx->bg_vm) {
@@ -2415,8 +2420,9 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
         PSCALRuntimeSetCurrentRuntimeContext(ctx->runtime_ctx);
         ctx->runtime_ctx_swapped = true;
     }
-    /* Allow pthread_cancel to interrupt sleeps/IO. */
-    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    /* `kill` can arrive at any time from here on. Setup and teardown hold vproc state that
+     * only they can finish, so a cancel waits until the command runs. */
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
     pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
 #if defined(PSCAL_TARGET_IOS)
     pthread_cleanup_push(shellInProcessBackgroundCancelCleanup, ctx);
@@ -2679,6 +2685,9 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
         fprintf(stderr, "[bg-stage] pre-run fdmap stdin host=%d stdout host=%d stderr host=%d bg_flag=%d\n",
                 host_in, host_out, host_err, (int)gShellCurrentBuiltinBackground);
     }
+    /* Allow pthread_cancel to interrupt sleeps/IO. A kill that came during setup acts here. */
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_testcancel();
     if (redir_failed_target) {
         shellRedirectionFailed(redir_failed_target, redir_failed_errno);
         bg_status = 1;
@@ -2698,6 +2707,7 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
     gShellBackgroundWorkerActive = ctx->prev_worker_flag;
 
 #if defined(PSCAL_TARGET_IOS)
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
     if (vp) {
         /* If the synthetic task was terminated via vprocKillShim, reflect that
          * status rather than a default 0 from the builtin dispatcher. */
@@ -5084,7 +5094,13 @@ static int shellPipelineRunStage(VM *vm,
         runtimeError(vm, "pipeline: failed to attach in-process stdio");
         status = 1;
     } else {
+#if defined(PSCAL_TARGET_IOS)
+        pthread_cleanup_push(shellInlineStageCancelled, vp);
+#endif
         status = shellRunBuiltinInProcess(vm, cmd, stdin_fd, stdout_fd, stderr_fd, apply_exec_redirs);
+#if defined(PSCAL_TARGET_IOS)
+        pthread_cleanup_pop(0);
+#endif
     }
 
     bool stderr_shared_with_stdout =

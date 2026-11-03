@@ -210,6 +210,9 @@ int vprocRegisterThread(VProc *vp, pthread_t tid);
 void vprocUnregisterThread(VProc *vp, pthread_t tid);
 int vprocSpawnThread(VProc *vp, void *(*start_routine)(void *), void *arg, pthread_t *thread_out);
 void vprocMarkExit(VProc *vp, int status);
+/* For a thread being unwound: ends the vprocs it made for itself that are active above keep, or
+ * all of them with NULL, and leaves keep current. */
+void vprocEndAbandoned(VProc *keep);
 void vprocSetParent(int pid, int parent_pid);
 /* What pid started becomes its parent's, for a vproc that stands for no process of its own. */
 void vprocPassChildrenToParent(int pid);
@@ -614,6 +617,7 @@ static inline int vprocOpenAt(VProc *vp, const char *path, int flags, int mode) 
 static inline int vprocSetWinsize(VProc *vp, int cols, int rows) { (void)vp; (void)cols; (void)rows; return 0; }
 static inline int vprocGetWinsize(VProc *vp, VProcWinsize *out) { if (out) { out->cols = 80; out->rows = 24; } return 0; }
 static inline int vprocRegisterThread(VProc *vp, pthread_t tid) { (void)vp; (void)tid; return 0; }
+static inline void vprocEndAbandoned(VProc *keep) { (void)keep; }
 static inline void vprocMarkExit(VProc *vp, int status) { (void)vp; (void)status; }
 static inline void vprocSetParent(int pid, int parent_pid) { (void)pid; (void)parent_pid; }
 static inline void vprocPassChildrenToParent(int pid) { (void)pid; }

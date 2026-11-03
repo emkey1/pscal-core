@@ -462,11 +462,56 @@ static bool shellCommandSubstitutionStartReader(ShellCommandSubReadContext *ctx,
 #endif
 }
 
+typedef struct {
+    int *saved_stdout;
+    int *saved_mapped_stdout;
+    int *mapped_stdout_fd;
+    bool *stdout_redirected;
+    bool *mapped_stdout_redirected;
+#if defined(PSCAL_TARGET_IOS)
+    VProc **active_vp;
+    struct pscal_fd **saved_stdout_pscal;
+#endif
+    ShellCommandSubReadContext *reader;
+} ShellCommandSubStdout;
+
+/* Puts stdout back, host fd 1 included: it is the whole process's. */
+static void shellCommandSubstitutionRestoreStdout(const ShellCommandSubStdout *state) {
+    if (*state->mapped_stdout_redirected && *state->saved_mapped_stdout >= 0) {
+        vprocHostDup2(*state->saved_mapped_stdout, *state->mapped_stdout_fd);
+        *state->mapped_stdout_redirected = false;
+    }
+    if (*state->saved_mapped_stdout >= 0) {
+        vprocHostClose(*state->saved_mapped_stdout);
+        *state->saved_mapped_stdout = -1;
+    }
+    if (*state->stdout_redirected) {
+        vprocHostDup2(*state->saved_stdout, STDOUT_FILENO);
+#if defined(PSCAL_TARGET_IOS)
+        if (*state->active_vp) {
+            if (*state->saved_stdout_pscal) {
+                (void)vprocAdoptPscalFd(*state->active_vp, STDOUT_FILENO, *state->saved_stdout_pscal);
+            } else {
+                (void)vprocRestoreHostFd(*state->active_vp, STDOUT_FILENO, STDOUT_FILENO);
+            }
+        }
+#endif
+        *state->stdout_redirected = false;
+    }
+    if (*state->saved_stdout >= 0) {
+        vprocHostClose(*state->saved_stdout);
+        *state->saved_stdout = -1;
+    }
+}
+
 /* The shell's thread is being cancelled or is exiting, so it will not reach the join:
  * in the app a killed background body is cancelled, and exit() is pthread_exit. The
  * context is on the heap for this, and the reader cleans up after itself. */
 static void shellCommandSubstitutionAbandon(void *arg) {
-    ShellCommandSubReadContext *ctx = (ShellCommandSubReadContext *)arg;
+    const ShellCommandSubStdout *state = (const ShellCommandSubStdout *)arg;
+    ShellCommandSubReadContext *ctx = state->reader;
+    shellInvalidateVprocStreamForFd(STDOUT_FILENO);
+    shellCommandSubstitutionRestoreStdout(state);
     __atomic_store_n(&ctx->abandoned, true, __ATOMIC_RELEASE);
     __atomic_store_n(&ctx->command_done, true, __ATOMIC_RELEASE);
 }
@@ -731,7 +776,19 @@ static char *shellRunCommandSubstitution(const char *command) {
 #endif
     reader_started = shellCommandSubstitutionStartReader(reader, &reader_thread);
 
-    pthread_cleanup_push(shellCommandSubstitutionAbandon, reader);
+    ShellCommandSubStdout stdout_state = {
+        .saved_stdout = &saved_stdout,
+        .saved_mapped_stdout = &saved_mapped_stdout,
+        .mapped_stdout_fd = &mapped_stdout_fd,
+        .stdout_redirected = &stdout_redirected,
+        .mapped_stdout_redirected = &mapped_stdout_redirected,
+#if defined(PSCAL_TARGET_IOS)
+        .active_vp = &active_vp,
+        .saved_stdout_pscal = &saved_stdout_pscal,
+#endif
+        .reader = reader,
+    };
+    pthread_cleanup_push(shellCommandSubstitutionAbandon, &stdout_state);
 
     memset(&opts, 0, sizeof(opts));
     opts.no_cache = 1;
@@ -824,31 +881,7 @@ static char *shellRunCommandSubstitution(const char *command) {
      * would stay open until stdout is next used: no end of file for the reader. */
     shellInvalidateVprocStreamForFd(STDOUT_FILENO);
 
-    if (mapped_stdout_redirected && saved_mapped_stdout >= 0) {
-        vprocHostDup2(saved_mapped_stdout, mapped_stdout_fd);
-        mapped_stdout_redirected = false;
-    }
-    if (saved_mapped_stdout >= 0) {
-        vprocHostClose(saved_mapped_stdout);
-        saved_mapped_stdout = -1;
-    }
-    if (stdout_redirected) {
-        vprocHostDup2(saved_stdout, STDOUT_FILENO);
-#if defined(PSCAL_TARGET_IOS)
-        if (active_vp) {
-            if (saved_stdout_pscal) {
-                (void)vprocAdoptPscalFd(active_vp, STDOUT_FILENO, saved_stdout_pscal);
-            } else {
-                (void)vprocRestoreHostFd(active_vp, STDOUT_FILENO, STDOUT_FILENO);
-            }
-        }
-#endif
-        stdout_redirected = false;
-    }
-    if (saved_stdout >= 0) {
-        vprocHostClose(saved_stdout);
-        saved_stdout = -1;
-    }
+    shellCommandSubstitutionRestoreStdout(&stdout_state);
 
     __atomic_store_n(&reader->command_done, true, __ATOMIC_RELEASE);
     if (reader_started) {
