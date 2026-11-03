@@ -2095,6 +2095,7 @@ static void shellSubshellResetState(pid_t dollar_pid) {
     free(gShellJobs);
     gShellJobs = NULL;
     gShellJobCount = 0;
+    gShellRuntime.finished_job_count = 0;
     gShellRuntime.job_control_enabled = false;
     gShellRuntime.job_control_initialized = true;
     for (int signo = 1; signo < NSIG; ++signo) {
@@ -2601,34 +2602,11 @@ static void shellFreeJob(ShellJob *job) {
     job->last_status = 0;
 }
 
-static void shellRememberReapedPid(pid_t pid, int status) {
-    ShellRuntimeState *ctx = shellGetContext();
-    if (!ctx) {
-        return;
-    }
-    size_t capacity = sizeof(ctx->reaped_pids) / sizeof(ctx->reaped_pids[0]);
-    if (ctx->reaped_pid_count == capacity) {
-        memmove(&ctx->reaped_pids[0], &ctx->reaped_pids[1],
-                (capacity - 1) * sizeof(ctx->reaped_pids[0]));
-        ctx->reaped_pid_count--;
-    }
-    ctx->reaped_pids[ctx->reaped_pid_count].pid = pid;
-    ctx->reaped_pids[ctx->reaped_pid_count].status = status;
-    ctx->reaped_pid_count++;
-}
-
 static void shellRemoveJobAt(size_t index) {
     if (index >= gShellJobCount) {
         return;
     }
     ShellJob *job = &gShellJobs[index];
-    ShellRuntimeState *ctx = shellGetContext();
-    if (ctx) {
-        ctx->last_removed_job_id = job->id;
-        ctx->last_removed_job_pgid = job->pgid;
-        ctx->last_removed_job_status = job->last_status;
-        ctx->last_removed_job_valid = true;
-    }
     shellFreeJob(job);
     if (index + 1 < gShellJobCount) {
         memmove(&gShellJobs[index],
@@ -2642,16 +2620,103 @@ static void shellRemoveJobAt(size_t index) {
     }
 }
 
+/* Call before the job leaves the table. As in bash the status stays known by the job's last pid
+ * however often it is asked for. A disowned job gives 0: bash forgets it when told to, before it
+ * has a status. */
+static ShellFinishedJob *shellRememberFinishedJob(const ShellJob *job, bool reported) {
+    ShellRuntimeState *ctx = shellGetContext();
+    if (!ctx) {
+        return NULL;
+    }
+    if (ctx->finished_job_count == SHELL_FINISHED_JOB_MAX) {
+        ctx->finished_job_count--;
+        memmove(&ctx->finished_jobs[0], &ctx->finished_jobs[1],
+                ctx->finished_job_count * sizeof(ctx->finished_jobs[0]));
+    }
+    ShellFinishedJob *entry = &ctx->finished_jobs[ctx->finished_job_count++];
+    entry->pgid = job->pgid;
+    entry->last_pid = job->last_pid;
+    entry->id = job->id;
+    entry->status = job->disowned ? 0 : job->last_status;
+    entry->has_id = !job->disowned;
+    entry->reported = reported || job->disowned;
+    return entry;
+}
+
+static ShellFinishedJob *shellFindFinishedJobByPid(pid_t pid) {
+    ShellRuntimeState *ctx = shellGetContext();
+    for (size_t i = ctx ? ctx->finished_job_count : 0; i > 0; --i) {
+        ShellFinishedJob *entry = &ctx->finished_jobs[i - 1];
+        if (entry->last_pid == pid || entry->pgid == pid) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+static ShellFinishedJob *shellFindFinishedJobById(size_t id) {
+    ShellRuntimeState *ctx = shellGetContext();
+    for (size_t i = ctx ? ctx->finished_job_count : 0; i > 0; --i) {
+        ShellFinishedJob *entry = &ctx->finished_jobs[i - 1];
+        if (entry->has_id && entry->id == id) {
+            return entry;
+        }
+    }
+    return NULL;
+}
+
+/* A job is starting. What has been reported gives up its number. A pid the system has used again
+ * means the new job from now on. */
+static void shellFinishedJobsBeforeNewJob(const pid_t *pids, size_t pid_count) {
+    ShellRuntimeState *ctx = shellGetContext();
+    if (!ctx) {
+        return;
+    }
+    size_t kept = 0;
+    for (size_t i = 0; i < ctx->finished_job_count; ++i) {
+        ShellFinishedJob entry = ctx->finished_jobs[i];
+        /* Not by group: on iOS a subshell's jobs are all in the subshell's. */
+        bool reused = false;
+        for (size_t j = 0; j < pid_count && !reused; ++j) {
+            reused = entry.last_pid == pids[j];
+        }
+        if (reused) {
+            continue;
+        }
+        if (entry.reported) {
+            entry.has_id = false;
+        }
+        ctx->finished_jobs[kept++] = entry;
+    }
+    ctx->finished_job_count = kept;
+}
+
+/* `jobs` has reported them, or a prompt has. Their pids still work, %n no longer does, and wait -n
+ * passes them by. */
+static void shellFinishedJobsReported(void) {
+    ShellRuntimeState *ctx = shellGetContext();
+    for (size_t i = 0; ctx && i < ctx->finished_job_count; ++i) {
+        ctx->finished_jobs[i].reported = true;
+        ctx->finished_jobs[i].has_id = false;
+    }
+}
+
 #if defined(PSCAL_TARGET_IOS)
 static ShellJob *shellFindJobByPid(pid_t pid);
 #endif
+
+/* A subshell numbers the jobs it started, and so does a shell started as a command. The session's
+ * others are not its to wait for, and a stamp on its own would have the shell above mirror them. */
+static bool shellNumbersItsOwnJobs(void) {
+    return gShellRuntime.in_subshell || gShellRuntime.started_as_command;
+}
 
 static size_t shellAllocateJobId(void) {
     size_t candidate = 1;
 #if defined(PSCAL_TARGET_IOS)
     int shell_pid = vprocGetShellSelfPid();
     int current_sid = (shell_pid > 0) ? vprocGetSid(shell_pid) : 0;
-    size_t snap_cap = vprocSnapshot(NULL, 0);
+    size_t snap_cap = shellNumbersItsOwnJobs() ? 0 : vprocSnapshot(NULL, 0);
     if (snap_cap > 0) {
         VProcSnapshot *snaps = (VProcSnapshot *)calloc(snap_cap, sizeof(VProcSnapshot));
         if (snaps) {
@@ -2659,6 +2724,11 @@ static size_t shellAllocateJobId(void) {
             bool used = true;
             while (used) {
                 used = false;
+                if (shellFindFinishedJobById(candidate)) {
+                    used = true;
+                    candidate++;
+                    continue;
+                }
                 for (size_t i = 0; i < snap_count; ++i) {
                     const VProcSnapshot *s = &snaps[i];
                     if (!s || s->pid <= 0 || s->job_id <= 0) {
@@ -2686,6 +2756,11 @@ static size_t shellAllocateJobId(void) {
     bool used = true;
     while (used) {
         used = false;
+        if (shellFindFinishedJobById(candidate)) {
+            used = true;
+            candidate++;
+            continue;
+        }
         for (size_t i = 0; i < gShellJobCount; ++i) {
             if (gShellJobs[i].id == candidate) {
                 used = true;
@@ -2710,6 +2785,7 @@ static ShellJob *shellRegisterJob(pid_t pgid, const pid_t *pids, size_t pid_coun
         return NULL;
     }
     memcpy(pid_copy, pids, sizeof(pid_t) * pid_count);
+    shellFinishedJobsBeforeNewJob(pids, pid_count);
 
     char label_buf[128] = {0};
     char *summary = NULL;
@@ -2755,10 +2831,12 @@ static ShellJob *shellRegisterJob(pid_t pgid, const pid_t *pids, size_t pid_coun
 
     gShellJobs = new_jobs;
     ShellJob *job = &gShellJobs[gShellJobCount++];
-    /* Preserve any existing vproc job id; otherwise allocate a new one and stamp it. A
-     * subshell's jobs share its group, so the group's id says nothing about which job this is. */
-    int job_id = gShellRuntime.in_subshell ? 0 : vprocGetJobId(pgid);
-    if (job_id <= 0 && pid_count > 0) {
+    /* Preserve any existing vproc job id; otherwise allocate a new one and stamp it. A shell with
+     * numbers of its own does neither: its jobs share its group, whose row holds the number its
+     * shell gave it. */
+    bool own_numbers = shellNumbersItsOwnJobs();
+    int job_id = own_numbers ? 0 : vprocGetJobId(pgid);
+    if (!own_numbers && job_id <= 0 && pid_count > 0) {
         job_id = vprocGetJobId(pids[0]);
     }
     if (job_id > 0) {
@@ -2792,11 +2870,11 @@ static ShellJob *shellRegisterJob(pid_t pgid, const pid_t *pids, size_t pid_coun
     }
     if (job_id <= 0) {
         job_id = (int)shellAllocateJobId();
-        if (!gShellRuntime.in_subshell) {
+        if (!own_numbers) {
             vprocSetJobId(pgid, job_id);
-        }
-        for (size_t i = 0; i < pid_count; ++i) {
-            vprocSetJobId(pids[i], job_id);
+            for (size_t i = 0; i < pid_count; ++i) {
+                vprocSetJobId(pids[i], job_id);
+            }
         }
     } else {
         size_t next_id = (size_t)job_id + 1;
@@ -2811,6 +2889,7 @@ static ShellJob *shellRegisterJob(pid_t pgid, const pid_t *pids, size_t pid_coun
     job->pgid = pgid;
     job->pids = pid_copy;
     job->pid_count = pid_count;
+    job->last_pid = pids[pid_count - 1];
     for (size_t i = 0; i < pid_count; ++i) {
         vprocSetCommandLabel(pids[i], summary);
         if (pgid > 0) {
@@ -2916,9 +2995,7 @@ static int shellCollectJobs(void) {
     current_sid = (shell_pid > 0) ? vprocGetSid(shell_pid) : 0;
     /* A subshell's jobs are the ones it started, not its shell's that run beside it. So
      * are those of a shell started as a command, which would also collect the caller's. */
-    size_t snap_cap = (gShellRuntime.in_subshell || gShellRuntime.started_as_command)
-                          ? 0
-                          : vprocSnapshot(NULL, 0);
+    size_t snap_cap = shellNumbersItsOwnJobs() ? 0 : vprocSnapshot(NULL, 0);
     if (snap_cap > 0) {
             VProcSnapshot *snaps = (VProcSnapshot *)calloc(snap_cap, sizeof(VProcSnapshot));
             if (snaps) {
@@ -3022,7 +3099,7 @@ static int shellCollectJobs(void) {
         if (stored_id <= 0 && job->pid_count > 0) {
             stored_id = vprocGetJobId(job->pids[0]);
         }
-        if (stored_id > 0) {
+        if (stored_id > 0 && !shellNumbersItsOwnJobs()) {
             job->id = (size_t)stored_id;
         }
 #endif
@@ -3073,8 +3150,10 @@ static int shellCollectJobs(void) {
                 job->running = true;
                 job_active = true;
             } else {
-                job->last_status = shellStatusFromWait(status);
-                shellRememberReapedPid(pid, job->last_status);
+                /* A job gives what its last command gave, whichever ended last. */
+                if (j + 1 == job->pid_count) {
+                    job->last_status = shellStatusFromWait(status);
+                }
                 job->pids[j] = -1;
             }
         }
@@ -3100,10 +3179,7 @@ static int shellCollectJobs(void) {
         if (all_done) {
             /* Its status is for `wait`. A job finishing is no command the script ran, so
              * it leaves $? and set -e alone. */
-            ShellRuntimeState *ctx = shellGetContext();
-            if (ctx && ctx->finished_job_count < sizeof(ctx->finished_job_statuses) / sizeof(int)) {
-                ctx->finished_job_statuses[ctx->finished_job_count++] = job->last_status;
-            }
+            shellRememberFinishedJob(job, false);
             shellRemoveJobAt(i);
             reaped++;
             continue;
@@ -3140,6 +3216,12 @@ static int shellCollectJobs(void) {
     }
 #endif
     return reaped;
+}
+
+/* A prompt is about to print, and bash reports there what has ended. */
+void shellRuntimeJobsBeforePrompt(void) {
+    shellCollectJobs();
+    shellFinishedJobsReported();
 }
 
 static size_t shellJobVisibleCount(void) {

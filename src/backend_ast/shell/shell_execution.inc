@@ -2440,6 +2440,8 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
     VM *bg_vm = NULL;
     VM *vm = ctx->vm ? ctx->vm : gShellCurrentVm;
     if (bg_ctx) {
+        /* As in a subshell: what its shell's jobs left is not a stage's to find. */
+        bg_ctx->finished_job_count = 0;
         ctx->bg_shell_ctx = bg_ctx;
         prev_ctx = shellRuntimeActivateContext(bg_ctx);
         ctx->prev_shell_ctx = prev_ctx;
@@ -5222,6 +5224,8 @@ static void *shellPipelineStageThreadMain(void *arg) {
     shellThreadLinkEnter(&tctx->link);
     bg_shell_ctx = tctx->link.ctx ? tctx->link.ctx : shellRuntimeCreateContext();
     if (bg_shell_ctx) {
+        /* As in a subshell: what its shell's jobs left is not a stage's to find. */
+        bg_shell_ctx->finished_job_count = 0;
         prev_shell_ctx = shellRuntimeActivateContext(bg_shell_ctx);
         bg_vm = (VM *)calloc(1, sizeof(VM));
         if (bg_vm) {

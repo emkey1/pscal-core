@@ -368,6 +368,7 @@ void shellRuntimeSetArg0(const char *name);
 const char *shellRuntimeGetArg0(void);
 void shellRuntimeInitJobControl(void);
 void shellRuntimeRestoreForeground(void);
+void shellRuntimeJobsBeforePrompt(void);
 void shellRuntimeInitSignals(void);
 void shellRuntimeInitExports(void);
 void *shellRuntimeProgramEnvEnter(void);

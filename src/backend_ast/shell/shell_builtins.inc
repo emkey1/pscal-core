@@ -11515,6 +11515,7 @@ Value vmBuiltinShellJobs(VM *vm, int arg_count, Value *args) {
     (void)arg_count;
     (void)args;
     shellCollectJobs();
+    shellFinishedJobsReported();
     size_t current_index = SIZE_MAX;
     size_t previous_index = SIZE_MAX;
     for (size_t i = gShellJobCount; i > 0; --i) {
@@ -11873,6 +11874,7 @@ static bool shellKillSignalJob(VM *vm, const char *spec_text, size_t index, int 
         job->stopped = false;
     }
     if (terminate) {
+        shellRememberFinishedJob(job, false);
         shellRemoveJobAt(index);
         shellCollectJobs();
         return true;
@@ -12318,103 +12320,136 @@ Value vmBuiltinShellBg(VM *vm, int arg_count, Value *args) {
     return makeVoid();
 }
 
-/* `wait` asks for the job shellCollectJobs just took off the table: by %n, or by the pid
- * in $!, which is its last process and so may not be the group's. */
-static bool shellWaitTargetIsLastRemoved(long target) {
-    return target > 0 && gShellRuntime.last_removed_job_valid &&
-           (gShellRuntime.last_removed_job_id == (size_t)target ||
-            gShellRuntime.last_removed_job_pgid == (pid_t)target ||
-            gShellRuntime.last_bg_pid == (pid_t)target);
+/* wait -n: a job that already ended and nothing has reported, or else the next to end. */
+static void shellWaitForNextJob(void) {
+    for (;;) {
+        ShellRuntimeState *ctx = shellGetContext();
+        for (size_t i = 0; ctx && i < ctx->finished_job_count; ++i) {
+            ShellFinishedJob *entry = &ctx->finished_jobs[i];
+            if (!entry->reported) {
+                entry->reported = true;
+                entry->has_id = false;
+                shellUpdateStatus(entry->status);
+                return;
+            }
+        }
+        if (shellJobVisibleCount() == 0) {
+            shellUpdateStatus(127);
+            return;
+        }
+        usleep(5000);
+        shellCollectJobs();
+    }
 }
 
-/* `wait pid` for a job already off the table: two that ended before the shell looked were both
- * reaped, and shellWaitTargetIsLastRemoved knows only the last. Asking again gives the same
- * answer, as under bash 5. A live job with that pid comes first, since a host reuses pids. */
-static bool shellWaitFindReapedPid(Value spec, int *out_status) {
+/* Waits for what is left of the job, which leaves it for the caller to take off the table.
+ * Gives what the job's last command gave. */
+static int shellWaitForJobAt(size_t index) {
+    ShellJob *job = &gShellJobs[index];
+    int status = job->last_status;
+    for (size_t i = 0; i < job->pid_count; ++i) {
+        pid_t pid = job->pids[i];
+        if (pid <= 0) {
+            continue;
+        }
+        ShellWaitResult wait_res;
+        int err = shellWaitPidDetailed(pid, false, &wait_res);
+        if (err != 0) {
+            continue;
+        }
+        if (i + 1 == job->pid_count) {
+            status = wait_res.status_mapped;
+        }
+        job->pids[i] = -1;
+    }
+    job->last_status = status;
+    return status;
+}
+
+/* One operand. As in bash a number is a pid and %n a job, and it may have ended long ago. */
+static int shellWaitForOperand(Value spec) {
+    const char *text = "";
     long target = -1;
-    if (VALUE_TYPE(spec) == TYPE_STRING && AS_STRING(spec) && AS_STRING(spec)[0] != '%') {
+    bool by_id = false;
+    if (VALUE_TYPE(spec) == TYPE_STRING && AS_STRING(spec)) {
+        text = AS_STRING(spec);
+        by_id = text[0] == '%';
+        const char *digits = by_id ? text + 1 : text;
         char *end = NULL;
-        long parsed = strtol(AS_STRING(spec), &end, 10);
-        if (end != AS_STRING(spec) && *end == '\0') {
+        long parsed = *digits ? strtol(digits, &end, 10) : -1;
+        if (end && *end == '\0' && parsed > 0) {
             target = parsed;
         }
     } else if (IS_INTLIKE(spec)) {
         target = (long)AS_INTEGER(spec);
     }
-    size_t live_index = 0;
-    if (target <= 0 || shellFindJobIndexByPid((pid_t)target, &live_index)) {
-        return false;
-    }
-    for (size_t i = gShellRuntime.reaped_pid_count; i > 0; --i) {
-        if (gShellRuntime.reaped_pids[i - 1].pid == (pid_t)target) {
-            *out_status = gShellRuntime.reaped_pids[i - 1].status;
-            return true;
+    if (target <= 0) {
+        if (by_id) {
+            fprintf(stderr, "wait: %s: no such job\n", text);
+            return 127;
         }
+        fprintf(stderr, "wait: `%s': not a pid or valid job spec\n", text);
+        return 1;
     }
-    return false;
-}
 
-/* wait -n: a job that already ended and nothing has reported, or else the next to end. */
-static void shellWaitForNextJob(void) {
-    while (gShellRuntime.finished_job_count == 0 && shellJobVisibleCount() > 0) {
-        usleep(5000);
-        shellCollectJobs();
+    for (size_t i = 0; i < gShellJobCount; ++i) {
+        ShellJob *job = &gShellJobs[i];
+        bool found = by_id ? (job->id == (size_t)target && !job->disowned)
+                           : (job->last_pid == (pid_t)target);
+        for (size_t j = 0; !by_id && !found && j < job->pid_count; ++j) {
+            found = job->pids[j] == (pid_t)target;
+        }
+        if (!found) {
+            continue;
+        }
+        if (job->disowned) {
+            return 0;
+        }
+        int status = shellWaitForJobAt(i);
+        ShellFinishedJob *entry = shellRememberFinishedJob(job, true);
+        if (entry && by_id) {
+            entry->has_id = false;
+        }
+        shellRemoveJobAt(i);
+        return status;
     }
-    if (gShellRuntime.finished_job_count == 0) {
-        shellUpdateStatus(127);
-        return;
+
+    ShellFinishedJob *entry = by_id ? shellFindFinishedJobById((size_t)target)
+                                    : shellFindFinishedJobByPid((pid_t)target);
+    if (entry) {
+        entry->reported = true;
+        if (by_id) {
+            entry->has_id = false;
+        }
+        return entry->status;
     }
-    int status = gShellRuntime.finished_job_statuses[0];
-    gShellRuntime.finished_job_count--;
-    memmove(gShellRuntime.finished_job_statuses, gShellRuntime.finished_job_statuses + 1,
-            gShellRuntime.finished_job_count * sizeof(int));
-    shellUpdateStatus(status);
+    if (by_id) {
+        fprintf(stderr, "wait: %%%ld: no such job\n", target);
+    } else {
+        fprintf(stderr, "wait: pid %ld is not a child of this shell\n", target);
+    }
+    return 127;
 }
 
 Value vmBuiltinShellWait(VM *vm, int arg_count, Value *args) {
+    (void)vm;
     shellCollectJobs();
-    size_t visible_count = shellJobVisibleCount();
     if (arg_count >= 1 && VALUE_TYPE(args[0]) == TYPE_STRING && AS_STRING(args[0]) &&
         strcmp(AS_STRING(args[0]), "-n") == 0) {
         shellWaitForNextJob();
         return makeVoid();
     }
-    int reaped_status = 0;
-    if (arg_count == 1 && shellWaitFindReapedPid(args[0], &reaped_status)) {
-        shellUpdateStatus(reaped_status);
-        return makeVoid();
-    }
-    if (arg_count == 1 && gShellJobCount == 0 && gShellRuntime.last_removed_job_valid) {
-        long target = -1;
-        Value spec = args[0];
-        if (VALUE_TYPE(spec) == TYPE_STRING && AS_STRING(spec)) {
-            const char *text = AS_STRING(spec);
-            if (text[0] == '%') {
-                text++;
-            }
-            if (text && *text) {
-                char *end = NULL;
-                long parsed = strtol(text, &end, 10);
-                if (end && *end == '\0' && parsed > 0) {
-                    target = parsed;
-                }
-            }
-        } else if (IS_INTLIKE(spec)) {
-            target = (long)AS_INTEGER(spec);
-        }
-        if (shellWaitTargetIsLastRemoved(target)) {
-            int status = gShellRuntime.last_removed_job_status;
-            gShellRuntime.last_removed_job_valid = false;
-            shellUpdateStatus(status);
-            return makeVoid();
-        }
-    }
     if (arg_count == 0) {
-        if (visible_count == 0) {
-            shellUpdateStatus(0);
-            return makeVoid();
+        /* Bash gives 0 here and forgets every job. A script keeps the one $! names, if that had
+         * already ended. */
+        ShellFinishedJob *ended = gShellRuntime.last_bg_pid > 0
+                                      ? shellFindFinishedJobByPid(gShellRuntime.last_bg_pid)
+                                      : NULL;
+        bool keep_last = ended && (!shellRuntimeIsInteractive() || shellNumbersItsOwnJobs());
+        ShellFinishedJob last;
+        if (keep_last) {
+            last = *ended;
         }
-        int final_status = 0;
         while (shellJobVisibleCount() > 0) {
             /* Match Bash's tendency to treat the most recent job as "current". */
             size_t index = 0;
@@ -12430,79 +12465,22 @@ Value vmBuiltinShellWait(VM *vm, int arg_count, Value *args) {
             if (!found) {
                 break;
             }
-            ShellJob *job = &gShellJobs[index];
-            int job_status = job->last_status;
-            for (size_t i = 0; i < job->pid_count; ++i) {
-                pid_t pid = job->pids[i];
-                if (pid <= 0) {
-                    continue;
-                }
-                ShellWaitResult wait_res;
-                int err = shellWaitPidDetailed(pid, false, &wait_res);
-                if (err != 0) {
-                    continue;
-                }
-                job_status = wait_res.status_mapped;
-                job->pids[i] = -1;
-            }
+            shellWaitForJobAt(index);
             shellRemoveJobAt(index);
-            final_status = job_status;
             shellCollectJobs();
         }
-        shellUpdateStatus(final_status);
+        gShellRuntime.finished_job_count = 0;
+        if (keep_last) {
+            gShellRuntime.finished_jobs[gShellRuntime.finished_job_count++] = last;
+        }
+        shellUpdateStatus(0);
         return makeVoid();
     }
-    size_t index = 0;
-    if (!shellResolveJobIndex(vm, "wait", arg_count, args, &index)) {
-        int fallback_status = 1;
-        if (arg_count == 1) {
-            long target = -1;
-            Value spec = args[0];
-            if (VALUE_TYPE(spec) == TYPE_STRING && AS_STRING(spec)) {
-                const char *text = AS_STRING(spec);
-                if (text[0] == '%') {
-                    text++;
-                }
-                if (text && *text) {
-                    char *end = NULL;
-                    long parsed = strtol(text, &end, 10);
-                    if (end && *end == '\0' && parsed > 0) {
-                        target = parsed;
-                    }
-                }
-            } else if (IS_INTLIKE(spec)) {
-                target = (long)AS_INTEGER(spec);
-            }
-            if (shellWaitTargetIsLastRemoved(target)) {
-                fallback_status = gShellRuntime.last_removed_job_status;
-                gShellRuntime.last_removed_job_valid = false;
-                shellUpdateStatus(fallback_status);
-                return makeVoid();
-            }
-            if (target > 0) {
-                fallback_status = 127;
-            }
-        }
-        shellUpdateStatus(fallback_status);
-        return makeVoid();
+    int status = 0;
+    for (int i = 0; i < arg_count; ++i) {
+        status = shellWaitForOperand(args[i]);
     }
-    ShellJob *job = &gShellJobs[index];
-    int final_status = job->last_status;
-    for (size_t i = 0; i < job->pid_count; ++i) {
-        pid_t pid = job->pids[i];
-        if (pid <= 0) {
-            continue;
-        }
-        ShellWaitResult wait_res;
-        int err = shellWaitPidDetailed(pid, false, &wait_res);
-        if (err != 0) {
-            continue;
-        }
-        final_status = wait_res.status_mapped;
-        job->pids[i] = -1;
-    }
-    shellRemoveJobAt(index);
-    shellUpdateStatus(final_status);
+    shellUpdateStatus(status);
     return makeVoid();
 }
 

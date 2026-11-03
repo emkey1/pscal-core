@@ -504,6 +504,8 @@ typedef struct ShellJob {
     pid_t pgid;
     pid_t *pids;
     size_t pid_count;
+    /* What $! gave. pids[] marks what has been reaped, this stays. */
+    pid_t last_pid;
     size_t id;
     bool running;
     bool stopped;
@@ -511,6 +513,20 @@ typedef struct ShellJob {
     int last_status;
     char *command;
 } ShellJob;
+
+/* What `wait` can still find of a job that has left the table. */
+typedef struct {
+    pid_t pgid;
+    pid_t last_pid;
+    size_t id;
+    int status;
+    /* %n still means this job, and no new job takes the number. */
+    bool has_id;
+    /* wait -n passes it by. */
+    bool reported;
+} ShellFinishedJob;
+
+#define SHELL_FINISHED_JOB_MAX 1024
 
 typedef struct {
     pid_t fg_job_id;
@@ -638,19 +654,9 @@ typedef struct ShellRuntimeState {
     size_t job_next_id;
     ShellJob *jobs;
     size_t job_count;
-    size_t last_removed_job_id;
-    pid_t last_removed_job_pgid;
-    int last_removed_job_status;
-    bool last_removed_job_valid;
-    /* Jobs that ended with nobody waiting on them, oldest first, for wait -n. */
-    int finished_job_statuses[64];
+    /* Oldest first. When it is full the oldest goes, so a long script cannot grow it. */
+    ShellFinishedJob finished_jobs[SHELL_FINISHED_JOB_MAX];
     size_t finished_job_count;
-    /* What `wait pid` finds once a job has been reaped, oldest first, as bash keeps them. */
-    struct {
-        pid_t pid;
-        int status;
-    } reaped_pids[64];
-    size_t reaped_pid_count;
     ShellJobControlContext job_control_ctx;
     ShellArrayVariable *array_vars;
     size_t array_var_count;
@@ -2903,9 +2909,6 @@ static ShellRuntimeState gShellRuntimeDefault = {
     .job_next_id = 1,
     .jobs = NULL,
     .job_count = 0,
-    .last_removed_job_id = 0,
-    .last_removed_job_status = 0,
-    .last_removed_job_valid = false,
     .array_vars = NULL,
     .array_var_count = 0,
     .array_var_capacity = 0,
@@ -3579,6 +3582,9 @@ void shellRuntimeKeepLineState(ShellRuntimeState *line_ctx) {
     KEEP_OWNED(array_var_capacity);
     KEEP_OWNED(jobs);
     KEEP_OWNED(job_count);
+    KEEP(finished_job_count);
+    memcpy(shell->finished_jobs, line_ctx->finished_jobs,
+           line_ctx->finished_job_count * sizeof(line_ctx->finished_jobs[0]));
     KEEP_OWNED(history);
     KEEP_OWNED(exit_trap);
     for (int i = 0; i < NSIG; ++i) {
@@ -4738,11 +4744,6 @@ ShellRuntimeState *shellRuntimeCreateContext(void) {
     }
     *ctx = *template_ctx;
     ctx->pipeline = (ShellPipelineContext){0};
-    ctx->last_removed_job_id = 0;
-    ctx->last_removed_job_status = 0;
-    ctx->last_removed_job_valid = false;
-    ctx->finished_job_count = 0;
-    ctx->reaped_pid_count = 0;
     /* Deep-copy owned runtime state so contexts do not share pointers. */
     ctx->dir_stack = NULL;
     ctx->dir_stack_count = 0;
@@ -4856,6 +4857,7 @@ ShellRuntimeState *shellRuntimeCreateContext(void) {
                 ShellJob *dst = &ctx->jobs[i];
                 dst->pgid = src->pgid;
                 dst->id = src->id;
+                dst->last_pid = src->last_pid;
                 dst->running = src->running;
                 dst->stopped = src->stopped;
                 dst->disowned = src->disowned;
@@ -5004,6 +5006,7 @@ static ShellRuntimeState *shellRuntimeCreateProgramContext(void) {
     free(ctx->jobs);
     ctx->jobs = NULL;
     ctx->job_count = 0;
+    ctx->finished_job_count = 0;
     ctx->last_bg_pid = 0;
     ctx->started_as_command = true;
     for (size_t i = 0; i < ctx->dir_stack_count; ++i) {
