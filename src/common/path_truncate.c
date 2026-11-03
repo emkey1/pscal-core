@@ -3556,9 +3556,8 @@ static void pathTruncateRefreshProc(const char *prefix, const char *request_path
             pathTruncateEnsureDir(device_dir);
             if (refresh_device_entries) {
                 PathTruncateDeviceProcSnapshot device_snapshots[256];
-                size_t device_count = pathTruncateSnapshotDeviceProcesses(
-                    device_snapshots,
-                    sizeof(device_snapshots) / sizeof(device_snapshots[0]));
+                size_t device_capacity = sizeof(device_snapshots) / sizeof(device_snapshots[0]);
+                size_t device_count = pathTruncateSnapshotDeviceProcesses(device_snapshots, device_capacity);
                 bool host_present = false;
                 for (size_t i = 0; i < device_count; ++i) {
                     if (device_snapshots[i].pid == (int)host_pid) {
@@ -3566,8 +3565,13 @@ static void pathTruncateRefreshProc(const char *prefix, const char *request_path
                         break;
                     }
                 }
-                if (!host_present && device_count < (sizeof(device_snapshots) / sizeof(device_snapshots[0]))) {
-                    PathTruncateDeviceProcSnapshot *entry = &device_snapshots[device_count++];
+                if (!host_present) {
+                    /* A full snapshot holds the newest processes, which can leave out
+                     * this one, and /proc/device/self still points here: it takes the
+                     * last slot. */
+                    PathTruncateDeviceProcSnapshot *entry = device_count < device_capacity
+                                                                ? &device_snapshots[device_count++]
+                                                                : &device_snapshots[device_capacity - 1];
                     entry->pid = (int)host_pid;
                     entry->ppid = (int)host_ppid;
                     snprintf(entry->name, sizeof(entry->name), "%s", "pscal-host");
