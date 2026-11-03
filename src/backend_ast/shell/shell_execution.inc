@@ -1974,7 +1974,6 @@ typedef struct {
     VM *vm;
     ShellCommand *cmd;
     int synthetic_pid;
-    int job_id;
 #if defined(PSCAL_TARGET_IOS)
     VProc *vp;
     ShellRuntimeState *bg_shell_ctx;
@@ -2578,7 +2577,7 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
     /* If stderr was requested to follow stdout, reuse the stdout handle (after open). */
     int bg_status = 0;
 #if defined(PSCAL_TARGET_IOS)
-    VProc *vp = NULL;
+    VProc *vp = ctx->vp;
 #endif
 
     if (stdout_path && *stdout_path) {
@@ -2636,82 +2635,32 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
         unsetenv("PSCALI_BG_STDERR_APPEND");
     }
 #if defined(PSCAL_TARGET_IOS)
-    vp = shellCreateVProcForStage(stdin_fd,
-                                  vm_stdout,
-                                  vm_stderr,
-                                  pscalRuntimeDetectWindowCols(),
-                                  pscalRuntimeDetectWindowRows(),
-                                  ctx->synthetic_pid > 0 ? ctx->synthetic_pid : -1,
-                                  true);
-    if (!vp) {
-        runtimeError(vm, "background: failed to allocate vproc");
-        goto cleanup;
-    }
-    ctx->vp = vp;
-    vprocRegisterThread(vp, pthread_self());
-    int shell_pid = vprocGetShellSelfPid();
-    if (ctx->parent_pid > 0) {
-        vprocSetParent(vprocPid(vp), ctx->parent_pid);
-    } else if (shell_pid > 0) {
-        vprocSetParent(vprocPid(vp), shell_pid);
-    }
-    int shell_sid = (shell_pid > 0) ? vprocGetSid(shell_pid) : -1;
-    pid_t group = (ctx->synthetic_pid > 0) ? ctx->synthetic_pid : vprocPid(vp);
-    if (shell_sid > 0) {
-        vprocSetSid(vprocPid(vp), shell_sid);
-    }
-    vprocSetPgid(vprocPid(vp), group);
-    ctx->synthetic_pid = group;
-    if (ctx->job_id > 0) {
-        vprocSetJobId(vprocPid(vp), ctx->job_id);
-        if (group > 0 && group != vprocPid(vp)) {
-            vprocSetJobId(group, ctx->job_id);
-        }
-    }
-    /* Label the vproc for lps/ps visibility. */
-        if (cmd && cmd->argc > 0 && cmd->argv) {
-            char label[96] = {0};
-            shellVprocFormatLabel(cmd, label, sizeof(label));
-            if (label[0]) {
-                vprocSetCommandLabel(vprocPid(vp), label);
-            }
-        }
-    /* Hand off host fds to the synthetic vproc so dup2 shims work on vproc-local
-     * descriptors during builtin execution. */
-    /* Adopt host fds into the child vproc so shimmed I/O stays per-process.
-     * If adoption fails, keep using the host fd directly (don’t close or rewrite
-     * the parent’s descriptors). */
+    /* What a redirection opened replaces what the job inherited at the `&`, and no copy of
+     * that stays open: `cmd > /dev/null &` lets go of the caller's stdout. */
     if (stdin_fd >= 0) {
-        int host_fd = stdin_fd;
-        int vfd = vprocAdoptHostFd(vp, host_fd);
-        if (vfd >= 0) {
-            stdin_fd = vfd;
-            if (tool_dbg && pipe_dbg) fprintf(stderr, "[bg-stage] adopted stdin host=%d vfd=%d\n", host_fd, vfd);
-        } else if (tool_dbg && pipe_dbg) {
-            fprintf(stderr, "[bg-stage] adopt stdin host=%d failed: %s\n", host_fd, strerror(errno));
+        if (vprocReplaceStdio(vp, STDIN_FILENO, stdin_fd) < 0 && !redir_failed_target) {
+            redir_failed_target = "stdin";
+            redir_failed_errno = errno;
         }
+        vprocHostClose(stdin_fd);
+        stdin_fd = -1;
+    }
+    if (vm_stdout >= 0 && vprocReplaceStdio(vp, STDOUT_FILENO, vm_stdout) < 0 && !redir_failed_target) {
+        redir_failed_target = stdout_path;
+        redir_failed_errno = errno;
+    }
+    if (vm_stderr >= 0 && vprocReplaceStdio(vp, STDERR_FILENO, vm_stderr) < 0 && !redir_failed_target) {
+        redir_failed_target = stderr_path;
+        redir_failed_errno = errno;
+    }
+    if (vm_stderr >= 0 && vm_stderr != vm_stdout) {
+        vprocHostClose(vm_stderr);
     }
     if (vm_stdout >= 0) {
-        int host_fd = vm_stdout;
-        int vfd = vprocAdoptHostFd(vp, host_fd);
-        if (vfd >= 0) {
-            vm_stdout = vfd;
-            if (tool_dbg && pipe_dbg) fprintf(stderr, "[bg-stage] adopted stdout host=%d vfd=%d\n", host_fd, vfd);
-        } else if (tool_dbg && pipe_dbg) {
-            fprintf(stderr, "[bg-stage] adopt stdout host=%d failed: %s\n", host_fd, strerror(errno));
-        }
+        vprocHostClose(vm_stdout);
     }
-    if (vm_stderr >= 0) {
-        int host_fd = vm_stderr;
-        int vfd = vprocAdoptHostFd(vp, host_fd);
-        if (vfd >= 0) {
-            vm_stderr = vfd;
-            if (tool_dbg && pipe_dbg) fprintf(stderr, "[bg-stage] adopted stderr host=%d vfd=%d\n", host_fd, vfd);
-        } else if (tool_dbg && pipe_dbg) {
-            fprintf(stderr, "[bg-stage] adopt stderr host=%d failed: %s\n", host_fd, strerror(errno));
-        }
-    }
-    vprocActivate(vp);
+    vm_stdout = -1;
+    vm_stderr = -1;
 #endif
     /* We already materialised stdout/stderr redirs above; skip apply_exec_redirs here.
      * Clear cmd redirs so downstream helpers do not reopen/dup back to the session. */
@@ -2748,26 +2697,7 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
     }
     gShellBackgroundWorkerActive = ctx->prev_worker_flag;
 
-cleanup:
 #if defined(PSCAL_TARGET_IOS)
-    if (stdin_fd >= 0) {
-        vprocCloseShim(stdin_fd);
-        if (vm_stdout == stdin_fd) {
-            vm_stdout = -1;
-        }
-        if (vm_stderr == stdin_fd) {
-            vm_stderr = -1;
-        }
-    }
-    if (vm_stdout >= 0) {
-        vprocCloseShim(vm_stdout);
-        if (vm_stderr == vm_stdout) {
-            vm_stderr = -1;
-        }
-    }
-    if (vm_stderr >= 0) {
-        vprocCloseShim(vm_stderr);
-    }
     if (vp) {
         /* If the synthetic task was terminated via vprocKillShim, reflect that
          * status rather than a default 0 from the builtin dispatcher. */
@@ -3439,7 +3369,7 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd) {
                         shellJobMarkRunning(job);
                         job->last_status = 0;
                     }
-                    gShellRuntime.last_bg_pid = bg_pgid;
+                    gShellRuntime.last_bg_pid = ctx->pids[ctx->launched - 1];
 #if defined(PSCAL_TARGET_IOS)
                     shellPrintJobStarted(job, bg_pgid);
 #endif
@@ -5195,6 +5125,11 @@ static int shellPipelineRunStage(VM *vm,
         ctx->launched = stage_pos + 1;
     }
     vprocDeactivate();
+    /* `eval` or a function alone is the shell going on with its script, no process of its own:
+     * the jobs it started are the shell's, and `wait` there has to find them. */
+    if (ctx->stage_count == 1 && shellStageRunsShellCode(cmd)) {
+        vprocPassChildrenToParent(vprocPid(vp));
+    }
     shellFinalizeStageVproc(vp, status);
 #else
     if (ctx->pids && stage_pos < ctx->stage_count) {
@@ -5392,6 +5327,49 @@ static void *shellPipelineStageThreadMain(void *arg) {
     free(tctx);
     return NULL;
 }
+
+#if defined(PSCAL_TARGET_IOS)
+/* A job's vproc is made by whatever reaches the `&`, and its thread starts under it. So stdio,
+ * the descriptors above it and the directory are copied there and then, as by a fork, and the
+ * thread never touches the vproc that started it: that one may end before the thread first
+ * runs, as `( cmd & )` and `eval "cmd &"` do. */
+static VProc *shellBackgroundStageCreateVProc(ShellBackgroundStageCtx *ctx, const ShellCommand *cmd) {
+    /* A simple command's stdin is /dev/null. A compound command keeps its own. */
+    VProc *vp = shellCreateVProcForStage(cmd->body ? -1 : -2,
+                                         -1,
+                                         -1,
+                                         pscalRuntimeDetectWindowCols(),
+                                         pscalRuntimeDetectWindowRows(),
+                                         ctx->synthetic_pid > 0 ? ctx->synthetic_pid : -1,
+                                         true);
+    if (!vp) {
+        return NULL;
+    }
+    int pid = vprocPid(vp);
+    int shell_pid = vprocGetShellSelfPid();
+    if (ctx->parent_pid > 0) {
+        vprocSetParent(pid, ctx->parent_pid);
+    } else if (shell_pid > 0) {
+        vprocSetParent(pid, shell_pid);
+    }
+    int shell_sid = (shell_pid > 0) ? vprocGetSid(shell_pid) : -1;
+    if (shell_sid > 0) {
+        vprocSetSid(pid, shell_sid);
+    }
+    pid_t group = (ctx->synthetic_pid > 0) ? ctx->synthetic_pid : pid;
+    vprocSetPgid(pid, group);
+    ctx->synthetic_pid = group;
+    /* Label the vproc for lps/ps visibility. */
+    if (cmd->argc > 0 && cmd->argv) {
+        char label[96] = {0};
+        shellVprocFormatLabel(cmd, label, sizeof(label));
+        if (label[0]) {
+            vprocSetCommandLabel(pid, label);
+        }
+    }
+    return vp;
+}
+#endif
 
 static bool shellPipelineExecuteStageInProcess(VM *vm,
                                                ShellPipelineContext *ctx,
@@ -5651,15 +5629,14 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
                 ? PSCALRuntimeGetCurrentRuntimeContext()
                 : NULL;
             bg_ctx->link = shellThreadLinkCapture();
+            bg_ctx->vp = shellBackgroundStageCreateVProc(bg_ctx, cloned);
 
             pthread_t stage_thread = 0;
-            pthread_attr_t attr;
-            pthread_attr_init(&attr);
-            pthread_attr_setstacksize(&attr, SHELL_TOOL_THREAD_STACK_SZ);
-            pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-            int rc = pthread_create(&stage_thread, &attr, shellInProcessBackgroundMain, bg_ctx);
-            pthread_attr_destroy(&attr);
+            int rc = bg_ctx->vp
+                ? vprocSpawnThread(bg_ctx->vp, shellInProcessBackgroundMain, bg_ctx, &stage_thread)
+                : ENOMEM;
             if (rc != 0) {
+                shellFinalizeStageVproc(bg_ctx->vp, 1);
                 shellFreeCommand(cloned);
                 free(cloned);
                 if (bg_ctx->link.ctx) {
@@ -5672,6 +5649,7 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
                 shellAbortPipeline();
                 return false;
             }
+            pthread_detach(stage_thread);
 
             if (async_stage_pid > 0) {
                 pid_t bg_pgid = (async_bg_pgid > 0) ? async_bg_pgid : async_stage_pid;
@@ -5681,7 +5659,8 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
                     shellJobMarkRunning(job);
                     job->last_status = 0;
                 }
-                gShellRuntime.last_bg_pid = bg_pgid;
+                /* The job's own pid: in a subshell the group is the subshell's. */
+                gShellRuntime.last_bg_pid = async_stage_pid;
 #if defined(PSCAL_TARGET_IOS)
                 shellPrintJobStarted(job, bg_pgid);
 #endif
@@ -5780,7 +5759,7 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
                     shellJobMarkRunning(job);
                     job->last_status = 0;
                 }
-                gShellRuntime.last_bg_pid = bg_pgid;
+                gShellRuntime.last_bg_pid = ctx->pids[stage_pos];
 #if defined(PSCAL_TARGET_IOS)
                 shellPrintJobStarted(job, bg_pgid);
 #endif

@@ -3120,6 +3120,21 @@ static bool vprocRegistryContains(const VProc *vp) {
     return found;
 }
 
+/* For a pointer that may be freed: only its address is compared until the registry has it,
+ * and the pid tells it from a newer vproc at the same address. */
+static bool vprocRegistryHoldsPid(const VProc *vp, int pid) {
+    bool found = false;
+    pthread_mutex_lock(&gVProcRegistryMu);
+    for (size_t i = 0; i < gVProcRegistryCount; ++i) {
+        if (gVProcRegistry[i] == vp) {
+            found = (vp->pid == pid);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&gVProcRegistryMu);
+    return found;
+}
+
 static void vprocClearThreadState(void) {
     gVProcCurrent = NULL;
     gVProcStackDepth = 0;
@@ -3243,6 +3258,7 @@ static int vprocSetForegroundPgidInternal(int sid, int fg_pgid, bool sync_tty);
 static void vprocSyncForegroundPgidToSessionTty(int sid, int fg_pgid);
 static struct pscal_fd *vprocSessionPscalFdForStd(int fd);
 static void vprocUnregisterThreadByPid(int pid, pthread_t tid);
+static void vprocRegisterStartedThread(int pid, pthread_t tid);
 static void vprocScratchTlsCleanupCurrentThread(void);
 static __thread bool gVprocPipelineStage = false;
 typedef void (*VprocStopWaitHookFn)(void);
@@ -8002,6 +8018,33 @@ static void vprocForgetSavedStdioLocked(VProc *vp, int host_fd) {
     }
 }
 
+int vprocReplaceStdio(VProc *vp, int target_fd, int host_src) {
+    if (!vp || target_fd < STDIN_FILENO || target_fd > STDERR_FILENO || host_src < 0) {
+        errno = EBADF;
+        return -1;
+    }
+    int cloned = vprocCloneFd(host_src);
+    if (cloned < 0) {
+        return -1;
+    }
+    (void)vprocClose(vp, target_fd);
+
+    pthread_mutex_lock(&vp->mu);
+    vp->entries[target_fd].host_fd = cloned;
+    vp->entries[target_fd].pscal_fd = NULL;
+    vp->entries[target_fd].kind = VPROC_FD_HOST;
+    if (target_fd == STDIN_FILENO) {
+        vp->stdin_host_fd = cloned;
+        vp->stdin_from_session = false;
+    } else if (target_fd == STDOUT_FILENO) {
+        vp->stdout_host_fd = cloned;
+    } else {
+        vp->stderr_host_fd = cloned;
+    }
+    pthread_mutex_unlock(&vp->mu);
+    return target_fd;
+}
+
 void vprocDestroy(VProc *vp) {
     if (!vp) {
         return;
@@ -8256,13 +8299,15 @@ static void *vprocThreadTrampoline(void *arg) {
     VProc *vp = ctx ? ctx->vp : NULL;
     int vp_pid = (ctx && ctx->vp_pid > 0) ? ctx->vp_pid : 0;
     bool vp_activated = false;
-    if (vp) {
-        if (vp_pid <= 0) {
-            vp_pid = vp->pid;
-        }
+    /* A creator does not wait for this thread, so its vproc may be gone. Activating it would
+     * mark the pointer as checked, and the next vprocCurrent would hand it out. The version
+     * is read first: a vproc destroyed after the check is noticed at the next use. */
+    unsigned long long registry_version = __atomic_load_n(&gVProcRegistryVersion, __ATOMIC_ACQUIRE);
+    if (vp && vprocRegistryHoldsPid(vp, vp_pid)) {
         vprocActivate(vp);
+        gVProcRegistrySeenVersion = registry_version;
         vp_activated = true;
-        vprocRegisterThread(vp, pthread_self());
+        vprocRegisterStartedThread(vp_pid, pthread_self());
     }
 
     /* A thread of a program reads the program's environment, as its creator does. */
@@ -9122,6 +9167,32 @@ int vprocRegisterThread(VProc *vp, pthread_t tid) {
     return vp->pid;
 }
 
+/* Registers a thread by pid alone, for callers whose vproc may be gone. A task that has
+ * ended stays ended: no thread is added to it, and no slot is made for a pid already reaped. */
+static void vprocRegisterStartedThread(int pid, pthread_t tid) {
+    if (pid <= 0) {
+        return;
+    }
+    char thread_name[16];
+    bool rename_thread = false;
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    if (entry && !entry->exited) {
+        bool duplicate = vprocTaskEntryHasThreadLocked(entry, tid);
+        if (duplicate || vprocEnsureThreadCapacityLocked(entry, entry->thread_count + 1)) {
+            if (!duplicate) {
+                entry->threads[entry->thread_count++] = tid;
+            }
+            entry->tid = tid;
+            rename_thread = vprocPrepareThreadNameLocked(entry, thread_name, sizeof(thread_name));
+        }
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    if (rename_thread) {
+        vprocApplyThreadName(thread_name);
+    }
+}
+
 static void vprocUnregisterThreadByPid(int pid, pthread_t tid) {
     if (pid <= 0) {
         return;
@@ -9167,10 +9238,11 @@ int vprocSpawnThread(VProc *vp, void *(*start_routine)(void *), void *arg, pthre
         errno = ENOMEM;
         return ENOMEM;
     }
+    int vp_pid = vp->pid;
     ctx->start_routine = start_routine;
     ctx->arg = arg;
     ctx->vp = vp;
-    ctx->vp_pid = vp->pid;
+    ctx->vp_pid = vp_pid;
     ctx->session_stdio = vprocSessionStdioCurrent();
     ctx->shell_self_pid = vprocGetShellSelfPid();
     ctx->kernel_pid = vprocGetKernelPid();
@@ -9203,6 +9275,9 @@ int vprocSpawnThread(VProc *vp, void *(*start_routine)(void *), void *arg, pthre
         errno = rc;
         return rc;
     }
+    /* A kill from here on cancels the thread, even one that has not run yet. It may also have
+     * finished and destroyed vp already, so this goes by the pid. */
+    vprocRegisterStartedThread(vp_pid, thread);
     if (thread_out) {
         *thread_out = thread;
     }
@@ -9311,6 +9386,18 @@ void vprocSetParent(int pid, int parent_pid) {
         }
     }
     vprocUpdateParentLocked(pid, parent_pid);
+    pthread_mutex_unlock(&gVProcTasks.mu);
+}
+
+void vprocPassChildrenToParent(int pid) {
+    if (pid <= 0) {
+        return;
+    }
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    if (entry && entry->parent_pid > 0) {
+        vprocReparentChildrenLocked(pid, entry->parent_pid);
+    }
     pthread_mutex_unlock(&gVProcTasks.mu);
 }
 

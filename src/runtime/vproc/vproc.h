@@ -98,6 +98,9 @@ void vprocMarkFdInherited(VProc *vp, int fd);
 void vprocShellFdFollow(int fd);
 /* Sync vproc table entry to a host fd already duplicated onto target_fd. */
 int vprocRestoreHostFd(VProc *vp, int target_fd, int host_src);
+/* A stdio slot becomes a copy of host_src for good, as between fork and exec: nothing of what
+ * it held stays open. The caller keeps host_src. */
+int vprocReplaceStdio(VProc *vp, int target_fd, int host_src);
 int vprocClose(VProc *vp, int fd);
 int vprocPipe(VProc *vp, int pipefd[2]);
 /* Duplicate a host fd onto a target host descriptor, bypassing shim indirection. */
@@ -198,6 +201,8 @@ void vprocUnregisterThread(VProc *vp, pthread_t tid);
 int vprocSpawnThread(VProc *vp, void *(*start_routine)(void *), void *arg, pthread_t *thread_out);
 void vprocMarkExit(VProc *vp, int status);
 void vprocSetParent(int pid, int parent_pid);
+/* What pid started becomes its parent's, for a vproc that stands for no process of its own. */
+void vprocPassChildrenToParent(int pid);
 int vprocSetPgid(int pid, int pgid);
 int vprocSetSid(int pid, int sid);
 int vprocGetPgid(int pid);
@@ -540,6 +545,12 @@ static inline int vprocDup(VProc *vp, int fd) { (void)vp; (void)fd; return -1; }
 static inline void vprocMarkFdInherited(VProc *vp, int fd) { (void)vp; (void)fd; }
 static inline void vprocShellFdFollow(int fd) { (void)fd; }
 static inline int vprocDup2(VProc *vp, int fd, int target) { (void)vp; (void)fd; (void)target; return -1; }
+static inline int vprocReplaceStdio(VProc *vp, int target_fd, int host_src) {
+    (void)vp;
+    (void)target_fd;
+    (void)host_src;
+    return 0;
+}
 static inline int vprocRestoreHostFd(VProc *vp, int target_fd, int host_src) {
     (void)vp;
     (void)target_fd;
@@ -595,6 +606,7 @@ static inline int vprocGetWinsize(VProc *vp, VProcWinsize *out) { if (out) { out
 static inline int vprocRegisterThread(VProc *vp, pthread_t tid) { (void)vp; (void)tid; return 0; }
 static inline void vprocMarkExit(VProc *vp, int status) { (void)vp; (void)status; }
 static inline void vprocSetParent(int pid, int parent_pid) { (void)pid; (void)parent_pid; }
+static inline void vprocPassChildrenToParent(int pid) { (void)pid; }
 static inline int vprocSetPgid(int pid, int pgid) { (void)pid; (void)pgid; return 0; }
 static inline int vprocSetSid(int pid, int sid) { (void)pid; (void)sid; return 0; }
 static inline int vprocGetPgid(int pid) { (void)pid; return -1; }
