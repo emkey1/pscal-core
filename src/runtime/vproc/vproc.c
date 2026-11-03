@@ -10896,6 +10896,33 @@ static bool vprocKillDeliverEntryLocked(VProcTaskEntry *entry,
     return true;
 }
 
+int vprocKillTree(pid_t pid, int sig) {
+    /* Gathered first: a delivery can move a task's children to another parent. */
+    int pids[256];
+    size_t count = 1;
+    pids[0] = (int)pid;
+    pthread_mutex_lock(&gVProcTasks.mu);
+    for (size_t i = 0; i < count; ++i) {
+        VProcTaskEntry *entry = vprocTaskFindLocked(pids[i]);
+        if (!entry || !entry->children) {
+            continue;
+        }
+        for (size_t c = 0; c < entry->child_count && count < sizeof(pids) / sizeof(pids[0]); ++c) {
+            if (entry->children[c] > 0) {
+                pids[count++] = entry->children[c];
+            }
+        }
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    int rc = vprocKillShim(pid, sig);
+    int saved_errno = errno;
+    for (size_t i = 1; i < count; ++i) {
+        (void)vprocKillShim(pids[i], sig);
+    }
+    errno = saved_errno;
+    return rc;
+}
+
 int vprocKillShim(pid_t pid, int sig) {
     bool dbg = vprocKillDebugEnabled();
     if (sig < 0 || sig >= 32) {
@@ -11067,6 +11094,8 @@ typedef struct {
     VProcExecEntryFn entry;
     int argc;
     char **argv;
+    VProcEnv *env;
+    int status;
 } VProcSimExecCtx;
 
 typedef struct {
@@ -11351,20 +11380,51 @@ static bool vprocSimForkCloneFdTable(VProc *child, VProc *parent) {
     return true;
 }
 
-static void *vprocSimExecThread(void *arg) {
+static void vprocSimExecFinish(void *arg) {
     VProcSimExecCtx *ctx = (VProcSimExecCtx *)arg;
-    int status = 127;
-    if (ctx && ctx->entry) {
-        status = ctx->entry(ctx->argc, ctx->argv);
-    }
-    if (ctx && ctx->vp) {
-        vprocMarkExit(ctx->vp, status);
+    /* This also runs on the normal way out, where a kill could stop it half done. */
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+    if (ctx->vp) {
+        vprocMarkExit(ctx->vp, ctx->status);
         vprocDestroy(ctx->vp);
     }
-    if (ctx) {
-        vprocSimFreeArgv(ctx->argv, ctx->argc);
-        free(ctx);
+    vprocEnvActivate(NULL);
+    vprocEnvRelease(ctx->env);
+    vprocSimFreeArgv(ctx->argv, ctx->argc);
+    free(ctx);
+}
+
+/* True when the task was killed before this, its first thread, was there to be cancelled. */
+static bool vprocSimExecAlreadyKilled(VProc *vp) {
+    bool exited = false;
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vp ? vprocTaskFindLocked(vp->pid) : NULL;
+    if (entry) {
+        exited = entry->exited;
     }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    return exited;
+}
+
+static void *vprocSimExecThread(void *arg) {
+    VProcSimExecCtx *ctx = (VProcSimExecCtx *)arg;
+    if (!ctx) {
+        return (void *)(intptr_t)127;
+    }
+    int status = 127;
+    ctx->status = status;
+    /* A kill cancels this thread and the app's exit() is pthread_exit. Either way what the
+     * child held has to close, or the pipes it held never reach end of file. */
+    pthread_cleanup_push(vprocSimExecFinish, ctx);
+    if (ctx->vp) {
+        vprocSetSubshellPid(vprocPid(ctx->vp));
+    }
+    vprocEnvActivate(ctx->env);
+    if (ctx->entry && !vprocSimExecAlreadyKilled(ctx->vp)) {
+        ctx->status = ctx->entry(ctx->argc, ctx->argv);
+    }
+    status = ctx->status;
+    pthread_cleanup_pop(1);
     return (void *)(intptr_t)status;
 }
 
@@ -11385,10 +11445,13 @@ static int vprocSimSpawnChild(VProc *vp, VProcExecEntryFn entry, char *const arg
     ctx->entry = entry;
     ctx->argc = argc;
     ctx->argv = argv_copy;
+    /* A process's environment is its own from here on, as with fork. */
+    ctx->env = vprocEnvCapture();
 
     pthread_t tid;
     int err = vprocSpawnThread(vp, vprocSimExecThread, ctx, &tid);
     if (err != 0) {
+        vprocEnvRelease(ctx->env);
         vprocSimFreeArgv(argv_copy, argc);
         free(ctx);
         errno = err;
@@ -11530,6 +11593,42 @@ int vprocSimulatedExec(VProcExecEntryFn entry, char *const argv[]) {
     vprocDeactivate();
     siglongjmp(*state->parent_env, 1);
     return -1;
+}
+
+pid_t vprocSpawnEntry(const char *label,
+                      bool inherit_parent_pgid,
+                      VProcExecEntryFn entry,
+                      char *const argv[]) {
+    if (!entry) {
+        errno = ENOENT;
+        return (pid_t)-1;
+    }
+    VProcCommandScope scope;
+    if (!vprocCommandScopeBegin(&scope, label, true, inherit_parent_pgid)) {
+        errno = ENOSYS;
+        return (pid_t)-1;
+    }
+    if (scope.prev && !vprocSimForkCloneFdTable(scope.vp, scope.prev)) {
+        int saved_errno = (errno != 0) ? errno : EIO;
+        vprocCommandScopeEnd(&scope, 127);
+        errno = saved_errno;
+        return (pid_t)-1;
+    }
+    /* Off the child before it starts: a kill must not cancel this thread, and the child's
+     * thread may have finished and destroyed the vproc by the time the spawn returns. */
+    int pid = scope.pid;
+    VProc *vp = scope.vp;
+    vprocUnregisterThreadByPid(pid, pthread_self());
+    vprocDeactivate();
+    if (vprocSimSpawnChild(vp, entry, argv) != 0) {
+        int saved_errno = (errno != 0) ? errno : EIO;
+        vprocMarkExit(vp, 127);
+        vprocDiscard(pid);
+        vprocDestroy(vp);
+        errno = saved_errno;
+        return (pid_t)-1;
+    }
+    return (pid_t)pid;
 }
 
 bool vprocCommandScopeBegin(VProcCommandScope *scope,
@@ -14381,6 +14480,51 @@ static int vprocHostIsatty(int fd) {
 
 static struct pscal_fd *vprocSessionPscalFdForStd(int fd);
 
+/* The name of the terminal behind a slot. The host's ttyname would look up whatever host
+ * descriptor has the slot's number, and has never heard of the app's terminals. */
+char *vprocTtynameShim(int fd) {
+    static __thread char name[32];
+    VProc *vp = vprocForThread();
+    struct pscal_fd *pscal_fd = NULL;
+    int host = -1;
+    if (vp) {
+        host = vprocResolveFdForShim(vp, fd, 0, &pscal_fd);
+    }
+#if defined(PSCAL_TARGET_IOS)
+    if (!pscal_fd && host < 0 &&
+        (fd == STDIN_FILENO || fd == STDOUT_FILENO || fd == STDERR_FILENO)) {
+        pscal_fd = vprocSessionPscalFdForStd(fd);
+    }
+#endif
+    if (pscal_fd) {
+        struct tty *tty = pscal_fd->tty;
+        int type = tty ? tty->type : 0;
+        int num = tty ? tty->num : -1;
+        pscal_fd_close(pscal_fd);
+        if (!tty) {
+            errno = ENOTTY;
+            return NULL;
+        }
+        if (type == TTY_PSEUDO_SLAVE_MAJOR) {
+            snprintf(name, sizeof(name), "/dev/pts/%d", num);
+        } else if (type == TTY_PSEUDO_MASTER_MAJOR) {
+            snprintf(name, sizeof(name), "/dev/ptmx");
+        } else if (type == TTY_CONSOLE_MAJOR) {
+            snprintf(name, sizeof(name), "/dev/tty%d", num);
+        } else {
+            snprintf(name, sizeof(name), "/dev/tty");
+        }
+        return name;
+    }
+    if (host < 0) {
+        host = shimTranslate(fd, 1);
+    }
+    if (host < 0) {
+        return NULL;
+    }
+    return ttyname(host);
+}
+
 int vprocIsattyShim(int fd) {
     VProc *vp = vprocForThread();
     if (vp) {
@@ -14961,6 +15105,14 @@ int vprocFstatShim(int fd, struct stat *st) {
             memset(st, 0, sizeof(*st));
             st->st_mode = S_IFCHR | 0600;
             st->st_nlink = 1;
+            if (pscal_fd->ops == &kVprocInprocPipeReadOps || pscal_fd->ops == &kVprocInprocPipeWriteOps) {
+                /* A pipeline's pipe: both ends are one file, as on a host. */
+                VprocInprocEnd *end = (VprocInprocEnd *)pscal_fd->userdata;
+                st->st_mode = S_IFIFO | 0600;
+                st->st_ino = (ino_t)(uintptr_t)(end ? end->pipe : NULL);
+                st->st_uid = (uid_t)geteuid();
+                st->st_gid = (gid_t)getegid();
+            }
             if (pscal_fd->tty) {
                 st->st_rdev = makedev(pscal_fd->tty->type, pscal_fd->tty->num);
                 st->st_ino = (ino_t)(pscal_fd->tty->num + 3);

@@ -323,6 +323,7 @@ DIR *vprocOpendirShim(const char *name);
 int vprocSymlinkShim(const char *target, const char *linkpath);
 ssize_t vprocReadlinkShim(const char *path, char *buf, size_t size);
 char *vprocRealpathShim(const char *path, char *resolved_path);
+char *vprocTtynameShim(int fd);
 int vprocIoctlShim(int fd, unsigned long request, ...);
 off_t vprocLseekShim(int fd, off_t offset, int whence);
 int vprocOpenShim(const char *path, int flags, ...);
@@ -330,6 +331,9 @@ int vprocPollShim(struct pollfd *fds, nfds_t nfds, int timeout);
 int vprocSelectShim(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout);
 pid_t vprocWaitPidShim(pid_t pid, int *status_out, int options);
 int vprocKillShim(pid_t pid, int sig);
+/* kill() for a task and everything under it, for what a host does with a process group: a
+ * stage's group is its own here, so a group kill does not reach what a nested shell runs. */
+int vprocKillTree(pid_t pid, int sig);
 pid_t vprocGetPidShim(void);
 pid_t vprocGetPpidShim(void);
 pid_t vprocGetpgrpShim(void);
@@ -524,6 +528,13 @@ pid_t vprocSimulatedForkWithEnv(const char *label,
                                 sigjmp_buf *parent_env);
 pid_t vprocSimulatedForkParentResume(void);
 int vprocSimulatedExec(VProcExecEntryFn entry, char *const argv[]);
+/* fork and exec as one call, for a caller with nothing to do between them: a new vproc with
+ * the caller's descriptors, environment and directory, running entry on a thread of its own.
+ * The pid is the caller's child, for the shims' waitpid and kill. */
+pid_t vprocSpawnEntry(const char *label,
+                      bool inherit_parent_pgid,
+                      VProcExecEntryFn entry,
+                      char *const argv[]);
 
 /* Signal API shims: allow vproc_shim.h to virtualize signal dispositions when
  * a vproc is active on the current thread. */
@@ -703,6 +714,7 @@ static inline int vprocCloseShim(int fd) { return close(fd); }
 static inline int vprocFsyncShim(int fd) { return fsync(fd); }
 static inline int vprocPipeShim(int pipefd[2]) { return pipe(pipefd); }
 static inline int vprocFstatShim(int fd, struct stat *st) { return fstat(fd, st); }
+static inline char *vprocTtynameShim(int fd) { return ttyname(fd); }
 static inline int vprocStatShim(const char *path, struct stat *st) { return stat(path, st); }
 static inline int vprocLstatShim(const char *path, struct stat *st) { return lstat(path, st); }
 static inline int vprocChdirShim(const char *path) { return chdir(path); }
@@ -749,6 +761,7 @@ static inline int vprocOpenShim(const char *path, int flags, ...) {
 }
 static inline pid_t vprocWaitPidShim(pid_t pid, int *status_out, int options) { return waitpid(pid, status_out, options); }
 static inline int vprocKillShim(pid_t pid, int sig) { return kill(pid, sig); }
+static inline int vprocKillTree(pid_t pid, int sig) { return kill(pid, sig); }
 static inline pid_t vprocGetPidShim(void) { return getpid(); }
 static inline pid_t vprocGetPpidShim(void) { return getppid(); }
 static inline pid_t vprocGetpgrpShim(void) { return getpgrp(); }
@@ -955,6 +968,17 @@ static inline int vprocSimulatedExec(VProcExecEntryFn entry, char *const argv[])
     (void)argv;
     errno = ENOSYS;
     return -1;
+}
+static inline pid_t vprocSpawnEntry(const char *label,
+                                    bool inherit_parent_pgid,
+                                    VProcExecEntryFn entry,
+                                    char *const argv[]) {
+    (void)label;
+    (void)inherit_parent_pgid;
+    (void)entry;
+    (void)argv;
+    errno = ENOSYS;
+    return (pid_t)-1;
 }
 static inline int vprocSetSigchldBlocked(int pid, bool block) { (void)pid; (void)block; return 0; }
 static inline void vprocClearSigchldPending(int pid) { (void)pid; }

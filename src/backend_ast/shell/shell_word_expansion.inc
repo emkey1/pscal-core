@@ -2610,9 +2610,11 @@ static bool shellInvokeBuiltin(VM *vm, ShellCommand *cmd) {
     }
 #if defined(PSCAL_TARGET_IOS)
     /* The VM's math and file routines of these names take values, not a command
-     * line (`ln -s a b` called ln(x)). As commands they mean the applets. */
+     * line (`ln -s a b` called ln(x), `halt -w` called Halt("-w")). As commands they
+     * mean the applets. poweroff and reboot get here as halt, their canonical name. */
     if ((strcasecmp(lookup, "ln") == 0 || strcasecmp(lookup, "mkdir") == 0 ||
-         strcasecmp(lookup, "rmdir") == 0 || strcasecmp(lookup, "reset") == 0) &&
+         strcasecmp(lookup, "rmdir") == 0 || strcasecmp(lookup, "reset") == 0 ||
+         strcasecmp(lookup, "halt") == 0) &&
         smallclueFindApplet(lookup) != NULL) {
         return false;
     }
