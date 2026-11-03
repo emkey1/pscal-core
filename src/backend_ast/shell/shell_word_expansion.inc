@@ -2730,8 +2730,9 @@ static ShellJob *shellRegisterJob(pid_t pgid, const pid_t *pids, size_t pid_coun
 
     gShellJobs = new_jobs;
     ShellJob *job = &gShellJobs[gShellJobCount++];
-    /* Preserve any existing vproc job id; otherwise allocate a new one and stamp it. */
-    int job_id = vprocGetJobId(pgid);
+    /* Preserve any existing vproc job id; otherwise allocate a new one and stamp it. A
+     * subshell's jobs share its group, so the group's id says nothing about which job this is. */
+    int job_id = gShellRuntime.in_subshell ? 0 : vprocGetJobId(pgid);
     if (job_id <= 0 && pid_count > 0) {
         job_id = vprocGetJobId(pids[0]);
     }
@@ -2766,7 +2767,9 @@ static ShellJob *shellRegisterJob(pid_t pgid, const pid_t *pids, size_t pid_coun
     }
     if (job_id <= 0) {
         job_id = (int)shellAllocateJobId();
-        vprocSetJobId(pgid, job_id);
+        if (!gShellRuntime.in_subshell) {
+            vprocSetJobId(pgid, job_id);
+        }
         for (size_t i = 0; i < pid_count; ++i) {
             vprocSetJobId(pids[i], job_id);
         }

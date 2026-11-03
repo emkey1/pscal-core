@@ -1841,7 +1841,8 @@ static void shellPrintJobStarted(const ShellJob *job, pid_t pid) {
     if (pid <= 0) {
         return;
     }
-    if (!shellRuntimeIsInteractive()) {
+    /* As under bash: a prompt announces its own jobs, on stderr, and a subshell announces none. */
+    if (!shellRuntimeIsInteractive() || gShellRuntime.in_subshell) {
         return;
     }
     size_t job_id = job ? job->id : 0;
@@ -1851,7 +1852,7 @@ static void shellPrintJobStarted(const ShellJob *job, pid_t pid) {
     if (job_id == 0) {
         return;
     }
-    shellFdPrintf(STDOUT_FILENO, "[%zu] %d\n", job_id, (int)pid);
+    shellFdPrintf(STDERR_FILENO, "[%zu] %d\n", job_id, (int)pid);
 }
 #endif
 

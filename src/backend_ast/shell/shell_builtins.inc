@@ -4067,20 +4067,28 @@ static Value shellRunToolInEnvironment(VM *vm,
                     tool_name ? tool_name : "<null>", (int)background, (int)gShellBackgroundWorkerActive, argc);
             }
             if (background && gShellBackgroundWorkerActive) {
-                fprintf(stderr, "[tool-inline] %s argc=%d (bg worker)\n", tool_name, argc);
-                for (int i = 0; i < argc; ++i) {
-                    fprintf(stderr, "[tool-inline] argv[%d]=%s\n", i, argv[i] ? argv[i] : "(null)");
+                if (tool_dbg) {
+                    fprintf(stderr, "[tool-inline] %s argc=%d (bg worker)\n", tool_name, argc);
+                    for (int i = 0; i < argc; ++i) {
+                        fprintf(stderr, "[tool-inline] argv[%d]=%s\n", i, argv[i] ? argv[i] : "(null)");
+                    }
                 }
                 /* Already running inside a background worker: execute inline so redirections
                  * remain active for this thread. */
                 bool frontend_reset = false;
                 status = shellRunToolInlineWithRestore(entry, argc, argv, tool_dbg, target_kind, &frontend_reset);
-                fprintf(stderr, "[tool-inline] %s exit=%d\n", tool_name, status);
+                if (tool_dbg) {
+                    fprintf(stderr, "[tool-inline] %s exit=%d\n", tool_name, status);
+                }
             } else if (background || target_kind == FRONTEND_KIND_SHELL) {
-                fprintf(stderr, "[tool-thread] %s argc=%d bg=%d\n", tool_name, argc, (int)background);
+                if (tool_dbg) {
+                    fprintf(stderr, "[tool-thread] %s argc=%d bg=%d\n", tool_name, argc, (int)background);
+                }
                 bool frontend_reset = false;
                 status = shellRunToolInThread(entry, argc, argv, target_kind, needs_shell_ctx, background, &frontend_reset);
-                fprintf(stderr, "[tool-thread] %s dispatched status=%d\n", tool_name, status);
+                if (tool_dbg) {
+                    fprintf(stderr, "[tool-thread] %s dispatched status=%d\n", tool_name, status);
+                }
                 if (!frontend_reset) {
                     shellInvalidateFrontendState(target_kind);
                 }
