@@ -4109,6 +4109,10 @@ static bool shellDirectoryStackChdir(VM *vm,
         shellUpdateStatus(1);
         return false;
     }
+    /* bash's `cd ""` stays put, though an empty path itself names nothing. */
+    if (!target[0]) {
+        target = ".";
+    }
     char old_cwd[PATH_MAX];
     if (!SHELL_GETCWD(old_cwd, sizeof(old_cwd))) {
         shellDirectoryStackReportErrno(vm, builtin);

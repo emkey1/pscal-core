@@ -6910,6 +6910,12 @@ static bool vprocResolveVirtualPath(VProc *vp, const char *path, char *out, size
         errno = EINVAL;
         return false;
     }
+    if (!path[0]) {
+        /* An empty path names nothing. Taken as the cwd, `rm -rf ""` walks it
+         * and removes "/<child>" for each entry, from the virtual root. */
+        errno = ENOENT;
+        return false;
+    }
     if (path[0] == '/') {
         const char *source = path;
         char stripped[PATH_MAX];

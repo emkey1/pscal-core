@@ -237,7 +237,8 @@ static const char *pathVirtualizedResolveAgainstVirtualCwd(const char *path,
     if (!path) {
         return NULL;
     }
-    if (path[0] == '/' || !resolved || resolved_len == 0) {
+    /* An empty path stays empty, so the host call fails with ENOENT rather than meaning the cwd. */
+    if (path[0] == '/' || path[0] == '\0' || !resolved || resolved_len == 0) {
         return path;
     }
     char cwd[PATH_MAX];
@@ -434,7 +435,7 @@ int pscalPathVirtualized_glob(const char *pattern,
     }
 
     char resolved_pattern[PATH_MAX];
-    bool relative_pattern = (pattern && pattern[0] != '/');
+    bool relative_pattern = (pattern && pattern[0] && pattern[0] != '/');
     const char *resolved_input =
         pathVirtualizedResolveAgainstVirtualCwd(pattern, resolved_pattern, sizeof(resolved_pattern));
 
