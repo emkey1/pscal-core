@@ -3483,12 +3483,9 @@ static bool vprocCommandLooksRemoteClient(const char *label) {
         }
     }
     size_t len = (size_t)(end - base);
-    if (len == 3 &&
-        tolower((unsigned char)base[0]) == 's' &&
-        tolower((unsigned char)base[1]) == 's' &&
-        tolower((unsigned char)base[2]) == 'h') {
-        return true;
-    }
+    /* ssh isn't here: ^C belongs to the remote end only when ssh has a terminal
+     * there, and smallclue then sets the session's passthrough flag. Without one
+     * ^C has to stop it, whichever way it was started. */
     if (len == 3 &&
         tolower((unsigned char)base[0]) == 's' &&
         tolower((unsigned char)base[1]) == 'c' &&
