@@ -108,6 +108,10 @@ static char *shellParamMarkWord(const char *raw, size_t len, bool in_double) {
     size_t length = 0;
     size_t capacity = 0;
     shellBufferEnsure(&out, &length, &capacity, len + 8);
+    if (out) {
+        /* An empty word leaves the loop below with nothing appended. */
+        out[0] = '\0';
+    }
     bool in_inner_double = false;
     size_t i = 0;
     while (i < len) {
