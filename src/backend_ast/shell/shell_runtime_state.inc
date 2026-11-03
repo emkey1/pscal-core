@@ -599,6 +599,7 @@ typedef struct ShellRuntimeState {
     bool continue_requested;
     bool pipeline_subshell_active;
     bool in_subshell;
+    bool started_as_command; /* a shell inside its caller: the session's jobs are not its own */
     pid_t subshell_parent_pid; /* $$ in a subshell is its shell's */
     int break_requested_levels;
     int continue_requested_levels;
@@ -3522,6 +3523,64 @@ void shellRuntimeSetPromptStatus(int status) {
     gShellRuntime.last_status = status;
 }
 
+/* What such a line leaves for the next: this is the shell's state, not the line's.
+ * What it owns is swapped, so that the line's context frees what the shell had.
+ * Everything else in there ends with the line, loop, pipeline and condition state
+ * above all, which Ctrl-C can leave half done. */
+void shellRuntimeKeepLineState(ShellRuntimeState *line_ctx) {
+    ShellRuntimeState *shell = shellGetContext();
+    if (!line_ctx || line_ctx == shell) {
+        return;
+    }
+#define KEEP(field) shell->field = line_ctx->field
+#define KEEP_OWNED(field) \
+    do { \
+        __typeof__(shell->field) held = shell->field; \
+        shell->field = line_ctx->field; \
+        line_ctx->field = held; \
+    } while (0)
+    KEEP(errexit_enabled);
+    KEEP(pipefail_enabled);
+    KEEP(nounset_enabled);
+    KEEP(noglob_enabled);
+    KEEP(noclobber_enabled);
+    KEEP(xtrace_enabled);
+    KEEP(verbose_enabled);
+    KEEP(braceexpand_disabled);
+    KEEP(allexport_enabled);
+    KEEP(posix_mode);
+    KEEP(last_bg_pid);
+    KEEP(job_next_id);
+    KEEP(getopts_index);
+    KEEP(getopts_offset);
+    KEEP(trap_enabled);
+    KEEP(dir_stack_initialised);
+    KEEP_OWNED(dir_stack);
+    KEEP_OWNED(dir_stack_count);
+    KEEP_OWNED(dir_stack_capacity);
+    KEEP_OWNED(hash_entries);
+    KEEP_OWNED(hash_count);
+    KEEP_OWNED(hash_capacity);
+    KEEP_OWNED(disabled_builtins);
+    KEEP_OWNED(disabled_builtin_count);
+    KEEP_OWNED(disabled_builtin_capacity);
+    KEEP_OWNED(readonly_vars);
+    KEEP_OWNED(readonly_var_count);
+    KEEP_OWNED(readonly_var_capacity);
+    KEEP_OWNED(array_vars);
+    KEEP_OWNED(array_var_count);
+    KEEP_OWNED(array_var_capacity);
+    KEEP_OWNED(jobs);
+    KEEP_OWNED(job_count);
+    KEEP_OWNED(history);
+    KEEP_OWNED(exit_trap);
+    for (int i = 0; i < NSIG; ++i) {
+        KEEP_OWNED(signal_traps[i]);
+    }
+#undef KEEP_OWNED
+#undef KEEP
+}
+
 void shellRuntimeRefreshTrapEnabled(void) {
     gShellRuntime.trap_enabled = false;
 #ifdef SIGINT
@@ -4788,6 +4847,7 @@ ShellRuntimeState *shellRuntimeCreateContext(void) {
                 const ShellJob *src = &template_ctx->jobs[i];
                 ShellJob *dst = &ctx->jobs[i];
                 dst->pgid = src->pgid;
+                dst->id = src->id;
                 dst->running = src->running;
                 dst->stopped = src->stopped;
                 dst->disowned = src->disowned;
@@ -4912,7 +4972,40 @@ static ShellRuntimeState *shellRuntimeCreateProgramContext(void) {
     ctx->readonly_var_capacity = 0;
     ctx->local_scope_active = false;
     ctx->pipeline_subshell_active = false;
+    ctx->errexit_enabled = false;
+    ctx->pipefail_enabled = false;
+    ctx->nounset_enabled = false;
+    ctx->noglob_enabled = false;
+    ctx->noclobber_enabled = false;
+    ctx->xtrace_enabled = false;
+    ctx->verbose_enabled = false;
+    ctx->braceexpand_disabled = false;
     ctx->allexport_enabled = false;
+    /* A signal being ignored stays ignored across exec. A trap does not. */
+    for (int i = 0; i < NSIG; ++i) {
+        if (ctx->signal_traps[i].action != SHELL_TRAP_ACTION_IGNORE) {
+            shellTrapClearEntry(&ctx->signal_traps[i]);
+        }
+    }
+    shellTrapClearEntry(&ctx->exit_trap);
+    /* The caller's to wait for, not this shell's. */
+    for (size_t i = 0; i < ctx->job_count; ++i) {
+        free(ctx->jobs[i].pids);
+        free(ctx->jobs[i].command);
+    }
+    free(ctx->jobs);
+    ctx->jobs = NULL;
+    ctx->job_count = 0;
+    ctx->last_bg_pid = 0;
+    ctx->started_as_command = true;
+    for (size_t i = 0; i < ctx->dir_stack_count; ++i) {
+        free(ctx->dir_stack[i]);
+    }
+    free(ctx->dir_stack);
+    ctx->dir_stack = NULL;
+    ctx->dir_stack_count = 0;
+    ctx->dir_stack_capacity = 0;
+    ctx->dir_stack_initialised = false;
     for (size_t i = 0; i < ctx->private_function_count; ++i) {
         free(ctx->private_functions[i].name);
         free(ctx->private_functions[i].parameter_metadata);

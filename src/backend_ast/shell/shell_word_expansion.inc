@@ -1702,6 +1702,17 @@ static ShellHistoryExpandResult shellExpandHistoryDesignatorAt(const char *input
     return SHELL_HISTORY_EXPAND_OK;
 }
 
+/* Bash's own exceptions: $!, ${!name} and [!...] are not history references. */
+static bool shellBangIsShellSyntax(const char *input, size_t at) {
+    if (at > 0 && input[at - 1] == '$') {
+        return true;
+    }
+    if (at > 1 && input[at - 1] == '{' && input[at - 2] == '$' && strchr(input + at + 1, '}')) {
+        return true;
+    }
+    return at > 0 && input[at - 1] == '[' && strchr(input + at + 1, ']');
+}
+
 bool shellRuntimeExpandHistoryReference(const char *input,
                                         char **out_line,
                                         bool *out_did_expand,
@@ -1761,7 +1772,7 @@ bool shellRuntimeExpandHistoryReference(const char *input,
             i++;
             continue;
         }
-        if (c == '!' && !in_single) {
+        if (c == '!' && !in_single && !shellBangIsShellSyntax(input, i)) {
             size_t consumed = 0;
             char *replacement = NULL;
             ShellHistoryExpandResult result =
@@ -2875,8 +2886,11 @@ static int shellCollectJobs(void) {
     }
     shell_pid = vprocGetShellSelfPid();
     current_sid = (shell_pid > 0) ? vprocGetSid(shell_pid) : 0;
-    /* A subshell's jobs are the ones it started, not its shell's that run beside it. */
-    size_t snap_cap = gShellRuntime.in_subshell ? 0 : vprocSnapshot(NULL, 0);
+    /* A subshell's jobs are the ones it started, not its shell's that run beside it. So
+     * are those of a shell started as a command, which would also collect the caller's. */
+    size_t snap_cap = (gShellRuntime.in_subshell || gShellRuntime.started_as_command)
+                          ? 0
+                          : vprocSnapshot(NULL, 0);
     if (snap_cap > 0) {
             VProcSnapshot *snaps = (VProcSnapshot *)calloc(snap_cap, sizeof(VProcSnapshot));
             if (snaps) {
