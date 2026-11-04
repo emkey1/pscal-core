@@ -87,6 +87,14 @@ static RecordedCommand* gRecordingCurrentCommand = NULL;
 #define GL_QUADS 0x0007
 #endif
 
+#ifndef GL_QUAD_STRIP
+#define GL_QUAD_STRIP 0x0008
+#endif
+
+#ifndef GL_POLYGON
+#define GL_POLYGON 0x0009
+#endif
+
 #ifndef GL_LINE_LOOP
 #define GL_LINE_LOOP 0x0002
 #endif
@@ -1786,6 +1794,12 @@ void gfx3dPopMatrix(void) {
 }
 
 void gfx3dBegin(unsigned int primitive) {
+    // Neither has a path of its own here. The same vertices make the same shape as a strip and a fan.
+    if (primitive == GL_QUAD_STRIP) {
+        primitive = GL_TRIANGLE_STRIP;
+    } else if (primitive == GL_POLYGON) {
+        primitive = GL_TRIANGLE_FAN;
+    }
     gImmediatePrimitive = primitive;
     gImmediateCount = 0;
     gImmediateRecording = true;

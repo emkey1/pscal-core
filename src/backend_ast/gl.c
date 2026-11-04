@@ -49,6 +49,12 @@ static inline Value pscalRunGlBuiltin(VM* vm,
 #ifndef GL_QUADS
 #define GL_QUADS 0x0007
 #endif
+#ifndef GL_QUAD_STRIP
+#define GL_QUAD_STRIP 0x0008
+#endif
+#ifndef GL_POLYGON
+#define GL_POLYGON 0x0009
+#endif
 #endif
 
 static bool ensureGlContext(VM* vm, const char* name) {
