@@ -10437,7 +10437,9 @@ size_t vprocSnapshot(VProcSnapshot *out, size_t capacity) {
         ++count;
     }
     pthread_mutex_unlock(&gVProcTasks.mu);
-    return count;
+    /* A caller sizes its buffer with one call and fills it with the next, and a task can start in
+     * between. It loops over what this returns, so that must be what it holds. */
+    return (out && count > capacity) ? capacity : count;
 }
 
 static inline bool vprocWaitParentMatchesLocked(const VProcTaskEntry *entry,
