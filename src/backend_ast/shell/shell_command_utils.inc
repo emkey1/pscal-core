@@ -476,10 +476,14 @@ typedef struct {
     ShellCommandSubReadContext *reader;
 } ShellCommandSubStdout;
 
-/* Puts stdout back, host fd 1 included: it is the whole process's. */
+/* Puts stdout back: the vproc's slot, or host fd 1 where there is no vproc. Lets go of the
+ * saved copies too: on the way out of a cancelled job nothing else will, and one more
+ * reference to a pipeline's write end means its reader never sees the end. */
 static void shellCommandSubstitutionRestoreStdout(const ShellCommandSubStdout *state) {
     if (*state->stdout_redirected) {
-        vprocHostDup2(*state->saved_stdout, STDOUT_FILENO);
+        if (*state->saved_stdout >= 0) {
+            vprocHostDup2(*state->saved_stdout, STDOUT_FILENO);
+        }
 #if defined(PSCAL_TARGET_IOS)
         if (*state->active_vp) {
             if (*state->saved_stdout_pscal) {
@@ -495,6 +499,10 @@ static void shellCommandSubstitutionRestoreStdout(const ShellCommandSubStdout *s
         *state->stdout_redirected = false;
     }
 #if defined(PSCAL_TARGET_IOS)
+    if (*state->saved_stdout_pscal) {
+        pscal_fd_close(*state->saved_stdout_pscal);
+        *state->saved_stdout_pscal = NULL;
+    }
     if (*state->saved_slot_stdout >= 0) {
         vprocHostClose(*state->saved_slot_stdout);
         *state->saved_slot_stdout = -1;
@@ -661,17 +669,21 @@ static char *shellRunCommandSubstitution(const char *command) {
         goto substitution_finish;
     }
 
-    saved_stdout = vprocHostDup(STDOUT_FILENO);
-    if (saved_stdout < 0) {
-        vprocHostClose(pipes[0]);
-        vprocHostClose(pipes[1]);
-        pipes[0] = pipes[1] = -1;
-        result = strdup("");
-        result_length = 0;
-        goto substitution_finish;
-    }
+    ShellCommandSubStdout stdout_state = {
+        .saved_stdout = &saved_stdout,
+        .stdout_redirected = &stdout_redirected,
+#if defined(PSCAL_TARGET_IOS)
+        .active_vp = &active_vp,
+        .saved_stdout_pscal = &saved_stdout_pscal,
+        .saved_slot_stdout = &saved_slot_stdout,
+#endif
+        .reader = reader,
+    };
 
 #if defined(PSCAL_TARGET_IOS)
+    /* A vproc has a stdout of its own, so only that moves. Host fd 1 is the whole process's:
+     * a job's substitution moving it reached every other thread, and a pipeline that dup'd it
+     * in that window put it back later, on a pipe long dead. */
     active_vp = vprocCurrent();
     if (active_vp) {
         saved_stdout_pscal = vprocGetPscalFd(active_vp, STDOUT_FILENO);
@@ -683,41 +695,46 @@ static char *shellRunCommandSubstitution(const char *command) {
                 vprocHostClose(pipes[0]);
                 vprocHostClose(pipes[1]);
                 pipes[0] = pipes[1] = -1;
-                vprocHostClose(saved_stdout);
-                saved_stdout = -1;
                 result = strdup("");
                 result_length = 0;
                 goto substitution_finish;
             }
         }
-    }
+    } else
 #endif
+    {
+        saved_stdout = vprocHostDup(STDOUT_FILENO);
+        if (saved_stdout < 0) {
+            vprocHostClose(pipes[0]);
+            vprocHostClose(pipes[1]);
+            pipes[0] = pipes[1] = -1;
+            result = strdup("");
+            result_length = 0;
+            goto substitution_finish;
+        }
+    }
 
-    if (vprocHostDup2(pipes[1], STDOUT_FILENO) < 0) {
+    int redirected;
+#if defined(PSCAL_TARGET_IOS)
+    if (active_vp) {
+        redirected = vprocRestoreHostFd(active_vp, STDOUT_FILENO, pipes[1]);
+    } else
+#endif
+    {
+        redirected = vprocHostDup2(pipes[1], STDOUT_FILENO);
+    }
+    stdout_redirected = true;
+    if (redirected < 0) {
         int err = errno;
+        shellCommandSubstitutionRestoreStdout(&stdout_state);
         vprocHostClose(pipes[0]);
         vprocHostClose(pipes[1]);
         pipes[0] = pipes[1] = -1;
-        vprocHostClose(saved_stdout);
-        saved_stdout = -1;
-#if defined(PSCAL_TARGET_IOS)
-        if (saved_slot_stdout >= 0) {
-            vprocHostClose(saved_slot_stdout);
-            saved_slot_stdout = -1;
-        }
-#endif
         fprintf(stderr, "exsh: command substitution: failed to redirect stdout: %s\n", strerror(err));
         result = strdup("");
         result_length = 0;
         goto substitution_finish;
     }
-    stdout_redirected = true;
-#if defined(PSCAL_TARGET_IOS)
-    if (active_vp) {
-        /* Keep shimmed writes (vproc fd table) aligned with host fd 1. */
-        (void)vprocRestoreHostFd(active_vp, STDOUT_FILENO, STDOUT_FILENO);
-    }
-#endif
 
     vprocHostClose(pipes[1]);
     pipes[1] = -1;
@@ -745,16 +762,6 @@ static char *shellRunCommandSubstitution(const char *command) {
 #endif
     reader_started = shellCommandSubstitutionStartReader(reader, &reader_thread);
 
-    ShellCommandSubStdout stdout_state = {
-        .saved_stdout = &saved_stdout,
-        .stdout_redirected = &stdout_redirected,
-#if defined(PSCAL_TARGET_IOS)
-        .active_vp = &active_vp,
-        .saved_stdout_pscal = &saved_stdout_pscal,
-        .saved_slot_stdout = &saved_slot_stdout,
-#endif
-        .reader = reader,
-    };
     pthread_cleanup_push(shellCommandSubstitutionAbandon, &stdout_state);
 
     memset(&opts, 0, sizeof(opts));
@@ -868,12 +875,6 @@ static char *shellRunCommandSubstitution(const char *command) {
         vprocHostClose(pipes[0]);
         pipes[0] = -1;
     }
-#if defined(PSCAL_TARGET_IOS)
-    if (saved_stdout_pscal) {
-        pscal_fd_close(saved_stdout_pscal);
-        saved_stdout_pscal = NULL;
-    }
-#endif
 
     /* shellRunSource ran in its own runtime context, so this is the only place its
      * status survives: reading the last status here would find this shell's own. */
