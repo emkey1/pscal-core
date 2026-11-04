@@ -524,6 +524,8 @@ typedef struct {
     bool has_id;
     /* wait -n passes it by. */
     bool reported;
+    /* `kill` ended it just now, and the next prompt is too soon to report that. */
+    bool killed_now;
 } ShellFinishedJob;
 
 #define SHELL_FINISHED_JOB_MAX 1024

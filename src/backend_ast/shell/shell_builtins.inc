@@ -11874,7 +11874,10 @@ static bool shellKillSignalJob(VM *vm, const char *spec_text, size_t index, int 
         job->stopped = false;
     }
     if (terminate) {
-        shellRememberFinishedJob(job, false);
+        ShellFinishedJob *entry = shellRememberFinishedJob(job, false);
+        if (entry) {
+            entry->killed_now = true;
+        }
         shellRemoveJobAt(index);
         shellCollectJobs();
         return true;

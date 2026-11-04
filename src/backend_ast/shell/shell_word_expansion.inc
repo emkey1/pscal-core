@@ -2640,6 +2640,7 @@ static ShellFinishedJob *shellRememberFinishedJob(const ShellJob *job, bool repo
     entry->status = job->disowned ? 0 : job->last_status;
     entry->has_id = !job->disowned;
     entry->reported = reported || job->disowned;
+    entry->killed_now = false;
     return entry;
 }
 
@@ -3220,10 +3221,20 @@ static int shellCollectJobs(void) {
     return reaped;
 }
 
-/* A prompt is about to print, and bash reports there what has ended. */
+/* A prompt is about to print, and bash reports there what has ended. What `kill` just ended it has
+ * not heard of yet, so that waits for the prompt after. */
 void shellRuntimeJobsBeforePrompt(void) {
     shellCollectJobs();
-    shellFinishedJobsReported();
+    ShellRuntimeState *ctx = shellGetContext();
+    for (size_t i = 0; ctx && i < ctx->finished_job_count; ++i) {
+        ShellFinishedJob *entry = &ctx->finished_jobs[i];
+        if (entry->killed_now) {
+            entry->killed_now = false;
+        } else {
+            entry->reported = true;
+            entry->has_id = false;
+        }
+    }
 }
 
 static size_t shellJobVisibleCount(void) {
