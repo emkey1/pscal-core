@@ -2110,6 +2110,7 @@ static void shellFinalizeStageVprocEx(VProc *vp, int status, bool keep_status) {
             (void)vprocKillShim(pid, stop_sig);
         }
     } else {
+        vprocCloseDescriptors(vp);
         vprocMarkExit(vp, status);
         if (pid > 0 && !keep_status) {
             vprocDiscard(pid);

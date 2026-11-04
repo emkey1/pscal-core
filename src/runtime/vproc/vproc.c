@@ -81,8 +81,10 @@ void __attribute__((weak)) pscalRuntimeRequestSigtstp(void) {
 extern ssize_t __read_nocancel(int, void *, size_t) __attribute__((weak_import));
 extern ssize_t __write_nocancel(int, const void *, size_t) __attribute__((weak_import));
 extern int __close_nocancel(int) __attribute__((weak_import));
-extern int __open(const char *, int, ...) __attribute__((weak_import));
-extern int __open_nocancel(const char *, int, ...) __attribute__((weak_import));
+/* The kernel's stubs, not libc's open: not variadic, and they read the mode from a register. Called
+ * as variadic, arm64 puts it on the stack, and a new file gets whatever the register holds. */
+extern int __open(const char *, int, int) __attribute__((weak_import));
+extern int __open_nocancel(const char *, int, int) __attribute__((weak_import));
 #endif
 
 #if defined(PSCAL_TARGET_IOS) || defined(VPROC_ENABLE_STUBS_FOR_TESTS)
@@ -1571,19 +1573,32 @@ static VPROC_UNUSED int vprocHostIsattyRaw(int fd) {
     return 0;
 }
 
+#if defined(PSCAL_TARGET_IOS)
+static _Thread_local bool gVprocFifoOpenDirect = false;
+static int vprocHostOpenFifoKillable(const char *path, int flags, mode_t mode, bool has_mode);
+#endif
+
 static int vprocHostOpenRawInternal(const char *path, int flags, mode_t mode, bool has_mode) {
     static int (*fn)(const char *, int, ...) = NULL;
     static int (*openat_fn)(int, const char *, int, ...) = NULL;
+#if defined(PSCAL_TARGET_IOS)
+    if (!gVprocFifoOpenDirect && !(flags & O_NONBLOCK) && (flags & O_ACCMODE) != O_RDWR) {
+        struct stat fifo_st;
+        if (vprocHostStatRaw(path, &fifo_st) == 0 && S_ISFIFO(fifo_st.st_mode)) {
+            return vprocHostOpenFifoKillable(path, flags, mode, has_mode);
+        }
+    }
+#endif
 #if defined(__APPLE__)
     if (&__open_nocancel) {
         vprocInterposeBypassEnter();
-        int res = has_mode ? __open_nocancel(path, flags, mode) : __open_nocancel(path, flags);
+        int res = __open_nocancel(path, flags, has_mode ? (int)mode : 0);
         vprocInterposeBypassExit();
         return res;
     }
     if (&__open) {
         vprocInterposeBypassEnter();
-        int res = has_mode ? __open(path, flags, mode) : __open(path, flags);
+        int res = __open(path, flags, has_mode ? (int)mode : 0);
         vprocInterposeBypassExit();
         return res;
     }
@@ -3269,6 +3284,7 @@ typedef struct {
     uint64_t real_timer_deadline_ns;
     uint64_t real_timer_interval_ns;
     uint64_t start_mono_ns;
+    uint64_t dying_since_ns; /* killed, with a thread still to unwind; vprocMarkExit ends it */
 } VProcTaskEntry;
 
 typedef enum {
@@ -4432,10 +4448,18 @@ static void vprocApplySignalLocked(VProcTaskEntry *entry, int sig) {
     } else if (sig > 0) {
         entry->status = entry->status & 0xff;
         entry->exit_signal = sig;
-        entry->exited = true;
         entry->stopped = false;
         entry->continued = false;
         entry->stop_signo = 0;
+        if (!vprocEntryIsCurrentThreadLocked(entry) && (entry->tid || entry->thread_count > 0)) {
+            /* Its thread is still running, and holds what the task holds until it has unwound.
+             * Whoever waits for the task finds out from vprocMarkExit, once that is over. */
+            if (entry->dying_since_ns == 0) {
+                entry->dying_since_ns = vprocNowMonoNs();
+            }
+            return;
+        }
+        entry->exited = true;
         entry->zombie = true;
         vprocNotifyParentSigchldLocked(entry, VPROC_SIGCHLD_EVENT_EXIT);
     }
@@ -4731,6 +4755,225 @@ static bool vprocCurrentHasInterruptingSignal(void) {
     pthread_mutex_unlock(&gVProcTasks.mu);
     return interrupt;
 }
+
+/* For a wait in place of a host call: does a signal end it? A handler runs here, and one that
+ * asked for SA_RESTART leaves the wait going, as the host call would have. A task being killed
+ * stops waiting even where its thread cannot be cancelled yet, such as during setup. */
+static __attribute__((unused)) bool vprocHostWaitInterrupted(void) {
+    VProc *vp = vprocCurrent();
+    int pid = vp ? vprocPid(vp) : 0;
+    if (pid <= 0) {
+        return false;
+    }
+    bool pending = vprocCurrentHasInterruptingSignal();
+    bool interrupt = false;
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    if (entry) {
+        interrupt = entry->dying_since_ns != 0;
+        for (int sig = 1; pending && !interrupt && sig < 32; ++sig) {
+            if (!(entry->pending_signals & vprocSigMask(sig)) ||
+                vprocSignalBlockedLocked(entry, sig) || vprocSignalIgnoredLocked(entry, sig)) {
+                continue;
+            }
+            VProcSignalAction action = vprocEffectiveSignalActionLocked(entry, sig);
+            if (action != VPROC_SIG_IGNORE) {
+                interrupt = action != VPROC_SIG_HANDLER || !(entry->actions[sig].sa_flags & SA_RESTART);
+            }
+        }
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    if (pending) {
+        vprocDeliverPendingSignalsForCurrent();
+    }
+    return interrupt;
+}
+
+#if defined(PSCAL_TARGET_IOS)
+static void vprocHostWaitCancelled(void *unused) {
+    (void)unused;
+    vprocInterposeBypassExit();
+}
+
+/* The host's read, write and open here are the nocancel ones, so a kill could not end a thread
+ * inside them: it stayed there after its job was reported gone, with what the job held still
+ * open. So wait first where a cancel can act, looking for signals now and then. In select, not
+ * poll: on Darwin poll reports neither the end of a FIFO nor that a FIFO is full. */
+static int vprocWaitHostFd(int host, bool for_write) {
+    if (host < 0 || host >= FD_SETSIZE) {
+        return 0;
+    }
+    for (;;) {
+        fd_set fds;
+        FD_ZERO(&fds);
+        FD_SET(host, &fds);
+        struct timeval slice = { 0, 100000 };
+        int ready;
+        pthread_cleanup_push(vprocHostWaitCancelled, NULL);
+        ready = vprocHostSelectRaw(host + 1, for_write ? NULL : &fds, for_write ? &fds : NULL, NULL, &slice);
+        pthread_cleanup_pop(0);
+        if (ready > 0 || (ready < 0 && errno != EINTR)) {
+            /* Ready, or nothing select can say about: the call itself decides. */
+            return 0;
+        }
+        if (vprocHostWaitInterrupted()) {
+            pthread_testcancel();
+            errno = EINTR;
+            return -1;
+        }
+    }
+}
+
+static bool vprocHostFdBlocks(int host) {
+    int flags = fcntl(host, F_GETFL, 0);
+    return flags >= 0 && !(flags & O_NONBLOCK);
+}
+
+/* A pipe or socket says it is writable with room for PIPE_BUF bytes, and a write of more could
+ * then block where no cancel reaches it. A longer write was never one unit anyway. */
+static ssize_t vprocHostWriteKillable(int host, const void *buf, size_t count) {
+    struct stat st;
+    if (count == 0 || !vprocHostFdBlocks(host) || vprocHostFstatRaw(host, &st) != 0 ||
+        !(S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode))) {
+        return vprocHostWrite(host, buf, count);
+    }
+    const char *bytes = (const char *)buf;
+    size_t done = 0;
+    while (done < count) {
+        size_t chunk = count - done < PIPE_BUF ? count - done : PIPE_BUF;
+        ssize_t wrote = vprocWaitHostFd(host, true) < 0 ? -1 : vprocHostWrite(host, bytes + done, chunk);
+        if (wrote < 0) {
+            return done > 0 ? (ssize_t)done : -1;
+        }
+        done += (size_t)wrote;
+    }
+    return (ssize_t)done;
+}
+
+typedef struct {
+    char path[PATH_MAX];
+    int flags;
+    mode_t mode;
+    bool has_mode;
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    int fd;
+    int err;
+    bool done;
+    bool abandoned;
+} VProcFifoOpen;
+
+static void vprocFifoOpenFree(VProcFifoOpen *open_state) {
+    pthread_mutex_destroy(&open_state->mu);
+    pthread_cond_destroy(&open_state->cv);
+    free(open_state);
+}
+
+static void *vprocFifoOpenMain(void *arg) {
+    VProcFifoOpen *open_state = (VProcFifoOpen *)arg;
+    sigset_t all_signals;
+    sigfillset(&all_signals);
+    (void)pthread_sigmask(SIG_SETMASK, &all_signals, NULL);
+    gVprocFifoOpenDirect = true;
+    int fd = vprocHostOpenRawInternal(open_state->path, open_state->flags, open_state->mode, open_state->has_mode);
+    int err = errno;
+    pthread_mutex_lock(&open_state->mu);
+    bool abandoned = open_state->abandoned;
+    open_state->fd = fd;
+    open_state->err = err;
+    open_state->done = true;
+    pthread_cond_broadcast(&open_state->cv);
+    pthread_mutex_unlock(&open_state->mu);
+    if (abandoned) {
+        if (fd >= 0) {
+            vprocHostClose(fd);
+        }
+        vprocFifoOpenFree(open_state);
+    }
+    return NULL;
+}
+
+/* Called with the lock held, by a killed or interrupted opener. The helper leaves its open only
+ * when the other end opens, so open that end too, and neither stays behind as a reader or a
+ * writer for whoever opens the FIFO next. */
+static void vprocFifoOpenAbandon(void *arg) {
+    VProcFifoOpen *open_state = (VProcFifoOpen *)arg;
+    char path[PATH_MAX];
+    snprintf(path, sizeof(path), "%s", open_state->path);
+    bool done = open_state->done;
+    open_state->abandoned = true;
+    pthread_mutex_unlock(&open_state->mu);
+    if (done) {
+        if (open_state->fd >= 0) {
+            vprocHostClose(open_state->fd);
+        }
+        vprocFifoOpenFree(open_state);
+        return;
+    }
+    int other_end = vprocHostOpenRawInternal(path, O_RDWR | O_NONBLOCK, 0, false);
+    if (other_end >= 0) {
+        vprocHostClose(other_end);
+    }
+}
+
+static int vprocHostOpenFifoDirect(const char *path, int flags, mode_t mode, bool has_mode) {
+    gVprocFifoOpenDirect = true;
+    int fd = vprocHostOpenRawInternal(path, flags, mode, has_mode);
+    int err = errno;
+    gVprocFifoOpenDirect = false;
+    errno = err;
+    return fd;
+}
+
+/* Opening a FIFO blocks until the other end opens, in the host's nocancel open. A helper thread
+ * waits there instead, and this thread waits where a kill or a signal can reach it. */
+static int vprocHostOpenFifoKillable(const char *path, int flags, mode_t mode, bool has_mode) {
+    VProcFifoOpen *open_state = strlen(path) < PATH_MAX ? (VProcFifoOpen *)calloc(1, sizeof(*open_state)) : NULL;
+    if (!open_state) {
+        return vprocHostOpenFifoDirect(path, flags, mode, has_mode);
+    }
+    snprintf(open_state->path, sizeof(open_state->path), "%s", path);
+    open_state->flags = flags;
+    open_state->mode = mode;
+    open_state->has_mode = has_mode;
+    open_state->fd = -1;
+    pthread_mutex_init(&open_state->mu, NULL);
+    pthread_cond_init(&open_state->cv, NULL);
+    pthread_t helper;
+    if (vprocHostPthreadCreate(&helper, NULL, vprocFifoOpenMain, open_state) != 0) {
+        vprocFifoOpenFree(open_state);
+        return vprocHostOpenFifoDirect(path, flags, mode, has_mode);
+    }
+    pthread_detach(helper);
+    pthread_mutex_lock(&open_state->mu);
+    while (!open_state->done) {
+        struct timespec deadline;
+        vprocInprocPipeWaitDeadline(&deadline);
+        pthread_cleanup_push(vprocFifoOpenAbandon, open_state);
+        pthread_cond_timedwait(&open_state->cv, &open_state->mu, &deadline);
+        pthread_cleanup_pop(0);
+        if (open_state->done) {
+            break;
+        }
+        pthread_mutex_unlock(&open_state->mu);
+        bool interrupted = vprocHostWaitInterrupted();
+        pthread_mutex_lock(&open_state->mu);
+        if (interrupted && !open_state->done) {
+            vprocFifoOpenAbandon(open_state);
+            errno = EINTR;
+            return -1;
+        }
+    }
+    int fd = open_state->fd;
+    int err = open_state->err;
+    pthread_mutex_unlock(&open_state->mu);
+    vprocFifoOpenFree(open_state);
+    errno = err;
+    return fd;
+}
+#else
+#define vprocHostWriteKillable(host, buf, count) vprocHostWrite((host), (buf), (count))
+#endif
 
 typedef struct {
     VProcSessionStdio *session;
@@ -8177,13 +8420,7 @@ int vprocReplaceStdio(VProc *vp, int target_fd, int host_src) {
     return target_fd;
 }
 
-void vprocDestroy(VProc *vp) {
-    if (!vp) {
-        return;
-    }
-    vprocRegistryRemove(vp);
-    // Lock shouldn't strictly be needed here if refcount is 0, but good practice
-    pthread_mutex_lock(&vp->mu);
+static void vprocCloseDescriptorsLocked(VProc *vp) {
     /* Close only the vproc-owned fds; do not close the saved host stdio fds. */
     for (size_t i = 0; i < vp->capacity; ++i) {
         if (vp->entries[i].kind == VPROC_FD_PSCAL && vp->entries[i].pscal_fd) {
@@ -8203,16 +8440,38 @@ void vprocDestroy(VProc *vp) {
     if (vp->stdin_host_fd >= 0) {
         (void)vprocResourceRemoveLocked(vp, vp->stdin_host_fd);
         vprocHostCloseRaw(vp->stdin_host_fd);
+        vp->stdin_host_fd = -1;
     }
     if (vp->stdout_host_fd >= 0) {
         (void)vprocResourceRemoveLocked(vp, vp->stdout_host_fd);
         vprocHostCloseRaw(vp->stdout_host_fd);
+        vp->stdout_host_fd = -1;
     }
     if (vp->stderr_host_fd >= 0) {
         (void)vprocResourceRemoveLocked(vp, vp->stderr_host_fd);
         vprocHostCloseRaw(vp->stderr_host_fd);
+        vp->stderr_host_fd = -1;
     }
     vprocResourceCloseAllLocked(vp);
+}
+
+void vprocCloseDescriptors(VProc *vp) {
+    if (!vp) {
+        return;
+    }
+    pthread_mutex_lock(&vp->mu);
+    vprocCloseDescriptorsLocked(vp);
+    pthread_mutex_unlock(&vp->mu);
+}
+
+void vprocDestroy(VProc *vp) {
+    if (!vp) {
+        return;
+    }
+    vprocRegistryRemove(vp);
+    // Lock shouldn't strictly be needed here if refcount is 0, but good practice
+    pthread_mutex_lock(&vp->mu);
+    vprocCloseDescriptorsLocked(vp);
     free(vp->resources);
     vp->resources = NULL;
     vp->resource_capacity = 0;
@@ -8409,6 +8668,7 @@ void vprocEndAbandoned(VProc *keep) {
         vprocDeactivate();
         if (vp && vprocRegistryHoldsOwn(vp) && vp->pid != shell_pid) {
             int pid = vp->pid;
+            vprocCloseDescriptors(vp);
             vprocMarkExit(vp, 128 + SIGTERM);
             vprocDiscard(pid);
             vprocDestroy(vp);
@@ -9459,6 +9719,7 @@ void vprocMarkExit(VProc *vp, int status) {
         entry->continued = false;
         entry->stop_signo = 0;
         entry->zombie = true;
+        entry->dying_since_ns = 0;
         entry->real_timer_active = false;
         entry->real_timer_deadline_ns = 0;
         entry->real_timer_interval_ns = 0;
@@ -10180,6 +10441,31 @@ static bool vprocHasKillTargetLocked(pid_t pid) {
     return false;
 }
 
+/* A killed thread ends within moments, and vprocMarkExit says so. One stuck where a cancel cannot
+ * reach it must not keep whoever waits for it for ever, so after a while it counts as gone.
+ * Returns whether any killed task is still running. */
+#define VPROC_KILLED_GRACE_NS (2ull * 1000000000ull)
+static bool vprocEndOverdueKilledLocked(void) {
+    bool running = false;
+    uint64_t now = vprocNowMonoNs();
+    for (size_t i = 0; i < gVProcTasks.count; ++i) {
+        VProcTaskEntry *entry = &gVProcTasks.items[i];
+        if (entry->pid <= 0 || entry->dying_since_ns == 0) {
+            continue;
+        }
+        if (now - entry->dying_since_ns < VPROC_KILLED_GRACE_NS) {
+            running = true;
+            continue;
+        }
+        vprocMaybeStampRusageLocked(entry);
+        entry->dying_since_ns = 0;
+        entry->exited = true;
+        entry->zombie = true;
+        vprocNotifyParentSigchldLocked(entry, VPROC_SIGCHLD_EVENT_EXIT);
+    }
+    return running;
+}
+
 pid_t vprocWaitPidShim(pid_t pid, int *status_out, int options) {
     bool allow_stop = (options & WUNTRACED) != 0;
     bool allow_cont = (options & WCONTINUED) != 0;
@@ -10213,6 +10499,7 @@ pid_t vprocWaitPidShim(pid_t pid, int *status_out, int options) {
     while (true) {
         VProcTaskEntry *ready = NULL;
         bool has_candidate = false;
+        bool killed_running = vprocEndOverdueKilledLocked();
 
         if (pid > 0) {
             VProcTaskEntry *entry = vprocTaskFindLocked((int)pid);
@@ -10302,7 +10589,13 @@ pid_t vprocWaitPidShim(pid_t pid, int *status_out, int options) {
             return 0;
         }
 
-        vprocCondWait(&gVProcTasks.cv, &gVProcTasks.mu);
+        if (killed_running) {
+            struct timespec deadline;
+            vprocInprocPipeWaitDeadline(&deadline);
+            vprocCondTimedWait(&gVProcTasks.cv, &gVProcTasks.mu, &deadline);
+        } else {
+            vprocCondWait(&gVProcTasks.cv, &gVProcTasks.mu);
+        }
     }
 }
 
@@ -10352,6 +10645,9 @@ static bool vprocKillDeliverEntryLocked(VProcTaskEntry *entry,
     }
     if (entry->zombie || entry->exited) {
         return false;
+    }
+    if (entry->dying_since_ns != 0) {
+        return true;
     }
     if (dbg) {
         vprocDebugLogf( "[vproc-kill] pid=%d sig=%d entry_pid=%d tid=%p\n",
@@ -10417,7 +10713,7 @@ static bool vprocKillDeliverEntryLocked(VProcTaskEntry *entry,
 
     vprocApplySignalLocked(entry, sig);
 
-    if (entry->exited) {
+    if (entry->exited || entry->dying_since_ns != 0) {
         if (entry->tid && !pthread_equal(entry->tid, self)) {
             vprocCancelListAdd(cancel_list, cancel_count, cancel_capacity, entry->tid);
         }
@@ -14040,6 +14336,9 @@ ssize_t vprocReadShim(int fd, void *buf, size_t count) {
             return vprocSessionReadInputShimMode(buf, count, false);
         }
     }
+    if (vprocHostFdBlocks(host) && vprocWaitHostFd(host, false) < 0) {
+        return -1;
+    }
 #endif
     return vprocHostRead(host, buf, count);
 }
@@ -14175,7 +14474,7 @@ ssize_t vprocWriteShim(int fd, const void *buf, size_t count) {
     if (vprocToolDebugEnabled()) {
         vprocDebugLogf( "[vwrite] fd=%d -> host=%d write_fd=%d count=%zu\n", fd, host, write_fd, count);
     }
-    ssize_t res = vprocHostWrite(write_fd, buf, count);
+    ssize_t res = vprocHostWriteKillable(write_fd, buf, count);
     if (res < 0 && errno == EPIPE) {
         gVprocClosedPipe = true;
     }
