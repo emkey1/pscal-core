@@ -12372,9 +12372,9 @@ Value vmBuiltinShellKill(VM *vm, int arg_count, Value *args) {
         }
 #if defined(PSCAL_TARGET_IOS)
         /* To itself, with a trap waiting: Ctrl-C's route through the vproc would not get there. */
-        else if (target_pid == getpid() && signal_number > 0 && signal_number < NSIG &&
+        else if (target_pid == shellRuntimeOwnPid() && signal_number > 0 && signal_number < 32 &&
                  shellRuntimeGetSignalTrapAction(signal_number) == SHELL_TRAP_ACTION_COMMAND) {
-            gShellTrapSignalsPending[signal_number] = 1;
+            vprocNoteCaughtSignal(target_pid, signal_number);
         }
 #endif
         else {
@@ -12646,9 +12646,20 @@ static bool shellHasOwnJob(void) {
     return false;
 }
 
+/* wait ended early for this signal: its status is the command's, and the trap runs now. */
+static void shellWaitInterrupted(int signo) {
+    shellUpdateStatus(128 + signo);
+    shellRuntimeProcessPendingSignals();
+}
+
 /* wait -n: a job that already ended and nothing has reported, or else the next to end. */
 static void shellWaitForNextJob(void) {
     for (;;) {
+        int signo = shellRuntimeSignalEndingWait();
+        if (signo > 0) {
+            shellWaitInterrupted(signo);
+            return;
+        }
         ShellRuntimeState *ctx = shellGetContext();
         for (size_t i = 0; ctx && i < ctx->finished_job_count; ++i) {
             ShellFinishedJob *entry = &ctx->finished_jobs[i];
@@ -12669,8 +12680,9 @@ static void shellWaitForNextJob(void) {
 }
 
 /* Waits for what is left of the job, which leaves it for the caller to take off the table.
- * Gives what the job's last command gave. */
-static int shellWaitForJobAt(size_t index) {
+ * Gives what the job's last command gave. A signal can end this early, with *signo_out set and
+ * the job still running. */
+static int shellWaitForJobAt(size_t index, int *signo_out) {
     ShellJob *job = &gShellJobs[index];
     int status = job->last_status;
     for (size_t i = 0; i < job->pid_count; ++i) {
@@ -12679,7 +12691,10 @@ static int shellWaitForJobAt(size_t index) {
             continue;
         }
         ShellWaitResult wait_res;
-        int err = shellWaitPidDetailed(pid, false, &wait_res);
+        int err = shellWaitPidForBuiltin(pid, &wait_res, signo_out);
+        if (*signo_out > 0) {
+            return status;
+        }
         if (err != 0) {
             continue;
         }
@@ -12693,7 +12708,7 @@ static int shellWaitForJobAt(size_t index) {
 }
 
 /* One operand. As in bash a number is a pid and %n a job, and it may have ended long ago. */
-static int shellWaitForOperand(Value spec) {
+static int shellWaitForOperand(Value spec, int *signo_out) {
     const char *text = "";
     long target = -1;
     bool by_id = false;
@@ -12731,7 +12746,10 @@ static int shellWaitForOperand(Value spec) {
         if (job->disowned) {
             return 0;
         }
-        int status = shellWaitForJobAt(i);
+        int status = shellWaitForJobAt(i, signo_out);
+        if (*signo_out > 0) {
+            return status;
+        }
         ShellFinishedJob *entry = shellRememberFinishedJob(job, true);
         if (entry && by_id) {
             entry->has_id = false;
@@ -12791,7 +12809,12 @@ Value vmBuiltinShellWait(VM *vm, int arg_count, Value *args) {
             if (!found) {
                 break;
             }
-            shellWaitForJobAt(index);
+            int signo = 0;
+            shellWaitForJobAt(index, &signo);
+            if (signo > 0) {
+                shellWaitInterrupted(signo);
+                return makeVoid();
+            }
             shellRemoveJobAt(index);
             shellCollectJobs();
         }
@@ -12804,7 +12827,12 @@ Value vmBuiltinShellWait(VM *vm, int arg_count, Value *args) {
     }
     int status = 0;
     for (int i = 0; i < arg_count; ++i) {
-        status = shellWaitForOperand(args[i]);
+        int signo = 0;
+        status = shellWaitForOperand(args[i], &signo);
+        if (signo > 0) {
+            shellWaitInterrupted(signo);
+            return makeVoid();
+        }
     }
     shellUpdateStatus(status);
     return makeVoid();
@@ -13348,6 +13376,10 @@ static int shellLoopExecuteBodySimple(ShellLoopFrame *frame) {
 Value vmHostShellLoopCheckCondition(VM *vm) {
     (void)vm;
     shellRuntimeProcessPendingSignals();
+    if (gShellExitRequested) {
+        /* A trap just ended the shell: the condition would replace the status it ended with. */
+        return makeBoolean(false);
+    }
     ShellLoopFrame *frame = shellLoopTop();
     if (!frame) {
         shellRuntimeEnterCondition();
@@ -13374,6 +13406,10 @@ Value vmHostShellLoopCheckCondition(VM *vm) {
 Value vmHostShellLoopExecuteBody(VM *vm) {
     (void)vm;
     shellRuntimeProcessPendingSignals();
+    if (gShellExitRequested) {
+        /* A trap just ended the shell: the body would replace the status it ended with. */
+        return makeBoolean(false);
+    }
     ShellLoopFrame *frame = shellLoopTop();
     if (!frame) {
         shellUpdateStatus(0);
@@ -13389,6 +13425,10 @@ Value vmHostShellLoopExecuteBody(VM *vm) {
 Value vmHostShellLoopCheckBody(VM *vm) {
     (void)vm;
     shellRuntimeProcessPendingSignals();
+    if (gShellExitRequested) {
+        /* A trap just ended the shell: the condition would replace the status it ended with. */
+        return makeBoolean(false);
+    }
     ShellLoopFrame *frame = shellLoopTop();
     if (!frame) {
         shellRuntimeEnterCondition();

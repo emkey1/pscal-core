@@ -446,6 +446,7 @@ static VProc *shellMakeStageVProc(int stdin_host,
     {
         int pid = vprocPid(vp);
         if (pid > 0) {
+            vprocResetCaughtSignals(pid);
             int job_mask = 0;
 #ifdef SIGTSTP
             job_mask |= (1 << SIGTSTP);
@@ -1919,6 +1920,20 @@ static int __attribute__((unused)) shellWaitPid(pid_t pid, int *status_out, bool
     return err;
 }
 
+static void shellWaitResultFill(ShellWaitResult *res, int status) {
+    res->status_raw = status;
+    if (WIFSTOPPED(status)) {
+        res->stopped = true;
+        res->status_mapped = 128 + WSTOPSIG(status);
+    } else if (WIFEXITED(status)) {
+        res->status_mapped = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        res->status_mapped = 128 + WTERMSIG(status);
+    } else {
+        res->status_mapped = status;
+    }
+}
+
 static int shellWaitPidDetailed(pid_t pid, bool allow_stop, ShellWaitResult *out) {
     ShellWaitResult tmp;
     ShellWaitResult *res = out ? out : &tmp;
@@ -1935,18 +1950,42 @@ static int shellWaitPidDetailed(pid_t pid, bool allow_stop, ShellWaitResult *out
         return errno;
     }
 
-    res->status_raw = status;
-    if (WIFSTOPPED(status)) {
-        res->stopped = true;
-        res->status_mapped = 128 + WSTOPSIG(status);
-    } else if (WIFEXITED(status)) {
-        res->status_mapped = WEXITSTATUS(status);
-    } else if (WIFSIGNALED(status)) {
-        res->status_mapped = 128 + WTERMSIG(status);
-    } else {
-        res->status_mapped = status;
-    }
+    shellWaitResultFill(res, status);
     return 0;
+}
+
+/* For the wait builtin, which unlike a foreground command ends early: *signo_out says for which
+ * signal, with no result and the job still running. A signal does not wake a blocking wait for
+ * this: the trap's handler restarts it, and on iOS nothing reaches it. Polling is slower, so only a
+ * shell with a trap does it: on iOS, with none, a signal that ends the shell takes effect when the
+ * wait is over. */
+static int shellWaitPidForBuiltin(pid_t pid, ShellWaitResult *res, int *signo_out) {
+    *signo_out = 0;
+    if (!shellRuntimeAnySignalTrapped()) {
+        return shellWaitPidDetailed(pid, false, res);
+    }
+    memset(res, 0, sizeof(*res));
+    res->pid = pid;
+    useconds_t delay = 200;
+    while (true) {
+        int status = 0;
+        pid_t waited = vprocWaitPidShim(pid, &status, WNOHANG);
+        if (waited > 0) {
+            shellWaitResultFill(res, status);
+            return 0;
+        }
+        if (waited < 0 && errno != EINTR) {
+            return errno;
+        }
+        *signo_out = shellRuntimeSignalEndingWait();
+        if (*signo_out > 0) {
+            return 0;
+        }
+        usleep(delay);
+        if (delay < 20000) {
+            delay *= 2;
+        }
+    }
 }
 
 #if defined(PSCAL_TARGET_IOS)
@@ -4926,6 +4965,17 @@ static int shellPipelineRunStage(VM *vm,
         }
     }
 #endif
+    /* A command alone on this thread is the shell at work: `trap ... CHLD` is not for each of its
+     * builtins, and its own commands would run the trap again. A subshell and a job are children. */
+    if (ctx->stage_count == 1 && cmd && !cmd->body) {
+        vprocSetSilentToParent(vprocPid(vp), true);
+        /* In a pipeline these run apart, as a subshell does; here `$$` is the shell, as bash has it. */
+        const char *stage_name = cmd->argc > 0 ? cmd->argv[0] : NULL;
+        if (stage_name && (strcmp(stage_name, ".") == 0 || strcmp(stage_name, "source") == 0 ||
+                           strcmp(stage_name, "eval") == 0)) {
+            vprocSetNotAProcess(vprocPid(vp));
+        }
+    }
     vprocRegisterThread(vp, pthread_self());
     vprocActivate(vp);
 
@@ -6057,7 +6107,14 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
         shellScalarCacheInvalidate();
         return makeVoid();
     }
+    bool exit_already_requested = gShellExitRequested;
     shellRuntimeProcessPendingSignals();
+    if (gShellExitRequested && !exit_already_requested) {
+        /* A trap, or a signal with none, ended the shell before this command. */
+        shellFreeCommand(cmd);
+        shellScalarCacheInvalidate();
+        return makeVoid();
+    }
     if (shellLoopSkipActive()) {
         shellFreeCommand(cmd);
         shellScalarCacheInvalidate();

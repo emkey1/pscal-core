@@ -54,6 +54,7 @@ void shellCwdScopeEnter(ShellCwdScope *scope) {
     }
     scope->saved_subshell_pid = vprocSubshellPid();
     vprocSetSubshellPid(vprocPid(vp));
+    vprocUnwindAsThreadDoes(vprocPid(vp));
 #endif
     char cwd[PATH_MAX];
     scope->cwd = SHELL_GETCWD(cwd, sizeof(cwd)) ? strdup(cwd) : NULL;
@@ -787,8 +788,6 @@ static int shellOpenHereBody(const char *body, size_t length, bool append_newlin
 
 static char *shellRunCommandSubstitution(const char *command) {
     const char *source = command ? command : "";
-    ShellScalarCacheEntry *cached_entry = NULL;
-    ShellScalarCacheEntry *stored_entry = NULL;
     ShellScalarCaptureFrame *capture_frame = NULL;
     bool capture_pushed = shellCaptureStackPush(NULL, source, NULL, 0, false);
     if (capture_pushed) {
@@ -797,7 +796,6 @@ static char *shellRunCommandSubstitution(const char *command) {
 
     char *result = NULL;
     size_t result_length = 0;
-    bool from_cache = false;
 
     ShellCommandSubReadContext *reader = NULL;
     pthread_t reader_thread;
@@ -844,26 +842,8 @@ static char *shellRunCommandSubstitution(const char *command) {
     bool saved_vm_abort = saved_vm ? saved_vm->abort_requested : false;
     const char *saved_vm_builtin = saved_vm ? saved_vm->current_builtin_name : NULL;
 
-    bool allow_scalar_cache = (gShellScriptDepth <= 1);
-    if (*source && allow_scalar_cache) {
-        cached_entry = shellScalarCacheFind(source);
-        if (cached_entry && cached_entry->result) {
-            from_cache = true;
-            stored_entry = cached_entry;
-            gShellRuntime.scalar_cache_hits++;
-            cached_entry->hits++;
-            result = strdup(cached_entry->result);
-            if (!result) {
-                result = strdup("");
-                result_length = 0;
-            } else {
-                result_length = cached_entry->result_length;
-            }
-            shellUpdateStatus(cached_entry->status);
-            goto substitution_finish;
-        }
-        gShellRuntime.scalar_cache_misses++;
-    }
+    /* Each one runs: `a=$(date) b=$(date)` or `echo $(next) $(next)` has the same text twice, and
+     * what it gives need not be the same. */
 
     reader = (ShellCommandSubReadContext *)calloc(1, sizeof(*reader));
     if (!reader) {
@@ -1146,14 +1126,6 @@ static char *shellRunCommandSubstitution(const char *command) {
     result = output;
     result_length = length;
 
-    if (*source && allow_scalar_cache) {
-        stored_entry = shellScalarCacheStore(source, result, result_length);
-        if (stored_entry) {
-            stored_entry->status = final_status;
-            gShellRuntime.scalar_cache_stores++;
-        }
-    }
-
 substitution_finish:
     gShellRuntime.command_substitutions_run++;
 #if defined(PSCAL_TARGET_IOS)
@@ -1167,8 +1139,8 @@ substitution_finish:
     }
     free(reader);
     if (capture_frame) {
-        capture_frame->entry = stored_entry;
-        capture_frame->from_cache = from_cache;
+        capture_frame->entry = NULL;
+        capture_frame->from_cache = false;
         if (capture_frame->capture) {
             free(capture_frame->capture);
             capture_frame->capture = NULL;
@@ -3016,7 +2988,11 @@ static char *shellLookupParameterValueInternal(const char *name,
             computed = (long long)geteuid();
             have_computed = true;
         } else if (len == 7 && strncmp(name, "BASHPID", 7) == 0) {
+#if defined(PSCAL_TARGET_IOS)
+            computed = (long long)shellRuntimeOwnPid();
+#else
             computed = (long long)getpid();
+#endif
             have_computed = true;
         }
         if (have_computed) {

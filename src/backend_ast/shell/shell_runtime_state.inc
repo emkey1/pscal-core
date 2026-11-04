@@ -3353,14 +3353,12 @@ static char *shellApplyVariableAttributes(const char *name, const char *value) {
     return copy;
 }
 static PSCAL_THREAD_LOCAL VM *gShellCurrentVm = NULL;
+/* On iOS the task holds them (vprocNoteCaughtSignal): a subshell shares this process, and what
+ * it is sent is not its parent's. */
+#if !defined(PSCAL_TARGET_IOS)
 static volatile sig_atomic_t gShellPendingSignals[NSIG] = {0};
-static _Thread_local uint64_t gShellSignalTrapsRunning = 0;
-#if defined(PSCAL_TARGET_IOS)
-/* Shells share the process there, and a nested one the thread: what is sent waits on the
- * vproc it went to, and what is here is what this thread's shell has taken from its own.
- * Ctrl-C and the like keep their process-wide flag. */
-static _Thread_local volatile sig_atomic_t gShellTrapSignalsPending[NSIG] = {0};
 #endif
+static _Thread_local uint64_t gShellSignalTrapsRunning = 0;
 void shellResetJobIds(void) {
     gShellRuntimeDefault.job_next_id = 1;
     if (SC()) {
@@ -3414,8 +3412,28 @@ ShellRuntimeState *shellRuntimeActivateContext(ShellRuntimeState *ctx) {
     return previous;
 }
 
+#if defined(PSCAL_TARGET_IOS)
+/* The task that is this shell. vprocCurrent() may not be: a builtin, eval or a sourced file
+ * runs under a vproc that ends with the command. A subshell or a shell run as a command has
+ * said which is its own. */
+static int shellRuntimeOwnPid(void) {
+    int pid = vprocSubshellPid();
+    if (pid <= 0) {
+        pid = vprocGetShellSelfPid();
+    }
+    return pid > 0 ? pid : (int)getpid();
+}
+#endif
+
 static pid_t shellRuntimeDollarPid(void) {
-    return gShellRuntime.in_subshell ? gShellRuntime.subshell_parent_pid : getpid();
+    if (gShellRuntime.in_subshell) {
+        return gShellRuntime.subshell_parent_pid;
+    }
+#if defined(PSCAL_TARGET_IOS)
+    return (pid_t)shellRuntimeOwnPid();
+#else
+    return getpid();
+#endif
 }
 
 bool shellRuntimeCurrentBuiltinBackground(void) {
@@ -4256,14 +4274,6 @@ bool shellRuntimeSetSignalTrap(int signo, ShellTrapAction action, const char *co
 
     if (action == SHELL_TRAP_ACTION_COMMAND) {
         sa.sa_handler = shellSignalHandler;
-#if defined(PSCAL_TARGET_IOS)
-        if (signo == SIGCHLD) {
-            /* Every applet there has a vproc, echo's in a trap too, so this would mean nothing. */
-            sa.sa_handler = SIG_DFL;
-        } else if (signo != SIGINT && signo != SIGQUIT && signo != SIGTSTP) {
-            sa.sa_handler = vprocDeferSignal;
-        }
-#endif
         sa.sa_flags |= SA_RESTART;
     } else if (action == SHELL_TRAP_ACTION_IGNORE) {
         sa.sa_handler = SIG_IGN;
@@ -4276,7 +4286,12 @@ bool shellRuntimeSetSignalTrap(int signo, ShellTrapAction action, const char *co
         }
     }
 
-    if (sigaction(signo, &sa, NULL) != 0) {
+#if defined(PSCAL_TARGET_IOS)
+    int set_rc = vprocSigaction(shellRuntimeOwnPid(), signo, &sa, NULL);
+#else
+    int set_rc = sigaction(signo, &sa, NULL);
+#endif
+    if (set_rc != 0) {
         if (command_copy) {
             free(command_copy);
         }
@@ -6210,7 +6225,13 @@ static void shellSignalHandler(int signo) {
     if (signo <= 0 || signo >= NSIG) {
         return;
     }
+#if defined(PSCAL_TARGET_IOS)
+    /* A stage keeps these two from the shell, and what it holds ends with it. */
+    int task = (signo == SIGINT || signo == SIGQUIT) ? 0 : vprocHandlerTaskPid();
+    vprocNoteCaughtSignal(task > 0 ? task : shellRuntimeOwnPid(), signo);
+#else
     gShellPendingSignals[signo] = 1;
+#endif
 }
 
 static bool shellLoopSkipActive(void) {

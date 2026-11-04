@@ -3306,6 +3306,10 @@ typedef struct {
     bool zombie;
     bool stop_unsupported;
     bool cooperative_stop_wait;
+    bool unwinds_itself;
+    bool silent_to_parent;
+    bool not_a_process;
+    uint32_t caught_signals;
     bool sigchld_delivery_queued;
     bool shell_prompt_read_active;
     int job_id;
@@ -3322,7 +3326,6 @@ typedef struct {
     int group_exit_code;
     uint32_t blocked_signals;
     uint32_t pending_signals;
-    uint32_t deferred_signals;
     uint32_t ignored_signals;
     int pending_counts[32];
     int fg_override_pgid;
@@ -4213,14 +4216,6 @@ static void vprocInitEntryDefaultsLocked(VProcTaskEntry *entry, int pid, const V
         entry->ignored_signals = inherit_parent->ignored_signals & ~(vprocSigMask(SIGKILL) | vprocSigMask(SIGSTOP));
         entry->sigchld_blocked = inherit_parent->sigchld_blocked;
         memcpy(entry->actions, inherit_parent->actions, sizeof(entry->actions));
-        /* A shell's trap is its own: like exec, a new vproc goes back to the default. */
-        for (int sig = 1; sig < 32; ++sig) {
-            if (entry->actions[sig].sa_handler == vprocDeferSignal) {
-                sigemptyset(&entry->actions[sig].sa_mask);
-                entry->actions[sig].sa_handler = SIG_DFL;
-                entry->actions[sig].sa_flags = 0;
-            }
-        }
         if (shell_pid > 0 && inherit_parent->pid == shell_pid) {
             int job_sigs[] = { SIGTSTP, SIGTTIN, SIGTTOU };
             size_t sig_count = sizeof(job_sigs) / sizeof(job_sigs[0]);
@@ -4399,16 +4394,19 @@ static bool vprocEntryIsCurrentThreadLocked(const VProcTaskEntry *entry) {
     return false;
 }
 
+/* Whose handler this thread is running. */
+static _Thread_local int gVprocHandlerTask = 0;
+
+int vprocHandlerTaskPid(void) {
+    return gVprocHandlerTask;
+}
+
 static void vprocInvokeHandlerLocked(VProcTaskEntry *entry, int sig) {
     if (!entry || !vprocSigIndexValid(sig)) {
         return;
     }
     struct sigaction sa = vprocGetSigactionLocked(entry, sig);
     if (sa.sa_handler == SIG_IGN || sa.sa_handler == SIG_DFL) {
-        return;
-    }
-    if (sa.sa_handler == vprocDeferSignal) {
-        entry->deferred_signals |= vprocSigMask(sig);
         return;
     }
     int saved_blocked = entry->blocked_signals;
@@ -4421,6 +4419,8 @@ static void vprocInvokeHandlerLocked(VProcTaskEntry *entry, int sig) {
             entry->blocked_signals |= vprocSigMask(s);
         }
     }
+    int outer_task = gVprocHandlerTask;
+    gVprocHandlerTask = entry->pid;
     pthread_mutex_unlock(&gVProcTasks.mu);
     if (sa.sa_flags & SA_SIGINFO) {
         siginfo_t info;
@@ -4433,6 +4433,7 @@ static void vprocInvokeHandlerLocked(VProcTaskEntry *entry, int sig) {
         sa.sa_handler(sig);
     }
     pthread_mutex_lock(&gVProcTasks.mu);
+    gVprocHandlerTask = outer_task;
     entry->blocked_signals = saved_blocked;
 }
 
@@ -4483,7 +4484,9 @@ static void vprocApplySignalLocked(VProcTaskEntry *entry, int sig) {
             sigemptyset(&entry->actions[sig].sa_mask);
             entry->ignored_signals &= ~vprocSigMask(sig);
         }
-        entry->continued = false;
+        if (sig != SIGCONT) {
+            entry->continued = false;
+        }
         entry->stop_signo = 0;
         entry->exit_signal = 0;
         entry->zombie = false;
@@ -4745,6 +4748,12 @@ bool vprocWaitIfStopped(VProc *vp) {
     return waited;
 }
 
+/* A VM worker runs under its frontend's vproc without being one of its threads. */
+static bool vprocCurrentIsEntryLocked(const VProcTaskEntry *entry) {
+    VProc *current = vprocCurrent();
+    return current && vprocPid(current) == entry->pid;
+}
+
 static bool vprocDeliverPendingSignalsLocked(VProcTaskEntry *entry) {
     uint32_t pending = entry->pending_signals;
     bool exit_current = false;
@@ -4762,6 +4771,16 @@ static bool vprocDeliverPendingSignalsLocked(VProcTaskEntry *entry) {
             /* Cooperative-stop workers consume SIGTSTP via explicit polling
              * paths (vprocSigpending/vprocSigwait or runtime request checks).
              * Do not transform this into a hard stop here. */
+            continue;
+        }
+        if (action == VPROC_SIG_KILL && entry->unwinds_itself) {
+            /* vprocDeliverTaskSignals hands it to the task. */
+            continue;
+        }
+        if (action == VPROC_SIG_HANDLER && (entry->tid || entry->thread_count > 0) &&
+            !vprocEntryIsCurrentThreadLocked(entry) && !vprocCurrentIsEntryLocked(entry)) {
+            /* This may be a child ending or the kernel thread. A handler belongs on its
+             * task's thread, where the task's state and descriptors are. */
             continue;
         }
         vprocApplySignalLocked(entry, sig);
@@ -4810,7 +4829,12 @@ static bool vprocCurrentHasInterruptingSignal(void) {
             if (vprocSignalIgnoredLocked(entry, sig)) {
                 continue;
             }
-            if (vprocEffectiveSignalActionLocked(entry, sig) == VPROC_SIG_IGNORE) {
+            VProcSignalAction action = vprocEffectiveSignalActionLocked(entry, sig);
+            if (action == VPROC_SIG_IGNORE) {
+                continue;
+            }
+            if (action == VPROC_SIG_KILL && entry->unwinds_itself) {
+                /* Stays queued until the task looks, so a retried read would only spin. */
                 continue;
             }
             interrupt = true;
@@ -6834,7 +6858,7 @@ static void vprocNotifyPidSigchldLocked(int target_pid, VProcSigchldEvent evt) {
 }
 
 static void vprocNotifyParentSigchldLocked(const VProcTaskEntry *child, VProcSigchldEvent evt) {
-    if (!child) {
+    if (!child || child->silent_to_parent) {
         return;
     }
     int parent_pid = child->parent_pid;
@@ -10313,7 +10337,10 @@ static void vprocClearEntryLocked(VProcTaskEntry *entry) {
     entry->group_exit_code = 0;
     entry->blocked_signals = 0;
     entry->pending_signals = 0;
-    entry->deferred_signals = 0;
+    entry->unwinds_itself = false;
+    entry->silent_to_parent = false;
+    entry->not_a_process = false;
+    entry->caught_signals = 0;
     entry->ignored_signals = 0;
     for (int i = 0; i < 32; ++i) {
         entry->pending_counts[i] = 0;
@@ -10647,7 +10674,9 @@ pid_t vprocWaitPidShim(pid_t pid, int *status_out, int options) {
             } else if (ready->continued) {
                 ready->continued = false;
             }
-            if (waiter_entry && waiter_entry->sigchld_events > 0 && !waiter_entry->sigchld_blocked) {
+            if (waiter_entry && waiter_entry->sigchld_events > 0 && !waiter_entry->sigchld_blocked &&
+                vprocEffectiveSignalActionLocked(waiter_entry, SIGCHLD) != VPROC_SIG_HANDLER) {
+                /* A handler still has to run: waiting for a child doesn't take its signal. */
                 waiter_entry->sigchld_events--;
                 if (waiter_entry->sigchld_events == 0) {
                     waiter_entry->pending_signals &= ~vprocSigMask(SIGCHLD);
@@ -10717,6 +10746,38 @@ static void vprocCancelListAdd(pthread_t **list, size_t *count, size_t *capacity
         *capacity = new_cap;
     }
     (*list)[(*count)++] = tid;
+}
+
+/* An inline stage runs on the thread of the shell that started it. Cancelling that thread would
+ * end the shell, which has to unwind itself. Only its main thread: a stage's worker is listed on
+ * the shell's task too, having started under it, and it can be cancelled. */
+static bool vprocThreadUnwindsItselfLocked(pthread_t tid) {
+    for (size_t i = 0; i < gVProcTasks.count; ++i) {
+        const VProcTaskEntry *entry = &gVProcTasks.items[i];
+        if (entry->pid > 0 && entry->unwinds_itself && !entry->exited && entry->tid &&
+            pthread_equal(entry->tid, tid)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Pending, a stop and a continue cancel each other. A task that opted out of real stops
+ * keeps its SIGTSTP: that is how it learns to unwind. */
+static void vprocDropOpposingPendingLocked(VProcTaskEntry *entry, int sig) {
+    if (sig == SIGCONT) {
+        if (entry->stop_unsupported) {
+            return;
+        }
+        const int stops[] = { SIGTSTP, SIGSTOP, SIGTTIN, SIGTTOU };
+        for (size_t i = 0; i < sizeof(stops) / sizeof(stops[0]); ++i) {
+            entry->pending_signals &= ~vprocSigMask(stops[i]);
+            entry->pending_counts[stops[i]] = 0;
+        }
+    } else if (sig == SIGTSTP || sig == SIGSTOP || sig == SIGTTIN || sig == SIGTTOU) {
+        entry->pending_signals &= ~vprocSigMask(SIGCONT);
+        entry->pending_counts[SIGCONT] = 0;
+    }
 }
 
 static bool vprocKillDeliverEntryLocked(VProcTaskEntry *entry,
@@ -10789,13 +10850,30 @@ static bool vprocKillDeliverEntryLocked(VProcTaskEntry *entry,
         return true;
     }
 
-    if (vprocSignalBlockedLocked(entry, sig)) {
+    VProcSignalAction action = vprocEffectiveSignalActionLocked(entry, sig);
+    bool blocked = vprocSignalBlockedLocked(entry, sig);
+    vprocDropOpposingPendingLocked(entry, sig);
+    if (sig == SIGCONT && entry->stopped && (blocked || action != VPROC_SIG_CONT)) {
+        /* Blocked, caught or ignored, a continue still continues. Only its handler waits. */
+        entry->stopped = false;
+        entry->stop_signo = 0;
+        entry->exit_signal = 0;
+        entry->zombie = false;
+        entry->continued = true;
+        vprocNotifyParentSigchldLocked(entry, VPROC_SIGCHLD_EVENT_CONT);
+    }
+
+    if (blocked) {
         vprocQueuePendingSignalLocked(entry, sig);
         return true;
     }
 
-    VProcSignalAction action = vprocEffectiveSignalActionLocked(entry, sig);
     if (action == VPROC_SIG_HANDLER && !vprocEntryIsCurrentThreadLocked(entry)) {
+        vprocQueuePendingSignalLocked(entry, sig);
+        return true;
+    }
+
+    if (action == VPROC_SIG_KILL && entry->unwinds_itself) {
         vprocQueuePendingSignalLocked(entry, sig);
         return true;
     }
@@ -10803,12 +10881,12 @@ static bool vprocKillDeliverEntryLocked(VProcTaskEntry *entry,
     vprocApplySignalLocked(entry, sig);
 
     if (entry->exited || entry->dying_since_ns != 0) {
-        if (entry->tid && !pthread_equal(entry->tid, self)) {
+        if (entry->tid && !pthread_equal(entry->tid, self) && !vprocThreadUnwindsItselfLocked(entry->tid)) {
             vprocCancelListAdd(cancel_list, cancel_count, cancel_capacity, entry->tid);
         }
         for (size_t t = 0; t < entry->thread_count; ++t) {
             pthread_t tid = entry->threads[t];
-            if (tid && !pthread_equal(tid, self)) {
+            if (tid && !pthread_equal(tid, self) && !vprocThreadUnwindsItselfLocked(tid)) {
                 vprocCancelListAdd(cancel_list, cancel_count, cancel_capacity, tid);
             }
         }
@@ -11334,6 +11412,13 @@ pid_t vprocGetPpidShim(void) {
     VProcTaskEntry *entry = vprocTaskFindLocked(pid);
     if (entry) {
         parent = (pid_t)entry->parent_pid;
+        for (int hops = 0; parent > 0 && hops < 32; ++hops) {
+            const VProcTaskEntry *above = vprocTaskFindLocked((int)parent);
+            if (!above || !above->not_a_process) {
+                break;
+            }
+            parent = (pid_t)above->parent_pid;
+        }
     } else {
         errno = ESRCH;
     }
@@ -11494,6 +11579,7 @@ bool vprocCommandScopeBegin(VProcCommandScope *scope,
     int pid = vprocPid(vp);
     scope->vp = vp;
     scope->pid = pid;
+    vprocResetCaughtSignals(pid);
 
     int owner_pid = scope->prev ? vprocPid(scope->prev) : vprocGetShellSelfPid();
     int kernel_pid = vprocGetKernelPid();
@@ -13652,32 +13738,117 @@ static void vprocDeliverPendingSignalsForCurrent(void) {
     }
 }
 
-void vprocDeliverPendingSignals(void) {
-    vprocDeliverPendingSignalsForCurrent();
-}
-
-void vprocDeferSignal(int sig) {
-    (void)sig;
-}
-
-int vprocTakeDeferredSignal(void) {
-    VProc *vp = vprocForThread();
-    if (!vp) {
+int vprocDeliverTaskSignals(int pid) {
+    if (pid <= 0) {
         return 0;
     }
-    int taken = 0;
+    int fatal = 0;
+    bool exit_current = false;
     pthread_mutex_lock(&gVProcTasks.mu);
-    VProcTaskEntry *entry = vprocTaskFindLocked(vprocPid(vp));
-    if (entry) {
-        for (int sig = 1; sig < 32 && taken == 0; ++sig) {
-            if (entry->deferred_signals & vprocSigMask(sig)) {
-                entry->deferred_signals &= ~vprocSigMask(sig);
-                taken = sig;
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    if (entry && entry->tid && pthread_equal(entry->tid, pthread_self())) {
+        if (vprocTaskExpireRealTimerLocked(entry, vprocNowMonoNs())) {
+            pthread_cond_broadcast(&gVProcTasks.cv);
+        }
+        exit_current = vprocDeliverPendingSignalsLocked(entry);
+        for (int sig = 1; entry->unwinds_itself && !fatal && sig < 32; ++sig) {
+            if ((entry->pending_signals & vprocSigMask(sig)) && !vprocSignalBlockedLocked(entry, sig) &&
+                vprocEffectiveSignalActionLocked(entry, sig) == VPROC_SIG_KILL) {
+                entry->pending_signals &= ~vprocSigMask(sig);
+                entry->pending_counts[sig] = 0;
+                fatal = sig;
             }
         }
     }
     pthread_mutex_unlock(&gVProcTasks.mu);
+    if (exit_current) {
+        pthread_exit(NULL);
+    }
+    return fatal;
+}
+
+void vprocNoteCaughtSignal(int pid, int sig) {
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    if (entry) {
+        entry->caught_signals |= vprocSigMask(sig);
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+}
+
+uint32_t vprocCaughtSignals(int pid) {
+    uint32_t caught = 0;
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    if (entry && entry->tid && pthread_equal(entry->tid, pthread_self())) {
+        caught = entry->caught_signals;
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    return caught;
+}
+
+bool vprocTakeCaughtSignal(int pid, int sig) {
+    bool taken = false;
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    if (entry && entry->tid && pthread_equal(entry->tid, pthread_self()) &&
+        (entry->caught_signals & vprocSigMask(sig))) {
+        entry->caught_signals &= ~vprocSigMask(sig);
+        taken = true;
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
     return taken;
+}
+
+void vprocSetUnwindsItself(int pid, bool enabled) {
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    if (entry) {
+        entry->unwinds_itself = enabled;
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+}
+
+void vprocUnwindAsThreadDoes(int pid) {
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    if (entry && !entry->unwinds_itself && vprocThreadUnwindsItselfLocked(pthread_self())) {
+        entry->unwinds_itself = true;
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+}
+
+void vprocSetSilentToParent(int pid, bool silent) {
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    if (entry) {
+        entry->silent_to_parent = silent;
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+}
+
+void vprocSetNotAProcess(int pid) {
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    if (entry) {
+        entry->not_a_process = true;
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+}
+
+void vprocResetCaughtSignals(int pid) {
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    for (int sig = 1; entry && sig < 32; ++sig) {
+        if (sig == SIGINT || sig == SIGQUIT || entry->actions[sig].sa_handler == SIG_DFL ||
+            entry->actions[sig].sa_handler == SIG_IGN) {
+            continue;
+        }
+        sigemptyset(&entry->actions[sig].sa_mask);
+        entry->actions[sig].sa_handler = SIG_DFL;
+        entry->actions[sig].sa_flags = 0;
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
 }
 
 int vprocSigpending(int pid, sigset_t *set) {

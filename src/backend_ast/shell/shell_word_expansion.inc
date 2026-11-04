@@ -1060,6 +1060,35 @@ static void shellUpdateStatus(int status) {
     shellRuntimeSetLastStatus(status);
 }
 
+/* The script stops here: the VM at the next instruction, the loops it is in at once. */
+static void shellEndWithRequest(void) {
+    shellRuntimeRequestExit();
+    if (gShellCurrentVm) {
+        gShellCurrentVm->exit_requested = true;
+        gShellCurrentVm->current_builtin_name = "signal";
+    }
+    if (gShellLoopStackSize > 0) {
+        gShellRuntime.break_requested = true;
+        gShellRuntime.break_requested_levels = (int)gShellLoopStackSize;
+        shellLoopRequestBreakLevels((int)gShellLoopStackSize);
+    }
+}
+
+/* The script goes on as it was, with the status it had, unless the trap ended it. */
+static void shellRunSignalTrapCommand(int signo) {
+    bool saved_sticky = gShellStatusSticky;
+    shellRuntimeRunSignalTrap(signo);
+    if (gShellReturnPending && !gShellExitRequested) {
+        /* `return` in the text: the VM stops for the function it broke into, not for the shell. */
+        return;
+    }
+    if (gShellExitRequested || (gShellCurrentVm && gShellCurrentVm->exit_requested)) {
+        shellEndWithRequest();
+    } else {
+        gShellStatusSticky = saved_sticky;
+    }
+}
+
 /*
  * POSIX specifies that foreground commands should see the shell's inherited
  * signal dispositions, except that asynchronous lists without job control must
@@ -1134,28 +1163,21 @@ static void shellHandleSignalCommon(int signo, bool from_status) {
         }
 
         if (command_trap) {
-            shellRuntimeRunSignalTrap(signo);
-            bool exit_now = gShellExitRequested ||
-                             (gShellCurrentVm && gShellCurrentVm->exit_requested);
-            if (exit_now && gShellLoopStackSize > 0) {
-                gShellRuntime.break_requested = true;
-                gShellRuntime.break_requested_levels = (int)gShellLoopStackSize;
-                shellLoopRequestBreakLevels((int)gShellLoopStackSize);
-            }
+            shellRunSignalTrapCommand(signo);
         }
         return;
     }
 
     if (command_trap) {
-        shellRuntimeRunSignalTrap(signo);
-        bool exit_now = gShellExitRequested ||
-                         (gShellCurrentVm && gShellCurrentVm->exit_requested);
-        if (exit_now && gShellLoopStackSize > 0) {
-            gShellRuntime.break_requested = true;
-            gShellRuntime.break_requested_levels = (int)gShellLoopStackSize;
-            shellLoopRequestBreakLevels((int)gShellLoopStackSize);
-        }
+        shellRunSignalTrapCommand(signo);
     }
+#if defined(PSCAL_TARGET_IOS)
+    /* A signal noted with no trap: vprocDeliverTaskSignals said it ends this shell. At a prompt,
+     * as in bash, SIGTERM does not. */
+    else if (!from_status && (signo != SIGTERM || !shellRuntimeIsInteractive())) {
+        shellEndWithRequest();
+    }
+#endif
 }
 
 static void shellHandlePendingSignal(int signo) {
@@ -1166,34 +1188,97 @@ static void shellHandleStatusSignal(int signo) {
     shellHandleSignalCommon(signo, true);
 }
 
-void shellRuntimeProcessPendingSignals(void) {
 #if defined(PSCAL_TARGET_IOS)
-    /* What another thread sent waits in this vproc's table. */
-    vprocDeliverPendingSignals();
-    for (int taken = vprocTakeDeferredSignal(); taken > 0; taken = vprocTakeDeferredSignal()) {
-        gShellTrapSignalsPending[taken] = 1;
+/* On iOS a signal waits with the task until the task asks. Its handler runs here, on the task's
+ * thread, however far down the vprocs of its commands that thread is. */
+static uint32_t shellRuntimeCaughtSignals(int owner) {
+    int fatal = vprocDeliverTaskSignals(owner);
+    if (fatal > 0) {
+        vprocNoteCaughtSignal(owner, fatal);
     }
+    return vprocCaughtSignals(owner);
+}
 #endif
+
+/* One sent by its own trap comes when that trap is done. Another signal's trap may break in. */
+static bool shellRuntimeSignalMustWait(int signo) {
+    return (gShellSignalTrapsRunning & ((uint64_t)1 << (signo % 64))) != 0;
+}
+
+void shellRuntimeProcessPendingSignals(void) {
     bool again = true;
     while (again) {
         again = false;
-        for (int signo = 1; signo < NSIG; ++signo) {
-            bool pending = gShellPendingSignals[signo];
+        /* All that have come, taken together, so that a trap's own commands see only what comes
+         * after it started. That may break in, and these run in order. */
+        uint64_t taken = 0;
 #if defined(PSCAL_TARGET_IOS)
-            pending = pending || gShellTrapSignalsPending[signo];
+        int owner = shellRuntimeOwnPid();
+        uint32_t caught = shellRuntimeCaughtSignals(owner);
+        for (int signo = 1; caught != 0 && signo < 32; ++signo) {
+            if ((caught & (1u << signo)) && !shellRuntimeSignalMustWait(signo) &&
+                vprocTakeCaughtSignal(owner, signo)) {
+                taken |= (uint64_t)1 << signo;
+            }
+        }
+#else
+        for (int signo = 1; signo < NSIG; ++signo) {
+            if (gShellPendingSignals[signo] && !shellRuntimeSignalMustWait(signo)) {
+                gShellPendingSignals[signo] = 0;
+                taken |= (uint64_t)1 << (signo % 64);
+            }
+        }
 #endif
-            /* One sent by its own trap comes when that trap is done. */
-            if (!pending || (gShellSignalTrapsRunning & ((uint64_t)1 << (signo % 64)))) {
+        for (int signo = 1; taken != 0 && signo < NSIG; ++signo) {
+            uint64_t bit = (uint64_t)1 << (signo % 64);
+            if (!(taken & bit)) {
                 continue;
             }
-            gShellPendingSignals[signo] = 0;
-#if defined(PSCAL_TARGET_IOS)
-            gShellTrapSignalsPending[signo] = 0;
-#endif
+            taken &= ~bit;
             shellHandlePendingSignal(signo);
+            if (gShellExitRequested) {
+                return;
+            }
             again = true;
         }
     }
+}
+
+/* What `wait` stops for: a signal with a trap, one that ends the shell, or Ctrl-C. */
+static int shellRuntimeSignalEndingWait(void) {
+#if defined(PSCAL_TARGET_IOS)
+    uint32_t caught = shellRuntimeCaughtSignals(shellRuntimeOwnPid());
+    for (int signo = 1; caught != 0 && signo < 32; ++signo) {
+        if (!(caught & (1u << signo))) {
+            continue;
+        }
+        ShellTrapAction action = shellRuntimeGetSignalTrapAction(signo);
+        if (shellRuntimeSignalMustWait(signo)) {
+            continue;
+        }
+        if (action == SHELL_TRAP_ACTION_COMMAND ||
+            (action == SHELL_TRAP_ACTION_DEFAULT && signo != SIGQUIT && signo != SIGTSTP)) {
+            return signo;
+        }
+    }
+#else
+    for (int signo = 1; signo < NSIG; ++signo) {
+        if (gShellPendingSignals[signo] && shellRuntimeGetSignalTrapAction(signo) == SHELL_TRAP_ACTION_COMMAND &&
+            !shellRuntimeSignalMustWait(signo)) {
+            return signo;
+        }
+    }
+#endif
+    return 0;
+}
+
+static bool shellRuntimeAnySignalTrapped(void) {
+    for (int signo = 1; signo < NSIG; ++signo) {
+        if (gShellSignalTraps[signo].action == SHELL_TRAP_ACTION_COMMAND) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void shellRuntimeSetExitOnSignal(bool enabled) {
@@ -2141,7 +2226,9 @@ static void shellSubshellResetState(pid_t dollar_pid) {
     shellTrapClearEntry(&gShellErrTrap);
     shellTrapClearEntry(&gShellDebugTrap);
     shellTrapClearEntry(&gShellReturnTrap);
+#if !defined(PSCAL_TARGET_IOS)
     memset((void *)gShellPendingSignals, 0, sizeof(gShellPendingSignals));
+#endif
     gShellRuntime.in_subshell = true;
 #if !defined(PSCAL_TARGET_IOS)
     shellCommandSubForgetFrames();

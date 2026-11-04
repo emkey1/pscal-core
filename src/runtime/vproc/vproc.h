@@ -330,13 +330,6 @@ int vprocPollShim(struct pollfd *fds, nfds_t nfds, int timeout);
 int vprocSelectShim(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout);
 pid_t vprocWaitPidShim(pid_t pid, int *status_out, int options);
 int vprocKillShim(pid_t pid, int sig);
-/* Runs this thread's vproc's handlers for what other threads have sent it. */
-void vprocDeliverPendingSignals(void);
-/* As a handler: only notes the signal on the vproc it was sent to, whichever thread sent it,
- * and a vproc made from that one starts with the default. */
-void vprocDeferSignal(int sig);
-/* What was noted on this thread's vproc, a signal at a time; 0 when there is none. */
-int vprocTakeDeferredSignal(void);
 pid_t vprocGetPidShim(void);
 pid_t vprocGetPpidShim(void);
 pid_t vprocGetpgrpShim(void);
@@ -484,6 +477,29 @@ void vprocDiscard(int pid);
 bool vprocSigchldPending(int pid);
 int vprocSetSigchldBlocked(int pid, bool block);
 void vprocClearSigchldPending(int pid);
+/* Runs the handlers of what waits on this task, if the caller is its main thread. Returns a
+ * signal that would end a task that unwinds itself, taken off the queue, or 0. */
+int vprocDeliverTaskSignals(int pid);
+/* For a handler that only notes its signal, as the shell's does: any of a task's threads may run
+ * it, so it notes on vprocHandlerTaskPid(), and the note stays with the task until its main thread
+ * takes it. Masks hold 1u << sig. */
+int vprocHandlerTaskPid(void);
+void vprocNoteCaughtSignal(int pid, int sig);
+uint32_t vprocCaughtSignals(int pid);
+bool vprocTakeCaughtSignal(int pid, int sig);
+/* A shell's task: a signal that would end it waits for vprocDeliverTaskSignals, since cancelling
+ * the thread would leave whatever the shell holds, and what started it waiting. */
+void vprocSetUnwindsItself(int pid, bool enabled);
+/* A shell started on another shell's thread, as a script run inline is: it can't be cancelled either. */
+void vprocUnwindAsThreadDoes(int pid);
+/* What this task does is the parent's own work, so no SIGCHLD for it. */
+void vprocSetSilentToParent(int pid, bool silent);
+/* A stage that only does the shell's own work, as `.` and `eval` do: getppid in what it starts gives
+ * the shell. The stage is still the parent that waits for them. */
+void vprocSetNotAProcess(int pid);
+/* As exec does: what the task caught goes back to default and what it ignored stays ignored.
+ * SIGINT and SIGQUIT stay: an in-process stage gets Ctrl-C by polling, not by being ended. */
+void vprocResetCaughtSignals(int pid);
 
 typedef struct {
     VProc *prev;
@@ -733,9 +749,6 @@ static inline int vprocOpenShim(const char *path, int flags, ...) {
 }
 static inline pid_t vprocWaitPidShim(pid_t pid, int *status_out, int options) { return waitpid(pid, status_out, options); }
 static inline int vprocKillShim(pid_t pid, int sig) { return kill(pid, sig); }
-static inline void vprocDeliverPendingSignals(void) {}
-static inline void vprocDeferSignal(int sig) { (void)sig; }
-static inline int vprocTakeDeferredSignal(void) { return 0; }
 static inline pid_t vprocGetPidShim(void) { return getpid(); }
 static inline pid_t vprocGetPpidShim(void) { return getppid(); }
 static inline pid_t vprocGetpgrpShim(void) { return getpgrp(); }
@@ -945,6 +958,16 @@ static inline int vprocSimulatedExec(VProcExecEntryFn entry, char *const argv[])
 }
 static inline int vprocSetSigchldBlocked(int pid, bool block) { (void)pid; (void)block; return 0; }
 static inline void vprocClearSigchldPending(int pid) { (void)pid; }
+static inline int vprocDeliverTaskSignals(int pid) { (void)pid; return 0; }
+static inline int vprocHandlerTaskPid(void) { return 0; }
+static inline void vprocNoteCaughtSignal(int pid, int sig) { (void)pid; (void)sig; }
+static inline uint32_t vprocCaughtSignals(int pid) { (void)pid; return 0; }
+static inline bool vprocTakeCaughtSignal(int pid, int sig) { (void)pid; (void)sig; return false; }
+static inline void vprocSetUnwindsItself(int pid, bool enabled) { (void)pid; (void)enabled; }
+static inline void vprocUnwindAsThreadDoes(int pid) { (void)pid; }
+static inline void vprocSetSilentToParent(int pid, bool silent) { (void)pid; (void)silent; }
+static inline void vprocSetNotAProcess(int pid) { (void)pid; }
+static inline void vprocResetCaughtSignals(int pid) { (void)pid; }
 static inline void vprocFormatCpuTimes(int utime_cs, int stime_cs, double *utime_s, double *stime_s) {
     if (utime_s) {
         *utime_s = (double)utime_cs / 100.0;
