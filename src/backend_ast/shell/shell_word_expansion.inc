@@ -3874,7 +3874,7 @@ static bool shellExpandWordFields(const char *text,
             continue;
         }
         bool appended = false;
-        if (!gShellRuntime.noglob_enabled && shellWordShouldGlob(flags, field)) {
+        if (!gShellRuntime.noglob_enabled && shellWordShouldGlob(flags, field) && shellFieldIsGlobPattern(field)) {
             char **glob_matches = NULL;
             size_t glob_count = 0;
             char *glob_pattern = shellGlobPatternFromField(field);

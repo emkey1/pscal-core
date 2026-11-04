@@ -421,16 +421,41 @@ extern char *secure_getenv(const char *name);
 #define SHELL_HAVE_ISSETUGID 1
 #endif
 
+/* Every tracked variable asks, so every command, and it takes up to 5 system calls, so the
+ * answer is kept. A process's ids change only by a call it makes itself: fork keeps them and
+ * exec starts over. Here that means applets: su, sudo, login and chroot set ids, exec, and come
+ * back if that fails, so the applet dispatcher says to ask again. The two low bits hold the
+ * answer and the rest count those calls, so a thread that was asking through one can't keep
+ * what it learned before it. An iOS session keeps its own, as its ids will be its vproc's. */
+enum {
+    SHELL_PRIVILEGED_KNOWN = 1,
+    SHELL_PRIVILEGED_YES = 2
+};
+static PSCAL_THREAD_LOCAL _Atomic unsigned gShellPrivileged = 0;
+
 static bool shellProcessIsPrivileged(void) {
+    unsigned state = atomic_load_explicit(&gShellPrivileged, memory_order_relaxed);
+    if (state & SHELL_PRIVILEGED_KNOWN) {
+        return (state & SHELL_PRIVILEGED_YES) != 0;
+    }
+    bool privileged = false;
 #if defined(SHELL_HAVE_ISSETUGID)
-    if (issetugid()) {
-        return true;
-    }
+    privileged = issetugid() != 0;
 #endif
-    if (geteuid() != getuid() || getegid() != getgid()) {
-        return true;
+    if (!privileged) {
+        privileged = geteuid() != getuid() || getegid() != getgid();
     }
-    return false;
+    unsigned answer = state | SHELL_PRIVILEGED_KNOWN | (privileged ? SHELL_PRIVILEGED_YES : 0);
+    atomic_compare_exchange_strong_explicit(&gShellPrivileged, &state, answer,
+                                            memory_order_relaxed, memory_order_relaxed);
+    return privileged;
+}
+
+void shellRuntimeIdsMayHaveChanged(void) {
+    unsigned state = atomic_load_explicit(&gShellPrivileged, memory_order_relaxed);
+    while (!atomic_compare_exchange_weak_explicit(&gShellPrivileged, &state, (state | 3u) + 1u,
+                                                  memory_order_relaxed, memory_order_relaxed)) {
+    }
 }
 
 static const char *shellSafeGetenv(const char *name) {

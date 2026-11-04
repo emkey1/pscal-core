@@ -1814,6 +1814,48 @@ static bool shellWordShouldGlob(uint8_t flags, const char *text) {
     return false;
 }
 
+/* bash's test for whether a field can expand at all: a `[` counts once a `]` follows it in
+ * the same part of a path. Any other field stays as it is, whatever files there are and
+ * whatever the glob options say, so the test command `[` reads no directory. A backslash from
+ * an expansion is left for glob to read. */
+static bool shellFieldIsGlobPattern(const char *field) {
+    bool bracket_open = false;
+    for (const char *cursor = field; *cursor; ++cursor) {
+        switch (*cursor) {
+            case SHELL_GLOB_LITERAL_MARK:
+                if (cursor[1]) {
+                    ++cursor;
+                }
+                break;
+            case '[':
+                bracket_open = true;
+                break;
+            case '/':
+                bracket_open = false;
+                break;
+            case ']':
+                if (bracket_open) {
+                    return true;
+                }
+                break;
+            case '@':
+            case '+':
+            case '!':
+                if (cursor[1] == '(') {
+                    return true;
+                }
+                break;
+            case '*':
+            case '?':
+            case '\\':
+                return true;
+            default:
+                break;
+        }
+    }
+    return false;
+}
+
 /* Takes ownership of `expanded` and the map, which grow with the marks they gain. */
 static bool shellMarkQuotedGlobChars(char **expanded, bool **quoted_map, size_t *quoted_len) {
     const char *text = *expanded;
