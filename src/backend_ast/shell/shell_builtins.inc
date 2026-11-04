@@ -808,7 +808,9 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
     if (meta && *meta) {
         char *copy = strdup(meta);
         if (copy) {
-            for (char *token = strtok(copy, ";"); token; token = strtok(NULL, ";")) {
+            /* strtok keeps its place per process, and on iOS another thread can start a loop now. */
+            char *save = NULL;
+            for (char *token = strtok_r(copy, ";", &save); token; token = strtok_r(NULL, ";", &save)) {
                 char *eq = strchr(token, '=');
                 if (eq) {
                     *eq = '\0';
