@@ -4401,17 +4401,23 @@ static void vprocMaybeStampRusageLocked(VProcTaskEntry *entry) {
     }
 }
 
+/* What delivering a signal to a virtual process does, once blocking has been
+ * ruled out. */
 typedef enum {
-    VPROC_SIG_IGNORE,
-    VPROC_SIG_STOP,
-    VPROC_SIG_CONT,
-    VPROC_SIG_KILL,
-    VPROC_SIG_HANDLER
+    VPROC_SIG_IGNORE,   /* discard the signal */
+    VPROC_SIG_STOP,     /* put the process in the stopped state */
+    VPROC_SIG_CONT,     /* resume a stopped process */
+    VPROC_SIG_KILL,     /* terminate the process */
+    VPROC_SIG_HANDLER   /* run an installed handler */
 } VProcSignalAction;
 
+/* The action a signal has while its disposition is SIG_DFL (POSIX, and
+ * Darwin's signal(3) for the BSD-specific ones). */
 static VProcSignalAction vprocDefaultSignalAction(int sig) {
     switch (sig) {
+#ifdef SIGCHLD
         case SIGCHLD:
+#endif
 #ifdef SIGWINCH
         case SIGWINCH:
 #endif
@@ -4434,18 +4440,19 @@ static VProcSignalAction vprocDefaultSignalAction(int sig) {
     }
 }
 
+/* The action delivering `sig` to `entry` takes, given the disposition it has
+ * installed. Callers hold gVProcTasks.mu. */
 static VProcSignalAction vprocEffectiveSignalActionLocked(VProcTaskEntry *entry, int sig) {
     if (!entry || !vprocSigIndexValid(sig)) {
         return vprocDefaultSignalAction(sig);
     }
-    struct sigaction sa = entry->actions[sig];
-    if (sa.sa_handler == SIG_IGN) {
+    if (entry->actions[sig].sa_handler == SIG_IGN) {
         return VPROC_SIG_IGNORE;
     }
-    if (sa.sa_handler != SIG_DFL) {
-        return VPROC_SIG_HANDLER;
+    if (entry->actions[sig].sa_handler == SIG_DFL) {
+        return vprocDefaultSignalAction(sig);
     }
-    return vprocDefaultSignalAction(sig);
+    return VPROC_SIG_HANDLER;
 }
 
 static bool vprocEntryIsCurrentThreadLocked(const VProcTaskEntry *entry) {
