@@ -2831,6 +2831,8 @@ static ShellJob *shellRegisterJob(pid_t pgid, const pid_t *pids, size_t pid_coun
 
     gShellJobs = new_jobs;
     ShellJob *job = &gShellJobs[gShellJobCount++];
+    /* realloc leaves what an old job left, and choosing a number looks at every slot. */
+    memset(job, 0, sizeof(*job));
     /* Preserve any existing vproc job id; otherwise allocate a new one and stamp it. A shell with
      * numbers of its own does neither: its jobs share its group, whose row holds the number its
      * shell gave it. */
