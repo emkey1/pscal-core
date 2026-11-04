@@ -3393,6 +3393,8 @@ typedef struct {
     uint32_t caught_signals;
     bool sigchld_delivery_queued;
     bool shell_prompt_read_active;
+    bool gave_up_terminal; /* TIOCNOTTY: it has no controlling terminal, whatever its session has */
+    bool adopted;          /* its parent died: whoever has it now keeps no group from being orphaned */
     int job_id;
     char *label;
     char comm[16];
@@ -4306,6 +4308,7 @@ static void vprocInitEntryDefaultsLocked(VProcTaskEntry *entry, int pid, const V
                                  ~(vprocSigMask(SIGKILL) | vprocSigMask(SIGSTOP));
         entry->ignored_signals = inherit_parent->ignored_signals & ~(vprocSigMask(SIGKILL) | vprocSigMask(SIGSTOP));
         entry->sigchld_blocked = inherit_parent->sigchld_blocked;
+        entry->gave_up_terminal = inherit_parent->gave_up_terminal;
         memcpy(entry->actions, inherit_parent->actions, sizeof(entry->actions));
         if (shell_pid > 0 && inherit_parent->pid == shell_pid) {
             int job_sigs[] = { SIGTSTP, SIGTTIN, SIGTTOU };
@@ -7052,6 +7055,7 @@ static void vprocOrphanChildrenLocked(int parent_pid, int new_parent_pid) {
         VProcTaskEntry *child = vprocTaskFindLocked(child_pid);
         if (child) {
             child->orphaned = true;
+            child->adopted = true;
             if (child->exited) {
                 vprocClearEntryLocked(child);
             }
@@ -12409,6 +12413,7 @@ pid_t vprocSetsidShim(void) {
     entry->fg_pgid = pid;
     entry->blocked_signals = 0;
     entry->pending_signals = 0;
+    entry->gave_up_terminal = false;
     rc = (pid_t)pid;
 out:
     pthread_mutex_unlock(&gVProcTasks.mu);
@@ -15581,6 +15586,113 @@ int pscalTtyGetForegroundPgid(int sid) {
     return vprocGetForegroundPgid(sid);
 }
 
+bool pscalTtyCallerIsKernel(void) {
+    return vprocForThread() == NULL;
+}
+
+bool pscalTtySignalIgnoredOrBlocked(int sig) {
+    VProc *vp = vprocForThread();
+    if (!vp) {
+        return false;
+    }
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(vprocPid(vp));
+    const bool refused = entry && (vprocSignalBlockedLocked(entry, sig) || vprocSignalIgnoredLocked(entry, sig));
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    return refused;
+}
+
+/* Orphaned: no live member has a parent alive in another group of the same session. A task
+ * parented to the kernel counts as the session leader's, as waiting for it does. */
+bool pscalTtyCurrentGroupOrphaned(void) {
+    VProc *vp = vprocForThread();
+    if (!vp) {
+        return false;
+    }
+    const int kernel_pid = vprocGetKernelPid();
+    bool orphaned = true;
+    pthread_mutex_lock(&gVProcTasks.mu);
+    const VProcTaskEntry *self = vprocTaskFindLocked(vprocPid(vp));
+    const int pgid = self ? self->pgid : 0;
+    for (size_t i = 0; pgid > 0 && i < gVProcTasks.count; ++i) {
+        const VProcTaskEntry *member = &gVProcTasks.items[i];
+        if (member->pid <= 0 || member->pgid != pgid || member->exited || member->adopted) {
+            continue;
+        }
+        const int parent_pid = (kernel_pid > 0 && member->parent_pid == kernel_pid) ? member->sid : member->parent_pid;
+        const VProcTaskEntry *parent = vprocTaskFindLocked(parent_pid);
+        if (parent && !parent->exited && parent->sid == member->sid && parent->pgid != pgid) {
+            orphaned = false;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    return orphaned;
+}
+
+/* The caller has just sent its own group this signal. If that stopped it, this is where it
+ * stops, and what it was doing starts over when it is continued. */
+int pscalTtyAfterJobSignal(int sig) {
+    VProc *vp = vprocForThread();
+    if (!vp) {
+        return _EINTR;
+    }
+    vprocDeliverPendingSignalsForCurrent();
+    if (vprocWaitIfStopped(vp)) {
+        return 0;
+    }
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(vprocPid(vp));
+    const bool restarts = entry && vprocSigIndexValid(sig) &&
+                          vprocEffectiveSignalActionLocked(entry, sig) == VPROC_SIG_HANDLER &&
+                          (entry->actions[sig].sa_flags & SA_RESTART);
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    return restarts ? 0 : _EINTR;
+}
+
+int pscalTtyCheckGroup(int sid, int pgid) {
+    int result = _ESRCH;
+    pthread_mutex_lock(&gVProcTasks.mu);
+    for (size_t i = 0; i < gVProcTasks.count; ++i) {
+        const VProcTaskEntry *entry = &gVProcTasks.items[i];
+        if (entry->pid <= 0 || entry->pgid != pgid || entry->exited) {
+            continue;
+        }
+        if (entry->sid == sid) {
+            result = 0;
+            break;
+        }
+        result = _EPERM;
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    return result;
+}
+
+void pscalTtyCallerGiveUpTerminal(void) {
+    VProc *vp = vprocForThread();
+    if (!vp) {
+        return;
+    }
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(vprocPid(vp));
+    if (entry) {
+        entry->gave_up_terminal = true;
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+}
+
+bool pscalTtyCallerGaveUpTerminal(void) {
+    VProc *vp = vprocForThread();
+    if (!vp) {
+        return false;
+    }
+    pthread_mutex_lock(&gVProcTasks.mu);
+    const VProcTaskEntry *entry = vprocTaskFindLocked(vprocPid(vp));
+    const bool gave_up = entry && entry->gave_up_terminal;
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    return gave_up;
+}
+
 int PSCALRuntimeSetSessionWinsize(uint64_t session_id, int cols, int rows) {
     return vprocSetSessionWinsize(session_id, cols, rows);
 }
@@ -17386,6 +17498,72 @@ char *vprocRealpathShim(const char *path, char *resolved_path) {
     return res;
 }
 
+/* Darwin keeps its speeds in numbers of bits per second, and its cflags in other bits. */
+#if defined(__APPLE__)
+static const struct {
+    dword_t code;
+    speed_t speed;
+} kVprocSpeeds[] = {
+    {0x0, 0},        {0x1, 50},        {0x2, 75},        {0x3, 110},      {0x4, 134},
+    {0x5, 150},      {0x6, 200},       {0x7, 300},       {0x8, 600},      {0x9, 1200},
+    {0xa, 1800},     {0xb, 2400},      {0xc, 4800},      {0xd, 9600},     {0xe, 19200},
+    {0xf, 38400},    {0x1001, 57600},  {0x1002, 115200}, {0x1003, 230400},
+};
+
+static void vprocCflagsToHost(dword_t cflags, struct termios *dst) {
+    dst->c_cflag = 0;
+    switch (cflags & CSIZE_) {
+        case CS5_: dst->c_cflag |= CS5; break;
+        case CS6_: dst->c_cflag |= CS6; break;
+        case CS7_: dst->c_cflag |= CS7; break;
+        default: dst->c_cflag |= CS8; break;
+    }
+    if (cflags & CSTOPB_) dst->c_cflag |= CSTOPB;
+    if (cflags & CREAD_) dst->c_cflag |= CREAD;
+    if (cflags & PARENB_) dst->c_cflag |= PARENB;
+    if (cflags & PARODD_) dst->c_cflag |= PARODD;
+    if (cflags & HUPCL_) dst->c_cflag |= HUPCL;
+    if (cflags & CLOCAL_) dst->c_cflag |= CLOCAL;
+    for (size_t i = 0; i < sizeof(kVprocSpeeds) / sizeof(kVprocSpeeds[0]); i++) {
+        if (kVprocSpeeds[i].code == (cflags & CBAUD_)) {
+            dst->c_ispeed = kVprocSpeeds[i].speed;
+            dst->c_ospeed = kVprocSpeeds[i].speed;
+        }
+    }
+}
+
+static dword_t vprocCflagsFromHost(const struct termios *src) {
+    dword_t cflags = 0;
+    switch (src->c_cflag & CSIZE) {
+        case CS5: cflags |= CS5_; break;
+        case CS6: cflags |= CS6_; break;
+        case CS7: cflags |= CS7_; break;
+        default: cflags |= CS8_; break;
+    }
+    if (src->c_cflag & CSTOPB) cflags |= CSTOPB_;
+    if (src->c_cflag & CREAD) cflags |= CREAD_;
+    if (src->c_cflag & PARENB) cflags |= PARENB_;
+    if (src->c_cflag & PARODD) cflags |= PARODD_;
+    if (src->c_cflag & HUPCL) cflags |= HUPCL_;
+    if (src->c_cflag & CLOCAL) cflags |= CLOCAL_;
+    dword_t speed = B38400_;
+    for (size_t i = 0; i < sizeof(kVprocSpeeds) / sizeof(kVprocSpeeds[0]); i++) {
+        if (kVprocSpeeds[i].speed == src->c_ospeed) {
+            speed = kVprocSpeeds[i].code;
+        }
+    }
+    return cflags | speed;
+}
+#else
+static void vprocCflagsToHost(dword_t cflags, struct termios *dst) {
+    dst->c_cflag = (tcflag_t)cflags;
+}
+
+static dword_t vprocCflagsFromHost(const struct termios *src) {
+    return (dword_t)src->c_cflag;
+}
+#endif
+
 static void vprocTermiosFromHost(const struct termios *src, struct termios_ *dst) {
     if (!dst) {
         return;
@@ -17394,7 +17572,7 @@ static void vprocTermiosFromHost(const struct termios *src, struct termios_ *dst
     if (!src) {
         return;
     }
-    dst->cflags = (dword_t)src->c_cflag;
+    dst->cflags = vprocCflagsFromHost(src);
 #define MAP_IN(flag) \
     do { \
         if (src->c_iflag & (flag)) dst->iflags |= flag##_; \
@@ -17419,6 +17597,39 @@ static void vprocTermiosFromHost(const struct termios *src, struct termios_ *dst
 #ifdef IXON
     MAP_IN(IXON);
 #endif
+#ifdef IGNBRK
+    MAP_IN(IGNBRK);
+#endif
+#ifdef BRKINT
+    MAP_IN(BRKINT);
+#endif
+#ifdef IGNPAR
+    MAP_IN(IGNPAR);
+#endif
+#ifdef PARMRK
+    MAP_IN(PARMRK);
+#endif
+#ifdef INPCK
+    MAP_IN(INPCK);
+#endif
+#ifdef ISTRIP
+    MAP_IN(ISTRIP);
+#endif
+#ifdef IUCLC
+    MAP_IN(IUCLC);
+#endif
+#ifdef IXANY
+    MAP_IN(IXANY);
+#endif
+#ifdef IXOFF
+    MAP_IN(IXOFF);
+#endif
+#ifdef IMAXBEL
+    MAP_IN(IMAXBEL);
+#endif
+#ifdef IUTF8
+    MAP_IN(IUTF8);
+#endif
 #ifdef OPOST
     MAP_OUT(OPOST);
 #endif
@@ -17433,6 +17644,15 @@ static void vprocTermiosFromHost(const struct termios *src, struct termios_ *dst
 #endif
 #ifdef ONLRET
     MAP_OUT(ONLRET);
+#endif
+#ifdef OLCUC
+    MAP_OUT(OLCUC);
+#endif
+#ifdef OFILL
+    MAP_OUT(OFILL);
+#endif
+#ifdef OFDEL
+    MAP_OUT(OFDEL);
 #endif
 #ifdef ISIG
     MAP_L(ISIG);
@@ -17460,6 +17680,32 @@ static void vprocTermiosFromHost(const struct termios *src, struct termios_ *dst
 #endif
 #ifdef IEXTEN
     MAP_L(IEXTEN);
+#endif
+#ifdef ECHONL
+    MAP_L(ECHONL);
+#endif
+#ifdef TOSTOP
+    MAP_L(TOSTOP);
+#endif
+#ifdef ECHOPRT
+    MAP_L(ECHOPRT);
+#endif
+#ifdef FLUSHO
+    MAP_L(FLUSHO);
+#endif
+#ifdef PENDIN
+    MAP_L(PENDIN);
+#endif
+#ifdef XCASE
+    MAP_L(XCASE);
+#endif
+#if defined(TABDLY) && defined(TAB3)
+    switch (src->c_oflag & TABDLY) {
+        case TAB1: dst->oflags |= TAB1_; break;
+        case TAB2: dst->oflags |= TAB2_; break;
+        case TAB3: dst->oflags |= TAB3_; break;
+        default: break;
+    }
 #endif
 #undef MAP_IN
 #undef MAP_OUT
@@ -17530,7 +17776,7 @@ static void vprocTermiosToHost(const struct termios_ *src, struct termios *dst) 
     if (!src) {
         return;
     }
-    dst->c_cflag = (tcflag_t)src->cflags;
+    vprocCflagsToHost(src->cflags, dst);
 #define MAP_IN(flag) \
     do { \
         if (src->iflags & flag##_) dst->c_iflag |= (flag); \
@@ -17555,6 +17801,39 @@ static void vprocTermiosToHost(const struct termios_ *src, struct termios *dst) 
 #ifdef IXON
     MAP_IN(IXON);
 #endif
+#ifdef IGNBRK
+    MAP_IN(IGNBRK);
+#endif
+#ifdef BRKINT
+    MAP_IN(BRKINT);
+#endif
+#ifdef IGNPAR
+    MAP_IN(IGNPAR);
+#endif
+#ifdef PARMRK
+    MAP_IN(PARMRK);
+#endif
+#ifdef INPCK
+    MAP_IN(INPCK);
+#endif
+#ifdef ISTRIP
+    MAP_IN(ISTRIP);
+#endif
+#ifdef IUCLC
+    MAP_IN(IUCLC);
+#endif
+#ifdef IXANY
+    MAP_IN(IXANY);
+#endif
+#ifdef IXOFF
+    MAP_IN(IXOFF);
+#endif
+#ifdef IMAXBEL
+    MAP_IN(IMAXBEL);
+#endif
+#ifdef IUTF8
+    MAP_IN(IUTF8);
+#endif
 #ifdef OPOST
     MAP_OUT(OPOST);
 #endif
@@ -17569,6 +17848,15 @@ static void vprocTermiosToHost(const struct termios_ *src, struct termios *dst) 
 #endif
 #ifdef ONLRET
     MAP_OUT(ONLRET);
+#endif
+#ifdef OLCUC
+    MAP_OUT(OLCUC);
+#endif
+#ifdef OFILL
+    MAP_OUT(OFILL);
+#endif
+#ifdef OFDEL
+    MAP_OUT(OFDEL);
 #endif
 #ifdef ISIG
     MAP_L(ISIG);
@@ -17596,6 +17884,32 @@ static void vprocTermiosToHost(const struct termios_ *src, struct termios *dst) 
 #endif
 #ifdef IEXTEN
     MAP_L(IEXTEN);
+#endif
+#ifdef ECHONL
+    MAP_L(ECHONL);
+#endif
+#ifdef TOSTOP
+    MAP_L(TOSTOP);
+#endif
+#ifdef ECHOPRT
+    MAP_L(ECHOPRT);
+#endif
+#ifdef FLUSHO
+    MAP_L(FLUSHO);
+#endif
+#ifdef PENDIN
+    MAP_L(PENDIN);
+#endif
+#ifdef XCASE
+    MAP_L(XCASE);
+#endif
+#if defined(TABDLY) && defined(TAB3)
+    switch (src->oflags & TABDLY_) {
+        case TAB1_: dst->c_oflag |= TAB1; break;
+        case TAB2_: dst->c_oflag |= TAB2; break;
+        case TAB3_: dst->c_oflag |= TAB3; break;
+        default: break;
+    }
 #endif
 #undef MAP_IN
 #undef MAP_OUT
@@ -17780,6 +18094,42 @@ static int vprocIoctlTranslate(unsigned long cmd) {
 #ifdef FIONREAD
         case FIONREAD:
             return FIONREAD_;
+#endif
+#ifdef TIOCEXCL
+        case TIOCEXCL:
+            return TIOCEXCL_;
+#endif
+#ifdef TIOCNXCL
+        case TIOCNXCL:
+            return TIOCNXCL_;
+#endif
+#ifdef TIOCOUTQ
+        case TIOCOUTQ:
+            return TIOCOUTQ_;
+#endif
+#ifdef TIOCSTI
+        case TIOCSTI:
+            return TIOCSTI_;
+#endif
+#ifdef TIOCNOTTY
+        case TIOCNOTTY:
+            return TIOCNOTTY_;
+#endif
+#ifdef TIOCGSID
+        case TIOCGSID:
+            return TIOCGSID_;
+#endif
+#ifdef TIOCDRAIN
+        case TIOCDRAIN:
+            return TCSBRK_;
+#endif
+#ifdef TIOCSBRK
+        case TIOCSBRK:
+            return TCSBRK_;
+#endif
+#ifdef TIOCCBRK
+        case TIOCCBRK:
+            return TCSBRK_;
 #endif
         default:
             return (int)cmd;
@@ -17973,6 +18323,14 @@ int vprocIoctlShim(int fd, unsigned long request, ...) {
     }
     if (pscal_fd) {
         int cmd = vprocIoctlTranslate(request);
+#ifdef TIOCFLUSH
+        /* tcflush on Darwin: a pointer to which of FREAD (1) and FWRITE (2), none meaning both. */
+        if (request == TIOCFLUSH) {
+            const int which = arg_val ? *(const int *)arg_val : 0;
+            cmd = TCFLSH_;
+            arg_val = (uintptr_t)(which == 1 ? TCIFLUSH_ : (which == 2 ? TCOFLUSH_ : TCIOFLUSH_));
+        }
+#endif
         if (cmd == TIOCGPTPEER_) {
             int res = _ENOTTY;
             if (vp && pscal_fd->tty && pscalPtyIsMaster(pscal_fd)) {
@@ -18002,7 +18360,7 @@ int vprocIoctlShim(int fd, unsigned long request, ...) {
             switch (cmd) {
                 case TCGETS_: {
                     if (!arg_val) {
-                        res = _EINVAL;
+                        res = _EFAULT;
                         break;
                     }
                     if (vprocIoctlWantsKernelTermios(request)) {
@@ -18020,7 +18378,7 @@ int vprocIoctlShim(int fd, unsigned long request, ...) {
                 case TCSETSW_:
                 case TCSETSF_: {
                     if (!arg_val) {
-                        res = _EINVAL;
+                        res = _EFAULT;
                         break;
                     }
                     if (vprocIoctlWantsKernelTermios(request)) {
@@ -18034,7 +18392,7 @@ int vprocIoctlShim(int fd, unsigned long request, ...) {
                 }
                 case TIOCGWINSZ_: {
                     if (!arg_val) {
-                        res = _EINVAL;
+                        res = _EFAULT;
                         break;
                     }
                     struct winsize_ ws;
@@ -18046,7 +18404,7 @@ int vprocIoctlShim(int fd, unsigned long request, ...) {
                 }
                 case TIOCSWINSZ_: {
                     if (!arg_val) {
-                        res = _EINVAL;
+                        res = _EFAULT;
                         break;
                     }
                     struct winsize_ ws;
@@ -18776,8 +19134,10 @@ int vprocOpenShim(const char *path, int flags, ...) {
         /* A tab's commands carry its session, so its terminal is theirs. The controlling
          * terminal table goes by session id, and a tab whose thread took its terminal before
          * its shell had a task holds another tab's shell's id there: that table sent one tab's
-         * /dev/tty to another, and to a closed one's after it closed. */
-        if (session && !vprocSessionStdioIsDefault(session) && session->pty_active &&
+         * /dev/tty to another, and to a closed one's after it closed. A process that let go
+         * of its terminal has none, as on Linux. */
+        if (!pscalTtyCallerGaveUpTerminal() &&
+            session && !vprocSessionStdioIsDefault(session) && session->pty_active &&
             session->pty_slave && session->pty_slave->tty &&
             session->pty_slave->tty->driver == &pty_slave) {
             int err = pscalPtyOpenSlave(session->pty_slave->tty->num, flags | O_NOCTTY, &tty_fd);
@@ -18791,6 +19151,9 @@ int vprocOpenShim(const char *path, int flags, ...) {
             return slot;
         }
         int err = pscalTtyOpenControlling(flags, &tty_fd);
+        if (err == _EBUSY || (err == _ENXIO && pscalTtyCallerGaveUpTerminal())) {
+            return vprocSetCompatErrno(err);
+        }
         if (err == _ENXIO || err == _ENOTTY) {
             /* If this vproc never claimed a controlling TTY, bind the session
              * PTY as the controlling terminal for the current sid and retry. */
