@@ -12665,6 +12665,10 @@ Value vmBuiltinShellKill(VM *vm, int arg_count, Value *args) {
                 rc = shellJobControlSendPgid(pgid, signal_number);
             }
         }
+        /* The shell's own group. shellJobControlSendPid takes 0 for a job that has no group yet. */
+        else if (target_pid == 0) {
+            rc = kill(0, signal_number);
+        }
 #if defined(PSCAL_TARGET_IOS)
         /* To itself, with a trap waiting: Ctrl-C's route through the vproc would not get there. */
         else if (target_pid == shellRuntimeOwnPid() && signal_number > 0 && signal_number < 32 &&

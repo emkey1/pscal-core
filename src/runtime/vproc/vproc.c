@@ -1657,8 +1657,29 @@ static pid_t vprocHostWaitpidRaw(pid_t pid, int *status_out, int options) {
     return (pid_t)-1;
 }
 
+#if defined(VPROC_ENABLE_STUBS_FOR_TESTS)
+static int (*gVProcHostKillHookForTests)(pid_t, int) = NULL;
+
+void vprocSetHostKillHookForTests(int (*hook)(pid_t, int)) {
+    gVProcHostKillHookForTests = hook;
+}
+#endif
+
+/* Only a single process goes to the host. The other forms mean something else there, as the task
+ * table's ids are synthetic and on iOS start at 1: group 1 arrives as -1, which the host reads as
+ * every process the user owns, 0 is the host's group around this process, and -N a real group that
+ * merely has the same number. */
 static int vprocHostKillRaw(pid_t pid, int sig) {
     static int (*fn)(pid_t, int) = NULL;
+    if (pid <= 0) {
+        errno = ESRCH;
+        return -1;
+    }
+#if defined(VPROC_ENABLE_STUBS_FOR_TESTS)
+    if (gVProcHostKillHookForTests) {
+        return gVProcHostKillHookForTests(pid, sig);
+    }
+#endif
     if (!fn) {
         fn = (int (*)(pid_t, int))vprocResolveSymbol("kill");
     }
@@ -10525,7 +10546,12 @@ static bool vprocHasWaitCandidateLocked(pid_t pid,
 }
 #endif
 
-static bool vprocHasKillTargetLocked(pid_t pid) {
+/* kill(-1) as on Linux: every task but the caller and init, which here is the kernel's own task. */
+static bool vprocBroadcastReachesLocked(const VProcTaskEntry *entry, int self_pid) {
+    return entry->pid > 1 && entry->pid != self_pid && entry->pid != vprocGetKernelPid();
+}
+
+static bool vprocHasKillTargetLocked(pid_t pid, int self_pid) {
     if (pid == 0) {
         return false;
     }
@@ -10536,7 +10562,7 @@ static bool vprocHasKillTargetLocked(pid_t pid) {
         VProcTaskEntry *entry = vprocTaskFindLocked(target);
         return entry != NULL;
     }
-    if (target_group) {
+    if (target_group && !broadcast_all) {
         VProcTaskEntry *entry = vprocTaskFindLocked(target);
         if (entry && entry->pgid == target) {
             return true;
@@ -10546,7 +10572,10 @@ static bool vprocHasKillTargetLocked(pid_t pid) {
         VProcTaskEntry *entry = &gVProcTasks.items[i];
         if (entry->pid <= 0) continue;
         if (broadcast_all) {
-            return true;
+            if (vprocBroadcastReachesLocked(entry, self_pid)) {
+                return true;
+            }
+            continue;
         }
         if (target_group) {
             if (entry->pgid == target) {
@@ -10801,6 +10830,10 @@ static bool vprocKillDeliverEntryLocked(VProcTaskEntry *entry,
     if (entry->dying_since_ns != 0) {
         return true;
     }
+    if (entry->pid == vprocGetKernelPid()) {
+        /* As init on Linux, nothing kills it. A cancel would end the thread that carries Ctrl-C. */
+        return true;
+    }
     if (dbg) {
         vprocDebugLogf( "[vproc-kill] pid=%d sig=%d entry_pid=%d tid=%p\n",
                 (int)requested_pid, sig, entry->pid, (void *)entry->tid);
@@ -10933,10 +10966,11 @@ int vprocKillShim(pid_t pid, int sig) {
         return -1;
     }
     bool require_virtual = vprocSignalRequiresVirtualDispatch(sig);
-    if (!vprocShimHasVirtualContext() && !require_virtual) {
+    /* The VM is the kernel: a group or everything means its task table, whoever asks. */
+    if (pid > 0 && !vprocShimHasVirtualContext() && !require_virtual) {
 #if defined(VPROC_ENABLE_STUBS_FOR_TESTS)
         pthread_mutex_lock(&gVProcTasks.mu);
-        bool has_target = vprocHasKillTargetLocked(pid);
+        bool has_target = vprocHasKillTargetLocked(pid, -1);
         pthread_mutex_unlock(&gVProcTasks.mu);
         if (!has_target) {
             return vprocHostKillRaw(pid, sig);
@@ -10970,19 +11004,15 @@ int vprocKillShim(pid_t pid, int sig) {
         int caller_pgid = vprocTaskPgidByPidLocked(caller_for_zero);
         if (caller_pgid <= 0) {
             pthread_mutex_unlock(&gVProcTasks.mu);
-            if (require_virtual) {
-                errno = ESRCH;
-                return -1;
-            }
-            return vprocHostKillRaw(pid, sig);
+            errno = ESRCH;
+            return -1;
         }
         target_group = true;
         target = caller_pgid;
     }
     if (sig == 0) {
-        /* Probe for existence: succeed if we find a matching entry. */
-        pid_t probe_pid = broadcast_all ? -1 : (target_group ? (pid_t)(-target) : (pid_t)target);
-        bool found = vprocHasKillTargetLocked(probe_pid);
+        /* Probe for existence: succeed if we find a matching entry. A caller is in its own group. */
+        bool found = (pid == 0) || vprocHasKillTargetLocked(pid, self_pid);
         pthread_mutex_unlock(&gVProcTasks.mu);
         if (found) {
             return 0;
@@ -10995,7 +11025,9 @@ int vprocKillShim(pid_t pid, int sig) {
                 target, (int)target_group, (int)broadcast_all, gVProcTasks.count);
     }
     bool delivered = false;
-    
+    /* kill(0, sig) is kill(-pgid, sig) from here on, for the caller's own thread too. */
+    pid_t requested_pid = target_group ? (pid_t)(-target) : pid;
+
     if (!broadcast_all && !target_group) {
         VProcTaskEntry *entry = vprocTaskFindLocked(target);
         if (entry && vprocKillDeliverEntryLocked(entry, pid, sig, dbg, self,
@@ -11015,13 +11047,12 @@ int vprocKillShim(pid_t pid, int sig) {
             }
 
             if (broadcast_all) {
-                // Don't kill self in broadcast
-                if (self_pid > 0 && entry->pid == self_pid) continue;
+                if (!vprocBroadcastReachesLocked(entry, self_pid)) continue;
             } else if (target_group) {
                 if (entry->pgid != target) continue;
             }
 
-            if (vprocKillDeliverEntryLocked(entry, pid, sig, dbg, self,
+            if (vprocKillDeliverEntryLocked(entry, requested_pid, sig, dbg, self,
                                             &cancel_list, &cancel_count, &cancel_capacity,
                                             &request_runtime_sigint,
                                             &request_runtime_sigtstp)) {
@@ -12619,7 +12650,7 @@ static void vprocEnsurePathTruncationDefault(void) {
      * truncation is anchored at the container root, /bin expands to
      * <container>/bin which does not exist. Prefer the Documents root so /bin
      * maps to <container>/Documents/bin where exsh assets are staged. */
-    if (container_root_len > 0 &&
+    if (container_root_len > 0 && !pathTruncatePrefixIsRoot(raw_prefix) &&
         strncmp(raw_prefix, container_root, container_root_len) == 0) {
         size_t n = snprintf(prefbuf, sizeof(prefbuf), "%s/Documents", raw_prefix);
         if (n > 0 && n < sizeof(prefbuf)) {
@@ -12629,6 +12660,13 @@ static void vprocEnsurePathTruncationDefault(void) {
     pathTruncateApplyEnvironment(prefix);
     pthread_mutex_unlock(&gPathTruncateMu);
 }
+
+#if defined(VPROC_ENABLE_STUBS_FOR_TESTS)
+void vprocRunPathTruncationDefaultForTests(void) {
+    __atomic_store_n(&gPathTruncateInit, false, __ATOMIC_RELEASE);
+    vprocEnsurePathTruncationDefault();
+}
+#endif
 
 void vprocApplyPathTruncation(const char *prefix) {
     pthread_mutex_lock(&gPathTruncateMu);
@@ -12641,7 +12679,7 @@ void vprocApplyPathTruncation(const char *prefix) {
                 : 0;
         char prefbuf[PATH_MAX];
         const char *use_prefix = prefix;
-        if (container_root_len > 0 &&
+        if (container_root_len > 0 && !pathTruncatePrefixIsRoot(prefix) &&
             strncmp(prefix, container_root, container_root_len) == 0) {
             size_t n = snprintf(prefbuf, sizeof(prefbuf), "%s/Documents", prefix);
             if (n > 0 && n < sizeof(prefbuf)) {

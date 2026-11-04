@@ -14,6 +14,12 @@ extern "C" {
 bool pathTruncateEnabled(void);
 
 /**
+ * Returns true when `prefix` names the real root, however it is spelled: "/",
+ * "//", "/./", "/usr/.." or a symlink to it. The root is never provisioned.
+ */
+bool pathTruncatePrefixIsRoot(const char *prefix);
+
+/**
  * Removes the PATH_TRUNCATE prefix from `absolute_path` and writes the user-facing
  * representation into `out`. When the prefix does not match or PATH_TRUNCATE is
  * disabled the original string is copied verbatim.
@@ -62,8 +68,9 @@ void pathTruncateMountClearAll(void);
 
 /**
  * Applies the PATH_TRUNCATE environment variable using the provided prefix.
- * Passing NULL clears PATH_TRUNCATE entirely. Internal caches are flushed so
- * subsequent path lookups observe the new value immediately.
+ * Passing NULL clears PATH_TRUNCATE entirely. The real root is not a prefix:
+ * $HOME stands in for it, or nothing when $HOME is the root too. Internal caches
+ * are flushed so subsequent path lookups observe the new value immediately.
  */
 void pathTruncateApplyEnvironment(const char *prefix);
 
@@ -75,6 +82,11 @@ void pathTruncateProvisionDev(const char *prefix);
 /* Ensures a minimal /proc tree under the truncated prefix and generates
  * a lightweight cpuinfo file for compatibility. */
 void pathTruncateProvisionProc(const char *prefix);
+
+#if defined(VPROC_ENABLE_STUBS_FOR_TESTS)
+/* While set, provisioning passes its prefix to the hook and touches nothing. */
+void pathTruncateSetProvisionHookForTests(void (*hook)(const char *prefix));
+#endif
 
 #ifdef __cplusplus
 }

@@ -64,6 +64,7 @@ static inline void pathTruncateLock(void)   { pthread_mutex_lock(&g_pathTruncate
 static inline void pathTruncateUnlock(void) { pthread_mutex_unlock(&g_pathTruncateMutex); }
 static void pathTruncateEnsureDir(const char *path);
 static void pathTruncateProvisionUsrBin(const char *prefix);
+static bool pathTruncateMayProvision(const char *prefix);
 static bool pathTruncateNormalizeAbsolute(const char *input, char *out, size_t out_size);
 static bool pathTruncatePrefixMatch(const char *path, const char *prefix, size_t prefix_len);
 static int pathTruncateMountCompareByTargetLength(const void *lhs, const void *rhs);
@@ -457,7 +458,7 @@ static void pathTruncateProvisionUsrBinFromBinDirectory(const char *prefix, cons
 }
 
 static void pathTruncateProvisionUsrBin(const char *prefix) {
-    if (!prefix || prefix[0] != '/') {
+    if (!pathTruncateMayProvision(prefix)) {
         return;
     }
     char usr_dir[PATH_MAX];
@@ -2729,10 +2730,10 @@ static void pathTruncateWriteProcPidEntries(const char *procdir,
 }
 
 static void pathTruncateRefreshProc(const char *prefix, const char *request_path) {
-    if (!prefix || prefix[0] != '/') {
+    if (request_path && !pathTruncateIsProcRequestPath(request_path)) {
         return;
     }
-    if (request_path && !pathTruncateIsProcRequestPath(request_path)) {
+    if (!pathTruncateMayProvision(prefix)) {
         return;
     }
     bool request_net = request_path &&
@@ -3798,6 +3799,29 @@ static void pathTruncateEnsureDir(const char *path) {
     mkdir(buf, 0777);
 }
 
+#if defined(VPROC_ENABLE_STUBS_FOR_TESTS)
+static void (*g_pathTruncateProvisionHook)(const char *prefix) = NULL;
+
+void pathTruncateSetProvisionHookForTests(void (*hook)(const char *prefix)) {
+    g_pathTruncateProvisionHook = hook;
+}
+#endif
+
+/* Everything that makes, replaces or prunes files for a prefix asks here first. Under the root it
+ * would make directories, prune /proc and rename links over /usr/bin on the real system. */
+static bool pathTruncateMayProvision(const char *prefix) {
+    if (!prefix || prefix[0] != '/' || pathTruncatePrefixIsRoot(prefix)) {
+        return false;
+    }
+#if defined(VPROC_ENABLE_STUBS_FOR_TESTS)
+    if (g_pathTruncateProvisionHook) {
+        g_pathTruncateProvisionHook(prefix);
+        return false;
+    }
+#endif
+    return true;
+}
+
 static bool pathTruncateNormalizeAbsolute(const char *input, char *out, size_t out_size) {
     if (!input || !out || out_size < 2) {
         errno = EINVAL;
@@ -3960,6 +3984,26 @@ static bool pathTruncateFetchPrefix(const char **out_prefix, size_t *out_length)
     *out_prefix = g_pathTruncatePrimary;
     *out_length = g_pathTruncatePrimaryLen;
     return true;
+}
+
+bool pathTruncatePrefixIsRoot(const char *prefix) {
+    if (!prefix || prefix[0] != '/') {
+        return false;
+    }
+    char normalized[PATH_MAX];
+    if (pathTruncateNormalizeAbsolute(prefix, normalized, sizeof(normalized)) &&
+        strcmp(normalized, "/") == 0) {
+        return true;
+    }
+    /* A symlink can reach it too, and `..` after one reads wrong from the spelling alone. */
+    bool is_root = false;
+    if (!g_pathTruncateResolving) {
+        char canonical[PATH_MAX];
+        g_pathTruncateResolving = 1;
+        is_root = realpath(prefix, canonical) && strcmp(canonical, "/") == 0;
+        g_pathTruncateResolving = 0;
+    }
+    return is_root;
 }
 
 static bool pathTruncateMatchesStoredPrefix(const char *path,
@@ -4219,32 +4263,39 @@ bool pathTruncateStrip(const char *absolute_path, char *out, size_t out_size) {
 
 void pathTruncateApplyEnvironment(const char *prefix) {
     pathTruncateLock();
+    if (pathTruncatePrefixIsRoot(prefix)) {
+        /* Not useful as a prefix, as pathTruncateFetchPrefix says: the home stands in. */
+        const char *home = getenv("HOME");
+        prefix = (home && home[0] == '/' && !pathTruncatePrefixIsRoot(home)) ? home : NULL;
+    }
     if (prefix && prefix[0] == '/') {
         setenv("PATH_TRUNCATE", prefix, 1);
-        /* Seed common root directories so path virtualization has writable parents. */
-        char tmpbuf[PATH_MAX];
-        int written = snprintf(tmpbuf, sizeof(tmpbuf), "%s/tmp", prefix);
-        if (written > 0 && (size_t)written < sizeof(tmpbuf)) {
-            pathTruncateEnsureDir(tmpbuf);
+        if (pathTruncateMayProvision(prefix)) {
+            /* Seed common root directories so path virtualization has writable parents. */
+            char tmpbuf[PATH_MAX];
+            int written = snprintf(tmpbuf, sizeof(tmpbuf), "%s/tmp", prefix);
+            if (written > 0 && (size_t)written < sizeof(tmpbuf)) {
+                pathTruncateEnsureDir(tmpbuf);
+            }
+            written = snprintf(tmpbuf, sizeof(tmpbuf), "%s/var/tmp", prefix);
+            if (written > 0 && (size_t)written < sizeof(tmpbuf)) {
+                pathTruncateEnsureDir(tmpbuf);
+            }
+            written = snprintf(tmpbuf, sizeof(tmpbuf), "%s/var/log", prefix);
+            if (written > 0 && (size_t)written < sizeof(tmpbuf)) {
+                pathTruncateEnsureDir(tmpbuf);
+            }
+            written = snprintf(tmpbuf, sizeof(tmpbuf), "%s/var/local", prefix);
+            if (written > 0 && (size_t)written < sizeof(tmpbuf)) {
+                pathTruncateEnsureDir(tmpbuf);
+            }
+            /* Seed emulated /dev with symlinks to system devices. */
+            pathTruncateProvisionDev(prefix);
+            /* Seed a minimal /proc tree with cpuinfo. */
+            pathTruncateProvisionProc(prefix);
+            /* Seed a virtual /usr/bin catalog for frontends and smallclue applets. */
+            pathTruncateProvisionUsrBin(prefix);
         }
-        written = snprintf(tmpbuf, sizeof(tmpbuf), "%s/var/tmp", prefix);
-        if (written > 0 && (size_t)written < sizeof(tmpbuf)) {
-            pathTruncateEnsureDir(tmpbuf);
-        }
-        written = snprintf(tmpbuf, sizeof(tmpbuf), "%s/var/log", prefix);
-        if (written > 0 && (size_t)written < sizeof(tmpbuf)) {
-            pathTruncateEnsureDir(tmpbuf);
-        }
-        written = snprintf(tmpbuf, sizeof(tmpbuf), "%s/var/local", prefix);
-        if (written > 0 && (size_t)written < sizeof(tmpbuf)) {
-            pathTruncateEnsureDir(tmpbuf);
-        }
-        /* Seed emulated /dev with symlinks to system devices. */
-        pathTruncateProvisionDev(prefix);
-        /* Seed a minimal /proc tree with cpuinfo. */
-        pathTruncateProvisionProc(prefix);
-        /* Seed a virtual /usr/bin catalog for frontends and smallclue applets. */
-        pathTruncateProvisionUsrBin(prefix);
     } else {
         unsetenv("PATH_TRUNCATE");
     }
@@ -4253,7 +4304,7 @@ void pathTruncateApplyEnvironment(const char *prefix) {
 }
 
 void pathTruncateProvisionDev(const char *prefix) {
-    if (!prefix || *prefix != '/') {
+    if (!pathTruncateMayProvision(prefix)) {
         return;
     }
     char devdir[PATH_MAX];

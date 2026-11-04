@@ -360,6 +360,9 @@ void vprocSetSessionKernelPid(int pid);
 int vprocEnsureKernelPid(void);
 #if defined(VPROC_ENABLE_STUBS_FOR_TESTS)
 void vprocResetStartupFstabStateForTests(void);
+void vprocRunPathTruncationDefaultForTests(void);
+/* While set, a signal that would go to the host goes to the hook instead. */
+void vprocSetHostKillHookForTests(int (*hook)(pid_t, int));
 #endif
 
 /* Per-session stdio ownership: duplicated host fds that define the
