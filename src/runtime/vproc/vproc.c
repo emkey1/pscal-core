@@ -51,7 +51,7 @@
 #endif
 #include "common/frontend_kind.h"
 #include "common/runtime_tty.h"
-#include "runtime/vproc/tty/ish_compat.h"
+#include "runtime/vproc/tty/pscal_compat.h"
 #include "runtime/vproc/tty/pscal_pty.h"
 #include "runtime/vproc/tty/pscal_tty_host.h"
 
