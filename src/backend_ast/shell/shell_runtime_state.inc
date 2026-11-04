@@ -578,6 +578,8 @@ typedef struct {
     struct pscal_fd **pscal_pipe_read;
     struct pscal_fd **pscal_pipe_write;
     struct pscal_fd **pscal_pipe_write_hold;
+    int window_cols;
+    int window_rows;
 #endif
 } ShellPipelineContext;
 

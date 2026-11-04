@@ -2035,6 +2035,7 @@ struct VProc {
     VProcResourceEntry *resources;
     size_t resource_count;
     size_t resource_capacity;
+    int pins;               // Threads borrowing this vproc for a moment, under gVProcRegistryMu
 };
 
 static int vprocSessionHostFdForStd(int std_fd);
@@ -2057,6 +2058,7 @@ static size_t gVProcRegistryCount = 0;
 static size_t gVProcRegistryCapacity = 0;
 static VProc *gVProcRegistryHint = NULL;
 static pthread_mutex_t gVProcRegistryMu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t gVProcPinsCv = PTHREAD_COND_INITIALIZER;
 static unsigned long long gVProcRegistryVersion = 1;
 static int gNextSyntheticPid = 0;
 static _Thread_local int gShellSelfPid = 0;
@@ -3154,6 +3156,48 @@ static void vprocRegistryRemove(VProc *vp) {
         }
     }
     pthread_mutex_unlock(&gVProcRegistryMu);
+}
+
+/* A thread that is not a vproc's owner can lose it at any moment: a pipeline stage's parent can
+ * be killed while the stage starts. A pin keeps it whole until vprocUnpin, since vprocDestroy
+ * waits for its pins once it has left the registry, and nothing can pin it after that. */
+static VProc *vprocPin(VProc *vp) {
+    if (!vp) {
+        return NULL;
+    }
+    VProc *pinned = NULL;
+    pthread_mutex_lock(&gVProcRegistryMu);
+    for (size_t i = 0; i < gVProcRegistryCount; ++i) {
+        if (gVProcRegistry[i] == vp) {
+            vp->pins++;
+            pinned = vp;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&gVProcRegistryMu);
+    return pinned;
+}
+
+static void vprocUnpin(VProc *vp) {
+    if (!vp) {
+        return;
+    }
+    pthread_mutex_lock(&gVProcRegistryMu);
+    if (--vp->pins == 0) {
+        pthread_cond_broadcast(&gVProcPinsCv);
+    }
+    pthread_mutex_unlock(&gVProcRegistryMu);
+}
+
+static void vprocWaitForPins(VProc *vp) {
+    int cancel_state;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+    pthread_mutex_lock(&gVProcRegistryMu);
+    while (vp->pins > 0) {
+        pthread_cond_wait(&gVProcPinsCv, &gVProcRegistryMu);
+    }
+    pthread_mutex_unlock(&gVProcRegistryMu);
+    pthread_setcancelstate(cancel_state, NULL);
 }
 
 static bool vprocRegistryContains(const VProc *vp) {
@@ -8096,13 +8140,12 @@ void vprocMarkFdInherited(VProc *vp, int fd) {
     pthread_mutex_unlock(&vp->mu);
 }
 
-VProc *vprocCreate(const VProcOptions *opts) {
+static VProc *vprocCreateFrom(const VProcOptions *opts, VProc *active) {
     VProcOptions local = opts ? *opts : vprocDefaultOptions();
     if (gNextSyntheticPid == 0) {
         gNextSyntheticPid = vprocNextPidSeed();
     }
     bool vproc_dbg = vprocVprocDebugEnabled();
-    VProc *active = vprocCurrent();
 #if defined(PSCAL_TARGET_IOS)
     VProcSessionStdio *session_stdio = vprocSessionStdioCurrent();
     bool inherit_pscal_stdio = false;
@@ -8311,6 +8354,17 @@ VProc *vprocCreate(const VProcOptions *opts) {
     return vp;
 }
 
+VProc *vprocCreate(const VProcOptions *opts) {
+    /* A cancel here would leave the pin held, and the parent's owner waiting on it for ever. */
+    int cancel_state;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+    VProc *active = vprocPin(vprocCurrent());
+    VProc *vp = vprocCreateFrom(opts, active);
+    vprocUnpin(active);
+    pthread_setcancelstate(cancel_state, NULL);
+    return vp;
+}
+
 int vprocAdoptPscalStdio(VProc *vp,
                          struct pscal_fd *stdin_fd,
                          struct pscal_fd *stdout_fd,
@@ -8482,6 +8536,7 @@ void vprocDestroy(VProc *vp) {
         return;
     }
     vprocRegistryRemove(vp);
+    vprocWaitForPins(vp);
     // Lock shouldn't strictly be needed here if refcount is 0, but good practice
     pthread_mutex_lock(&vp->mu);
     vprocCloseDescriptorsLocked(vp);

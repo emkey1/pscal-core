@@ -3011,6 +3011,10 @@ static bool shellEnsurePipeline(size_t stages, bool negated) {
         ctx->in_process = true;
         ctx->in_process_worker = false;
         ctx->session_stdio = vprocSessionStdioCurrent();
+        /* Asked here, by the vproc's owner. A stage on a thread of its own has only borrowed
+         * that vproc, which is gone the moment the owner is killed. */
+        ctx->window_cols = pscalRuntimeDetectWindowCols();
+        ctx->window_rows = pscalRuntimeDetectWindowRows();
         if (gShellRuntime.in_subshell && vprocCurrent()) {
             /* Its stages stay in the subshell's group, which the terminal signals. */
             ctx->pgid = vprocGetPgid(vprocPid(vprocCurrent()));
@@ -4805,8 +4809,8 @@ static int shellPipelineRunStage(VM *vm,
     VProc *vp = shellCreateVProcForStage(stdin_fd,
                                          stdout_fd,
                                          stderr_fd,
-                                         pscalRuntimeDetectWindowCols(),
-                                         pscalRuntimeDetectWindowRows(),
+                                         ctx->window_cols > 0 ? ctx->window_cols : pscalRuntimeDetectWindowCols(),
+                                         ctx->window_rows > 0 ? ctx->window_rows : pscalRuntimeDetectWindowRows(),
                                          pid_hint,
                                          inherit_pscal_stdio);
     if (!vp) {
@@ -5019,6 +5023,8 @@ static ShellPipelineContext *shellCloneSingleStagePipelineContext(const ShellPip
     clone->in_process = src ? src->in_process : true;
     clone->in_process_worker = false;
     clone->session_stdio = src ? src->session_stdio : NULL;
+    clone->window_cols = src ? src->window_cols : 0;
+    clone->window_rows = src ? src->window_rows : 0;
 #endif
     clone->pids = (pid_t *)calloc(1, sizeof(pid_t));
     if (!clone->pids) {
