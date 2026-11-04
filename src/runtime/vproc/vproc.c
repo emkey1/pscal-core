@@ -30,6 +30,8 @@
 #include <dlfcn.h>
 #include <pwd.h>
 #include <grp.h>
+#include <libgen.h>
+#include <sys/param.h>
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #include <sys/syscall.h>
@@ -15070,6 +15072,52 @@ static ssize_t vprocEnvFindLocked(const VProcEnv *env, const char *name, size_t 
 
 VProcEnv *vprocEnvCapture(void) {
     return vprocEnvCaptureFiltered(NULL, NULL);
+}
+
+/* Darwin's basename and dirname answer in one buffer each for the whole process, so one `dirname`
+ * could print what another one running beside it asked for. A thread gets buffers of its own when
+ * it first asks, on the heap, as an array in thread-local storage would cost every thread. */
+typedef struct {
+    char base[MAXPATHLEN];
+    char dir[MAXPATHLEN];
+} VProcPathNames;
+
+static pthread_key_t gVprocPathNamesKey;
+static pthread_once_t gVprocPathNamesOnce = PTHREAD_ONCE_INIT;
+
+static void vprocPathNamesMakeKey(void) {
+    (void)pthread_key_create(&gVprocPathNamesKey, free);
+}
+
+static VProcPathNames *vprocPathNamesForThread(void) {
+    (void)pthread_once(&gVprocPathNamesOnce, vprocPathNamesMakeKey);
+    VProcPathNames *names = (VProcPathNames *)pthread_getspecific(gVprocPathNamesKey);
+    if (!names) {
+        names = (VProcPathNames *)malloc(sizeof(VProcPathNames));
+        if (names && pthread_setspecific(gVprocPathNamesKey, names) != 0) {
+            free(names);
+            names = NULL;
+        }
+    }
+    return names;
+}
+
+char *vprocBasenameShim(char *path) {
+#if defined(__APPLE__)
+    VProcPathNames *names = vprocPathNamesForThread();
+    return names ? basename_r(path, names->base) : NULL;
+#else
+    return basename(path);
+#endif
+}
+
+char *vprocDirnameShim(char *path) {
+#if defined(__APPLE__)
+    VProcPathNames *names = vprocPathNamesForThread();
+    return names ? dirname_r(path, names->dir) : NULL;
+#else
+    return dirname(path);
+#endif
 }
 
 VProcEnv *vprocEnvCaptureFiltered(bool (*keep)(const char *entry, void *arg), void *arg) {

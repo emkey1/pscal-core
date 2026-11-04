@@ -5,6 +5,7 @@
 #endif
 
 #if defined(PSCAL_TARGET_IOS) && !defined(VPROC_SHIM_DISABLED)
+#include <libgen.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #define VPROC_SHIM_PRESENT 1
@@ -61,12 +62,17 @@
 #undef setenv
 #undef unsetenv
 #undef environ
+#undef basename
+#undef dirname
 
 #define getenv vprocGetenvShim
 #define setenv vprocSetenvShim
 #define unsetenv vprocUnsetenvShim
 /* `extern char **environ;` after this declares vprocEnvironShim again, compatibly. */
 #define environ (*vprocEnvironShim())
+/* libc answers these in one buffer for the whole process. */
+#define basename(path) vprocBasenameShim((path))
+#define dirname(path) vprocDirnameShim((path))
 
 #define read  vprocReadShim
 #define write vprocWriteShim

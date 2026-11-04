@@ -292,6 +292,9 @@ VProcEnv *vprocEnvRetain(VProcEnv *env);
 void vprocEnvRelease(VProcEnv *env);
 VProcEnv *vprocEnvCurrent(void);
 VProcEnv *vprocEnvActivate(VProcEnv *env);
+/* As basename and dirname, with an answer that is the calling thread's until it next asks. */
+char *vprocBasenameShim(char *path);
+char *vprocDirnameShim(char *path);
 char *vprocGetenvShim(const char *name);
 int vprocSetenvShim(const char *name, const char *value, int overwrite);
 int vprocUnsetenvShim(const char *name);
