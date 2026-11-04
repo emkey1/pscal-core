@@ -4446,6 +4446,14 @@ Value vmBuiltinShellPscalasm(VM *vm, int arg_count, Value *args) {
 
 #endif /* PSCAL_TARGET_IOS */
 
+static int shellFlushBuiltinOutput(VM *vm, const char *name);
+
+/* pushd and popd have moved by now: bash reports a failed write and still succeeds. */
+static void shellDirectoryStackReport(VM *vm, const char *name) {
+    shellDirectoryStackPrint();
+    (void)shellFlushBuiltinOutput(vm, name);
+}
+
 Value vmBuiltinShellDirs(VM *vm, int arg_count, Value *args) {
     (void)args;
     if (arg_count > 0) {
@@ -4456,7 +4464,7 @@ Value vmBuiltinShellDirs(VM *vm, int arg_count, Value *args) {
     if (!shellDirectoryStackEnsureInitialised(vm, "dirs")) {
         return makeVoid();
     }
-    shellDirectoryStackPrint(STDOUT_FILENO);
+    shellDirectoryStackPrint();
     shellUpdateStatus(0);
     return makeVoid();
 }
@@ -4491,7 +4499,7 @@ Value vmBuiltinShellPushd(VM *vm, int arg_count, Value *args) {
         gShellRuntime.dir_stack_initialised = true;
         shellDirectoryStackUpdateEnvironment(old_cwd, gShellRuntime.dir_stack[0]);
         free(old_cwd);
-        shellDirectoryStackPrint(STDOUT_FILENO);
+        shellDirectoryStackReport(vm, "pushd");
         shellUpdateStatus(0);
         return makeVoid();
     }
@@ -4522,7 +4530,7 @@ Value vmBuiltinShellPushd(VM *vm, int arg_count, Value *args) {
     gShellRuntime.dir_stack_initialised = true;
     shellDirectoryStackUpdateEnvironment(old_cwd, gShellRuntime.dir_stack[0]);
     free(old_cwd);
-    shellDirectoryStackPrint(STDOUT_FILENO);
+    shellDirectoryStackReport(vm, "pushd");
     shellUpdateStatus(0);
     return makeVoid();
 }
@@ -4561,7 +4569,7 @@ Value vmBuiltinShellPopd(VM *vm, int arg_count, Value *args) {
     gShellRuntime.dir_stack_initialised = true;
     shellDirectoryStackUpdateEnvironment(old_cwd, gShellRuntime.dir_stack[0]);
     free(old_cwd);
-    shellDirectoryStackPrint(STDOUT_FILENO);
+    shellDirectoryStackReport(vm, "popd");
     shellUpdateStatus(0);
     return makeVoid();
 }
@@ -4744,7 +4752,9 @@ static void shellEchoWriteString(const char *text,
 
 /* `echo a >&-`: the write fails, the command does, and the text goes with it. */
 static int shellFlushBuiltinOutput(VM *vm, const char *name) {
-    if (fflush(stdout) == 0) {
+    /* glibc drops the text at the write that failed and keeps only the stream's flag, so the
+     * flush after it succeeds. */
+    if (fflush(stdout) == 0 && !ferror(stdout)) {
         return 0;
     }
     /* A reader that left would have ended a process with no message. The shell ignores
@@ -4762,6 +4772,15 @@ static int shellFlushBuiltinOutput(VM *vm, const char *name) {
 #endif
     clearerr(stdout);
     return status;
+}
+
+/* Bash does this after every builtin that prints. Left in the buffer, the text came out at the
+ * next flush, wherever stdout was by then. */
+static void shellCheckBuiltinOutput(VM *vm, const char *name) {
+    int status = shellFlushBuiltinOutput(vm, name);
+    if (status != 0) {
+        shellUpdateStatus(status);
+    }
 }
 
 Value vmBuiltinShellEcho(VM *vm, int arg_count, Value *args) {
@@ -13111,6 +13130,7 @@ Value vmBuiltinShellBuiltin(VM *vm, int arg_count, Value *args) {
         printValueToStream(result, stdout);
         fputc('\n', stdout);
     }
+    shellCheckBuiltinOutput(vm, name);
 
     freeValue(&result);
     return makeVoid();

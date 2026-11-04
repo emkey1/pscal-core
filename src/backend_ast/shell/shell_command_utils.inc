@@ -4252,27 +4252,7 @@ static bool shellDirectoryStackChdir(VM *vm,
     return true;
 }
 
-static void shellDirectoryStackWriteAll(int fd, const char *data, size_t len) {
-    while (len > 0) {
-        ssize_t wrote = write(fd, data, len);
-        if (wrote < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            break;
-        }
-        if (wrote == 0) {
-            break;
-        }
-        data += (size_t)wrote;
-        len -= (size_t)wrote;
-    }
-}
-
-static void shellDirectoryStackWriteEntry(int fd, const char *entry) {
-    if (fd < 0) {
-        return;
-    }
+static void shellDirectoryStackWriteEntry(const char *entry) {
     if (!entry) {
         return;
     }
@@ -4280,36 +4260,33 @@ static void shellDirectoryStackWriteEntry(int fd, const char *entry) {
     size_t home_len = home ? strlen(home) : 0;
     if (home_len > 0 && strncmp(entry, home, home_len) == 0 &&
         (entry[home_len] == '\0' || entry[home_len] == '/')) {
-        shellDirectoryStackWriteAll(fd, "~", 1);
+        fputs("~", stdout);
         const char *suffix = entry + home_len;
         if (*suffix == '/') {
             suffix++;
             if (*suffix) {
-                shellDirectoryStackWriteAll(fd, "/", 1);
-                shellDirectoryStackWriteAll(fd, suffix, strlen(suffix));
+                fputs("/", stdout);
+                fputs(suffix, stdout);
             }
         }
         return;
     }
-    shellDirectoryStackWriteAll(fd, entry, strlen(entry));
+    fputs(entry, stdout);
 }
 
-static void shellDirectoryStackPrint(int fd) {
-    if (fd < 0) {
-        return;
-    }
+static void shellDirectoryStackPrint(void) {
     if (!gShellRuntime.dir_stack || gShellRuntime.dir_stack_count == 0) {
-        shellDirectoryStackWriteAll(fd, "\n", 1);
+        fputs("\n", stdout);
         return;
     }
     for (size_t i = 0; i < gShellRuntime.dir_stack_count; ++i) {
         const char *entry = gShellRuntime.dir_stack[i] ? gShellRuntime.dir_stack[i] : "";
-        shellDirectoryStackWriteEntry(fd, entry);
+        shellDirectoryStackWriteEntry(entry);
         if (i + 1 < gShellRuntime.dir_stack_count) {
-            shellDirectoryStackWriteAll(fd, " ", 1);
+            fputs(" ", stdout);
         }
     }
-    shellDirectoryStackWriteAll(fd, "\n", 1);
+    fputs("\n", stdout);
 }
 
 static char *shellLookupRawEnvironmentValue(const char *name, size_t len) {

@@ -2343,6 +2343,8 @@ static bool shellRunBody(VM *vm, ShellCommand *cmd) {
     return true;
 }
 
+static void shellCheckBuiltinOutput(VM *vm, const char *name);
+
 #if defined(PSCAL_TARGET_IOS)
 static bool shellInvokeBuiltin(VM *vm, ShellCommand *cmd);
 
@@ -2611,6 +2613,7 @@ static bool shellInvokeBuiltin(VM *vm, ShellCommand *cmd) {
             }
         }
         handler(vm, total_args, args);
+        shellCheckBuiltinOutput(vm, name);
     }
     gShellCurrentBuiltinBackground = previous_background;
     shellRuntimeSetCurrentCommandName(previous_name);
