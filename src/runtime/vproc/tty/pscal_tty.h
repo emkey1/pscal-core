@@ -239,6 +239,11 @@ int pscalTtySessionPtyNum(pid_t_ sid);
 /* Called with the task-table lock held, so nothing under here may ask for it. */
 void pscalTtyDropSession(pid_t_ sid);
 
+/* vproc saying which group is the foreground of a session whose terminal this layer knows.
+ * Asks nothing about the caller, sends no signal, and doesn't call back: vproc holds no lock
+ * of its own for this, and has already written its side down. */
+void pscalTtySetSessionForeground(pid_t_ sid, pid_t_ pgid);
+
 /* Marks the terminal as read by a session's reader thread, for good. Such a reader
  * only sees finished lines, so line mode has to hand it the control keys at once. */
 void pscalTtySetSessionReader(struct pscal_fd *fd);

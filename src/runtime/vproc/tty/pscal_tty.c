@@ -1030,15 +1030,9 @@ static int ttyJobControlCheck(struct tty *tty, int sig) {
     while (pscalTtyIsControlling(tty)) {
         lock(&tty->lock);
         const pid_t_ foreground = tty->fg_group;
-        const pid_t_ session = tty->session;
         unlock(&tty->lock);
         const int group = pscalTtyCurrentPgid();
         if (foreground == 0 || group == foreground) {
-            return 0;
-        }
-        /* The shell hands the terminal over through vproc's record, which may not have
-         * reached this copy of it. */
-        if (group == pscalTtyGetForegroundPgid(session)) {
             return 0;
         }
         const bool refused = pscalTtySignalIgnoredOrBlocked(sig);
@@ -1443,6 +1437,29 @@ void pscalTtyDropSession(pid_t_ sid) {
         ttyForgetOwnerUnlocked(removed, sid);
         ttyRelease(removed);
     }
+}
+
+void pscalTtySetSessionForeground(pid_t_ sid, pid_t_ pgid) {
+    if (sid <= 0) {
+        return;
+    }
+    struct tty *tty = NULL;
+    lock(&gSessionsLock);
+    const TtySessionEntry *entry = ttySessionFindLocked(sid);
+    if (entry) {
+        tty = entry->tty;
+        ttyRetain(tty);
+    }
+    unlock(&gSessionsLock);
+    if (!tty) {
+        return;
+    }
+    lock(&tty->lock);
+    if (tty->session == sid) {
+        tty->fg_group = pgid;
+    }
+    unlock(&tty->lock);
+    ttyRelease(tty);
 }
 
 int pscalTtySessionPtyNum(pid_t_ sid) {

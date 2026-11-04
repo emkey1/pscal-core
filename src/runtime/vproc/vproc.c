@@ -2160,7 +2160,6 @@ static pthread_cond_t gKernelThreadCv = PTHREAD_COND_INITIALIZER;
 static bool gKernelThreadReady = false;
 typedef enum {
     VPROC_KERNEL_EVENT_CONTROL_SIGNAL = 0,
-    VPROC_KERNEL_EVENT_FOREGROUND_HANDOFF,
     VPROC_KERNEL_EVENT_CONTINUE_PGID,
     VPROC_KERNEL_EVENT_SIGCHLD_AGGREGATE
 } VProcKernelEventType;
@@ -3460,7 +3459,6 @@ static void vprocTaskTableRepairLocked(void);
 static int vprocPtyNumForPid(int pid);
 static int vprocSetForegroundPgidInternal(int sid, int fg_pgid, bool sync_tty);
 static void vprocSyncForegroundPgidToSessionTty(int sid, int fg_pgid);
-static struct pscal_fd *vprocSessionPscalFdForStd(int fd);
 static void vprocUnregisterThreadByPid(int pid, pthread_t tid);
 static void vprocRegisterStartedThread(int pid, pthread_t tid);
 static void vprocThreadLeavesStarter(void *arg);
@@ -5227,7 +5225,6 @@ static ssize_t vprocSessionReadInput(VProcSessionStdio *session, void *buf, size
 static bool vprocRequestControlSignalForSessionInternal(uint64_t session_id,
                                                         int sig,
                                                         bool allow_runtime_fallback);
-static bool vprocKernelQueueForegroundHandoff(int sid, int fg_pgid);
 static bool vprocKernelQueueContinuePgid(int pgid);
 static bool vprocKernelQueueSigchldAggregate(int target_pid, bool ensure_kernel);
 
@@ -10596,21 +10593,12 @@ bool vprocGetShellJobControlState(int *shell_pid_out,
 
 static void vprocSyncForegroundPgidToSessionTty(int sid, int fg_pgid) {
 #if defined(PSCAL_TARGET_IOS) || defined(VPROC_ENABLE_STUBS_FOR_TESTS)
-    /* Keep the controlling TTY's foreground group aligned with the vproc
-     * session leader so job-control signals flow to the right pgid. */
+    /* The kernel keeps its own books, by session, whoever is asking: this can be a thread with
+     * no session of its own, and a program's tcsetpgrp is the one subject to checks. */
     if (sid <= 0 || fg_pgid <= 0) {
         return;
     }
-    struct pscal_fd *pscal_fd = vprocSessionPscalFdForStd(STDIN_FILENO);
-    if (pscal_fd) {
-        if (pscal_fd->ops && pscal_fd->ops->ioctl) {
-            dword_t fg = (dword_t)fg_pgid;
-            (void)pscal_fd->ops->ioctl(pscal_fd, TIOCSPGRP_, &fg);
-        }
-        pscal_fd_close(pscal_fd);
-        return;
-    }
-    (void)vprocHostTcsetpgrpRaw(STDIN_FILENO, (pid_t)fg_pgid);
+    pscalTtySetSessionForeground((pid_t_)sid, (pid_t_)fg_pgid);
 #else
     (void)sid;
     (void)fg_pgid;
@@ -10660,12 +10648,10 @@ static int vprocSetForegroundPgidInternal(int sid, int fg_pgid, bool sync_tty) {
     }
     pthread_mutex_unlock(&gVProcTasks.mu);
     if (rc == 0) {
-        bool handoff_queued = false;
+        /* Before this returns: a job the shell has just put in the foreground may read at once,
+         * and must not be taken for a background one. */
         if (sync_tty) {
-            handoff_queued = vprocKernelQueueForegroundHandoff(sid, fg_pgid);
-            if (!handoff_queued) {
-                vprocSyncForegroundPgidToSessionTty(sid, fg_pgid);
-            }
+            vprocSyncForegroundPgidToSessionTty(sid, fg_pgid);
         }
         if (sync_tty && should_continue_fg) {
             if (!vprocKernelQueueContinuePgid(fg_pgid)) {
@@ -13322,11 +13308,6 @@ static void *vprocKernelThreadMain(void *arg) {
                                                                  ev.allow_runtime_fallback);
                 }
                 break;
-            case VPROC_KERNEL_EVENT_FOREGROUND_HANDOFF:
-                if (ev.sid > 0 && ev.pgid > 0) {
-                    vprocSyncForegroundPgidToSessionTty(ev.sid, ev.pgid);
-                }
-                break;
             case VPROC_KERNEL_EVENT_CONTINUE_PGID:
                 if (ev.pgid > 0) {
                     (void)vprocKillShim(-ev.pgid, SIGCONT);
@@ -13541,18 +13522,6 @@ bool vprocRequestControlSignalForSession(uint64_t session_id, int sig) {
     return vprocRequestControlSignalForSessionInternal(session_id, sig, false);
 }
 
-static bool vprocKernelQueueForegroundHandoff(int sid, int fg_pgid) {
-    if (sid <= 0 || fg_pgid <= 0) {
-        return false;
-    }
-    VProcKernelControlEvent event;
-    memset(&event, 0, sizeof(event));
-    event.type = VPROC_KERNEL_EVENT_FOREGROUND_HANDOFF;
-    event.sid = sid;
-    event.pgid = fg_pgid;
-    return vprocKernelQueueEventInternal(&event, true);
-}
-
 static bool vprocKernelQueueContinuePgid(int pgid) {
     if (pgid <= 0) {
         return false;
@@ -13721,15 +13690,20 @@ void vprocSessionStdioActivate(VProcSessionStdio *stdio_ctx) {
                  gSessionStdioTls ? (void *)gSessionStdioTls->stdout_pscal_fd : NULL,
                  gSessionStdioTls ? (void *)gSessionStdioTls->stderr_pscal_fd : NULL);
     /* Ensure the session PTY is marked as the controlling terminal for this
-     * session so /dev/tty resolves for non-leader vprocs (pipeline stages). */
-    if (gSessionStdioTls && gSessionStdioTls->pty_slave && gSessionStdioTls->pty_slave->tty) {
+     * session so /dev/tty resolves for non-leader vprocs (pipeline stages). Only
+     * for a thread that can say whose session that is. A tab's first thread can't
+     * yet: it would give the terminal to the host's session, or to the shell of
+     * the last tab, and the shell's own TIOCSCTTY would then be refused. */
+    if (gSessionStdioTls && gSessionStdioTls->pty_slave && gSessionStdioTls->pty_slave->tty &&
+        (vprocForThread() || vprocSessionShellPidHint(gSessionStdioTls) > 0)) {
         struct tty *tty = gSessionStdioTls->pty_slave->tty;
         int sid = pscalTtyCurrentSid();
         if (sid > 0) {
+            const int recorded = vprocGetForegroundPgid(sid);
             lock(&tty->lock);
             if (tty->session == 0) {
                 tty->session = (pid_t_)sid;
-                tty->fg_group = (pid_t_)sid;
+                tty->fg_group = (pid_t_)(recorded > 0 ? recorded : sid);
             }
             unlock(&tty->lock);
             pscalTtySetControlling(tty);
