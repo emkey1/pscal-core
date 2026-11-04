@@ -50,13 +50,9 @@ static bool shellToolTcgetattr(int fd, struct termios *termios) {
     return tcgetattr(fd, termios) == 0;
 }
 
-/* In the app a tool's terminal runs in line mode, and part of a line typed while it
- * ran is still waiting there, on its way to the next prompt. */
-#if defined(PSCAL_TARGET_IOS)
+/* Not a flush: a line typed while a tool ran is still waiting in the terminal, on its way
+ * to the next prompt. */
 #define SHELL_TOOL_RESTORE_ACTION TCSADRAIN
-#else
-#define SHELL_TOOL_RESTORE_ACTION TCSAFLUSH
-#endif
 
 static bool shellToolTcsetattr(int fd, int action, const struct termios *termios) {
     if (!termios) {
