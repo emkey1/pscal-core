@@ -121,6 +121,7 @@ static void sdlLogEvent(const char *label, const SDL_Event *event) {
 }
 #endif
 
+#include "backend_ast/graphics_3d_backend.h"
 #include "pscal_sdl_runtime.h" // Includes SDL family headers and SDL declarations
 #include "core/globals.h" // Includes SDL.h and SDL_ttf.h via its includes, and audio.h
 
@@ -718,6 +719,10 @@ static void cleanupSdlWindowResourcesInternal(void) {
     if (gSdlInitialized && sdlTextInputActive()) {
         sdlStopTextInput();
     }
+
+    // The 3D backend holds this renderer's layer and textures. The next window's renderer can land
+    // on the same address, and then a second program in this process draws to a layer nobody shows.
+    gfx3dReleaseResources();
 
     if (gSdlGLContext) {
         cleanupBalls3DRenderingResources();
