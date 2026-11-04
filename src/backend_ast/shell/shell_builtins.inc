@@ -13662,9 +13662,16 @@ static int shellLoopExecuteBodySimple(ShellLoopFrame *frame) {
     }
 }
 
-Value vmHostShellLoopCheckCondition(VM *vm) {
-    (void)vm;
+/* A signal's trap acts on the chunk it broke into, and that is this one: a function's body or a
+ * subshell's runs in a VM the last command to run around it did not name. */
+static void shellLoopTakeSignals(VM *vm) {
+    VM *previous_vm = shellSwapCurrentVm(vm);
     shellRuntimeProcessPendingSignals();
+    shellRestoreCurrentVm(previous_vm);
+}
+
+Value vmHostShellLoopCheckCondition(VM *vm) {
+    shellLoopTakeSignals(vm);
     if (gShellExitRequested) {
         /* A trap just ended the shell: the condition would replace the status it ended with. */
         return makeBoolean(false);
@@ -13693,8 +13700,7 @@ Value vmHostShellLoopCheckCondition(VM *vm) {
 }
 
 Value vmHostShellLoopExecuteBody(VM *vm) {
-    (void)vm;
-    shellRuntimeProcessPendingSignals();
+    shellLoopTakeSignals(vm);
     if (gShellExitRequested) {
         /* A trap just ended the shell: the body would replace the status it ended with. */
         return makeBoolean(false);
@@ -13712,8 +13718,7 @@ Value vmHostShellLoopExecuteBody(VM *vm) {
 }
 
 Value vmHostShellLoopCheckBody(VM *vm) {
-    (void)vm;
-    shellRuntimeProcessPendingSignals();
+    shellLoopTakeSignals(vm);
     if (gShellExitRequested) {
         /* A trap just ended the shell: the condition would replace the status it ended with. */
         return makeBoolean(false);
@@ -13761,8 +13766,7 @@ Value vmHostShellLastStatus(VM *vm) {
 }
 
 Value vmHostShellLoopIsReady(VM *vm) {
-    (void)vm;
-    shellRuntimeProcessPendingSignals();
+    shellLoopTakeSignals(vm);
     ShellLoopFrame *frame = shellLoopTop();
     if ((gShellExitRequested || gShellRuntime.break_requested) && frame) {
         frame->break_pending = true;
@@ -13800,8 +13804,7 @@ Value vmHostShellLoopIsReady(VM *vm) {
 }
 
 Value vmHostShellLoopAdvance(VM *vm) {
-    (void)vm;
-    shellRuntimeProcessPendingSignals();
+    shellLoopTakeSignals(vm);
     ShellLoopFrame *frame = shellLoopTop();
     if (!frame) {
         return makeBoolean(false);

@@ -3387,6 +3387,21 @@ static PSCAL_THREAD_LOCAL VM *gShellCurrentVm = NULL;
 static volatile sig_atomic_t gShellPendingSignals[NSIG] = {0};
 #endif
 static _Thread_local uint64_t gShellSignalTrapsRunning = 0;
+/* A substitution runs in this process, where under bash it is a process of its own: what is sent
+ * to the shell waits until it is done, and the shell takes it then, so what the trap prints and its
+ * `exit` are the shell's. `held` is what the shell around it has a trap for, `own` what it has set
+ * one for itself, and `touched` what it has changed the disposition of. On iOS a shell run as a
+ * command, or a subshell, may share this thread, and `task` says which shell this is about. */
+typedef struct {
+    int depth;
+#if defined(PSCAL_TARGET_IOS)
+    int task;
+#endif
+    uint64_t held;
+    uint64_t own;
+    uint64_t touched;
+} ShellSubstitutionSignals;
+static _Thread_local ShellSubstitutionSignals gShellSubstitutionSignals;
 void shellResetJobIds(void) {
     gShellRuntimeDefault.job_next_id = 1;
     if (SC()) {
@@ -3934,6 +3949,17 @@ static bool shellRuntimeTrapEndedChunk(VM *vm) {
     return true;
 }
 
+/* A signal that ended the shell left the loops it was in skipping their bodies, and what the EXIT
+ * trap runs would be skipped with them. Those loops are over. Only this trap: under bash a signal's
+ * trap that runs during `break` has its commands skipped too. */
+static void shellLoopsOverForExitTrap(void) {
+    for (size_t i = 0; i < gShellLoopStackSize; ++i) {
+        gShellLoopStack[i].skip_body = false;
+        gShellLoopStack[i].break_pending = false;
+        gShellLoopStack[i].continue_pending = false;
+    }
+}
+
 /* Nothing unwinds under bash when a script exits or errexit ends it, so every redirection
  * around that point holds while the EXIT trap runs. Here the frames undo them on the way
  * out, so the trap runs first, where it stands. Inside eval, source and a trap's text bash
@@ -3949,6 +3975,7 @@ static void shellRuntimeRunExitTrapInPlace(void) {
     gShellExitTrap.command = NULL;
     gShellExitTrap.action = SHELL_TRAP_ACTION_DEFAULT;
     gShellExitRequested = false;
+    shellLoopsOverForExitTrap();
     shellRuntimeExecuteTrap(command, "<exit-trap>");
     free(command);
     /* `exit` in the trap gives the status. */
@@ -4146,6 +4173,7 @@ void shellRuntimeRunExitTrap(void) {
     if (gShellExitTrap.action != SHELL_TRAP_ACTION_COMMAND || !gShellExitTrap.command) {
         return;
     }
+    shellLoopsOverForExitTrap();
     shellRuntimeExecuteTrap(gShellExitTrap.command, "<exit-trap>");
 }
 
@@ -4394,25 +4422,7 @@ void shellRuntimeNoteIgnoredSignals(void) {
 #endif
 }
 
-bool shellRuntimeSetSignalTrap(int signo, ShellTrapAction action, const char *command) {
-    if (signo <= 0 || signo >= NSIG) {
-        return false;
-    }
-#if !defined(PSCAL_TARGET_IOS)
-    if (gShellSignalIgnoredOnEntry[signo] && !shellRuntimeIsInteractive()) {
-        return true;
-    }
-#endif
-
-    char *command_copy = NULL;
-    if (action == SHELL_TRAP_ACTION_COMMAND) {
-        const char *text = command ? command : "";
-        command_copy = strdup(text);
-        if (!command_copy) {
-            return false;
-        }
-    }
-
+static int shellRuntimeInstallSignalAction(int signo, ShellTrapAction action) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sigemptyset(&sa.sa_mask);
@@ -4432,10 +4442,89 @@ bool shellRuntimeSetSignalTrap(int signo, ShellTrapAction action, const char *co
     }
 
 #if defined(PSCAL_TARGET_IOS)
-    int set_rc = vprocSigaction(shellRuntimeOwnPid(), signo, &sa, NULL);
+    return vprocSigaction(shellRuntimeOwnPid(), signo, &sa, NULL);
 #else
-    int set_rc = sigaction(signo, &sa, NULL);
+    return sigaction(signo, &sa, NULL);
 #endif
+}
+
+static bool shellRuntimeInSubstitution(void) {
+#if defined(PSCAL_TARGET_IOS)
+    return gShellSubstitutionSignals.depth > 0 && gShellSubstitutionSignals.task == shellRuntimeOwnPid();
+#else
+    return gShellSubstitutionSignals.depth > 0;
+#endif
+}
+
+/* Returns what to hand to Leave. */
+static ShellSubstitutionSignals shellSubstitutionSignalsEnter(void) {
+    ShellSubstitutionSignals saved = gShellSubstitutionSignals;
+    gShellSubstitutionSignals.depth++;
+#if defined(PSCAL_TARGET_IOS)
+    if (gShellSubstitutionSignals.task != shellRuntimeOwnPid()) {
+        gShellSubstitutionSignals.task = shellRuntimeOwnPid();
+        gShellSubstitutionSignals.held = 0;
+    }
+#endif
+    /* A trap the substitution around this one set is the shell's, to this one. */
+    for (int signo = 1; signo < NSIG; ++signo) {
+        if (gShellSignalTraps[signo].action == SHELL_TRAP_ACTION_COMMAND) {
+            gShellSubstitutionSignals.held |= (uint64_t)1 << (signo % 64);
+        }
+    }
+    gShellSubstitutionSignals.own = 0;
+    gShellSubstitutionSignals.touched = 0;
+    return saved;
+}
+
+/* Dispositions are the process's: the shell's come back. Called in the shell's own context. */
+static void shellSubstitutionSignalsLeave(const ShellSubstitutionSignals *saved) {
+    uint64_t touched = gShellSubstitutionSignals.touched;
+    gShellSubstitutionSignals = *saved;
+    for (int signo = 1; touched != 0 && signo < NSIG; ++signo) {
+        uint64_t bit = (uint64_t)1 << (signo % 64);
+        if (touched & bit) {
+            touched &= ~bit;
+            (void)shellRuntimeInstallSignalAction(signo, gShellSignalTraps[signo].action);
+        }
+    }
+}
+
+bool shellRuntimeSetSignalTrap(int signo, ShellTrapAction action, const char *command) {
+    if (signo <= 0 || signo >= NSIG) {
+        return false;
+    }
+#if !defined(PSCAL_TARGET_IOS)
+    if (gShellSignalIgnoredOnEntry[signo] && !shellRuntimeIsInteractive()) {
+        return true;
+    }
+#endif
+
+    char *command_copy = NULL;
+    if (action == SHELL_TRAP_ACTION_COMMAND) {
+        const char *text = command ? command : "";
+        command_copy = strdup(text);
+        if (!command_copy) {
+            return false;
+        }
+    }
+
+    int set_rc = 0;
+    if (shellRuntimeInSubstitution()) {
+        uint64_t bit = (uint64_t)1 << (signo % 64);
+        gShellSubstitutionSignals.touched |= bit;
+        if (action == SHELL_TRAP_ACTION_COMMAND) {
+            gShellSubstitutionSignals.own |= bit;
+        } else {
+            gShellSubstitutionSignals.own &= ~bit;
+        }
+        /* The shell's handler stays, for what is sent to the shell in the meantime. */
+        if (action == SHELL_TRAP_ACTION_COMMAND || !(gShellSubstitutionSignals.held & bit)) {
+            set_rc = shellRuntimeInstallSignalAction(signo, action);
+        }
+    } else {
+        set_rc = shellRuntimeInstallSignalAction(signo, action);
+    }
     if (set_rc != 0) {
         if (command_copy) {
             free(command_copy);

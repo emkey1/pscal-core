@@ -1089,6 +1089,8 @@ static void shellRunSignalTrapCommand(int signo) {
     }
 }
 
+static bool shellRuntimeSignalIsForShell(int signo);
+
 /*
  * POSIX specifies that foreground commands should see the shell's inherited
  * signal dispositions, except that asynchronous lists without job control must
@@ -1163,12 +1165,18 @@ static void shellHandleSignalCommon(int signo, bool from_status) {
         }
 
         if (command_trap) {
-            shellRunSignalTrapCommand(signo);
+            if (from_status && shellRuntimeSignalIsForShell(signo)) {
+                /* What ran in a substitution died of it. The shell takes it when that is over. */
+                shellSignalHandler(signo);
+            } else {
+                shellRunSignalTrapCommand(signo);
+            }
         }
         return;
     }
 
-    if (command_trap) {
+    /* A command dying of it says nothing about this shell, which has not been sent it. */
+    if (command_trap && !from_status) {
         shellRunSignalTrapCommand(signo);
     }
 #if defined(PSCAL_TARGET_IOS)
@@ -1200,9 +1208,39 @@ static uint32_t shellRuntimeCaughtSignals(int owner) {
 }
 #endif
 
+/* Is what has come for this signal the shell's, around the substitution this thread is in? */
+static bool shellRuntimeSignalIsForShell(int signo) {
+    uint64_t bit = (uint64_t)1 << (signo % 64);
+    return shellRuntimeInSubstitution() && (gShellSubstitutionSignals.held & bit) &&
+           !(gShellSubstitutionSignals.own & bit);
+}
+
 /* One sent by its own trap comes when that trap is done. Another signal's trap may break in. */
 static bool shellRuntimeSignalMustWait(int signo) {
-    return (gShellSignalTrapsRunning & ((uint64_t)1 << (signo % 64))) != 0;
+    return (gShellSignalTrapsRunning & ((uint64_t)1 << (signo % 64))) != 0 || shellRuntimeSignalIsForShell(signo);
+}
+
+/* What the shell takes afterwards, but what a substitution's process would die of under bash, so the
+ * body ends here. Ctrl-C reaches a foreground's whole group. On iOS a signal with no trap waits on
+ * the task for someone to act on it. */
+static bool shellRuntimeSignalEndsSubstitution(int signo) {
+    if (shellRuntimeSignalIsForShell(signo)) {
+        return signo == SIGINT || signo == SIGQUIT;
+    }
+#if defined(PSCAL_TARGET_IOS)
+    if (shellRuntimeInSubstitution() && shellRuntimeGetSignalTrapAction(signo) == SHELL_TRAP_ACTION_DEFAULT &&
+        signo != SIGINT && signo != SIGQUIT && signo != SIGTSTP) {
+        return signo != SIGTERM || !shellRuntimeIsInteractive();
+    }
+#endif
+    return false;
+}
+
+static void shellRuntimeEndSubstitution(int signo) {
+    if (!gShellExitRequested) {
+        shellUpdateStatus(128 + signo);
+        shellEndWithRequest();
+    }
 }
 
 void shellRuntimeProcessPendingSignals(void) {
@@ -1216,14 +1254,23 @@ void shellRuntimeProcessPendingSignals(void) {
         int owner = shellRuntimeOwnPid();
         uint32_t caught = shellRuntimeCaughtSignals(owner);
         for (int signo = 1; caught != 0 && signo < 32; ++signo) {
-            if ((caught & (1u << signo)) && !shellRuntimeSignalMustWait(signo) &&
-                vprocTakeCaughtSignal(owner, signo)) {
+            if (!(caught & (1u << signo))) {
+                continue;
+            }
+            if (shellRuntimeSignalEndsSubstitution(signo)) {
+                shellRuntimeEndSubstitution(signo);
+            } else if (!shellRuntimeSignalMustWait(signo) && vprocTakeCaughtSignal(owner, signo)) {
                 taken |= (uint64_t)1 << signo;
             }
         }
 #else
         for (int signo = 1; signo < NSIG; ++signo) {
-            if (gShellPendingSignals[signo] && !shellRuntimeSignalMustWait(signo)) {
+            if (!gShellPendingSignals[signo]) {
+                continue;
+            }
+            if (shellRuntimeSignalEndsSubstitution(signo)) {
+                shellRuntimeEndSubstitution(signo);
+            } else if (!shellRuntimeSignalMustWait(signo)) {
                 gShellPendingSignals[signo] = 0;
                 taken |= (uint64_t)1 << (signo % 64);
             }
@@ -1253,7 +1300,7 @@ static int shellRuntimeSignalEndingWait(void) {
             continue;
         }
         ShellTrapAction action = shellRuntimeGetSignalTrapAction(signo);
-        if (shellRuntimeSignalMustWait(signo)) {
+        if (shellRuntimeSignalMustWait(signo) && !shellRuntimeSignalEndsSubstitution(signo)) {
             continue;
         }
         if (action == SHELL_TRAP_ACTION_COMMAND ||
@@ -1264,7 +1311,7 @@ static int shellRuntimeSignalEndingWait(void) {
 #else
     for (int signo = 1; signo < NSIG; ++signo) {
         if (gShellPendingSignals[signo] && shellRuntimeGetSignalTrapAction(signo) == SHELL_TRAP_ACTION_COMMAND &&
-            !shellRuntimeSignalMustWait(signo)) {
+            (!shellRuntimeSignalMustWait(signo) || shellRuntimeSignalEndsSubstitution(signo))) {
             return signo;
         }
     }
@@ -2247,6 +2294,7 @@ static void shellSubshellResetState(pid_t dollar_pid) {
     }
 #if !defined(PSCAL_TARGET_IOS)
     memset((void *)gShellPendingSignals, 0, sizeof(gShellPendingSignals));
+    memset(&gShellSubstitutionSignals, 0, sizeof(gShellSubstitutionSignals));
 #endif
     gShellRuntime.in_subshell = true;
 #if !defined(PSCAL_TARGET_IOS)

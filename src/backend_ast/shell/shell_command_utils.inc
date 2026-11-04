@@ -1026,7 +1026,9 @@ static char *shellRunCommandSubstitution(const char *command) {
         shellCwdScopeEnter(&cwd_scope);
         opts.first_line = gShellCurrentCommandLine;
         opts.inherit_locals = true;
+        ShellSubstitutionSignals saved_signals = shellSubstitutionSignalsEnter();
         status = shellRunSource(source, "<command-substitution>", &opts, &exit_requested);
+        shellSubstitutionSignalsLeave(&saved_signals);
         shellCwdScopeLeave(&cwd_scope);
     }
 

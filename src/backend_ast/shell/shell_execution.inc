@@ -6114,7 +6114,12 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
         return makeVoid();
     }
     bool exit_already_requested = gShellExitRequested;
-    shellRuntimeProcessPendingSignals();
+    /* What came during a substitution in its words waits for the command: `x=$(cmd)` assigns, and
+     * then the trap runs. A pipeline waits as a whole: the stages before this one have started, and
+     * they use its context. */
+    if (!cmd->ran_command_substitution && !(gShellRuntime.pipeline.active && cmd->pipeline_index > 0)) {
+        shellRuntimeProcessPendingSignals();
+    }
     if (gShellExitRequested && !exit_already_requested) {
         /* A trap, or a signal with none, ended the shell before this command. */
         shellFreeCommand(cmd);
