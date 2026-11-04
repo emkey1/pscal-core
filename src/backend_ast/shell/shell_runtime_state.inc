@@ -2430,9 +2430,10 @@ typedef struct {
     bool traps_dormant_return;
 } ShellBodyState;
 
-/* What a thread started by a subshell takes from it, beyond the vproc every new thread
- * starts under. Empty outside a subshell. */
+/* What a thread started by a shell takes from it, beyond the vproc every new thread starts
+ * under. Outside a subshell that is only interactive. */
 typedef struct {
+    bool interactive;
     ShellRuntimeState *ctx;
     VProcEnv *env;
     int subshell_pid;
@@ -3468,7 +3469,10 @@ bool shellRuntimeCurrentBuiltinBackground(void) {
 }
 static unsigned int gShellRandomSeed = 0;
 static bool gShellRandomSeedInitialized = false;
-static bool gShellInteractiveMode = false;
+/* Whether this shell is at a prompt. Per thread: a shell run as a command shares the process
+ * with the prompt that ran it, is not interactive itself, and if killed never puts anything
+ * back. The shell's own threads take it from the one that started them (ShellThreadLink). */
+static PSCAL_THREAD_LOCAL bool gShellInteractiveMode = false;
 
 static bool shellRuntimeEnsureDisabledCapacity(size_t needed) {
     if (gShellRuntime.disabled_builtin_capacity >= needed) {
