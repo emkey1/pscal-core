@@ -266,7 +266,8 @@ static FILE *vmVprocStreamOpen(int std_fd,
             return cache->fp;
         }
         struct stat current_st;
-        if (fstat(host_fd, &current_st) == 0 &&
+        /* By slot: fstat is the shim, and a host number is not a slot. See shellVprocStreamOpen. */
+        if (fstat(std_fd, &current_st) == 0 &&
             current_st.st_dev == cache->host_dev &&
             current_st.st_ino == cache->host_ino) {
             return cache->fp;
@@ -307,7 +308,7 @@ static FILE *vmVprocStreamOpen(int std_fd,
     cache->fp = fp;
     cache->host_fd = host_fd;
     struct stat host_st;
-    if (fstat(host_fd, &host_st) == 0) {
+    if (fstat(std_fd, &host_st) == 0) {
         cache->host_dev = host_st.st_dev;
         cache->host_ino = host_st.st_ino;
         cache->host_identity_valid = true;
