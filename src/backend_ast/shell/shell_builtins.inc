@@ -12313,8 +12313,9 @@ static bool shellWaitTargetIsLastRemoved(long target) {
 }
 
 /* `wait pid` for a job already off the table: two that ended before the shell looked were both
- * reaped, and shellWaitTargetIsLastRemoved knows only the last. The status is asked for once. */
-static bool shellWaitTakeReapedPid(Value spec, int *out_status) {
+ * reaped, and shellWaitTargetIsLastRemoved knows only the last. Asking again gives the same
+ * answer, as under bash 5. A live job with that pid comes first, since a host reuses pids. */
+static bool shellWaitFindReapedPid(Value spec, int *out_status) {
     long target = -1;
     if (VALUE_TYPE(spec) == TYPE_STRING && AS_STRING(spec) && AS_STRING(spec)[0] != '%') {
         char *end = NULL;
@@ -12325,18 +12326,15 @@ static bool shellWaitTakeReapedPid(Value spec, int *out_status) {
     } else if (IS_INTLIKE(spec)) {
         target = (long)AS_INTEGER(spec);
     }
-    if (target <= 0) {
+    size_t live_index = 0;
+    if (target <= 0 || shellFindJobIndexByPid((pid_t)target, &live_index)) {
         return false;
     }
     for (size_t i = gShellRuntime.reaped_pid_count; i > 0; --i) {
-        if (gShellRuntime.reaped_pids[i - 1].pid != (pid_t)target) {
-            continue;
+        if (gShellRuntime.reaped_pids[i - 1].pid == (pid_t)target) {
+            *out_status = gShellRuntime.reaped_pids[i - 1].status;
+            return true;
         }
-        *out_status = gShellRuntime.reaped_pids[i - 1].status;
-        gShellRuntime.reaped_pid_count--;
-        memmove(&gShellRuntime.reaped_pids[i - 1], &gShellRuntime.reaped_pids[i],
-                (gShellRuntime.reaped_pid_count - (i - 1)) * sizeof(gShellRuntime.reaped_pids[0]));
-        return true;
     }
     return false;
 }
@@ -12367,7 +12365,7 @@ Value vmBuiltinShellWait(VM *vm, int arg_count, Value *args) {
         return makeVoid();
     }
     int reaped_status = 0;
-    if (arg_count == 1 && shellWaitTakeReapedPid(args[0], &reaped_status)) {
+    if (arg_count == 1 && shellWaitFindReapedPid(args[0], &reaped_status)) {
         shellUpdateStatus(reaped_status);
         return makeVoid();
     }
