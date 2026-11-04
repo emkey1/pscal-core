@@ -13,6 +13,13 @@ bool loadBytecodeFromCache(const char* source_path,
                            int dep_count,
                            BytecodeChunk* chunk);
 void saveBytecodeToCache(const char* source_path, const char* compiler_id, const BytecodeChunk* chunk);
+// For a frontend that passes dependencies to loadBytecodeFromCache(): the entry is only good for
+// these files as they are now, so pass the same list in the same order, or the load misses.
+void saveBytecodeToCacheWithDependencies(const char* source_path,
+                                         const char* compiler_id,
+                                         const char** dependencies,
+                                         int dep_count,
+                                         const BytecodeChunk* chunk);
 bool saveBytecodeToFile(const char* file_path, const char* source_path, const BytecodeChunk* chunk);
 bool loadBytecodeFromFile(const char* file_path, BytecodeChunk* chunk);
 

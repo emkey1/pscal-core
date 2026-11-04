@@ -317,7 +317,8 @@ char *pscalPathVirtualized_getcwd(char *buffer, size_t size) {
     if (!result) {
         return result;
     }
-    pathVirtualizedStripInPlace(buffer, strlen(buffer) + 1);
+    /* result, not buffer: with a NULL buffer the shim allocated it. */
+    pathVirtualizedStripInPlace(result, strlen(result) + 1);
     return result;
 }
 

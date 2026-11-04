@@ -30,6 +30,7 @@
 #include <ctype.h>
 #include <limits.h>
 #include <stdarg.h>
+#include "common/path_virtualization.h"
 
 #define CACHE_ROOT ".pscal"
 #define CACHE_DIR "bc_cache"
@@ -390,6 +391,19 @@ static bool computeSourceHash(const char* source_path, bool require_file, uint64
     fclose(f);
     *out_hash = hash;
     return true;
+}
+
+/* An import is looked for from the working directory too, so one source can compile to two
+ * programs from two directories, and the other directory's copy can be older than an entry
+ * written for the first. So the hash an entry records covers the files it was compiled from. */
+static uint64_t hashWithDependencies(uint64_t source_hash, const char** dependencies, int dep_count) {
+    for (int i = 0; dependencies && i < dep_count; ++i) {
+        uint64_t dep_hash = 0;
+        if (computeSourceHash(dependencies[i], false, &dep_hash)) {
+            fnv1aUpdateUInt64(&source_hash, dep_hash);
+        }
+    }
+    return source_hash;
 }
 
 /* ================= PSB3 primitives: ByteBuf (write) / Cursor (read) =====
@@ -2963,6 +2977,7 @@ bool loadBytecodeFromCache(const char* source_path,
         free(dir);
         return loadFail("cannot read the source %s", source_path);
     }
+    source_hash = hashWithDependencies(source_hash, dependencies, dep_count);
 
     char* cache_path = cacheEntryPath(dir, safe_id, source_path);
     if (!cache_path) {
@@ -3246,12 +3261,21 @@ static bool serializeBytecodeChunk(FILE* f,
 }
 
 void saveBytecodeToCache(const char* source_path, const char* compiler_id, const BytecodeChunk* chunk) {
+    saveBytecodeToCacheWithDependencies(source_path, compiler_id, NULL, 0, chunk);
+}
+
+void saveBytecodeToCacheWithDependencies(const char* source_path,
+                                         const char* compiler_id,
+                                         const char** dependencies,
+                                         int dep_count,
+                                         const BytecodeChunk* chunk) {
     if (!chunk || !cacheSourceIsFile(source_path)) return;
 
     uint64_t source_hash = 0, combined_hash = 0;
     if (!computeSourceHash(source_path, true, &source_hash)) {
         return;
     }
+    source_hash = hashWithDependencies(source_hash, dependencies, dep_count);
     combined_hash = computeCombinedHash(source_hash, chunk);
 
     char safe_id[32];

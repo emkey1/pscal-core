@@ -41,6 +41,7 @@
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #endif
+#include "common/path_virtualization.h"
 
 /* Also guards the whole-struct copy in copyDynamicArraySnapshotValue()
  * below, so it must be the SAME mutex the VM's replaceValueCell() takes
