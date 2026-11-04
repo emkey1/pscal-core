@@ -195,8 +195,9 @@ int pscalPtyOpenSlave(int pty_num, int flags, struct pscal_fd **out_slave) {
     if (!out_slave) {
         return _EINVAL;
     }
+    /* A number nothing has is a name nothing is at. */
     if (!ptyNumberInRange(pty_num)) {
-        return _ENXIO;
+        return _ENOENT;
     }
     struct tty *slave = NULL;
     lock(&gPtySlotsLock);
@@ -206,13 +207,20 @@ int pscalPtyOpenSlave(int pty_num, int flags, struct pscal_fd **out_slave) {
     }
     unlock(&gPtySlotsLock);
     if (!slave) {
-        return _ENXIO;
+        return _ENOENT;
     }
     lock(&slave->lock);
-    const bool openable = slave->pty.other != NULL && !slave->pty.slave_locked;
+    const bool master_gone = slave->pty.other == NULL;
+    const bool locked = slave->pty.slave_locked;
+    const bool exclusive = slave->exclusive;
     unlock(&slave->lock);
     int result = _EIO;
-    if (openable) {
+    if (master_gone) {
+        /* The node went with the master, though someone may still hold the slave. */
+        result = _ENOENT;
+    } else if (!locked && exclusive) {
+        result = _EBUSY;
+    } else if (!locked) {
         struct pscal_fd *fd = ttyOpenFile(slave, flags);
         if (fd) {
             *out_slave = fd;

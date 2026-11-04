@@ -34,3 +34,34 @@ __attribute__((weak)) int pscalTtySendGroupSignal(int pgid, int sig) {
     (void)sig;
     return 0;
 }
+
+__attribute__((weak)) bool pscalTtyCallerIsKernel(void) {
+    return false;
+}
+
+__attribute__((weak)) bool pscalTtySignalIgnoredOrBlocked(int sig) {
+    (void)sig;
+    return false;
+}
+
+__attribute__((weak)) bool pscalTtyCurrentGroupOrphaned(void) {
+    return false;
+}
+
+__attribute__((weak)) int pscalTtyAfterJobSignal(int sig) {
+    (void)sig;
+    return _EINTR;
+}
+
+__attribute__((weak)) int pscalTtyCheckGroup(int sid, int pgid) {
+    (void)sid;
+    (void)pgid;
+    return 0;
+}
+
+__attribute__((weak)) void pscalTtyCallerGiveUpTerminal(void) {
+}
+
+__attribute__((weak)) bool pscalTtyCallerGaveUpTerminal(void) {
+    return false;
+}

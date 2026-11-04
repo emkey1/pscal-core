@@ -91,8 +91,8 @@ static inline void unlock(lock_t *l) {
 #define SIGWINCH_ SIGWINCH
 #define NUM_SIGS 64
 
-/* The host's errno for a negative result: 0 for a result that is not an error, and
- * EIO for any code the shims have no use for telling apart. */
+/* The host's errno for a negative result, and 0 for a result that is not an error. A
+ * program has to see the error that happened; EIO is only for a code nobody listed. */
 int pscalCompatErrno(int err);
 
 #ifdef __cplusplus

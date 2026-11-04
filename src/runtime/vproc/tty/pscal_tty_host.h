@@ -25,6 +25,24 @@ void pscalTtySetForegroundPgid(int sid, int fg_pgid);
 int pscalTtyGetForegroundPgid(int sid);
 int pscalTtySendGroupSignal(int pgid, int sig);
 
+/* A thread that is no process of its own, such as a session's reader: nothing about job
+ * control applies to it. */
+bool pscalTtyCallerIsKernel(void);
+/* Has the calling process ignored or blocked this signal? */
+bool pscalTtySignalIgnoredOrBlocked(int sig);
+/* Is the calling process's group orphaned: no member with a parent in another group of
+ * the same session? */
+bool pscalTtyCurrentGroupOrphaned(void);
+/* Having sent the caller's own group this signal: 0 to start the call over, which is what
+ * a stop that has been continued and a handler with SA_RESTART come to, else _EINTR. */
+int pscalTtyAfterJobSignal(int sig);
+/* May this group be a foreground group of this session? 0, or _EPERM if it belongs to
+ * another, or _ESRCH if there is no such group. */
+int pscalTtyCheckGroup(int sid, int pgid);
+/* TIOCNOTTY by a process that doesn't lead its session: only that process lets go. */
+void pscalTtyCallerGiveUpTerminal(void);
+bool pscalTtyCallerGaveUpTerminal(void);
+
 /* pscal_tty.c supplies these. */
 bool pscalTtyIsControlling(struct tty *tty);
 void pscalTtySetControlling(struct tty *tty);

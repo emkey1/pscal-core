@@ -38,6 +38,26 @@ int pscalCompatErrno(int err) {
             return EACCES;
         case _EBADF:
             return EBADF;
+        case _ENOENT:
+            return ENOENT;
+        case _ESRCH:
+            return ESRCH;
+        case _EFAULT:
+            return EFAULT;
+        case _EBUSY:
+            return EBUSY;
+        case _EEXIST:
+            return EEXIST;
+        case _ENODEV:
+            return ENODEV;
+        case _ENOTDIR:
+            return ENOTDIR;
+        case _EISDIR:
+            return EISDIR;
+        case _EMFILE:
+            return EMFILE;
+        case _ENOTEMPTY:
+            return ENOTEMPTY;
         default:
             return EIO;
     }

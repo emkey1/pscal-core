@@ -48,42 +48,95 @@ extern "C" {
 
 #define ISIG_ (1u << 0)
 #define ICANON_ (1u << 1)
+#define XCASE_ (1u << 2)
 #define ECHO_ (1u << 3)
 #define ECHOE_ (1u << 4)
 #define ECHOK_ (1u << 5)
-#define ECHOKE_ (1u << 6)
+#define ECHONL_ (1u << 6)
 #define NOFLSH_ (1u << 7)
+#define TOSTOP_ (1u << 8)
 #define ECHOCTL_ (1u << 9)
+#define ECHOPRT_ (1u << 10)
+#define ECHOKE_ (1u << 11)
+#define FLUSHO_ (1u << 12)
+#define PENDIN_ (1u << 14)
 #define IEXTEN_ (1u << 15)
 
+#define IGNBRK_ (1u << 0)
+#define BRKINT_ (1u << 1)
+#define IGNPAR_ (1u << 2)
+#define PARMRK_ (1u << 3)
+#define INPCK_ (1u << 4)
+#define ISTRIP_ (1u << 5)
 #define INLCR_ (1u << 6)
 #define IGNCR_ (1u << 7)
 #define ICRNL_ (1u << 8)
+#define IUCLC_ (1u << 9)
 #define IXON_ (1u << 10)
+#define IXANY_ (1u << 11)
+#define IXOFF_ (1u << 12)
+#define IMAXBEL_ (1u << 13)
+#define IUTF8_ (1u << 14)
 
 #define OPOST_ (1u << 0)
+#define OLCUC_ (1u << 1)
 #define ONLCR_ (1u << 2)
 #define OCRNL_ (1u << 3)
 #define ONOCR_ (1u << 4)
 #define ONLRET_ (1u << 5)
+#define OFILL_ (1u << 6)
+#define OFDEL_ (1u << 7)
+#define TABDLY_ (3u << 11)
+#define TAB1_ (1u << 11)
+#define TAB2_ (2u << 11)
+#define TAB3_ (3u << 11)
+
+#define CBAUD_ 0x100fu
+#define B38400_ 0xfu
+#define CSIZE_ (3u << 4)
+#define CS5_ (0u << 4)
+#define CS6_ (1u << 4)
+#define CS7_ (2u << 4)
+#define CS8_ (3u << 4)
+#define CSTOPB_ (1u << 6)
+#define CREAD_ (1u << 7)
+#define PARENB_ (1u << 8)
+#define PARODD_ (1u << 9)
+#define HUPCL_ (1u << 10)
+#define CLOCAL_ (1u << 11)
 
 #define TCGETS_ 0x5401
 #define TCSETS_ 0x5402
 #define TCSETSW_ 0x5403
 #define TCSETSF_ 0x5404
+#define TCSBRK_ 0x5409
 #define TCFLSH_ 0x540b
+#define TIOCEXCL_ 0x540c
+#define TIOCNXCL_ 0x540d
 #define TIOCSCTTY_ 0x540e
 #define TIOCGPGRP_ 0x540f
 #define TIOCSPGRP_ 0x5410
+#define TIOCOUTQ_ 0x5411
+#define TIOCSTI_ 0x5412
 #define TIOCGWINSZ_ 0x5413
 #define TIOCSWINSZ_ 0x5414
 #define FIONREAD_ 0x541b
 #define TIOCPKT_ 0x5420
+#define TIOCNOTTY_ 0x5422
+#define TCSBRKP_ 0x5425
+#define TIOCGSID_ 0x5429
 #define TIOCGPTPEER_ 0x5441
 #define TIOCSPTLCK_ 0x40045431
-/* These two have the top bit set, so ops->ioctl receives them as negative ints. */
+/* These have the top bit set, so ops->ioctl receives them as negative ints. */
 #define TIOCGPTN_ 0x80045430
 #define TIOCGPKT_ 0x80045438
+#define TIOCGEXCL_ 0x80045440
+
+/* What a read of a master in packet mode can report, with no data. */
+#define TIOCPKT_FLUSHREAD_ 1
+#define TIOCPKT_FLUSHWRITE_ 2
+#define TIOCPKT_NOSTOP_ 16
+#define TIOCPKT_DOSTOP_ 32
 
 #define TCIFLUSH_ 0
 #define TCOFLUSH_ 1
@@ -141,6 +194,7 @@ struct tty {
         bool slave_locked; /* on a slave: opens fail until the master unlocks it */
         bool packet_mode;  /* on a master */
         bool peer_hung_up; /* on a master: tty_hangup was called on its slave */
+        byte_t packet_status; /* on a master: the TIOCPKT_ events not yet read */
     } pty;
 
     /* The rest belongs to pscal_tty.c and pscal_pty.c. */
@@ -151,6 +205,11 @@ struct tty {
     unsigned opens;
     bool hung_up;
     bool session_reader;
+    bool exclusive;    /* TIOCEXCL */
+    bool literal_next; /* the VLNEXT key has been typed and the next byte is plain */
+    bool erase_open;   /* ECHOPRT has shown a backslash and owes a slash */
+    unsigned column;      /* where output has left the cursor */
+    unsigned line_column; /* where the line being typed began, for rubbing out a tab */
     unsigned eof_reads;
     pthread_cond_t readable;
     pthread_cond_t writable;
@@ -165,8 +224,9 @@ extern const struct pscal_fd_ops pscal_tty_fd_ops;
  * threads serving the app's UI. The caller holds no terminal lock. */
 ssize_t tty_input(struct tty *tty, const char *input, size_t len, bool blocking);
 
-/* Stores the size and sends SIGWINCH. May be called with the session registry's lock
- * held and before any session exists. */
+/* Stores the size, and if that is a change sends SIGWINCH to the foreground group, if
+ * there is one. May be called with the session registry's lock held and before any
+ * session exists. */
 void tty_set_winsize(struct tty *tty, struct winsize_ size);
 
 /* Marks the terminal hung up and wakes everyone waiting on it. The caller holds
@@ -188,7 +248,8 @@ void pscalTtySetSessionReader(struct pscal_fd *fd);
 bool pscalTtyTakeEofKey(struct pscal_fd *fd);
 
 /* The check a slave read starts with, for reads served from vproc's session queue
- * instead: _EINTR or _EIO for a background caller, which has been sent SIGTTIN, else 0. */
+ * instead. 0 to go ahead, which a stopped caller gets once it has been continued; _EINTR
+ * for a caller a handler interrupted; _EIO for one that can't be stopped. */
 int pscalTtyCheckBackgroundRead(struct pscal_fd *fd);
 
 /* Between pscal_tty.c and pscal_pty.c; nothing else should call these. */
