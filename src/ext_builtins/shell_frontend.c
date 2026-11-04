@@ -104,7 +104,6 @@ void registerShellFrontendBuiltins(void) {
     registerShellBuiltin(category, command_group, "enable", vmBuiltinShellEnable);
     registerShellBuiltin(category, command_group, "help", vmBuiltinShellHelp);
     registerShellBuiltin(category, command_group, "type", vmBuiltinShellType);
-    registerShellBuiltin(category, command_group, "which", vmBuiltinShellWhich);
     registerShellBuiltin(category, command_group, "builtin", vmBuiltinShellBuiltin);
     registerShellBuiltin(category, command_group, ":", vmBuiltinShellColon);
     registerShellBuiltin(category, command_group, "bind", vmBuiltinShellBind);
@@ -115,6 +114,8 @@ void registerShellFrontendBuiltins(void) {
     registerShellBuiltin(category, command_group, "true", vmBuiltinShellTrue);
     registerShellBuiltin(category, command_group, "false", vmBuiltinShellFalse);
 #ifdef PSCAL_MOBILE_PLATFORM
+    /* On a host `which` is the system's program, as under bash. */
+    registerShellBuiltin(category, command_group, "which", vmBuiltinShellWhich);
     registerShellBuiltin(category, command_group, "pascal", vmBuiltinShellPascal);
 #ifdef BUILD_DASCAL
     registerShellBuiltin(category, command_group, "dascal", vmBuiltinShellDascal);

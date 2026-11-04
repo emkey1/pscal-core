@@ -104,15 +104,21 @@ static const char *shellVisiblePath(const char *path, char *buffer, size_t buffe
 }
 #endif
 
+/* The name to look a command up under. A host has the files, so a path there runs the file
+ * and never the builtin of that name. On iOS nothing execs, so /bin/x means x. */
 static const char *shellCommandLookupName(const char *name,
                                           char *buffer,
                                           size_t buffer_size) {
+#if !defined(PSCAL_TARGET_IOS)
+    (void)buffer;
+    (void)buffer_size;
+    return name;
+#else
     if (!name || !*name) {
         return name;
     }
 
     const char *candidate = name;
-#if defined(PSCAL_TARGET_IOS)
     if (name[0] == '/' &&
         buffer &&
         buffer_size > 0 &&
@@ -120,10 +126,6 @@ static const char *shellCommandLookupName(const char *name,
         buffer[0] == '/') {
         candidate = buffer;
     }
-#else
-    (void)buffer;
-    (void)buffer_size;
-#endif
 
     static const char *prefixes[] = {
         "/usr/bin/",
@@ -144,6 +146,7 @@ static const char *shellCommandLookupName(const char *name,
         return leaf;
     }
     return name;
+#endif
 }
 
 static bool shellBufferEnsure(char **buffer, size_t *length, size_t *capacity, size_t extra);

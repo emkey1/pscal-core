@@ -9398,7 +9398,8 @@ Value vmBuiltinShellCommand(VM *vm, int arg_count, Value *args) {
             shellUpdateStatus(1);
             return makeVoid();
         }
-        if (cmd.argv && cmd.argv[0] && cmd.argv[0][0] != '\0') {
+        /* Only -p looks anywhere but where the command would look by itself. */
+        if (use_default_path && cmd.argv && cmd.argv[0] && cmd.argv[0][0] != '\0') {
             ShellCommandResult *results = NULL;
             size_t count = 0;
             if (!shellCommandCollectInfo(cmd.argv[0], false, use_default_path, &results, &count)) {
@@ -9412,6 +9413,9 @@ Value vmBuiltinShellCommand(VM *vm, int arg_count, Value *args) {
             }
             for (size_t idx = 0; idx < count; ++idx) {
                 ShellCommandResult *entry = &results[idx];
+                if (entry->kind == SHELL_COMMAND_RESULT_BUILTIN || entry->kind == SHELL_COMMAND_RESULT_APPLET) {
+                    break;
+                }
                 if (entry->kind == SHELL_COMMAND_RESULT_FILE && entry->detail && entry->detail[0] != '\0') {
                     char *replacement = strdup(entry->detail);
                     if (replacement) {
@@ -11136,6 +11140,7 @@ static const ShellHelpTopic kShellHelpTopics[] = {
         NULL,
         0
     },
+#if defined(PSCAL_TARGET_IOS)
     {
         "which",
         "Locate commands and builtins.",
@@ -11147,6 +11152,7 @@ static const ShellHelpTopic kShellHelpTopics[] = {
         NULL,
         0
     },
+#endif
     {
         "enable",
         "Enable or disable shell builtins.",
