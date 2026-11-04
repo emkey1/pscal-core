@@ -3825,6 +3825,13 @@ static int vprocCentiFromMicros(int64_t micros) {
 
 static bool vprocThreadUsageMicros(pthread_t tid, int64_t *user_us, int64_t *system_us) {
 #if defined(__APPLE__)
+    /* A thread that ended and was not joined still gives the name its port had, and that name
+     * soon comes back for some other right. thread_info on an ordinary port ends the process,
+     * so ask the kernel first whether the name is a thread's. The name isn't ours to release:
+     * this call adds no reference, and a release takes another owner's right. */
+    if (pthread_kill(tid, 0) != 0) {
+        return false;
+    }
     thread_t thread_port = pthread_mach_thread_np(tid);
     if (thread_port == MACH_PORT_NULL) {
         return false;
@@ -3832,7 +3839,6 @@ static bool vprocThreadUsageMicros(pthread_t tid, int64_t *user_us, int64_t *sys
     thread_basic_info_data_t info;
     mach_msg_type_number_t count = THREAD_BASIC_INFO_COUNT;
     kern_return_t kr = thread_info(thread_port, THREAD_BASIC_INFO, (thread_info_t)&info, &count);
-    mach_port_deallocate(mach_task_self(), thread_port);
     if (kr != KERN_SUCCESS) {
         return false;
     }
