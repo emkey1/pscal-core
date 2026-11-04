@@ -1539,6 +1539,9 @@ typedef struct {
     int target_fd;
     int source_fd;
     int write_fd;
+    const char *path;
+    int flags;
+    mode_t mode;
     const char *here_body;
     size_t here_length;
     bool close_target;
@@ -1596,6 +1599,45 @@ static bool shellFdVarAssign(const char *name, int fd) {
     return ok;
 }
 
+/* The lowest descriptor above every number these redirections name. */
+static int shellRedirsFirstUnnamedFd(const ShellCommand *cmd) {
+    int first = 0;
+    for (size_t i = 0; i < cmd->redir_count; ++i) {
+        const ShellRedirection *redir = &cmd->redirs[i];
+        if (redir->fd >= first) {
+            first = redir->fd + 1;
+        }
+        if (redir->kind == SHELL_RUNTIME_REDIR_DUP && redir->dup_target_fd >= first) {
+            first = redir->dup_target_fd + 1;
+        }
+    }
+    return first;
+}
+
+/* One that will not move stays where it is. */
+static int shellFdMoveUpTo(int fd, int lowest) {
+    if (fd < 0 || fd >= lowest) {
+        return fd;
+    }
+    int moved = fcntl(fd, F_DUPFD, lowest);
+    if (moved < 0) {
+        return fd;
+    }
+    close(fd);
+    return moved;
+}
+
+/* In the child, in its turn: `cmd 2>log >/missing` reports into log. */
+static int shellRedirOpOpenOrExit(const ShellRuntimeRedirOp *op) {
+    int fd = open(op->path, op->flags, op->mode);
+    if (fd < 0) {
+        int err = errno;
+        fprintf(stderr, "exsh: %s: %s\n", op->path, strerror(err));
+        _exit(1);
+    }
+    return fd;
+}
+
 static int shellSpawnProcess(VM *vm,
                              const ShellCommand *cmd,
                              int stdin_fd,
@@ -1621,12 +1663,13 @@ static int shellSpawnProcess(VM *vm,
 
     size_t op_count = 0;
     int prep_error = 0;
-    /* A redirection that cannot open fails this command, not the script. The child
+    /* A redirection that cannot be done fails this command, not the script. The child
      * reports it and exits 1, so a pipeline stage, `&` and `wait` see an ordinary
      * failed process and the rest of a pipeline still runs. */
-    int redir_error = 0;
-    const char *redir_error_target = NULL;
-    enum { SHELL_REDIR_ERROR_AMBIGUOUS = -1 };
+    const char *ambiguous_target = NULL;
+    /* A here-document is ready before the fork, and the child goes through the list in
+     * order, so it waits where no number on the list can write over it or name it. */
+    int here_body_fd_min = shellRedirsFirstUnnamedFd(cmd);
     /* A word that waits for its turn sees what the ones before it did, so the child does them all,
      * in order. Under bash it does every one. */
     bool redirs_in_child = false;
@@ -1649,20 +1692,18 @@ static int shellSpawnProcess(VM *vm,
                     prep_error = EINVAL;
                     goto spawn_cleanup;
                 }
-                int fd = open(redir->path, redir->flags, redir->mode);
-                if (fd < 0) {
-                    redir_error = errno;
-                    redir_error_target = redir->path;
-                    break;
-                }
+                /* The child opens it. A FIFO's open waits for the other end, which may be
+                 * the shell's next command: `echo x > fifo & cat fifo`. */
                 op.type = SHELL_REDIR_OP_OPEN;
-                op.source_fd = fd;
+                op.source_fd = -1;
+                op.path = redir->path;
+                op.flags = redir->flags;
+                op.mode = redir->mode;
                 break;
             }
             case SHELL_RUNTIME_REDIR_DUP: {
                 if (redir->ambiguous) {
-                    redir_error = SHELL_REDIR_ERROR_AMBIGUOUS;
-                    redir_error_target = redir->path;
+                    ambiguous_target = redir->path ? redir->path : "";
                     break;
                 }
                 op.type = SHELL_REDIR_OP_DUP;
@@ -1675,8 +1716,7 @@ static int shellSpawnProcess(VM *vm,
                 if (op.close_target && redir->fd_var) {
                     op.target_fd = shellFdVarValue(redir->fd_var);
                     if (op.target_fd < 0) {
-                        redir_error = SHELL_REDIR_ERROR_AMBIGUOUS;
-                        redir_error_target = redir->fd_var;
+                        ambiguous_target = redir->fd_var;
                     }
                 }
                 break;
@@ -1690,6 +1730,7 @@ static int shellSpawnProcess(VM *vm,
                     prep_error = errno;
                     goto spawn_cleanup;
                 }
+                op.source_fd = shellFdMoveUpTo(op.source_fd, here_body_fd_min);
                 op.write_fd = -1;
                 op.here_body = body;
                 op.here_length = body_length;
@@ -1706,6 +1747,7 @@ static int shellSpawnProcess(VM *vm,
                     prep_error = errno;
                     goto spawn_cleanup;
                 }
+                op.source_fd = shellFdMoveUpTo(op.source_fd, here_body_fd_min);
                 op.write_fd = -1;
                 op.here_body = body;
                 op.here_length = redir->here_string_length;
@@ -1719,7 +1761,7 @@ static int shellSpawnProcess(VM *vm,
                 prep_error = EINVAL;
                 goto spawn_cleanup;
         }
-        if (redir_error != 0) {
+        if (ambiguous_target) {
             break;
         }
         ops[op_count++] = op;
@@ -1805,21 +1847,46 @@ static int shellSpawnProcess(VM *vm,
                 }
             }
 
+            /* This child may go on to run shell code: a function or a compound command. And
+             * before any open: one can wait for as long as nothing opens the other end of a
+             * FIFO, and a signal the shell traps must still end this child. */
+            if (lists_jobs) {
+                shellSubshellResetStateListingJobs(dollar_pid);
+            } else {
+                shellSubshellResetState(dollar_pid);
+            }
+
             for (size_t i = 0; i < op_count; ++i) {
                 ShellRuntimeRedirOp *op = &ops[i];
                 /* Bash does these in the child too, so the shell never hears of the number. */
                 if (op->fd_var && !op->close_target) {
-                    op->target_fd = fcntl(op->source_fd, F_DUPFD, 10);
+                    int source_fd = op->type == SHELL_REDIR_OP_OPEN ? shellRedirOpOpenOrExit(op) : op->source_fd;
+                    op->target_fd = fcntl(source_fd, F_DUPFD, 10);
                     if (op->target_fd < 0 || !shellFdVarAssign(op->fd_var, op->target_fd)) {
                         if (op->target_fd < 0) {
-                            fprintf(stderr, "exsh: %d: %s\n", op->source_fd, strerror(errno));
+                            fprintf(stderr, "exsh: %d: %s\n", source_fd, strerror(errno));
                         }
                         _exit(1);
+                    }
+                    if (op->type == SHELL_REDIR_OP_OPEN) {
+                        close(source_fd);
                     }
                     continue;
                 }
                 switch (op->type) {
-                    case SHELL_REDIR_OP_OPEN:
+                    case SHELL_REDIR_OP_OPEN: {
+                        int fd = shellRedirOpOpenOrExit(op);
+                        /* With the target closed, open can land right on it. */
+                        if (fd != op->target_fd) {
+                            if (dup2(fd, op->target_fd) < 0) {
+                                int err = errno;
+                                fprintf(stderr, "exsh: %s: %s\n", cmd->argv[0], strerror(err));
+                                _exit(1);
+                            }
+                            close(fd);
+                        }
+                        break;
+                    }
                     case SHELL_REDIR_OP_HEREDOC:
                     case SHELL_REDIR_OP_HERE_STRING:
                         if (dup2(op->source_fd, op->target_fd) < 0) {
@@ -1844,10 +1911,9 @@ static int shellSpawnProcess(VM *vm,
                 _exit(1);
             }
 
-            /* After the earlier ones: `cmd 2>log >/missing` reports into log. */
-            if (redir_error != 0) {
-                fprintf(stderr, "exsh: %s: %s\n", redir_error_target,
-                        redir_error == SHELL_REDIR_ERROR_AMBIGUOUS ? "ambiguous redirect" : strerror(redir_error));
+            /* After the earlier ones, like an open that fails. */
+            if (ambiguous_target) {
+                fprintf(stderr, "exsh: %s: ambiguous redirect\n", ambiguous_target);
                 _exit(1);
             }
 
@@ -1863,8 +1929,7 @@ static int shellSpawnProcess(VM *vm,
 
             for (size_t i = 0; i < op_count; ++i) {
                 ShellRuntimeRedirOp *op = &ops[i];
-                if ((op->type == SHELL_REDIR_OP_OPEN || op->type == SHELL_REDIR_OP_HEREDOC ||
-                     op->type == SHELL_REDIR_OP_HERE_STRING) &&
+                if ((op->type == SHELL_REDIR_OP_HEREDOC || op->type == SHELL_REDIR_OP_HERE_STRING) &&
                     op->source_fd >= 0 && op->source_fd != op->target_fd) {
                     close(op->source_fd);
                     op->source_fd = -1;
@@ -1874,12 +1939,6 @@ static int shellSpawnProcess(VM *vm,
             /* They are done. A builtin or a function would open them again: `f 2>&1 > out` sent
              * both streams to out, and under `set -C` the second open failed. */
             shellFreeRedirections((ShellCommand *)cmd);
-            /* This child may go on to run shell code: a function or a compound command. */
-            if (lists_jobs) {
-                shellSubshellResetStateListingJobs(dollar_pid);
-            } else {
-                shellSubshellResetState(dollar_pid);
-            }
             bool builtin_ran = shellInvokeBuiltin(vm ? vm : gShellCurrentVm, (ShellCommand *)cmd);
             if (builtin_ran) {
                 int status = gShellRuntime.last_status;
