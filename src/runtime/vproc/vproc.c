@@ -8918,6 +8918,31 @@ int vprocDupAbove(VProc *vp, int fd, int min) {
     return slot;
 }
 
+#if defined(PSCAL_TARGET_IOS)
+/* stdin_host_fd follows stdin here, so the descriptor it named has no other owner once it
+ * moves. Left open, `cat < f` kept 2 for each run, and a loop of them ran out after about 116
+ * runs at a limit of 256. Callers clone first, so their source may be that descriptor. */
+static void vprocMoveSavedStdinLocked(VProc *vp, int cloned) {
+    if (vp->stdin_host_fd >= 0 && vp->stdin_host_fd != cloned) {
+        (void)vprocResourceRemoveLocked(vp, vp->stdin_host_fd);
+        vprocHostCloseRaw(vp->stdin_host_fd);
+    }
+    vp->stdin_host_fd = cloned;
+    vp->stdin_from_session = false;
+    VProcSessionStdio *session = vprocSessionStdioCurrent();
+    if (session && session->stdin_host_fd >= 0) {
+        struct stat session_st;
+        struct stat cloned_st;
+        if (vprocHostFstatRaw(session->stdin_host_fd, &session_st) == 0 &&
+            vprocHostFstatRaw(cloned, &cloned_st) == 0 &&
+            session_st.st_dev == cloned_st.st_dev &&
+            session_st.st_ino == cloned_st.st_ino) {
+            vp->stdin_from_session = true;
+        }
+    }
+}
+#endif
+
 int vprocDup2(VProc *vp, int fd, int target) {
     if (!vp || target < 0) {
         errno = EBADF;
@@ -9001,19 +9026,7 @@ int vprocDup2(VProc *vp, int fd, int target) {
     vp->entries[target].inherit = target > STDERR_FILENO;
 #if defined(PSCAL_TARGET_IOS)
     if (target == STDIN_FILENO) {
-        vp->stdin_host_fd = cloned;
-        vp->stdin_from_session = false;
-        VProcSessionStdio *session = vprocSessionStdioCurrent();
-        if (session && session->stdin_host_fd >= 0) {
-            struct stat session_st;
-            struct stat cloned_st;
-            if (vprocHostFstatRaw(session->stdin_host_fd, &session_st) == 0 &&
-                vprocHostFstatRaw(cloned, &cloned_st) == 0 &&
-                session_st.st_dev == cloned_st.st_dev &&
-                session_st.st_ino == cloned_st.st_ino) {
-                vp->stdin_from_session = true;
-            }
-        }
+        vprocMoveSavedStdinLocked(vp, cloned);
     }
 #endif
     pthread_mutex_unlock(&vp->mu);
@@ -9056,19 +9069,7 @@ int vprocRestoreHostFd(VProc *vp, int target_fd, int host_src) {
     vp->entries[target_fd].kind = VPROC_FD_HOST;
 #if defined(PSCAL_TARGET_IOS)
     if (target_fd == STDIN_FILENO) {
-        vp->stdin_host_fd = cloned;
-        vp->stdin_from_session = false;
-        VProcSessionStdio *session = vprocSessionStdioCurrent();
-        if (session && session->stdin_host_fd >= 0) {
-            struct stat session_st;
-            struct stat cloned_st;
-            if (vprocHostFstatRaw(session->stdin_host_fd, &session_st) == 0 &&
-                vprocHostFstatRaw(cloned, &cloned_st) == 0 &&
-                session_st.st_dev == cloned_st.st_dev &&
-                session_st.st_ino == cloned_st.st_ino) {
-                vp->stdin_from_session = true;
-            }
-        }
+        vprocMoveSavedStdinLocked(vp, cloned);
     }
 #endif
     pthread_mutex_unlock(&vp->mu);
