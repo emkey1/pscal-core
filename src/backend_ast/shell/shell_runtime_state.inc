@@ -645,6 +645,12 @@ typedef struct ShellRuntimeState {
     /* Jobs that ended with nobody waiting on them, oldest first, for wait -n. */
     int finished_job_statuses[64];
     size_t finished_job_count;
+    /* What `wait pid` finds once a job has been reaped, oldest first, as bash keeps them. */
+    struct {
+        pid_t pid;
+        int status;
+    } reaped_pids[64];
+    size_t reaped_pid_count;
     ShellJobControlContext job_control_ctx;
     ShellArrayVariable *array_vars;
     size_t array_var_count;
@@ -4735,6 +4741,7 @@ ShellRuntimeState *shellRuntimeCreateContext(void) {
     ctx->last_removed_job_status = 0;
     ctx->last_removed_job_valid = false;
     ctx->finished_job_count = 0;
+    ctx->reaped_pid_count = 0;
     /* Deep-copy owned runtime state so contexts do not share pointers. */
     ctx->dir_stack = NULL;
     ctx->dir_stack_count = 0;

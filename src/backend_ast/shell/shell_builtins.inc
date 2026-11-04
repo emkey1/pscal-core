@@ -12312,6 +12312,35 @@ static bool shellWaitTargetIsLastRemoved(long target) {
             gShellRuntime.last_bg_pid == (pid_t)target);
 }
 
+/* `wait pid` for a job already off the table: two that ended before the shell looked were both
+ * reaped, and shellWaitTargetIsLastRemoved knows only the last. The status is asked for once. */
+static bool shellWaitTakeReapedPid(Value spec, int *out_status) {
+    long target = -1;
+    if (VALUE_TYPE(spec) == TYPE_STRING && AS_STRING(spec) && AS_STRING(spec)[0] != '%') {
+        char *end = NULL;
+        long parsed = strtol(AS_STRING(spec), &end, 10);
+        if (end != AS_STRING(spec) && *end == '\0') {
+            target = parsed;
+        }
+    } else if (IS_INTLIKE(spec)) {
+        target = (long)AS_INTEGER(spec);
+    }
+    if (target <= 0) {
+        return false;
+    }
+    for (size_t i = gShellRuntime.reaped_pid_count; i > 0; --i) {
+        if (gShellRuntime.reaped_pids[i - 1].pid != (pid_t)target) {
+            continue;
+        }
+        *out_status = gShellRuntime.reaped_pids[i - 1].status;
+        gShellRuntime.reaped_pid_count--;
+        memmove(&gShellRuntime.reaped_pids[i - 1], &gShellRuntime.reaped_pids[i],
+                (gShellRuntime.reaped_pid_count - (i - 1)) * sizeof(gShellRuntime.reaped_pids[0]));
+        return true;
+    }
+    return false;
+}
+
 /* wait -n: a job that already ended and nothing has reported, or else the next to end. */
 static void shellWaitForNextJob(void) {
     while (gShellRuntime.finished_job_count == 0 && shellJobVisibleCount() > 0) {
@@ -12335,6 +12364,11 @@ Value vmBuiltinShellWait(VM *vm, int arg_count, Value *args) {
     if (arg_count >= 1 && VALUE_TYPE(args[0]) == TYPE_STRING && AS_STRING(args[0]) &&
         strcmp(AS_STRING(args[0]), "-n") == 0) {
         shellWaitForNextJob();
+        return makeVoid();
+    }
+    int reaped_status = 0;
+    if (arg_count == 1 && shellWaitTakeReapedPid(args[0], &reaped_status)) {
+        shellUpdateStatus(reaped_status);
         return makeVoid();
     }
     if (arg_count == 1 && gShellJobCount == 0 && gShellRuntime.last_removed_job_valid) {

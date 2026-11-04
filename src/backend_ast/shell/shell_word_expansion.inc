@@ -2592,6 +2592,22 @@ static void shellFreeJob(ShellJob *job) {
     job->last_status = 0;
 }
 
+static void shellRememberReapedPid(pid_t pid, int status) {
+    ShellRuntimeState *ctx = shellGetContext();
+    if (!ctx) {
+        return;
+    }
+    size_t capacity = sizeof(ctx->reaped_pids) / sizeof(ctx->reaped_pids[0]);
+    if (ctx->reaped_pid_count == capacity) {
+        memmove(&ctx->reaped_pids[0], &ctx->reaped_pids[1],
+                (capacity - 1) * sizeof(ctx->reaped_pids[0]));
+        ctx->reaped_pid_count--;
+    }
+    ctx->reaped_pids[ctx->reaped_pid_count].pid = pid;
+    ctx->reaped_pids[ctx->reaped_pid_count].status = status;
+    ctx->reaped_pid_count++;
+}
+
 static void shellRemoveJobAt(size_t index) {
     if (index >= gShellJobCount) {
         return;
@@ -3049,6 +3065,7 @@ static int shellCollectJobs(void) {
                 job_active = true;
             } else {
                 job->last_status = shellStatusFromWait(status);
+                shellRememberReapedPid(pid, job->last_status);
                 job->pids[j] = -1;
             }
         }
