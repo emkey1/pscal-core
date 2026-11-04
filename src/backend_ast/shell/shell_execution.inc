@@ -327,6 +327,11 @@ static VProc *shellCreateVProcForStage(int stdin_host,
     bool stdin_use_pscal = false;
     bool stdout_use_pscal = false;
     bool stderr_use_pscal = false;
+    /* What the starter closed stays closed. vprocCreate would take the host's descriptor of that
+     * number, and `{ ls; } >&-` would write to the process's stdout. */
+    bool stdin_closed = false;
+    bool stdout_closed = false;
+    bool stderr_closed = false;
     struct pscal_fd *pscal_stdin = NULL;
     struct pscal_fd *pscal_stdout = NULL;
     struct pscal_fd *pscal_stderr = NULL;
@@ -340,6 +345,7 @@ static VProc *shellCreateVProcForStage(int stdin_host,
             } else {
                 pscal_stdin = vprocGetPscalFd(active, STDIN_FILENO);
                 stdin_use_pscal = (pscal_stdin != NULL);
+                stdin_closed = !stdin_use_pscal;
             }
         }
         if (stdout_host < 0) {
@@ -349,6 +355,7 @@ static VProc *shellCreateVProcForStage(int stdin_host,
             } else {
                 pscal_stdout = vprocGetPscalFd(active, STDOUT_FILENO);
                 stdout_use_pscal = (pscal_stdout != NULL);
+                stdout_closed = !stdout_use_pscal;
             }
         }
         if (stderr_host < 0) {
@@ -358,6 +365,7 @@ static VProc *shellCreateVProcForStage(int stdin_host,
             } else {
                 pscal_stderr = vprocGetPscalFd(active, STDERR_FILENO);
                 stderr_use_pscal = (pscal_stderr != NULL);
+                stderr_closed = !stderr_use_pscal;
             }
         }
     } else if (session_stdio) {
@@ -431,6 +439,9 @@ static VProc *shellCreateVProcForStage(int stdin_host,
     if (pscal_stdin) pscal_fd_close(pscal_stdin);
     if (pscal_stdout) pscal_fd_close(pscal_stdout);
     if (pscal_stderr) pscal_fd_close(pscal_stderr);
+    if (stdin_closed) (void)vprocClose(vp, STDIN_FILENO);
+    if (stdout_closed) (void)vprocClose(vp, STDOUT_FILENO);
+    if (stderr_closed) (void)vprocClose(vp, STDERR_FILENO);
 #if defined(PSCAL_TARGET_IOS)
     {
         int pid = vprocPid(vp);
@@ -1582,6 +1593,9 @@ static int shellSpawnProcess(VM *vm,
                 }
             }
 
+            /* They are done. A builtin or a function would open them again: `f 2>&1 > out` sent
+             * both streams to out, and under `set -C` the second open failed. */
+            shellFreeRedirections((ShellCommand *)cmd);
             /* This child may go on to run shell code: a function or a compound command. */
             shellSubshellResetState(dollar_pid);
             bool builtin_ran = shellInvokeBuiltin(vm ? vm : gShellCurrentVm, (ShellCommand *)cmd);
@@ -1979,8 +1993,6 @@ typedef struct {
     VProc *vp;
     ShellRuntimeState *bg_shell_ctx;
     VM *bg_vm;
-    char *stdout_path;
-    char *stderr_path;
     int shell_pid;
     int parent_pid;
     int kernel_pid;
@@ -2194,12 +2206,6 @@ static void __attribute__((unused)) shellInstallVprocSigintHandler(VProc *vp) {
     (void)vprocSigaction(vprocPid(vp), SIGINT, &sa, NULL);
 }
 
-/* Open a background redirection target using container-root semantics for
- * absolute paths on iOS. */
-static int shellBgOpenPath(const char *raw_path,
-                           bool append,
-                           char *out_final,
-                           size_t out_final_sz);
 #endif
 static void shellRedirectionFailed(const char *target, int err);
 
@@ -2209,13 +2215,6 @@ static void shellInProcessBackgroundCancelCleanup(void *arg) {
     if (!ctx) {
         return;
     }
-
-    /* Undo global environment toggles that would otherwise leak into the
-     * interactive shell when a background task is cancelled via vprocKillShim. */
-    unsetenv("PSCALI_BG_STDOUT");
-    unsetenv("PSCALI_BG_STDOUT_APPEND");
-    unsetenv("PSCALI_BG_STDERR");
-    unsetenv("PSCALI_BG_STDERR_APPEND");
 
     if (ctx->runtime_ctx_swapped && PSCALRuntimeSetCurrentRuntimeContext) {
         PSCALRuntimeSetCurrentRuntimeContext(ctx->prev_runtime_ctx);
@@ -2250,13 +2249,6 @@ static void shellInProcessBackgroundCancelCleanup(void *arg) {
         free(ctx->bg_shell_ctx);
         ctx->bg_shell_ctx = NULL;
     }
-    if (ctx->stderr_path && ctx->stderr_path == ctx->stdout_path) {
-        ctx->stderr_path = NULL;
-    }
-    free(ctx->stdout_path);
-    ctx->stdout_path = NULL;
-    free(ctx->stderr_path);
-    ctx->stderr_path = NULL;
 
     if (ctx->cmd) {
         shellFreeCommand(ctx->cmd);
@@ -2489,195 +2481,20 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
             }
         }
     }
-    const char *stdout_raw = NULL;
-    const char *stderr_raw = NULL;
-    bool stdout_append = false;
-    bool stderr_append = false;
-    int stdin_fd = -1;
-    bool stdin_redirected = false;
-    /* The first redirection that cannot open fails the job. It is reported once the job
-     * has a vproc, so `wait` gets the status. */
-    const char *redir_failed_target = NULL;
-    int redir_failed_errno = 0;
-    /* Background defaults: stdin -> /dev/null unless explicitly redirected.
-     * A compound command keeps its stdin. */
-    if (ctx->cmd && ctx->cmd->background && !ctx->cmd->body) {
-        stdin_fd = -2;
-    }
-
-    if (cmd && redir_count > 0 && cmd->redirs) {
-        for (size_t i = 0; i < redir_count; ++i) {
-            ShellRedirection *r = &cmd->redirs[i];
-            if (r->kind == SHELL_RUNTIME_REDIR_OPEN) {
-                if (r->fd == STDIN_FILENO && r->path) {
-                    int fd = -1;
-#if defined(PSCAL_TARGET_IOS)
-                    const char *stdin_path = r->path;
-                    char stdin_expanded[PATH_MAX];
-                    if (r->path[0] == '/') {
-                        if (!pathTruncateExpand(r->path, stdin_expanded, sizeof(stdin_expanded))) {
-                            stdin_path = NULL;
-                        } else {
-                            stdin_path = stdin_expanded;
-                        }
-                    }
-                    if (stdin_path) {
-                        fd = vprocHostOpen(stdin_path, r->flags, r->mode);
-                    }
-#else
-                    fd = open(r->path, r->flags, r->mode);
-#endif
-                    if (fd >= 0) {
-                        stdin_fd = fd;
-                        stdin_redirected = true;
-                    } else if (!redir_failed_target) {
-                        redir_failed_target = r->path;
-                        redir_failed_errno = errno;
-                    }
-                } else if (r->fd == STDOUT_FILENO && r->path) {
-                    stdout_raw = r->path;
-                    stdout_append = (r->flags & O_APPEND) != 0;
-                } else if (r->fd == STDERR_FILENO && r->path) {
-                    stderr_raw = r->path;
-                    stderr_append = (r->flags & O_APPEND) != 0;
-                }
-            } else if (r->kind == SHELL_RUNTIME_REDIR_DUP) {
-                if (r->ambiguous && !redir_failed_target) {
-                    redir_failed_target = r->path;
-                    redir_failed_errno = EINVAL;
-                }
-                if (r->fd == STDERR_FILENO && r->dup_target_fd == STDOUT_FILENO && stdout_raw) {
-                    stderr_raw = stdout_raw;
-                    stderr_append = stdout_append;
-                }
-            }
-        }
-    }
-
-    if (!stdin_redirected && stdin_fd < 0 && !(cmd && cmd->body)) {
-#if defined(PSCAL_TARGET_IOS)
-        stdin_fd = vprocHostOpen("/dev/null", O_RDONLY);
-#else
-        stdin_fd = open("/dev/null", O_RDONLY);
-#endif
-    }
-
-    const char *stdout_env = stdout_raw;
-    const char *stderr_env = stderr_raw;
-    if (tool_dbg || redir_dbg || pipe_dbg) {
-        fprintf(stderr, "[bg-stage] stdout_raw=%s stderr_raw=%s\n",
-                stdout_raw ? stdout_raw : "<null>",
-                stderr_raw ? stderr_raw : "<null>");
-    }
-#if defined(PSCAL_TARGET_IOS)
-    if (tool_dbg) {
-        fprintf(stderr, "[bg-stage] cmd=%s stdout_raw=%s stderr_raw=%s\n",
-                cmd && cmd->argc > 0 ? cmd->argv[0] : "<null>",
-                stdout_env ? stdout_env : "<none>",
-                stderr_env ? stderr_env : "<none>");
-    }
-#endif
-    char *stdout_path = stdout_env ? strdup(stdout_env) : NULL;
-    char *stderr_path = stderr_env ? strdup(stderr_env) : NULL;
-    ctx->stdout_path = stdout_path;
-    ctx->stderr_path = stderr_path;
-    int vm_stdout = -1;
-    int vm_stderr = -1;
-    /* If stderr was requested to follow stdout, reuse the stdout handle (after open). */
     int bg_status = 0;
 #if defined(PSCAL_TARGET_IOS)
     VProc *vp = ctx->vp;
 #endif
-
-    if (stdout_path && *stdout_path) {
-        char resolved_out[PATH_MAX];
-        vm_stdout = shellBgOpenPath(stdout_path, stdout_append, resolved_out, sizeof(resolved_out));
-        if (vm_stdout < 0 && !redir_failed_target) {
-            redir_failed_target = stdout_path;
-            redir_failed_errno = errno;
-        }
-        if (vm_stdout >= 0 && resolved_out[0]) {
-            free(stdout_path);
-            stdout_path = strdup(resolved_out);
-            ctx->stdout_path = stdout_path;
-        }
-        if (tool_dbg || redir_dbg) {
-            fprintf(stderr, "[bg-stage] open stdout '%s' fd=%d err=%s\n",
-                    stdout_path ? stdout_path : "<null>",
-                    vm_stdout, (vm_stdout < 0) ? strerror(errno) : "ok");
-        }
-    }
-    if (stderr_path && *stderr_path) {
-        char resolved_err[PATH_MAX];
-        vm_stderr = shellBgOpenPath(stderr_path, stderr_append, resolved_err, sizeof(resolved_err));
-        if (vm_stderr < 0 && !redir_failed_target) {
-            redir_failed_target = stderr_path;
-            redir_failed_errno = errno;
-        }
-        if (vm_stderr >= 0 && resolved_err[0]) {
-            free(stderr_path);
-            stderr_path = strdup(resolved_err);
-            ctx->stderr_path = stderr_path;
-        }
-        if (tool_dbg || redir_dbg) {
-            fprintf(stderr, "[bg-stage] open stderr '%s' fd=%d err=%s\n",
-                    stderr_path ? stderr_path : "<null>",
-                    vm_stderr, (vm_stderr < 0) ? strerror(errno) : "ok");
-        }
-    }
-    if (stdout_path && stderr_path && strcmp(stdout_path, stderr_path) == 0 && vm_stdout >= 0) {
-        vm_stderr = vm_stdout;
-    }
-    /* Now that paths may have been rewritten, export the final paths for tools. */
-    if (stdout_path) {
-        setenv("PSCALI_BG_STDOUT", stdout_path, 1);
-        setenv("PSCALI_BG_STDOUT_APPEND", stdout_append ? "1" : "0", 1);
-    } else {
-        unsetenv("PSCALI_BG_STDOUT");
-        unsetenv("PSCALI_BG_STDOUT_APPEND");
-    }
-    if (stderr_path) {
-        setenv("PSCALI_BG_STDERR", stderr_path, 1);
-        setenv("PSCALI_BG_STDERR_APPEND", stderr_append ? "1" : "0", 1);
-    } else {
-        unsetenv("PSCALI_BG_STDERR");
-        unsetenv("PSCALI_BG_STDERR_APPEND");
-    }
-#if defined(PSCAL_TARGET_IOS)
-    /* What a redirection opened replaces what the job inherited at the `&`, and no copy of
-     * that stays open: `cmd > /dev/null &` lets go of the caller's stdout. */
-    if (stdin_fd >= 0) {
-        if (vprocReplaceStdio(vp, STDIN_FILENO, stdin_fd) < 0 && !redir_failed_target) {
-            redir_failed_target = "stdin";
-            redir_failed_errno = errno;
-        }
-        vprocHostClose(stdin_fd);
-        stdin_fd = -1;
-    }
-    if (vm_stdout >= 0 && vprocReplaceStdio(vp, STDOUT_FILENO, vm_stdout) < 0 && !redir_failed_target) {
-        redir_failed_target = stdout_path;
-        redir_failed_errno = errno;
-    }
-    if (vm_stderr >= 0 && vprocReplaceStdio(vp, STDERR_FILENO, vm_stderr) < 0 && !redir_failed_target) {
-        redir_failed_target = stderr_path;
-        redir_failed_errno = errno;
-    }
-    if (vm_stderr >= 0 && vm_stderr != vm_stdout) {
-        vprocHostClose(vm_stderr);
-    }
-    if (vm_stdout >= 0) {
-        vprocHostClose(vm_stdout);
-    }
-    vm_stdout = -1;
-    vm_stderr = -1;
-#endif
-    /* We already materialised stdout/stderr redirs above; skip apply_exec_redirs here.
-     * Clear cmd redirs so downstream helpers do not reopen/dup back to the session. */
-    cmd->redir_count = 0;
+    /* Each redirection acts in the order written, on the job's own descriptors, as in a forked
+     * child. Nothing is saved, because the job never goes back to what it had: `cmd > /dev/null &`
+     * lets go of the caller's stdout. A failure is reported with what came before it in effect,
+     * and `wait` gets the status. */
+    bool redirected = shellApplyExecRedirections(cmd, NULL, NULL);
+    /* They are done, and what runs the command must not open them again. */
+    shellFreeRedirections(cmd);
     if (tool_dbg && pipe_dbg) {
         VProcSessionStdio *session_stdio = vprocSessionStdioCurrent();
-        fprintf(stderr, "[bg-stage] about to run builtin stdin_fd=%d stdout_fd=%d stderr_fd=%d session_out=%d session_err=%d\n",
-                stdin_fd, vm_stdout, vm_stderr,
+        fprintf(stderr, "[bg-stage] about to run builtin session_out=%d session_err=%d\n",
                 session_stdio ? session_stdio->stdout_host_fd : -1,
                 session_stdio ? session_stdio->stderr_host_fd : -1);
     }
@@ -2691,12 +2508,7 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
     /* Allow pthread_cancel to interrupt sleeps/IO. A kill that came during setup acts here. */
     pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
     pthread_testcancel();
-    if (redir_failed_target) {
-        shellRedirectionFailed(redir_failed_target, redir_failed_errno);
-        bg_status = 1;
-    } else {
-        bg_status = shellRunBuiltinInProcess(vm, cmd, stdin_fd, vm_stdout, vm_stderr, false);
-    }
+    bg_status = redirected ? shellRunBuiltinInProcess(vm, cmd, -1, -1, -1, false) : 1;
     if (tool_dbg && pipe_dbg) {
         fprintf(stderr, "[bg-stage] finished run status=%d\n", bg_status);
     }
@@ -2739,20 +2551,8 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
         shellFinalizeStageVprocEx(vp, bg_status, true);
         ctx->vp = NULL;
     }
-#else
-    if (stdin_fd >= 0) close(stdin_fd);
-    if (vm_stdout >= 0) close(vm_stdout);
-    if (vm_stderr >= 0) close(vm_stderr);
 #endif
-    unsetenv("PSCALI_BG_STDOUT");
-    unsetenv("PSCALI_BG_STDOUT_APPEND");
-    unsetenv("PSCALI_BG_STDERR");
-    unsetenv("PSCALI_BG_STDERR_APPEND");
     shellFreeCommand(cmd);
-    free(stdout_path);
-    ctx->stdout_path = NULL;
-    free(stderr_path);
-    ctx->stderr_path = NULL;
     free(cmd);
 #if defined(PSCAL_TARGET_IOS)
     /* Restore VM/runtime context now that the background task is done. */
@@ -2876,63 +2676,6 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd);
 
 #if defined(PSCAL_TARGET_IOS)
 static bool shellDupOntoTarget(VProc *vp, int src_fd, int target_fd, bool dbg, const char *label);
-static void shellBgEnsureParentDir(const char *path) {
-    if (!path || !*path) {
-        return;
-    }
-    const char *last_slash = strrchr(path, '/');
-    if (!last_slash || last_slash == path) {
-        /* No parent component or root only. */
-        return;
-    }
-    char buf[PATH_MAX];
-    size_t len = (size_t)(last_slash - path);
-    if (len >= sizeof(buf)) {
-        return;
-    }
-    memcpy(buf, path, len);
-    buf[len] = '\0';
-    /* Create each segment of the parent path. */
-    for (char *p = buf + 1; *p; ++p) {
-        if (*p == '/') {
-            *p = '\0';
-            mkdir(buf, 0777);
-            *p = '/';
-        }
-    }
-    mkdir(buf, 0777);
-}
-static int shellBgOpenPath(const char *raw_path,
-                           bool append,
-                           char *out_final,
-                           size_t out_final_sz) {
-    if (out_final && out_final_sz > 0) {
-        out_final[0] = '\0';
-    }
-    if (!raw_path || !*raw_path) {
-        return -1;
-    }
-    const char *open_path = raw_path;
-    char expanded[PATH_MAX];
-    if (raw_path[0] == '/') {
-        if (!pathTruncateExpand(raw_path, expanded, sizeof(expanded))) {
-            return -1;
-        }
-        open_path = expanded;
-    }
-    shellBgEnsureParentDir(open_path);
-    int flags = O_CREAT | O_WRONLY | (append ? O_APPEND : O_TRUNC);
-    int fd = -1;
-#if defined(PSCAL_TARGET_IOS)
-    fd = vprocHostOpen(open_path, flags, 0666);
-#else
-    fd = open(open_path, flags, 0666);
-#endif
-    if (fd >= 0 && out_final && out_final_sz > 0) {
-        snprintf(out_final, out_final_sz, "%s", open_path);
-    }
-    return fd;
-}
 static void shellPipelineSessionCloseSpool(ShellPipelineContext *ctx) {
     if (!ctx) {
         return;
@@ -3801,11 +3544,14 @@ static bool shellDupOntoTarget(VProc *vp, int src_fd, int target_fd, bool dbg, c
 #if defined(PSCAL_TARGET_IOS)
     if (vp) {
         int vrc = vprocDup2(vp, src_fd, target_fd);
+        int dup_errno = errno;
         if (dbg) {
             fprintf(stderr, "[redir] vprocDup2 %d->%d rc=%d host_src=%d (%s)\n",
                     src_fd, target_fd, vrc, host_src, label ? label : "");
         }
-        if (vrc < 0 && host_src < 0 && src_fd > STDERR_FILENO) {
+        /* That slot is closed. Its number means nothing on the host: `>&2` after `2>&-` must
+         * not reach the process's stderr. */
+        if (vrc < 0 && dup_errno == EBADF) {
             errno = EBADF;
             return false;
         }
@@ -5356,13 +5102,26 @@ static void *shellPipelineStageThreadMain(void *arg) {
 }
 
 #if defined(PSCAL_TARGET_IOS)
+/* bash's test for keeping stdin in a job, where `<&0` means what the shell has. An input
+ * redirection counts whatever its number, a duplication only on stdin itself. */
+static bool shellCommandRedirectsStdin(const ShellCommand *cmd) {
+    for (size_t i = 0; i < cmd->redir_count; ++i) {
+        const ShellRedirection *r = &cmd->redirs[i];
+        if (r->kind == SHELL_RUNTIME_REDIR_DUP ? r->fd == STDIN_FILENO
+            : r->kind != SHELL_RUNTIME_REDIR_OPEN || (r->flags & O_ACCMODE) != O_WRONLY) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* A job's vproc is made by whatever reaches the `&`, and its thread starts under it. So stdio,
  * the descriptors above it and the directory are copied there and then, as by a fork, and the
  * thread never touches the vproc that started it: that one may end before the thread first
  * runs, as `( cmd & )` and `eval "cmd &"` do. */
 static VProc *shellBackgroundStageCreateVProc(ShellBackgroundStageCtx *ctx, const ShellCommand *cmd) {
-    /* A simple command's stdin is /dev/null. A compound command keeps its own. */
-    VProc *vp = shellCreateVProcForStage(cmd->body ? -1 : -2,
+    /* A simple command's stdin is /dev/null unless it redirects stdin. A compound command keeps its own. */
+    VProc *vp = shellCreateVProcForStage((cmd->body || shellCommandRedirectsStdin(cmd)) ? -1 : -2,
                                          -1,
                                          -1,
                                          pscalRuntimeDetectWindowCols(),

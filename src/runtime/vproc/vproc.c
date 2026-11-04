@@ -2284,9 +2284,7 @@ static bool vprocAllowRealFdFallback(VProc *vp, int fd) {
     if (!vp || fd < 0) {
         return false;
     }
-    if (fd == STDIN_FILENO || fd == STDOUT_FILENO || fd == STDERR_FILENO) {
-        return true;
-    }
+    /* Not the host's stdio either: a vproc's own slot was closed, and `cat <&-` fails. */
     bool allow = false;
     pthread_mutex_lock(&vp->mu);
     allow = vprocOwnsHostFdLocked(vp, fd);
@@ -14014,7 +14012,12 @@ ssize_t vprocReadShim(int fd, void *buf, size_t count) {
     if (controlling_stdin) {
         (void)vprocWaitIfStopped(vp);
     }
+    /* stdin_host_fd follows stdin, so it may name a file the job redirected stdin from, or the
+     * /dev/null a job starts with. Only the terminal stops a job that reads it: `cat < f &` stopped
+     * and never ended. A host build's default session is no terminal, whatever its stdin is. */
     if (controlling_stdin && !gVprocPipelineStage &&
+        (vprocHostIsatty(host) ||
+         (vp->stdin_from_session && !vprocSessionStdioIsDefault(vprocSessionStdioCurrent()))) &&
         vprocShouldStopForBackgroundTty(vprocCurrent(), SIGTTIN)) {
         errno = EINTR;
         return -1;
@@ -14069,6 +14072,12 @@ ssize_t vprocWriteShim(int fd, const void *buf, size_t count) {
             return vprocSetCompatErrno((int)res);
         }
         return res;
+    }
+    /* A vproc always starts with its stdio, so an empty one was closed, and nothing below may
+     * find it another way out. */
+    if (vp && host < 0 && fd >= STDIN_FILENO && fd <= STDERR_FILENO) {
+        errno = EBADF;
+        return -1;
     }
 #if defined(PSCAL_TARGET_IOS)
     VProcSessionStdio *session = vprocSessionStdioCurrent();
