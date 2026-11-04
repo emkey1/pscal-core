@@ -209,6 +209,10 @@ int vprocRegisterTidHint(int pid, pthread_t tid);
 int vprocRegisterThread(VProc *vp, pthread_t tid);
 void vprocUnregisterThread(VProc *vp, pthread_t tid);
 int vprocSpawnThread(VProc *vp, void *(*start_routine)(void *), void *arg, pthread_t *thread_out);
+/* For a thread that has only borrowed the current vproc: its owner's vprocDestroy waits for vprocUnpin.
+ * NULL when there is none or it is already going. Don't block while holding one. */
+VProc *vprocPinCurrent(void);
+void vprocUnpin(VProc *vp);
 /* Before vprocMarkExit: whoever waits for the task may go on to use the pipes it held. */
 void vprocCloseDescriptors(VProc *vp);
 void vprocMarkExit(VProc *vp, int status);
@@ -636,6 +640,8 @@ static inline int vprocSetWinsize(VProc *vp, int cols, int rows) { (void)vp; (vo
 static inline int vprocGetWinsize(VProc *vp, VProcWinsize *out) { if (out) { out->cols = 80; out->rows = 24; } return 0; }
 static inline int vprocRegisterThread(VProc *vp, pthread_t tid) { (void)vp; (void)tid; return 0; }
 static inline void vprocEndAbandoned(VProc *keep) { (void)keep; }
+static inline VProc *vprocPinCurrent(void) { return NULL; }
+static inline void vprocUnpin(VProc *vp) { (void)vp; }
 static inline void vprocCloseDescriptors(VProc *vp) { (void)vp; }
 static inline void vprocMarkExit(VProc *vp, int status) { (void)vp; (void)status; }
 static inline void vprocSetParent(int pid, int parent_pid) { (void)pid; (void)parent_pid; }

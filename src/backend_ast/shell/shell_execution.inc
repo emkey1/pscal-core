@@ -312,13 +312,13 @@ static void shellThreadLinkRelease(ShellThreadLink *link) {
     link->env = NULL;
 }
 
-static VProc *shellCreateVProcForStage(int stdin_host,
-                                       int stdout_host,
-                                       int stderr_host,
-                                       int cols,
-                                       int rows,
-                                       int pid_hint,
-                                       bool inherit_pscal_stdio) {
+static VProc *shellMakeStageVProc(int stdin_host,
+                                  int stdout_host,
+                                  int stderr_host,
+                                  int cols,
+                                  int rows,
+                                  int pid_hint,
+                                  bool inherit_pscal_stdio) {
     (void)vprocEnsureKernelPid();
     /* Optionally inherit stdio from the active vproc; never fall back to the
      * interactive session if the caller disables inheritance. Background workers
@@ -463,6 +463,25 @@ static VProc *shellCreateVProcForStage(int stdin_host,
         }
     }
 #endif
+    return vp;
+}
+
+/* A stage on a thread of its own has only borrowed the vproc it reads its stdio from, and the
+ * owner can be killed at any moment, so it holds that vproc until it has one of its own. A cancel
+ * in here would leave the pin held, and the owner waiting on it for ever. */
+static VProc *shellCreateVProcForStage(int stdin_host,
+                                       int stdout_host,
+                                       int stderr_host,
+                                       int cols,
+                                       int rows,
+                                       int pid_hint,
+                                       bool inherit_pscal_stdio) {
+    int cancel_state;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+    VProc *parent = vprocPinCurrent();
+    VProc *vp = shellMakeStageVProc(stdin_host, stdout_host, stderr_host, cols, rows, pid_hint, inherit_pscal_stdio);
+    vprocUnpin(parent);
+    pthread_setcancelstate(cancel_state, NULL);
     return vp;
 }
 #endif

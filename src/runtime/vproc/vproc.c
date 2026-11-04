@@ -3178,7 +3178,7 @@ static VProc *vprocPin(VProc *vp) {
     return pinned;
 }
 
-static void vprocUnpin(VProc *vp) {
+void vprocUnpin(VProc *vp) {
     if (!vp) {
         return;
     }
@@ -8592,6 +8592,10 @@ void vprocDeactivate(void) {
 
 VProc *vprocCurrent(void) {
     return vprocForThread();
+}
+
+VProc *vprocPinCurrent(void) {
+    return vprocPin(vprocForThread());
 }
 
 void vprocDiscard(int pid) {
