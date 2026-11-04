@@ -11773,12 +11773,29 @@ static void *vprocSimExecThread(void *arg) {
         vprocSetSubshellPid(vprocPid(ctx->vp));
     }
     vprocEnvActivate(ctx->env);
+    /* A signal from before the exec, which nothing else here would look at. */
+    vprocDeliverPendingSignalsForCurrent();
     if (ctx->entry && !vprocSimExecAlreadyKilled(ctx->vp)) {
         ctx->status = ctx->entry(ctx->argc, ctx->argv);
     }
     status = ctx->status;
     pthread_cleanup_pop(1);
     return (void *)(intptr_t)status;
+}
+
+/* As exec does: the code a handler was in has gone, so a caught signal goes back to its default
+ * action. What was ignored stays ignored, and the mask and what is pending stay as they are. */
+static void vprocSimExecResetCaughtSignals(int pid) {
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    for (int sig = 1; entry && sig < 32; ++sig) {
+        if (entry->actions[sig].sa_handler != SIG_IGN && entry->actions[sig].sa_handler != SIG_DFL) {
+            sigemptyset(&entry->actions[sig].sa_mask);
+            entry->actions[sig].sa_handler = SIG_DFL;
+            entry->actions[sig].sa_flags = 0;
+        }
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
 }
 
 static int vprocSimSpawnChild(VProc *vp, VProcExecEntryFn entry, char *const argv[]) {
@@ -11933,6 +11950,7 @@ int vprocSimulatedExec(VProcExecEntryFn entry, char *const argv[]) {
         }
         vprocSetCommandLabel(state->child_pid, label);
     }
+    vprocSimExecResetCaughtSignals(state->child_pid);
     if (vprocSimSpawnChild(state->child_vp, entry, argv) != 0) {
         if (errno == 0) {
             errno = EIO;
@@ -18055,6 +18073,8 @@ ssize_t vprocReadRedirectedStdin(void *buf, size_t count) {
     return vprocHostRead(host, buf, count);
 }
 
+#define VPROC_POLL_SIGNAL_CHECK_MS 100
+
 int vprocPollShim(struct pollfd *fds, nfds_t nfds, int timeout) {
     vprocDeliverPendingSignalsForCurrent();
     VProc *vp = vprocForThread();
@@ -18202,6 +18222,12 @@ int vprocPollShim(struct pollfd *fds, nfds_t nfds, int timeout) {
 
             bool timer_limited = false;
             int effective_wait = vprocClampTimeoutByCurrentRealTimer(vp, wait_timeout, &timer_limited);
+            /* A signal has to end this wait with EINTR. Only a pscal_fd brings the wake pipe, so
+             * a wait on host descriptors alone looks for one every so often. */
+            if (!wake_enabled && (effective_wait < 0 || effective_wait > VPROC_POLL_SIGNAL_CHECK_MS)) {
+                effective_wait = VPROC_POLL_SIGNAL_CHECK_MS;
+                timer_limited = false;
+            }
             int host_ready = 0;
             if (host_poll_count > 0) {
                 host_ready = vprocHostPollRaw(host_fds, (nfds_t)host_poll_count, effective_wait);
