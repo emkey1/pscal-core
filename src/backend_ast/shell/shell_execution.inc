@@ -280,6 +280,7 @@ static void shellVprocLabelScopeEnd(ShellVprocLabelScope *scope) {
 static ShellThreadLink shellThreadLinkCapture(void) {
     ShellThreadLink link;
     memset(&link, 0, sizeof(link));
+    link.return_scope = gShellReturnScopeDepth + gShellThreadReturnScope;
     if (!gShellRuntime.in_subshell) {
         return link;
     }
@@ -293,6 +294,7 @@ static ShellThreadLink shellThreadLinkCapture(void) {
 }
 
 static void shellThreadLinkEnter(const ShellThreadLink *link) {
+    gShellThreadReturnScope = link ? link->return_scope : 0;
     if (link && link->ctx) {
         vprocEnvActivate(link->env);
         vprocSetSubshellPid(link->subshell_pid);

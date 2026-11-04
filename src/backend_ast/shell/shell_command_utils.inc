@@ -1233,6 +1233,24 @@ static bool shellFunctionIsDefined(const char *name) {
     return defined;
 }
 
+static bool shellFunctionIsTraced(const char *name) {
+    pthread_mutex_lock(&gShellFunctionTableMutex);
+    ShellFunctionEntry *entry = shellFindFunctionEntryUnlocked(name);
+    bool traced = entry && entry->traced;
+    pthread_mutex_unlock(&gShellFunctionTableMutex);
+    return traced;
+}
+
+static bool shellFunctionSetTraced(const char *name, bool traced) {
+    pthread_mutex_lock(&gShellFunctionTableMutex);
+    ShellFunctionEntry *entry = shellFindFunctionEntryUnlocked(name);
+    if (entry) {
+        entry->traced = traced;
+    }
+    pthread_mutex_unlock(&gShellFunctionTableMutex);
+    return entry != NULL;
+}
+
 static ShellCompiledFunction *shellFindCompiledFunction(const char *name) {
     ShellCompiledFunction *compiled = NULL;
     pthread_mutex_lock(&gShellFunctionTableMutex);

@@ -1078,7 +1078,7 @@ static void shellEndWithRequest(void) {
 static void shellRunSignalTrapCommand(int signo) {
     bool saved_sticky = gShellStatusSticky;
     shellRuntimeRunSignalTrap(signo);
-    if (gShellReturnPending && !gShellExitRequested) {
+    if ((gShellReturnPending || gShellDiscardPending) && !gShellExitRequested) {
         /* `return` in the text: the VM stops for the function it broke into, not for the shell. */
         return;
     }
@@ -2066,11 +2066,18 @@ static bool shellInvokeFunction(VM *vm, ShellCommand *cmd) {
     bool using_cached_vm = false;
     bool nested_vm_initialized = false;
     bool frame_pushed = false;
+    bool caller_traps_back = false;
     InterpretResult result = INTERPRET_OK;
     size_t redirect_scope_depth = shellRuntimeRedirectScopeDepth();
     size_t loop_depth = gShellLoopStackSize;
     size_t case_depth = gShellCaseStack.count;
     int condition_depth = gShellConditionDepth;
+    bool err_trap_at_call = shellTrapIsLive(&gShellErrTrap);
+    ShellCallerTraps caller_traps;
+    shellCallerTrapsPutAside(&caller_traps, shellFunctionIsTraced(name));
+    /* A bare `return` in a function a trap calls is about the function. */
+    bool saved_trap_status_valid = gShellTrapStatusValid;
+    gShellTrapStatusValid = false;
     /* The pipeline that called the function is still the shell's: its negation and status
      * apply when the call returns, whatever the body's pipelines do. A stage's context may
      * be in use by the stages beside it, and those keep it. */
@@ -2131,34 +2138,42 @@ static bool shellInvokeFunction(VM *vm, ShellCommand *cmd) {
         name_pushed = true;
     }
 
+    gShellReturnScopeDepth++;
     result = interpretBytecode(invoke_vm, &compiled->chunk,
                                globalSymbols, constGlobalSymbols, procedure_table, 0);
-    if (gShellReturnPending) {
+    shellRuntimeFinishChunk(invoke_vm);
+    bool returned = gShellReturnPending;
+    if (returned || gShellDiscardPending) {
         /* It may have left a condition of its own. One the call is in still holds:
          * `set -e; if f; then` ignores a failure inside f. */
         gShellConditionDepth = condition_depth;
     }
     gShellReturnPending = false;
-    if (result != INTERPRET_OK && !gShellExitRequested) {
-        shellUpdateStatus(1);
-    } else {
-        shellUpdateStatus(shellRuntimeLastStatus());
+    int call_status = (result != INTERPRET_OK && !gShellExitRequested) ? 1 : shellRuntimeLastStatus();
+    if (!gShellDiscardPending) {
+        shellRuntimeRunReturnTrap(returned, call_status);
     }
-    if (gShellReturnTrap.action == SHELL_TRAP_ACTION_COMMAND) {
-        int status_after = shellRuntimeLastStatus();
-        shellRuntimeRunReturnTrap();
-        shellUpdateStatus(status_after);
-    }
+    gShellReturnScopeDepth--;
+    shellCallerTrapsBack(&caller_traps);
+    caller_traps_back = true;
+    gShellTrapStatusValid = saved_trap_status_valid;
+    /* The caller's ERR trap and errexit answer to the call. */
+    shellUpdateStatus(call_status);
+    gShellErrTrapSkipOnce = !err_trap_at_call;
     if (name_pushed) {
         gShellFunctionNameCount--;
         memmove(gShellFunctionNames, gShellFunctionNames + 1, gShellFunctionNameCount * sizeof(char *));
     }
-    if (gShellExitRequested && vm) {
+    if ((gShellExitRequested || gShellDiscardPending) && vm) {
         /* `exit` ended this chunk. It ends the one that called the function too. */
         vm->exit_requested = true;
     }
 
 invoke_cleanup:
+    if (!caller_traps_back) {
+        shellCallerTrapsBack(&caller_traps);
+        gShellTrapStatusValid = saved_trap_status_valid;
+    }
     shellRuntimeUnwindRedirectScopes(redirect_scope_depth);
     shellUnwindChunk(loop_depth, case_depth);
     if (pipeline_saved) {
@@ -2223,9 +2238,13 @@ static void shellSubshellResetState(pid_t dollar_pid) {
     if (gShellExitTrap.action == SHELL_TRAP_ACTION_COMMAND) {
         shellTrapClearEntry(&gShellExitTrap);
     }
-    shellTrapClearEntry(&gShellErrTrap);
-    shellTrapClearEntry(&gShellDebugTrap);
-    shellTrapClearEntry(&gShellReturnTrap);
+    gShellTextDepth = 0;
+    /* set -E and set -T hand these on to a subshell. It lists them either way. */
+    gShellErrTrap.dormant = gShellErrTrap.dormant || !gShellRuntime.errtrace_enabled;
+    gShellReturnTrap.dormant = gShellReturnTrap.dormant || !gShellRuntime.functrace_enabled;
+    if (!gShellRuntime.functrace_enabled) {
+        shellTrapClearEntry(&gShellDebugTrap);
+    }
 #if !defined(PSCAL_TARGET_IOS)
     memset((void *)gShellPendingSignals, 0, sizeof(gShellPendingSignals));
 #endif
@@ -2267,6 +2286,8 @@ static void shellBodyStateFree(ShellBodyState *state) {
         shellFreeParameterArray(state->params, state->param_count);
     }
     shellVariableAttributesFree(state->attributes, state->attribute_count);
+    free(state->err_trap);
+    free(state->return_trap);
     free(state);
 }
 
@@ -2307,6 +2328,15 @@ static ShellBodyState *shellBodyStateCapture(void) {
     state->dollar_pid = shellRuntimeDollarPid();
     /* A thread's own, and the stage's thread is another. */
     state->ifs_unset = gShellIfsUnset;
+    /* Per thread there, and the body's thread may be another. */
+    if (gShellErrTrap.command) {
+        state->err_trap = strdup(gShellErrTrap.command);
+        state->traps_dormant_err = gShellErrTrap.dormant;
+    }
+    if (gShellReturnTrap.command) {
+        state->return_trap = strdup(gShellReturnTrap.command);
+        state->traps_dormant_return = gShellReturnTrap.dormant;
+    }
     if (gShellVariableAttributeCount > 0) {
         state->attributes = (ShellVariableAttribute *)calloc(gShellVariableAttributeCount, sizeof(ShellVariableAttribute));
         if (!state->attributes) {
@@ -2337,6 +2367,9 @@ typedef struct {
     ShellVariableAttribute *saved_attributes;
     size_t saved_attribute_count;
     bool saved_ifs_unset;
+    ShellTrapEntry saved_err_trap;
+    ShellTrapEntry saved_debug_trap;
+    ShellTrapEntry saved_return_trap;
 } ShellBodyScope;
 
 static void shellBodyScopeEnter(ShellBodyState *state, ShellBodyScope *scope) {
@@ -2351,6 +2384,25 @@ static void shellBodyScopeEnter(ShellBodyState *state, ShellBodyScope *scope) {
         return;
     }
     scope->previous_ctx = shellRuntimeActivateContext(state->ctx);
+    /* The body may run on the shell's own thread, whose traps come back with it. */
+    scope->saved_err_trap = gShellErrTrap;
+    scope->saved_debug_trap = gShellDebugTrap;
+    scope->saved_return_trap = gShellReturnTrap;
+    memset(&gShellErrTrap, 0, sizeof(gShellErrTrap));
+    memset(&gShellDebugTrap, 0, sizeof(gShellDebugTrap));
+    memset(&gShellReturnTrap, 0, sizeof(gShellReturnTrap));
+    if (state->err_trap) {
+        gShellErrTrap.action = SHELL_TRAP_ACTION_COMMAND;
+        gShellErrTrap.command = state->err_trap;
+        gShellErrTrap.dormant = state->traps_dormant_err;
+        state->err_trap = NULL;
+    }
+    if (state->return_trap) {
+        gShellReturnTrap.action = SHELL_TRAP_ACTION_COMMAND;
+        gShellReturnTrap.command = state->return_trap;
+        gShellReturnTrap.dormant = state->traps_dormant_return;
+        state->return_trap = NULL;
+    }
     shellSubshellResetState(state->dollar_pid);
     scope->previous_env = vprocEnvActivate(state->env);
     VProc *self = vprocCurrent();
@@ -2389,6 +2441,12 @@ static void shellBodyScopeLeave(ShellBodyState *state, const ShellBodyScope *sco
     gShellVariableAttributes = scope->saved_attributes;
     gShellVariableAttributeCount = scope->saved_attribute_count;
     gShellIfsUnset = scope->saved_ifs_unset;
+    shellTrapClearEntry(&gShellErrTrap);
+    shellTrapClearEntry(&gShellDebugTrap);
+    shellTrapClearEntry(&gShellReturnTrap);
+    gShellErrTrap = scope->saved_err_trap;
+    gShellDebugTrap = scope->saved_debug_trap;
+    gShellReturnTrap = scope->saved_return_trap;
     vprocEnvActivate(scope->previous_env);
     vprocSetSubshellPid(scope->previous_subshell_pid);
     shellRuntimeActivateContext(scope->previous_ctx);
@@ -2421,7 +2479,11 @@ static bool shellRunBody(VM *vm, ShellCommand *cmd) {
     size_t redirect_scope_depth = shellRuntimeRedirectScopeDepth();
     InterpretResult result = interpretBytecode(body_vm, &cmd->body->chunk,
                                                globalSymbols, constGlobalSymbols, procedure_table, 0);
+    shellRuntimeFinishChunk(body_vm);
     shellRuntimeUnwindRedirectScopes(redirect_scope_depth);
+    /* Whatever ended the body ends with it: it may run on the shell's own thread. */
+    gShellReturnPending = false;
+    gShellDiscardPending = false;
     bool exit_requested = shellRuntimeConsumeExitRequested();
     int status = (result == INTERPRET_OK || exit_requested) ? shellRuntimeLastStatus() : 1;
     shellRuntimeRunExitTrap();

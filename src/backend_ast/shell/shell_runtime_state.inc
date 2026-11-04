@@ -498,12 +498,13 @@ typedef struct {
 typedef struct ShellTrapEntry {
     ShellTrapAction action;
     char *command;
+    /* Handed to a subshell or a substitution without set -E or -T: `trap` lists it, nothing runs it. */
+    bool dormant;
 } ShellTrapEntry;
 
 static PSCAL_THREAD_LOCAL ShellTrapEntry gShellErrTrap;
 static PSCAL_THREAD_LOCAL ShellTrapEntry gShellDebugTrap;
 static PSCAL_THREAD_LOCAL ShellTrapEntry gShellReturnTrap;
-static PSCAL_THREAD_LOCAL int gShellReturnTrapDepth = 0;
 
 typedef struct ShellJob {
     pid_t pgid;
@@ -622,6 +623,8 @@ typedef struct ShellRuntimeState {
     bool errexit_defer_active;
     bool trap_enabled;
     bool posix_mode;
+    bool errtrace_enabled; /* set -E: a function sees the ERR trap */
+    bool functrace_enabled; /* set -T: a function sees the RETURN trap */
     bool local_scope_active;
     bool break_requested;
     bool continue_requested;
@@ -662,6 +665,8 @@ typedef struct ShellRuntimeState {
     ShellTrapEntry exit_trap;
     bool trap_executing;
     int script_depth;
+    int return_scope_depth; /* functions and sourced files around what runs: where `return` means something */
+    int text_depth; /* eval, source and a trap's text around what runs; a substitution counts as one */
     int condition_depth;
     size_t job_next_id;
     ShellJob *jobs;
@@ -717,6 +722,8 @@ static void shellSetContext(ShellRuntimeState *ctx);
 #define gShellExitTrap (SC()->exit_trap)
 #define gShellTrapExecuting (SC()->trap_executing)
 #define gShellScriptDepth (SC()->script_depth)
+#define gShellReturnScopeDepth (SC()->return_scope_depth)
+#define gShellTextDepth (SC()->text_depth)
 #define gShellConditionDepth (SC()->condition_depth)
 #define gShellJobs (SC()->jobs)
 #define gShellJobCount (SC()->job_count)
@@ -761,6 +768,7 @@ typedef struct ShellFunctionEntry {
     char *name;
     char *parameter_metadata;
     ShellCompiledFunction *compiled;
+    bool traced; /* declare -ft: it sees the caller's RETURN trap */
 } ShellFunctionEntry;
 
 static ShellFunctionEntry *gShellFunctionTable = NULL;
@@ -1114,6 +1122,7 @@ static char *shellBuildArrayLiteral(const ShellArrayVariable *var);
 static bool shellArrayRegistryInitializeAssociative(const char *name);
 static ShellAlias *shellFindAlias(const char *name);
 static void shellReportRecoverableError(VM *vm, bool with_location, const char *fmt, ...);
+static void shellFdPrintf(int fd, const char *fmt, ...);
 
 static bool shellReadonlyEnsureCapacity(size_t needed);
 static ShellReadonlyEntry *shellReadonlyFindMutable(const char *name);
@@ -2415,6 +2424,10 @@ typedef struct {
     struct ShellVariableAttribute *attributes;
     size_t attribute_count;
     bool ifs_unset;
+    char *err_trap;
+    char *return_trap;
+    bool traps_dormant_err;
+    bool traps_dormant_return;
 } ShellBodyState;
 
 /* What a thread started by a subshell takes from it, beyond the vproc every new thread
@@ -2423,6 +2436,7 @@ typedef struct {
     ShellRuntimeState *ctx;
     VProcEnv *env;
     int subshell_pid;
+    int return_scope; /* this one always */
 } ShellThreadLink;
 #endif
 
@@ -3038,6 +3052,19 @@ static PSCAL_THREAD_LOCAL size_t gShellSourceNameCount = 0;
 static PSCAL_THREAD_LOCAL bool gShellIfsUnset = false;
 static PSCAL_THREAD_LOCAL bool gShellPipeStatusFresh = false;
 static PSCAL_THREAD_LOCAL bool gShellReturnPending = false;
+/* What $? was when `return` ran: a RETURN trap sees that, and the caller sees its status. */
+static PSCAL_THREAD_LOCAL int gShellReturnPriorStatus = 0;
+/* `return 1 2` and the like: everything running goes, down to what the shell last read. */
+static PSCAL_THREAD_LOCAL bool gShellDiscardPending = false;
+/* $? when the running trap broke in, for a bare `return` in its text. */
+static PSCAL_THREAD_LOCAL bool gShellTrapStatusValid = false;
+static PSCAL_THREAD_LOCAL int gShellTrapStatus = 0;
+/* The call that just ended failed, and its ERR trap was set during it: that one does not answer
+ * for it. errexit still does. */
+static PSCAL_THREAD_LOCAL bool gShellErrTrapSkipOnce = false;
+/* A thread started for a stage or a job may have no copy of the context it started from, and
+ * `return` there ends the stage: this says whether there was a call around it. */
+static PSCAL_THREAD_LOCAL int gShellThreadReturnScope = 0;
 static PSCAL_THREAD_LOCAL int gShellReturnStatus = 0;
 static PSCAL_THREAD_LOCAL char *gShellLastWord = NULL;
 static PSCAL_THREAD_LOCAL time_t gShellSecondsBase = 0;
@@ -3545,6 +3572,7 @@ static void shellTrapClearEntry(ShellTrapEntry *entry) {
         entry->command = NULL;
     }
     entry->action = SHELL_TRAP_ACTION_DEFAULT;
+    entry->dormant = false;
 }
 
 static bool shellTrapSetCommand(ShellTrapEntry *entry, const char *command) {
@@ -3563,6 +3591,7 @@ static bool shellTrapSetCommand(ShellTrapEntry *entry, const char *command) {
     }
     entry->action = SHELL_TRAP_ACTION_COMMAND;
     entry->command = copy;
+    entry->dormant = false;
     return true;
 }
 
@@ -3603,8 +3632,16 @@ void shellRuntimeRequestExit(void) {
     gShellExitRequested = true;
 }
 
+static bool shellTrapIsLive(const ShellTrapEntry *entry) {
+    return entry->action == SHELL_TRAP_ACTION_COMMAND && entry->command && !entry->dormant;
+}
+
 void shellRuntimeSetLastStatus(int status) {
     gShellStatusVersion++;
+    /* The pipeline it was in finishes with the same status. */
+    if (status != gShellRuntime.last_status) {
+        gShellErrTrapSkipOnce = false;
+    }
     if (gShellArithmeticErrorPending) {
         status = 1;
         gShellArithmeticErrorPending = false;
@@ -3615,8 +3652,7 @@ void shellRuntimeSetLastStatus(int status) {
     shellSetTrackedVariable("EXSH_LAST_STATUS", buffer, false);
     bool suppress_errexit = shellRuntimeEvaluatingCondition();
     if (status != 0) {
-        if ((gShellRuntime.errexit_enabled || gShellErrTrap.action == SHELL_TRAP_ACTION_COMMAND) &&
-            !suppress_errexit) {
+        if ((gShellRuntime.errexit_enabled || shellTrapIsLive(&gShellErrTrap)) && !suppress_errexit) {
             gShellRuntime.errexit_pending = true;
             gShellRuntime.errexit_defer_active = true;
         }
@@ -3666,6 +3702,8 @@ void shellRuntimeKeepLineState(ShellRuntimeState *line_ctx) {
     KEEP(braceexpand_disabled);
     KEEP(allexport_enabled);
     KEEP(posix_mode);
+    KEEP(errtrace_enabled);
+    KEEP(functrace_enabled);
     KEEP(last_bg_pid);
     KEEP(job_next_id);
     KEEP(getopts_index);
@@ -3750,6 +3788,9 @@ static void shellRuntimeExecuteTrap(const char *command, const char *label) {
     int saved_continue_levels = gShellRuntime.continue_requested_levels;
     bool saved_errexit_pending = gShellRuntime.errexit_pending;
     bool saved_errexit_defer_active = gShellRuntime.errexit_defer_active;
+    bool saved_return_pending = gShellReturnPending;
+    bool saved_trap_status_valid = gShellTrapStatusValid;
+    int saved_trap_status = gShellTrapStatus;
     VM *current_vm = gShellCurrentVm;
     bool saved_vm_exit = false;
     bool saved_vm_abort = false;
@@ -3769,6 +3810,9 @@ static void shellRuntimeExecuteTrap(const char *command, const char *label) {
     gShellRuntime.continue_requested_levels = 0;
     gShellRuntime.errexit_pending = false;
     gShellRuntime.errexit_defer_active = false;
+    gShellReturnPending = false;
+    gShellTrapStatusValid = true;
+    gShellTrapStatus = gShellRuntime.last_status;
 
     bool exit_requested = false;
     int status = EXIT_FAILURE;
@@ -3787,7 +3831,9 @@ static void shellRuntimeExecuteTrap(const char *command, const char *label) {
     }
 
     if (can_run || shellSymbolTableScopeIsActive()) {
+        gShellTextDepth++;
         status = shellRunSource(command, label ? label : "<trap>", &opts, &exit_requested);
+        gShellTextDepth--;
     }
     shellResetPipeline();
     *caller_pipeline = saved_pipeline;
@@ -3806,6 +3852,10 @@ static void shellRuntimeExecuteTrap(const char *command, const char *label) {
             current_vm->exit_requested = true;
         }
     }
+
+    gShellReturnPending = saved_return_pending || gShellReturnPending;
+    gShellTrapStatusValid = saved_trap_status_valid;
+    gShellTrapStatus = saved_trap_status;
 
     bool trap_exit_requested = gShellExitRequested;
     bool trap_break_requested = gShellRuntime.break_requested;
@@ -3862,6 +3912,50 @@ static void shellRuntimeExecuteTrap(const char *command, const char *label) {
     gShellTrapExecuting = false;
 }
 
+/* `return` in a trap's text ends what the trap broke into, and so does what drops a whole
+ * command. The caller's chunk stops at its next instruction. */
+static bool shellRuntimeTrapEndedChunk(VM *vm) {
+    if (gShellExitRequested || (!gShellReturnPending && !gShellDiscardPending)) {
+        return false;
+    }
+    if (gShellReturnPending) {
+        gShellRuntime.last_status = gShellReturnStatus;
+    }
+    gShellRuntime.errexit_pending = false;
+    gShellRuntime.errexit_defer_active = false;
+    if (vm) {
+        vm->exit_requested = true;
+        vm->current_builtin_name = "return";
+    }
+    return true;
+}
+
+/* Nothing unwinds under bash when a script exits or errexit ends it, so every redirection
+ * around that point holds while the EXIT trap runs. Here the frames undo them on the way
+ * out, so the trap runs first, where it stands. Inside eval, source and a trap's text bash
+ * does undo what that text opened, so those wait for their caller. */
+static void shellRuntimeRunExitTrapInPlace(void) {
+    if (gShellExitTrap.action != SHELL_TRAP_ACTION_COMMAND || !gShellExitTrap.command ||
+        gShellTrapExecuting || gShellTextDepth > 0 || gShellRuntime.pipeline.stage_count > 1) {
+        return;
+    }
+    int status = gShellRuntime.last_status;
+    bool requested = gShellExitRequested;
+    char *command = gShellExitTrap.command;
+    gShellExitTrap.command = NULL;
+    gShellExitTrap.action = SHELL_TRAP_ACTION_DEFAULT;
+    gShellExitRequested = false;
+    shellRuntimeExecuteTrap(command, "<exit-trap>");
+    free(command);
+    /* `exit` in the trap gives the status. */
+    if (!gShellExitRequested) {
+        gShellRuntime.last_status = status;
+        gShellRuntime.errexit_pending = false;
+        gShellRuntime.errexit_defer_active = false;
+    }
+    gShellExitRequested = gShellExitRequested || requested;
+}
+
 bool shellRuntimeShouldDeferExit(VM *vm) {
     if (!gShellRuntime.errexit_defer_active) {
         return false;
@@ -3890,17 +3984,23 @@ bool shellRuntimeMaybeRequestPendingExit(VM *vm) {
         return false;
     }
     gShellRuntime.errexit_pending = false;
-    if (gShellErrTrap.action == SHELL_TRAP_ACTION_COMMAND && gShellErrTrap.command) {
+    bool err_trap_skipped = gShellErrTrapSkipOnce;
+    gShellErrTrapSkipOnce = false;
+    if (shellTrapIsLive(&gShellErrTrap) && !err_trap_skipped) {
         int failed_status = gShellRuntime.last_status;
         shellRuntimeExecuteTrap(gShellErrTrap.command, "<err-trap>");
         gShellRuntime.errexit_pending = false;
         gShellRuntime.errexit_defer_active = false;
         if (gShellExitRequested) {
             /* `exit` in the trap. */
+            shellRuntimeRunExitTrapInPlace();
             if (vm) {
                 vm->exit_requested = true;
                 vm->abort_requested = true;
             }
+            return true;
+        }
+        if (shellRuntimeTrapEndedChunk(vm)) {
             return true;
         }
         /* $? is still the command that failed. */
@@ -3909,6 +4009,7 @@ bool shellRuntimeMaybeRequestPendingExit(VM *vm) {
     if (!gShellRuntime.errexit_enabled) {
         return false;
     }
+    shellRuntimeRunExitTrapInPlace();
     shellRuntimeRequestExit();
     if (vm) {
         vm->exit_requested = true;
@@ -3922,6 +4023,17 @@ bool shellRuntimeMaybeRequestPendingExit(VM *vm) {
         }
     }
     return true;
+}
+
+/* A chunk whose last command failed stops before the check that runs its ERR trap, and that
+ * trap answers to what happened in there. */
+void shellRuntimeFinishChunk(VM *vm) {
+    if (!gShellRuntime.errexit_pending || gShellExitRequested || gShellReturnPending || gShellDiscardPending ||
+        !shellTrapIsLive(&gShellErrTrap)) {
+        return;
+    }
+    gShellRuntime.errexit_defer_active = false;
+    shellRuntimeMaybeRequestPendingExit(vm);
 }
 
 const volatile bool *shellRuntimePendingExitFlag(void) {
@@ -3952,27 +4064,17 @@ void shellRuntimeRunSignalTrap(int signo) {
     bool nested = gShellTrapExecuting;
     gShellSignalTrapsRunning |= own_bit;
     gShellTrapExecuting = false;
-    gShellReturnPending = false;
     /* The text outlives this call even if the trap changes itself. */
     char *command = strdup(entry->command);
     shellRuntimeExecuteTrap(command, label);
     free(command);
     gShellTrapExecuting = nested;
     gShellSignalTrapsRunning &= ~own_bit;
-    /* `return` in the text ends the function it broke into, as under eval. */
-    if (gShellReturnPending && !gShellExitRequested) {
-        if (shellLocalScopeDepth() == 0 && shellRuntimeIsOutermostScript() && !gShellRuntime.in_subshell) {
-            gShellReturnPending = false;
-            runtimeError(gShellCurrentVm, "return: can only `return' from a function or sourced script");
-            gShellRuntime.last_status = status_before;
-            return;
-        }
-        shellUpdateStatus(gShellReturnStatus);
-        if (gShellCurrentVm) {
-            gShellCurrentVm->exit_requested = true;
-            gShellCurrentVm->current_builtin_name = "return";
-        }
+    if (shellRuntimeTrapEndedChunk(gShellCurrentVm)) {
         return;
+    }
+    if (gShellExitRequested) {
+        shellRuntimeRunExitTrapInPlace();
     }
     /* Otherwise $? is what it was, unless that was the end of the shell. */
     if (!gShellExitRequested) {
@@ -3988,12 +4090,51 @@ static void shellRuntimeRunDebugTrap(void) {
     }
 }
 
-/* A function does not see the RETURN trap of its caller, so this fires only for the
- * function that set it. */
-static void shellRuntimeRunReturnTrap(void) {
-    if (gShellReturnTrap.action == SHELL_TRAP_ACTION_COMMAND && gShellReturnTrap.command &&
-        gShellReturnTrapDepth == shellLocalScopeDepth() && gShellReturnTrapDepth > 0) {
-        shellRuntimeExecuteTrap(gShellReturnTrap.command, "<return-trap>");
+/* A function and a sourced file run it as they end. $? in it is what it was before `return`,
+ * and the status stays what the call gives, whatever the trap does. */
+static void shellRuntimeRunReturnTrap(bool returned, int status) {
+    if (!shellTrapIsLive(&gShellReturnTrap)) {
+        return;
+    }
+    if (returned) {
+        gShellRuntime.last_status = gShellReturnPriorStatus;
+    }
+    shellRuntimeExecuteTrap(gShellReturnTrap.command, "<return-trap>");
+    gShellReturnPending = false;
+    gShellRuntime.last_status = status;
+    gShellRuntime.errexit_pending = false;
+    gShellRuntime.errexit_defer_active = false;
+}
+
+/* A function starts without the caller's ERR and RETURN traps unless set -E and set -T hand
+ * them on, and they come back when it ends, if it left none of its own in their place. */
+typedef struct {
+    ShellTrapEntry err;
+    ShellTrapEntry ret;
+} ShellCallerTraps;
+
+static void shellCallerTrapsPutAside(ShellCallerTraps *saved, bool traced) {
+    memset(saved, 0, sizeof(*saved));
+    if (!gShellRuntime.errtrace_enabled && !gShellErrTrap.dormant) {
+        saved->err = gShellErrTrap;
+        memset(&gShellErrTrap, 0, sizeof(gShellErrTrap));
+    }
+    if (!gShellRuntime.functrace_enabled && !traced && !gShellReturnTrap.dormant) {
+        saved->ret = gShellReturnTrap;
+        memset(&gShellReturnTrap, 0, sizeof(gShellReturnTrap));
+    }
+}
+
+static void shellCallerTrapsBack(ShellCallerTraps *saved) {
+    if (gShellErrTrap.action == SHELL_TRAP_ACTION_DEFAULT) {
+        gShellErrTrap = saved->err;
+    } else {
+        shellTrapClearEntry(&saved->err);
+    }
+    if (gShellReturnTrap.action == SHELL_TRAP_ACTION_DEFAULT) {
+        gShellReturnTrap = saved->ret;
+    } else {
+        shellTrapClearEntry(&saved->ret);
     }
 }
 
@@ -4401,8 +4542,14 @@ static char *shellRuntimeOptionFlags(void) {
     if (gShellRuntime.noclobber_enabled) {
         flags[count++] = 'C';
     }
+    if (gShellRuntime.errtrace_enabled) {
+        flags[count++] = 'E';
+    }
     if (shellRuntimeIsInteractive()) {
         flags[count++] = 'H';
+    }
+    if (gShellRuntime.functrace_enabled) {
+        flags[count++] = 'T';
     }
     flags[count] = '\0';
     return strdup(flags);
@@ -4861,6 +5008,7 @@ static void shellCopyDefinitionTables(ShellRuntimeState *ctx,
                                           : NULL;
             /* Bodies are never freed: another session may be running them. */
             dst->compiled = functions[i].compiled;
+            dst->traced = functions[i].traced;
             if (dst->name) {
                 ctx->private_function_count++;
             }
@@ -5157,6 +5305,10 @@ static ShellRuntimeState *shellRuntimeCreateProgramContext(void) {
     ctx->verbose_enabled = false;
     ctx->braceexpand_disabled = false;
     ctx->allexport_enabled = false;
+    ctx->errtrace_enabled = false;
+    ctx->functrace_enabled = false;
+    ctx->return_scope_depth = 0;
+    ctx->text_depth = 0;
     /* A signal being ignored stays ignored across exec. A trap does not. */
     for (int i = 0; i < NSIG; ++i) {
         if (ctx->signal_traps[i].action != SHELL_TRAP_ACTION_IGNORE) {
@@ -6700,6 +6852,73 @@ static void shellUnwindChunk(size_t loop_depth, size_t case_depth) {
     }
     while (gShellLoopStackSize > loop_depth) {
         shellLoopPopFrameFlushed();
+    }
+}
+
+bool shellRuntimeConsumeDiscard(void) {
+    bool pending = gShellDiscardPending;
+    gShellDiscardPending = false;
+    return pending;
+}
+
+/* What the shell last read has been dropped, part way through, and it reads on. Only the
+ * outermost chunk of a context comes here, so all of this was that command's. */
+void shellRuntimeAbandonCommand(void) {
+    shellUnwindChunk(0, 0);
+    gShellConditionDepth = 0;
+    gShellRuntime.break_requested = false;
+    gShellRuntime.break_requested_levels = 0;
+    gShellRuntime.continue_requested = false;
+    gShellRuntime.continue_requested_levels = 0;
+    gShellRuntime.errexit_pending = false;
+    gShellRuntime.errexit_defer_active = false;
+    shellResetPipeline();
+}
+
+/* A substitution sees the caller's ERR and RETURN traps only under set -E and set -T, and what
+ * it sets stays in there. These are per thread rather than per context. */
+void *shellRuntimeSubstitutionTrapsPutAside(void) {
+    ShellCallerTraps *saved = (ShellCallerTraps *)malloc(sizeof(ShellCallerTraps));
+    if (!saved) {
+        return NULL;
+    }
+    saved->err = gShellErrTrap;
+    saved->ret = gShellReturnTrap;
+    memset(&gShellErrTrap, 0, sizeof(gShellErrTrap));
+    memset(&gShellReturnTrap, 0, sizeof(gShellReturnTrap));
+    if (saved->err.command) {
+        (void)shellTrapSetCommand(&gShellErrTrap, saved->err.command);
+        gShellErrTrap.dormant = saved->err.dormant || !gShellRuntime.errtrace_enabled;
+    }
+    if (saved->ret.command) {
+        (void)shellTrapSetCommand(&gShellReturnTrap, saved->ret.command);
+        gShellReturnTrap.dormant = saved->ret.dormant || !gShellRuntime.functrace_enabled;
+    }
+    return saved;
+}
+
+void shellRuntimeSubstitutionTrapsBack(void *saved) {
+    if (!saved) {
+        return;
+    }
+    shellTrapClearEntry(&gShellErrTrap);
+    shellTrapClearEntry(&gShellReturnTrap);
+    gShellErrTrap = ((ShellCallerTraps *)saved)->err;
+    gShellReturnTrap = ((ShellCallerTraps *)saved)->ret;
+    free(saved);
+}
+
+/* A script run as a command starts over: there is no call for `return` to end. */
+void shellRuntimeContextResetReturnScope(ShellRuntimeState *ctx) {
+    if (ctx) {
+        ctx->return_scope_depth = 0;
+    }
+    gShellThreadReturnScope = 0;
+}
+
+void shellRuntimeContextSetTextDepth(ShellRuntimeState *ctx, int depth) {
+    if (ctx) {
+        ctx->text_depth = depth;
     }
 }
 

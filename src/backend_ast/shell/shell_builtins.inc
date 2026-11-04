@@ -4973,12 +4973,24 @@ Value vmBuiltinShellSource(VM *vm, int arg_count, Value *args) {
     int condition_depth = gShellConditionDepth;
     size_t loop_depth = gShellLoopStackSize;
     size_t case_depth = gShellCaseStack.count;
+    bool err_trap_at_call = shellTrapIsLive(&gShellErrTrap);
+    bool saved_trap_status_valid = gShellTrapStatusValid;
+    gShellTrapStatusValid = false;
+    gShellReturnScopeDepth++;
+    gShellTextDepth++;
     int status = shellRunSource(source, path, &opts, &exit_requested);
+    gShellTextDepth--;
     shellUnwindChunk(loop_depth, case_depth);
-    if (gShellReturnPending) {
+    bool returned = gShellReturnPending;
+    if (returned || gShellDiscardPending) {
         gShellConditionDepth = condition_depth;
     }
     gShellReturnPending = false;
+    if (!exit_requested && !gShellDiscardPending) {
+        shellRuntimeRunReturnTrap(returned, status);
+    }
+    gShellReturnScopeDepth--;
+    gShellTrapStatusValid = saved_trap_status_valid;
     if (pipeline_saved) {
         shellResetPipeline();
         *caller_pipeline = saved_pipeline;
@@ -5002,13 +5014,19 @@ Value vmBuiltinShellSource(VM *vm, int arg_count, Value *args) {
     }
 
     if (exit_requested) {
+        shellRuntimeRunExitTrapInPlace();
         shellRuntimeRequestExit();
         if (vm) {
             vm->exit_requested = true;
         }
     }
+    if (gShellDiscardPending && vm) {
+        vm->exit_requested = true;
+        vm->current_builtin_name = "return";
+    }
 
-    shellUpdateStatus(status);
+    shellUpdateStatus(exit_requested ? shellRuntimeLastStatus() : status);
+    gShellErrTrapSkipOnce = !err_trap_at_call;
     return makeVoid();
 }
 
@@ -5083,11 +5101,14 @@ Value vmBuiltinShellEval(VM *vm, int arg_count, Value *args) {
     }
     bool exit_requested = false;
     int status = EXIT_FAILURE;
+    bool err_trap_at_call = shellTrapIsLive(&gShellErrTrap);
     if (can_run || shellSymbolTableScopeIsActive()) {
         opts.first_line = gShellCurrentCommandLine;
         size_t loop_depth = gShellLoopStackSize;
         size_t case_depth = gShellCaseStack.count;
+        gShellTextDepth++;
         status = shellRunSource(script, "<eval>", &opts, &exit_requested);
+        gShellTextDepth--;
         shellUnwindChunk(loop_depth, case_depth);
     }
     if (pipeline_saved) {
@@ -5107,22 +5128,18 @@ Value vmBuiltinShellEval(VM *vm, int arg_count, Value *args) {
     }
 
     if (exit_requested) {
+        shellRuntimeRunExitTrapInPlace();
         shellRuntimeRequestExit();
         if (vm) {
             vm->exit_requested = true;
         }
+        shellUpdateStatus(shellRuntimeLastStatus());
+        return makeVoid();
     }
 
-    if (gShellReturnPending && !exit_requested) {
-        if (shellLocalScopeDepth() == 0 && shellRuntimeIsOutermostScript() && !gShellRuntime.in_subshell) {
-            /* No function around it, and bash goes on. */
-            gShellReturnPending = false;
-            runtimeError(vm, "return: can only `return' from a function or sourced script");
-            shellUpdateStatus(2);
-            return makeVoid();
-        }
+    if (gShellReturnPending || gShellDiscardPending) {
         /* `return` in the text: the caller's function ends too. */
-        shellUpdateStatus(gShellReturnStatus);
+        shellUpdateStatus(gShellReturnPending ? gShellReturnStatus : shellRuntimeLastStatus());
         if (vm) {
             vm->exit_requested = true;
             vm->current_builtin_name = "return";
@@ -5131,6 +5148,7 @@ Value vmBuiltinShellEval(VM *vm, int arg_count, Value *args) {
     }
 
     shellUpdateStatus(status);
+    gShellErrTrapSkipOnce = !err_trap_at_call;
     return makeVoid();
 }
 
@@ -5191,6 +5209,7 @@ Value vmBuiltinShellExit(VM *vm, int arg_count, Value *args) {
         }
     }
     shellUpdateStatus(code);
+    shellRuntimeRunExitTrapInPlace();
     shellRuntimeRequestExit();
     if (vm) {
         vm->exit_requested = true;
@@ -5302,46 +5321,54 @@ Value vmBuiltinShellExecCommand(VM *vm, int arg_count, Value *args) {
     return makeVoid();
 }
 
+/* What bash does with a command it cannot go on with: all that is running goes, down to what
+ * the shell last read, and it reads on. In eval, source and a function that is several chunks,
+ * and each one's caller stops too. */
+static void shellRuntimeDiscardCommand(VM *vm) {
+    shellUpdateStatus(2);
+    gShellDiscardPending = true;
+    if (vm) {
+        vm->exit_requested = true;
+        vm->current_builtin_name = "return";
+    }
+}
+
+static int shellSkipDoubleDash(int arg_count, Value *args) {
+    return (arg_count > 0 && VALUE_TYPE(args[0]) == TYPE_STRING && AS_STRING(args[0]) &&
+            strcmp(AS_STRING(args[0]), "--") == 0) ? 1 : 0;
+}
+
 Value vmBuiltinShellReturn(VM *vm, int arg_count, Value *args) {
     VM *previous_vm = shellSwapCurrentVm(vm);
-    int status = gShellRuntime.last_status;
+    /* With no number it is $?, from before the trap if one is running: a trap's own commands
+     * do not change it. */
+    int status = gShellTrapStatusValid ? gShellTrapStatus : gShellRuntime.last_status;
 
-    bool top_level = shellLocalScopeDepth() == 0 && shellRuntimeIsOutermostScript();
-#if defined(PSCAL_TARGET_IOS)
-    /* A subshell there is a thread, with no record of the calls around it. */
-    top_level = top_level && !gShellRuntime.in_subshell;
-#endif
-    if (top_level) {
-        runtimeError(vm, "return: can only `return' from a function or sourced script");
-        shellRestoreCurrentVm(previous_vm);
-        return makeVoid();
-    }
-
-    if (arg_count > 1) {
-        runtimeError(vm, "return: too many arguments");
-        shellUpdateStatus(1);
-        shellRestoreCurrentVm(previous_vm);
-        return makeVoid();
-    }
-
-    if (arg_count == 1) {
-        Value v = args[0];
-        if (VALUE_TYPE(v) != TYPE_STRING || !AS_STRING(v)) {
-            runtimeError(vm, "return: status must be a string number");
-            shellUpdateStatus(1);
-            shellRestoreCurrentVm(previous_vm);
-            return makeVoid();
-        }
+    int first = shellSkipDoubleDash(arg_count, args);
+    if (arg_count > first) {
+        const char *text = VALUE_TYPE(args[first]) == TYPE_STRING ? AS_STRING(args[first]) : NULL;
         int parsed = 0;
-        if (!shellParseReturnStatus(AS_STRING(v), &parsed)) {
-            runtimeError(vm, "return: invalid status '%s'", AS_STRING(v));
-            shellUpdateStatus(1);
+        if (!text || !shellParseReturnStatus(text, &parsed)) {
+            runtimeError(vm, "return: %s: numeric argument required", text ? text : "");
+            status = 2;
+        } else if (arg_count > first + 1) {
+            runtimeError(vm, "return: too many arguments");
+            shellRuntimeDiscardCommand(vm);
             shellRestoreCurrentVm(previous_vm);
             return makeVoid();
+        } else {
+            status = parsed;
         }
-        status = parsed;
     }
 
+    if (gShellReturnScopeDepth == 0 && gShellThreadReturnScope == 0) {
+        runtimeError(vm, "return: can only `return' from a function or sourced script");
+        shellUpdateStatus(2);
+        shellRestoreCurrentVm(previous_vm);
+        return makeVoid();
+    }
+
+    gShellReturnPriorStatus = gShellRuntime.last_status;
     shellUpdateStatus(status);
     /* An eval runs its text in a VM of its own, and has to pass this on. */
     gShellReturnPending = true;
@@ -7646,6 +7673,7 @@ Value vmBuiltinShellDeclare(VM *vm, int arg_count, Value *args) {
     bool mark_unexported = false;
     bool print_mode = false;
     bool functions_mode = false;
+    int trace_attribute = 0;
     bool function_names_only = false;
     unsigned set_attributes = 0;
     unsigned clear_attributes = 0;
@@ -7717,13 +7745,20 @@ Value vmBuiltinShellDeclare(VM *vm, int arg_count, Value *args) {
                 }
             } else if (opt == 'p' && token[0] == '-') {
                 print_mode = true;
-            } else if (opt == 'f' && token[0] == '-') {
-                functions_mode = true;
+            } else if (opt == 'f') {
+                /* `+f` is taken and means nothing, and `+ft` leaves a function traced. */
+                functions_mode = functions_mode || token[0] == '-';
+                if (token[0] == '+') {
+                    break;
+                }
             } else if (opt == 'F' && token[0] == '-') {
                 functions_mode = true;
                 function_names_only = true;
-            } else if (opt == 't' || opt == 'n') {
-                /* Accepted: nothing here uses them. */
+            } else if (opt == 't') {
+                /* On a function: it sees the caller's RETURN trap. */
+                trace_attribute = token[0] == '-' ? 1 : -1;
+            } else if (opt == 'n') {
+                /* Accepted: nothing here uses it. */
             } else {
                 shellReportRecoverableError(vm, true, "%s: -%c: invalid option", builtin_name, opt);
                 ok = false;
@@ -7771,6 +7806,19 @@ Value vmBuiltinShellDeclare(VM *vm, int arg_count, Value *args) {
             shellUpdateStatus(0);
             return makeVoid();
         }
+    }
+
+    if (ok && functions_mode && !print_mode && trace_attribute != 0 && index < arg_count) {
+        int trace_status = 0;
+        for (int i = index; i < arg_count; ++i) {
+            const char *name = VALUE_TYPE(args[i]) == TYPE_STRING ? AS_STRING(args[i]) : NULL;
+            if (!name || !shellFunctionSetTraced(name, trace_attribute > 0)) {
+                trace_status = 1;
+            }
+        }
+        gShellRuntime.local_scope_active = false;
+        shellUpdateStatus(trace_status);
+        return makeVoid();
     }
 
     if (ok && (print_mode || functions_mode)) {
@@ -9043,6 +9091,147 @@ static void shellTimesFormatValue(char *buffer, size_t buffer_size, clock_t tick
     buffer[buffer_size - 1] = '\0';
 }
 
+/* `time` around a pipeline. A frame belongs to the VM that started it: `return` can stop that
+ * chunk before it reaches the end, and what it left is passed over. */
+typedef struct {
+    VM *vm;
+    bool skipped;
+    struct timeval wall;
+    struct rusage self;
+    struct rusage children;
+} ShellTimeFrame;
+
+static PSCAL_THREAD_LOCAL ShellTimeFrame *gShellTimeFrames = NULL;
+static PSCAL_THREAD_LOCAL size_t gShellTimeFrameCount = 0;
+static PSCAL_THREAD_LOCAL size_t gShellTimeFrameCapacity = 0;
+
+Value vmBuiltinShellTimeBegin(VM *vm, int arg_count, Value *args) {
+    (void)arg_count;
+    (void)args;
+    if (gShellTimeFrameCount == gShellTimeFrameCapacity) {
+        size_t capacity = gShellTimeFrameCapacity ? gShellTimeFrameCapacity * 2 : 4;
+        ShellTimeFrame *grown = (ShellTimeFrame *)realloc(gShellTimeFrames, capacity * sizeof(ShellTimeFrame));
+        if (!grown) {
+            return makeVoid();
+        }
+        gShellTimeFrames = grown;
+        gShellTimeFrameCapacity = capacity;
+    }
+    ShellTimeFrame *frame = &gShellTimeFrames[gShellTimeFrameCount++];
+    frame->vm = vm;
+    frame->skipped = shellLoopSkipActive();
+    gettimeofday(&frame->wall, NULL);
+    getrusage(RUSAGE_SELF, &frame->self);
+    getrusage(RUSAGE_CHILDREN, &frame->children);
+    return makeVoid();
+}
+
+static double shellTimevalSeconds(const struct timeval *end, const struct timeval *start) {
+    return (double)(end->tv_sec - start->tv_sec) + (double)(end->tv_usec - start->tv_usec) / 1000000.0;
+}
+
+/* TIMEFORMAT: %% and %[p][l]R, U and S, %P. Text goes through as it is. */
+static void shellTimeReport(const char *format, double real, double user, double sys) {
+    char out[1024];
+    size_t used = 0;
+    for (const char *p = format; *p && used + 64 < sizeof(out); ++p) {
+        if (*p != '%') {
+            out[used++] = *p;
+            continue;
+        }
+        p++;
+        if (*p == '%') {
+            out[used++] = '%';
+            continue;
+        }
+        if (*p == 'P') {
+            used += (size_t)snprintf(out + used, sizeof(out) - used, "%.2f", real > 0 ? (user + sys) * 100.0 / real : 0.0);
+            continue;
+        }
+        int precision = 3;
+        if (*p >= '0' && *p <= '9') {
+            precision = *p - '0';
+            if (precision > 3) {
+                precision = 3;
+            }
+            p++;
+        }
+        bool long_form = false;
+        if (*p == 'l') {
+            long_form = true;
+            p++;
+        }
+        double value = 0;
+        if (*p == 'R') {
+            value = real;
+        } else if (*p == 'U') {
+            value = user;
+        } else if (*p == 'S') {
+            value = sys;
+        } else {
+            if (!*p) {
+                break;
+            }
+            out[used++] = '%';
+            out[used++] = *p;
+            continue;
+        }
+        if (long_form) {
+            long minutes = (long)(value / 60.0);
+            used += (size_t)snprintf(out + used, sizeof(out) - used, "%ldm%.*fs", minutes, precision, value - (double)minutes * 60.0);
+        } else {
+            used += (size_t)snprintf(out + used, sizeof(out) - used, "%.*f", precision, value);
+        }
+    }
+    out[used] = '\0';
+    shellFdPrintf(STDERR_FILENO, "%s\n", out);
+}
+
+/* One argument, its letters: p for -p, e for `time` with no pipeline after it. */
+Value vmBuiltinShellTimeEnd(VM *vm, int arg_count, Value *args) {
+    const char *mode = (arg_count > 0 && VALUE_TYPE(args[0]) == TYPE_STRING && AS_STRING(args[0])) ? AS_STRING(args[0]) : "";
+    while (gShellTimeFrameCount > 0 && gShellTimeFrames[gShellTimeFrameCount - 1].vm != vm) {
+        gShellTimeFrameCount--;
+    }
+    if (gShellTimeFrameCount == 0) {
+        return makeVoid();
+    }
+    ShellTimeFrame frame = gShellTimeFrames[--gShellTimeFrameCount];
+    if (frame.skipped) {
+        return makeVoid();
+    }
+    if (strchr(mode, 'e')) {
+        shellUpdateStatus(0);
+    }
+    struct timeval now;
+    struct rusage self;
+    struct rusage children;
+    gettimeofday(&now, NULL);
+    getrusage(RUSAGE_SELF, &self);
+    getrusage(RUSAGE_CHILDREN, &children);
+    double real = shellTimevalSeconds(&now, &frame.wall);
+    double user = shellTimevalSeconds(&self.ru_utime, &frame.self.ru_utime) +
+                  shellTimevalSeconds(&children.ru_utime, &frame.children.ru_utime);
+    double sys = shellTimevalSeconds(&self.ru_stime, &frame.self.ru_stime) +
+                 shellTimevalSeconds(&children.ru_stime, &frame.children.ru_stime);
+    const char *format = "\nreal\t%3lR\nuser\t%3lU\nsys\t%3lS";
+    if (strchr(mode, 'p')) {
+        format = "real %2R\nuser %2U\nsys %2S";
+    } else {
+        ShellLocalVariable *local = shellLocalScopeFind("TIMEFORMAT");
+        const char *custom = local ? (local->no_value ? NULL : local->value) : shellSafeGetenv("TIMEFORMAT");
+        if (custom) {
+            if (!*custom) {
+                return makeVoid();
+            }
+            format = custom;
+        }
+    }
+    shellFlushStandardStreams();
+    shellTimeReport(format, real, user, sys);
+    return makeVoid();
+}
+
 Value vmBuiltinShellTimes(VM *vm, int arg_count, Value *args) {
     (void)args;
     (void)arg_count;
@@ -9836,17 +10025,23 @@ Value vmBuiltinShellUnsetenv(VM *vm, int arg_count, Value *args) {
     return vmBuiltinShellUnset(vm, arg_count, args);
 }
 
-static bool shellParseLoopLevel(const char *text, int *out_level) {
+static bool shellParseLoopLevel(const char *text, long *out_level) {
     if (!text || !out_level) {
         return false;
     }
     errno = 0;
     char *end = NULL;
     long value = strtol(text, &end, 10);
-    if (errno != 0 || !end || *end != '\0' || value <= 0 || value > INT_MAX) {
+    if (errno != 0 || !end || end == text) {
         return false;
     }
-    *out_level = (int)value;
+    while (isspace((unsigned char)*end)) {
+        end++;
+    }
+    if (*end != '\0') {
+        return false;
+    }
+    *out_level = value;
     return true;
 }
 
@@ -9954,7 +10149,13 @@ static bool shellParseReturnStatus(const char *text, int *out_status) {
     errno = 0;
     char *end = NULL;
     long value = strtol(text, &end, 10);
-    if (errno != 0 || !end || *end != '\0') {
+    if (errno != 0 || !end || end == text) {
+        return false;
+    }
+    while (isspace((unsigned char)*end)) {
+        end++;
+    }
+    if (*end != '\0') {
         return false;
     }
     int status = (int)((unsigned long)value & 0xFFu);
@@ -9975,8 +10176,8 @@ static size_t shellSetOptionTable(ShellSetOption *out) {
         {"braceexpand", &gShellRuntime.braceexpand_disabled, true},
         {"emacs", NULL, false},
         {"errexit", &gShellRuntime.errexit_enabled, false},
-        {"errtrace", NULL, false},
-        {"functrace", NULL, false},
+        {"errtrace", &gShellRuntime.errtrace_enabled, false},
+        {"functrace", &gShellRuntime.functrace_enabled, false},
         {"hashall", NULL, false},
         {"histexpand", NULL, false},
         {"history", NULL, false},
@@ -10101,6 +10302,8 @@ Value vmBuiltinShellSet(VM *vm, int arg_count, Value *args) {
                     case 'v': name = "verbose"; break;
                     case 'C': name = "noclobber"; break;
                     case 'B': name = "braceexpand"; break;
+                    case 'E': name = "errtrace"; break;
+                    case 'T': name = "functrace"; break;
                     default: break;
                 }
                 if (*flag == 'o') {
@@ -10351,9 +10554,6 @@ Value vmBuiltinShellTrap(VM *vm, int arg_count, Value *args) {
             } else if (action == SHELL_TRAP_ACTION_IGNORE) {
                 pseudo->action = SHELL_TRAP_ACTION_IGNORE;
             }
-            if (pseudo == &gShellReturnTrap) {
-                gShellReturnTrapDepth = shellLocalScopeDepth();
-            }
             continue;
         }
         int signo = 0;
@@ -10548,15 +10748,54 @@ Value vmBuiltinShellLocal(VM *vm, int arg_count, Value *args) {
     return makeVoid();
 }
 
+/* What break and continue say about their argument. False means it is dealt with. */
+static bool shellLoopControlLevels(VM *vm, const char *name, int arg_count, Value *args, int *levels) {
+    *levels = 1;
+    if (gShellLoopStackSize == 0) {
+        runtimeError(vm, "%s: only meaningful in a `for', `while', or `until' loop", name);
+        shellUpdateStatus(0);
+        return false;
+    }
+    int first = shellSkipDoubleDash(arg_count, args);
+    if (arg_count <= first) {
+        return true;
+    }
+    const char *text = VALUE_TYPE(args[first]) == TYPE_STRING ? AS_STRING(args[first]) : NULL;
+    long value = 0;
+    if (!text || !shellParseLoopLevel(text, &value)) {
+        /* The shell ends here, without running the rest of the line. */
+        runtimeError(vm, "%s: %s: numeric argument required", name, text ? text : "");
+        shellUpdateStatus(2);
+        shellRuntimeRequestExit();
+        if (vm) {
+            vm->exit_requested = true;
+            vm->current_builtin_name = "exit";
+        }
+        return false;
+    }
+    if (arg_count > first + 1) {
+        runtimeError(vm, "%s: too many arguments", name);
+        shellRuntimeDiscardCommand(vm);
+        return false;
+    }
+    if (value <= 0) {
+        /* Every loop ends, continue or not. */
+        runtimeError(vm, "%s: %s: loop count out of range", name, text);
+        gShellRuntime.break_requested = true;
+        gShellRuntime.break_requested_levels = (int)gShellLoopStackSize;
+        shellLoopRequestBreakLevels((int)gShellLoopStackSize);
+        shellUpdateStatus(1);
+        return false;
+    }
+    /* More than there are means them all. What is left over would stay asked for. */
+    *levels = value > (long)gShellLoopStackSize ? (int)gShellLoopStackSize : (int)value;
+    return true;
+}
+
 Value vmBuiltinShellBreak(VM *vm, int arg_count, Value *args) {
     int levels = 1;
-    if (arg_count > 0) {
-        if (VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0]) ||
-            !shellParseLoopLevel(AS_STRING(args[0]), &levels)) {
-            runtimeError(vm, "break: expected positive integer");
-            shellUpdateStatus(1);
-            return makeVoid();
-        }
+    if (!shellLoopControlLevels(vm, "break", arg_count, args, &levels)) {
+        return makeVoid();
     }
     gShellRuntime.break_requested = true;
     gShellRuntime.break_requested_levels = levels;
@@ -10567,13 +10806,8 @@ Value vmBuiltinShellBreak(VM *vm, int arg_count, Value *args) {
 
 Value vmBuiltinShellContinue(VM *vm, int arg_count, Value *args) {
     int levels = 1;
-    if (arg_count > 0) {
-        if (VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0]) ||
-            !shellParseLoopLevel(AS_STRING(args[0]), &levels)) {
-            runtimeError(vm, "continue: expected positive integer");
-            shellUpdateStatus(1);
-            return makeVoid();
-        }
+    if (!shellLoopControlLevels(vm, "continue", arg_count, args, &levels)) {
+        return makeVoid();
     }
     gShellRuntime.continue_requested = true;
     gShellRuntime.continue_requested_levels = levels;
@@ -10673,6 +10907,11 @@ static void shellReportRecoverableError(VM *vm, bool with_location, const char *
     if (vm) {
         vm->abort_requested = false;
     }
+}
+
+/* The parser asks: `time` is a keyword unless an alias comes first. */
+bool shellRuntimeAliasExpands(const char *name) {
+    return shellShoptOptionEnabled("expand_aliases") && shellFindAlias(name) != NULL;
 }
 
 static void shellFreeAlias(ShellAlias *alias) {
