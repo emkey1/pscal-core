@@ -127,9 +127,14 @@ typedef struct {
     gid_t *members_gids; /* unused; placeholder */
 } PscalGroupEntry;
 
+/* Every thread of the app reads these, and what getpwuid returned is still in a caller's hands when
+ * the file changes. So a table is never changed or freed once installed: a reload installs a new one
+ * under the lock, and the old one stays for whoever holds an answer from it, at the cost of one table
+ * per edit of the file. A file is read outside the lock, since it could block. */
+static pthread_mutex_t gPscalUserDbLock = PTHREAD_MUTEX_INITIALIZER;
+
 static PscalPasswdEntry *gPscalPasswd = NULL;
 static size_t gPscalPasswdCount = 0;
-static size_t gPscalPasswdCapacity = 0;
 static bool gPscalPasswdLoaded = false;
 static char gPscalPasswdPath[PATH_MAX] = {0};
 static dev_t gPscalPasswdDev = 0;
@@ -139,7 +144,6 @@ static off_t gPscalPasswdSize = 0;
 
 static PscalGroupEntry *gPscalGroup = NULL;
 static size_t gPscalGroupCount = 0;
-static size_t gPscalGroupCapacity = 0;
 static bool gPscalGroupLoaded = false;
 static char gPscalGroupPath[PATH_MAX] = {0};
 static dev_t gPscalGroupDev = 0;
@@ -165,24 +169,6 @@ static void pscalFreeGroupEntries(PscalGroupEntry *entries, size_t count) {
         free(entries[i].passwd);
         free(entries[i].members_gids);
     }
-}
-
-static void pscalFreePasswd(void) {
-    if (!gPscalPasswd) return;
-    pscalFreePasswdEntries(gPscalPasswd, gPscalPasswdCount);
-    free(gPscalPasswd);
-    gPscalPasswd = NULL;
-    gPscalPasswdCount = 0;
-    gPscalPasswdCapacity = 0;
-}
-
-static void pscalFreeGroup(void) {
-    if (!gPscalGroup) return;
-    pscalFreeGroupEntries(gPscalGroup, gPscalGroupCount);
-    free(gPscalGroup);
-    gPscalGroup = NULL;
-    gPscalGroupCount = 0;
-    gPscalGroupCapacity = 0;
 }
 
 static bool pscalEnsurePasswdArrayCapacity(PscalPasswdEntry **entries,
@@ -288,12 +274,14 @@ static void pscalLoadPasswd(void) {
     if (!passwd_path || stat(passwd_path, &st) != 0) {
         return;
     }
+    pthread_mutex_lock(&gPscalUserDbLock);
     bool needs_reload = !gPscalPasswdLoaded ||
                         strcmp(gPscalPasswdPath, passwd_path) != 0 ||
                         st.st_mtime != gPscalPasswdMtime ||
                         st.st_size != gPscalPasswdSize ||
                         st.st_ino != gPscalPasswdIno ||
                         st.st_dev != gPscalPasswdDev;
+    pthread_mutex_unlock(&gPscalUserDbLock);
     if (!needs_reload) {
         return;
     }
@@ -363,16 +351,16 @@ static void pscalLoadPasswd(void) {
         free(new_entries);
         return;
     }
-    pscalFreePasswd();
+    pthread_mutex_lock(&gPscalUserDbLock);
     gPscalPasswd = new_entries;
     gPscalPasswdCount = new_count;
-    gPscalPasswdCapacity = new_capacity;
     gPscalPasswdLoaded = true;
     strlcpy(gPscalPasswdPath, passwd_path, sizeof(gPscalPasswdPath));
     gPscalPasswdDev = st.st_dev;
     gPscalPasswdIno = st.st_ino;
     gPscalPasswdMtime = st.st_mtime;
     gPscalPasswdSize = st.st_size;
+    pthread_mutex_unlock(&gPscalUserDbLock);
 }
 
 static void pscalLoadGroup(void) {
@@ -382,12 +370,14 @@ static void pscalLoadGroup(void) {
     if (!group_path || stat(group_path, &st) != 0) {
         return;
     }
+    pthread_mutex_lock(&gPscalUserDbLock);
     bool needs_reload = !gPscalGroupLoaded ||
                         strcmp(gPscalGroupPath, group_path) != 0 ||
                         st.st_mtime != gPscalGroupMtime ||
                         st.st_size != gPscalGroupSize ||
                         st.st_ino != gPscalGroupIno ||
                         st.st_dev != gPscalGroupDev;
+    pthread_mutex_unlock(&gPscalUserDbLock);
     if (!needs_reload) {
         return;
     }
@@ -441,58 +431,74 @@ static void pscalLoadGroup(void) {
         free(new_entries);
         return;
     }
-    pscalFreeGroup();
+    pthread_mutex_lock(&gPscalUserDbLock);
     gPscalGroup = new_entries;
     gPscalGroupCount = new_count;
-    gPscalGroupCapacity = new_capacity;
     gPscalGroupLoaded = true;
     strlcpy(gPscalGroupPath, group_path, sizeof(gPscalGroupPath));
     gPscalGroupDev = st.st_dev;
     gPscalGroupIno = st.st_ino;
     gPscalGroupMtime = st.st_mtime;
     gPscalGroupSize = st.st_size;
+    pthread_mutex_unlock(&gPscalUserDbLock);
 }
 
 static struct passwd *pscalGetpwuid(uid_t uid) {
     pscalLoadPasswd();
+    struct passwd *found = NULL;
+    pthread_mutex_lock(&gPscalUserDbLock);
     for (size_t i = 0; i < gPscalPasswdCount; ++i) {
         if (gPscalPasswd[i].pw.pw_uid == uid) {
-            return &gPscalPasswd[i].pw;
+            found = &gPscalPasswd[i].pw;
+            break;
         }
     }
-    return NULL;
+    pthread_mutex_unlock(&gPscalUserDbLock);
+    return found;
 }
 
 static struct passwd *pscalGetpwnam(const char *name) {
     if (!name) return NULL;
     pscalLoadPasswd();
+    struct passwd *found = NULL;
+    pthread_mutex_lock(&gPscalUserDbLock);
     for (size_t i = 0; i < gPscalPasswdCount; ++i) {
         if (strcmp(gPscalPasswd[i].pw.pw_name, name) == 0) {
-            return &gPscalPasswd[i].pw;
+            found = &gPscalPasswd[i].pw;
+            break;
         }
     }
-    return NULL;
+    pthread_mutex_unlock(&gPscalUserDbLock);
+    return found;
 }
 
 static struct group *pscalGetgrgid(gid_t gid) {
     pscalLoadGroup();
+    struct group *found = NULL;
+    pthread_mutex_lock(&gPscalUserDbLock);
     for (size_t i = 0; i < gPscalGroupCount; ++i) {
         if (gPscalGroup[i].gr.gr_gid == gid) {
-            return &gPscalGroup[i].gr;
+            found = &gPscalGroup[i].gr;
+            break;
         }
     }
-    return NULL;
+    pthread_mutex_unlock(&gPscalUserDbLock);
+    return found;
 }
 
 static struct group *pscalGetgrnam(const char *name) {
     if (!name) return NULL;
     pscalLoadGroup();
+    struct group *found = NULL;
+    pthread_mutex_lock(&gPscalUserDbLock);
     for (size_t i = 0; i < gPscalGroupCount; ++i) {
         if (strcmp(gPscalGroup[i].gr.gr_name, name) == 0) {
-            return &gPscalGroup[i].gr;
+            found = &gPscalGroup[i].gr;
+            break;
         }
     }
-    return NULL;
+    pthread_mutex_unlock(&gPscalUserDbLock);
+    return found;
 }
 
 static bool pscalAllowHostPasswdFallbackForUid(uid_t uid) {
