@@ -8827,7 +8827,11 @@ bool vprocTerminateSessionById(uint64_t session_id) {
     }
     pthread_mutex_unlock(&gVProcSessionPtys.mu);
 
-    if (sid <= 0 && shell_pid > 0) {
+    /* The session's shell says whose this is. A shell tab's tty->session can name
+     * another tab's session, or none of them: its thread activates the terminal
+     * before it has a task, and asks for the current session there. Going by that,
+     * closing a second tab whose shell would not end took the first tab's shell. */
+    if (shell_pid > 0) {
         sid = vprocGetSid(shell_pid);
     }
     if (sid <= 0) {
@@ -13031,7 +13035,9 @@ static bool vprocRequestControlSignalForSessionInternal(uint64_t session_id,
         return true;
     }
 
-    if (fg_pgid > 0) {
+    /* Only in this session's own group: tty->session and the foreground group read
+     * from it can be another tab's. See vprocTerminateSessionById. */
+    if (fg_pgid > 0 && (shell_pid <= 0 || vprocGetSid(shell_pid) == sid)) {
         if (vprocKillShim(-fg_pgid, sig) == 0) {
             return true;
         }
