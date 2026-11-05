@@ -1316,6 +1316,7 @@ static bool shellStoreFunction(const char *name, const char *param_meta, ShellCo
     entry->name = name_copy;
     entry->parameter_metadata = meta_copy;
     entry->compiled = compiled;
+    entry->traced = false;
     pthread_mutex_unlock(&gShellFunctionTableMutex);
     return true;
 }
