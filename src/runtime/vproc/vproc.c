@@ -2102,8 +2102,14 @@ bool vprocGetShellJobControlState(int *shell_pid_out,
                                   int *fg_pgid_out);
 
 static __thread VProc *gVProcCurrent = NULL;
-static __thread VProc *gVProcStack[16] = {0};
+/* What gVProcCurrent replaced on this thread. Each eval, source or nested shell adds one, so a
+ * recursion has no limit here: the first ones stay in place, and only a deep one allocates. */
+#define VPROC_STACK_INLINE 16
+static __thread VProc *gVProcStackInline[VPROC_STACK_INLINE] = {0};
+static __thread VProc **gVProcStackSpill = NULL;
+static __thread size_t gVProcStackSpillCapacity = 0;
 static __thread size_t gVProcStackDepth = 0;
+static __thread size_t gVProcStackLost = 0;
 static __thread unsigned long long gVProcRegistrySeenVersion = 0;
 static VProc **gVProcRegistry = NULL;
 static size_t gVProcRegistryCount = 0;
@@ -3301,13 +3307,26 @@ static bool vprocRegistryHoldsPid(const VProc *vp, int pid) {
     return found;
 }
 
+static inline VProc **vprocStackSlot(size_t index) {
+    return (index < VPROC_STACK_INLINE) ? &gVProcStackInline[index]
+                                        : &gVProcStackSpill[index - VPROC_STACK_INLINE];
+}
+
+static void vprocStackFreeSpill(void) {
+    free(gVProcStackSpill);
+    gVProcStackSpill = NULL;
+    gVProcStackSpillCapacity = 0;
+}
+
 static void vprocClearThreadState(void) {
     gVProcCurrent = NULL;
     gVProcStackDepth = 0;
+    gVProcStackLost = 0;
     gVProcRegistrySeenVersion = __atomic_load_n(&gVProcRegistryVersion, __ATOMIC_ACQUIRE);
-    for (size_t i = 0; i < sizeof(gVProcStack) / sizeof(gVProcStack[0]); ++i) {
-        gVProcStack[i] = NULL;
+    for (size_t i = 0; i < VPROC_STACK_INLINE; ++i) {
+        gVProcStackInline[i] = NULL;
     }
+    vprocStackFreeSpill();
 }
 
 /* Fast validation for the common case where vp is the current thread's vproc. */
@@ -8677,8 +8696,9 @@ void vprocDestroy(VProc *vp) {
         gVProcCurrent = NULL;
     }
     for (size_t i = 0; i < gVProcStackDepth; ++i) {
-        if (gVProcStack[i] == vp) {
-            gVProcStack[i] = NULL;
+        VProc **slot = vprocStackSlot(i);
+        if (*slot == vp) {
+            *slot = NULL;
         }
     }
     pthread_mutex_unlock(&vp->mu);
@@ -8687,14 +8707,33 @@ void vprocDestroy(VProc *vp) {
     free(vp);
 }
 
+static void vprocStackPush(VProc *vp) {
+    size_t depth = gVProcStackDepth;
+    if (gVProcStackLost > 0) {
+        gVProcStackLost++;
+        return;
+    }
+    if (depth >= VPROC_STACK_INLINE && depth - VPROC_STACK_INLINE >= gVProcStackSpillCapacity) {
+        size_t capacity = gVProcStackSpillCapacity ? gVProcStackSpillCapacity * 2 : VPROC_STACK_INLINE;
+        VProc **grown = (VProc **)realloc(gVProcStackSpill, capacity * sizeof(*grown));
+        if (!grown) {
+            gVProcStackLost++;
+            return;
+        }
+        gVProcStackSpill = grown;
+        gVProcStackSpillCapacity = capacity;
+    }
+    *vprocStackSlot(depth) = vp;
+    gVProcStackDepth = depth + 1;
+}
+
 void vprocActivate(VProc *vp) {
     gVProcTlsReady = 1;
     if (gVProcCurrent && !vprocRegistryContainsValidated(gVProcCurrent)) {
         /* vprocRegistryContainsValidated already cleared thread-local state. */
     }
-    if (gVProcCurrent &&
-        gVProcStackDepth < (sizeof(gVProcStack) / sizeof(gVProcStack[0]))) {
-        gVProcStack[gVProcStackDepth++] = gVProcCurrent;
+    if (gVProcCurrent) {
+        vprocStackPush(gVProcCurrent);
     }
     gVProcCurrent = vp;
     gVProcRegistrySeenVersion = __atomic_load_n(&gVProcRegistryVersion, __ATOMIC_ACQUIRE);
@@ -8702,10 +8741,21 @@ void vprocActivate(VProc *vp) {
 }
 
 void vprocDeactivate(void) {
+    if (gVProcStackLost > 0) {
+        /* Memory ran out when this one began, so what it replaced is gone. The next one down
+         * stands in for it: every level still ends once, and the thread keeps a vproc. */
+        gVProcStackLost--;
+        gVProcCurrent = *vprocStackSlot(gVProcStackDepth - 1);
+        return;
+    }
     if (gVProcStackDepth > 0) {
-        gVProcCurrent = gVProcStack[gVProcStackDepth - 1];
-        gVProcStack[gVProcStackDepth - 1] = NULL;
+        VProc **top = vprocStackSlot(gVProcStackDepth - 1);
+        gVProcCurrent = *top;
+        *top = NULL;
         gVProcStackDepth--;
+        if (gVProcStackDepth == VPROC_STACK_INLINE) {
+            vprocStackFreeSpill();
+        }
     } else {
         gVProcCurrent = NULL;
     }
@@ -16288,7 +16338,7 @@ static void vprocCwdFollowOwner(VProc *owner) {
         if (vprocRegistryContains(vp)) {
             vprocSetVirtualCwd(vp, cwd);
         }
-        vp = (depth > 0) ? gVProcStack[--depth] : NULL;
+        vp = (depth > 0) ? *vprocStackSlot(--depth) : NULL;
     }
 }
 
@@ -16303,7 +16353,7 @@ void vprocShellFdFollow(int fd) {
     VProc *vp = from;
     size_t depth = gVProcStackDepth;
     while (vp != owner && depth > 0) {
-        vp = gVProcStack[--depth];
+        vp = *vprocStackSlot(--depth);
         if (vp && vprocRegistryContains(vp)) {
             vprocCopyFdEntry(from, vp, fd);
         }
@@ -16356,7 +16406,7 @@ mode_t vprocShellUmaskShim(mode_t mask) {
         if (vprocRegistryContains(vp)) {
             vp->file_mask = mask & 0777;
         }
-        vp = (depth > 0) ? gVProcStack[--depth] : NULL;
+        vp = (depth > 0) ? *vprocStackSlot(--depth) : NULL;
     }
     if (gVprocSubshellPid <= 0) {
         vprocHostMaskSet(mask & 0777);
