@@ -104,6 +104,7 @@ int vprocCreateInprocPipe(struct pscal_fd **out_read, struct pscal_fd **out_writ
 int vprocDup(VProc *vp, int fd);
 int vprocDup2(VProc *vp, int fd, int target);
 int vprocDupAbove(VProc *vp, int fd, int min);
+int vprocFreeFdAbove(VProc *vp, int min);
 void vprocMarkFdInherited(VProc *vp, int fd);
 void vprocShellFdFollow(int fd);
 /* Sync vproc table entry to a host fd already duplicated onto target_fd. */

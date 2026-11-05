@@ -610,6 +610,42 @@ static bool shellCommandSubKeepExecBackups(ShellExecRedirBackup *backups, size_t
     return true;
 }
 
+/* {name}> f in a substitution lasts as long as it does: under bash it was its own process. */
+static void shellCommandSubKeepFdVar(int fd) {
+    ShellCommandSubFrame *frame = gShellCommandSubFrame;
+    if (!frame) {
+        return;
+    }
+    for (size_t j = 0; j < frame->exec_backup_count; ++j) {
+        if (frame->exec_backups[j].target_fd == fd) {
+            return;
+        }
+    }
+    if (frame->exec_backup_count == frame->exec_backup_capacity) {
+        size_t capacity = frame->exec_backup_capacity ? frame->exec_backup_capacity * 2 : 4;
+        ShellExecRedirBackup *resized =
+            (ShellExecRedirBackup *)realloc(frame->exec_backups, capacity * sizeof(ShellExecRedirBackup));
+        if (!resized) {
+            return;
+        }
+        frame->exec_backups = resized;
+        frame->exec_backup_capacity = capacity;
+    }
+    ShellExecRedirBackup backup;
+    memset(&backup, 0, sizeof(backup));
+    backup.target_fd = fd;
+    backup.saved_fd = -1;
+    backup.vproc_saved_fd = -1;
+#if defined(PSCAL_TARGET_IOS)
+    /* Only the slot: that number means nothing on the host. */
+    backup.slot_only = frame->vp != NULL;
+    backup.was_closed = frame->vp == NULL;
+#else
+    backup.was_closed = true;
+#endif
+    frame->exec_backups[frame->exec_backup_count++] = backup;
+}
+
 static void shellCommandSubRecordJob(const pid_t *pids, size_t count) {
     ShellCommandSubFrame *frame = gShellCommandSubFrame;
     if (!frame) {

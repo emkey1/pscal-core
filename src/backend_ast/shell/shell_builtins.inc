@@ -13035,7 +13035,16 @@ static void shellWaitForNextJob(void) {
             }
         }
         if (!shellHasOwnJob()) {
-            shellUpdateStatus(127);
+            /* A substitution's copy of a job the shell started is no child of its own. Bash finds
+             * it has no child, calls them all ended, and gives 0 for each in turn. */
+            int status = 127;
+            for (size_t i = 0; i < gShellJobCount && status != 0; ++i) {
+                if (gShellJobs[i].inherited && !gShellJobs[i].disowned) {
+                    shellRemoveJobAt(i);
+                    status = 0;
+                }
+            }
+            shellUpdateStatus(status);
             return;
         }
         usleep(5000);

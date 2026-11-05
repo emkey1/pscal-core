@@ -377,9 +377,12 @@ static bool shellParamLoadSubject(const char *name, size_t name_len, const char 
         return subject->value != NULL;
     }
     if (name_len == 1 && name[0] == '!') {
-        size_t consumed = 0;
-        subject->value = shellExpandParameter("!", &consumed, NULL, NULL);
-        subject->is_set = subject->value && subject->value[0];
+        char buffer[32] = "";
+        if (gShellRuntime.last_bg_pid > 0) {
+            snprintf(buffer, sizeof(buffer), "%d", (int)gShellRuntime.last_bg_pid);
+        }
+        subject->value = strdup(buffer);
+        subject->is_set = buffer[0] != '\0';
         return subject->value != NULL;
     }
     shellRefreshSpecialArray(name, name_len);
@@ -900,10 +903,15 @@ static char *shellExpandBraceParameter(const char *inner, size_t inner_len, bool
         }
         return length;
     }
-    /* ${!name}, ${!name[@]}, ${!prefix*}. */
-    if (inner[0] == '!' && inner_len > 1) {
+    /* ${!name}, ${!name[@]}, ${!prefix*}. An operator right after the `!` is $! with that
+     * operator: ${!:-x}. */
+    if (inner[0] == '!' && inner_len > 1 && !strchr(":-=+%/^,", inner[1])) {
         const char *rest = inner + 1;
         size_t rest_len = inner_len - 1;
+        if (rest[0] == '!' || rest[0] == '$') {
+            shellParamBadSubstitution(inner, inner_len);
+            return strdup("");
+        }
         char last = rest[rest_len - 1];
         size_t name_len = 0;
         if ((last == '*' || last == '@') && rest_len > 1 &&

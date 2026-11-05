@@ -9372,6 +9372,17 @@ int vprocDupAbove(VProc *vp, int fd, int min) {
     return slot;
 }
 
+/* The lowest slot from min up with nothing in it. */
+int vprocFreeFdAbove(VProc *vp, int min) {
+    pthread_mutex_lock(&vp->mu);
+    int slot = min;
+    while ((size_t)slot < vp->capacity && vp->entries[slot].kind != VPROC_FD_NONE) {
+        ++slot;
+    }
+    pthread_mutex_unlock(&vp->mu);
+    return slot;
+}
+
 #if defined(PSCAL_TARGET_IOS)
 /* stdin_host_fd follows stdin here, so the descriptor it named has no other owner once it
  * moves. Left open, `cat < f` kept 2 for each run, and a loop of them ran out after about 116

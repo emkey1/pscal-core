@@ -2447,6 +2447,8 @@ typedef struct {
     size_t here_string_length;
     /* Fails when applied, in its turn among the command's redirections. */
     bool ambiguous;
+    /* {name}> f: the shell picks the descriptor from 10 up and name gets its number. fd is -1. */
+    char *fd_var;
 } ShellRedirection;
 
 typedef struct {
@@ -2922,6 +2924,10 @@ typedef struct {
     /* iOS, above stdio: the slot is the whole descriptor. Nothing of the host's
      * was saved, and an entry that was closed before goes back to closed. */
     bool slot_only;
+    /* iOS, a stdio slot with nothing in it, which means closed. The host's descriptor of that
+     * number goes back to what it was, and the slot goes back to empty: it must not become a
+     * copy of the host's. */
+    bool slot_empty;
 } ShellExecRedirBackup;
 
 /* A command substitution runs in the shell's own process, because `tid=$(builtin

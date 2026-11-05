@@ -253,6 +253,16 @@ static char *shellProcessSubstitution(char direction, const char *command) {
         shellReportRecoverableError(gShellCurrentVm, true, "process substitution: %s", strerror(errno));
         return NULL;
     }
+    /* Out of the numbers a script names: `exec 3< <(cmd)` opens this path onto 3, and what goes
+     * when the command is done must not be 3. Not close-on-exec, as what the command starts opens
+     * the path too. */
+    for (int i = 0; i < 2; ++i) {
+        int high = fcntl(fds[i], F_DUPFD, SHELL_COMMAND_SUB_READ_FD_MIN);
+        if (high >= 0) {
+            close(fds[i]);
+            fds[i] = high;
+        }
+    }
     pid_t pid = fork();
     if (pid < 0) {
         shellReportRecoverableError(gShellCurrentVm, true, "process substitution: %s", strerror(errno));
@@ -392,6 +402,10 @@ static char *shellExpandParameterEx(const char *input,
         }
         pid_t pid = gShellRuntime.last_bg_pid;
         if (pid <= 0) {
+            if (gShellRuntime.nounset_enabled && !gShellNounsetSuppressed) {
+                shellReportRecoverableError(gShellCurrentVm, true, "$!: unbound variable");
+                shellExpansionFail();
+            }
             return strdup("");
         }
         char buffer[32];
@@ -838,6 +852,7 @@ static void shellFreeRedirections(ShellCommand *cmd) {
         free(cmd->redirs[i].here_doc);
         free(cmd->redirs[i].here_string_literal);
         free(cmd->redirs[i].here_string);
+        free(cmd->redirs[i].fd_var);
     }
     free(cmd->redirs);
     cmd->redirs = NULL;
@@ -4421,7 +4436,9 @@ static bool shellAddRedirection(ShellCommand *cmd, const char *spec) {
     }
 
     int fd = -1;
-    if (fd_text && *fd_text) {
+    if (fd_text && fd_text[0] == '{') {
+        /* {name}> f: the runtime picks it. */
+    } else if (fd_text && *fd_text) {
         fd = atoi(fd_text);
     } else if (strcmp(type_text, "<") == 0 || strcmp(type_text, "<<") == 0 || strcmp(type_text, "<<<") == 0 || strcmp(type_text, "<&") == 0 || strcmp(type_text, "<>") == 0) {
         fd = STDIN_FILENO;
@@ -4633,6 +4650,9 @@ static bool shellAddRedirection(ShellCommand *cmd, const char *spec) {
         return false;
     }
     cmd->redirs = new_redirs;
+    if (fd_text && fd_text[0] == '{') {
+        redir.fd_var = strndup(fd_text + 1, strlen(fd_text) - 2);
+    }
     cmd->redirs[cmd->redir_count++] = redir;
     free(word_encoded);
     free(copy);

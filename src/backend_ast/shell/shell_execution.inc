@@ -1496,7 +1496,58 @@ typedef struct {
     size_t here_length;
     bool close_target;
     bool append_newline;
+    const char *fd_var;
 } ShellRuntimeRedirOp;
+
+/* The number in {name}>&-'s name. -1 for anything but a plain number, unset included. */
+static int shellFdVarValue(const char *name) {
+    const char *bracket = strchr(name, '[');
+    size_t name_len = bracket ? (size_t)(bracket - name) : strlen(name);
+    ShellParamSubject subject;
+    int fd = -1;
+    if (shellParamLoadSubject(name, name_len, bracket ? bracket + 1 : NULL, bracket ? strlen(bracket + 1) - 1 : 0,
+                              &subject) &&
+        subject.value && subject.value[0]) {
+        char *end = NULL;
+        errno = 0;
+        long value = strtol(subject.value, &end, 10);
+        if (errno == 0 && *end == '\0' && isdigit((unsigned char)subject.value[0]) && value <= INT_MAX) {
+            fd = (int)value;
+        }
+    }
+    shellParamSubjectFree(&subject);
+    return fd;
+}
+
+/* False, with both of bash's lines said, if name cannot take it. */
+static bool shellFdVarAssign(const char *name, int fd) {
+    char text[32];
+    snprintf(text, sizeof(text), "%d", fd);
+    const char *bracket = strchr(name, '[');
+    size_t name_len = bracket ? (size_t)(bracket - name) : strlen(name);
+    char *base = strndup(name, name_len);
+    if (!base) {
+        return false;
+    }
+    bool ok = !shellReadonlyContains(base);
+    if (!ok) {
+        fprintf(stderr, "exsh: %s: readonly variable\n", base);
+    } else if (bracket) {
+        char *key = shellParamSubscriptKey(name, name_len, bracket + 1, strlen(bracket + 1) - 1);
+        ok = key != NULL;
+        if (key) {
+            shellArrayRegistrySetElement(base, key, text);
+            free(key);
+        }
+    } else {
+        ok = shellSetTrackedVariable(base, text, false);
+    }
+    if (!ok) {
+        fprintf(stderr, "exsh: %s: cannot assign fd to variable\n", base);
+    }
+    free(base);
+    return ok;
+}
 
 static int shellSpawnProcess(VM *vm,
                              const ShellCommand *cmd,
@@ -1538,6 +1589,7 @@ static int shellSpawnProcess(VM *vm,
         ShellRuntimeRedirOp op;
         memset(&op, 0, sizeof(op));
         op.target_fd = redir->fd;
+        op.fd_var = redir->fd_var;
         switch (redir->kind) {
             case SHELL_RUNTIME_REDIR_OPEN: {
                 if (!redir->path) {
@@ -1566,6 +1618,13 @@ static int shellSpawnProcess(VM *vm,
                 if (!op.close_target && op.source_fd < 0) {
                     prep_error = EBADF;
                     goto spawn_cleanup;
+                }
+                if (op.close_target && redir->fd_var) {
+                    op.target_fd = shellFdVarValue(redir->fd_var);
+                    if (op.target_fd < 0) {
+                        redir_error = SHELL_REDIR_ERROR_AMBIGUOUS;
+                        redir_error_target = redir->fd_var;
+                    }
                 }
                 break;
             }
@@ -1688,6 +1747,17 @@ static int shellSpawnProcess(VM *vm,
 
             for (size_t i = 0; i < op_count; ++i) {
                 ShellRuntimeRedirOp *op = &ops[i];
+                /* Bash does these in the child too, so the shell never hears of the number. */
+                if (op->fd_var && !op->close_target) {
+                    op->target_fd = fcntl(op->source_fd, F_DUPFD, 10);
+                    if (op->target_fd < 0 || !shellFdVarAssign(op->fd_var, op->target_fd)) {
+                        if (op->target_fd < 0) {
+                            fprintf(stderr, "exsh: %d: %s\n", op->source_fd, strerror(errno));
+                        }
+                        _exit(1);
+                    }
+                    continue;
+                }
                 switch (op->type) {
                     case SHELL_REDIR_OP_OPEN:
                     case SHELL_REDIR_OP_HEREDOC:
@@ -2525,10 +2595,12 @@ static ShellCommand *shellCloneCommandForBackground(const ShellCommand *src) {
             dr->here_doc = sr->here_doc ? strdup(sr->here_doc) : NULL;
             dr->here_string_literal = sr->here_string_literal ? strdup(sr->here_string_literal) : NULL;
             dr->here_string = sr->here_string ? strdup(sr->here_string) : NULL;
+            dr->fd_var = sr->fd_var ? strdup(sr->fd_var) : NULL;
             if ((sr->path && !dr->path) ||
                 (sr->here_doc && !dr->here_doc) ||
                 (sr->here_string_literal && !dr->here_string_literal) ||
-                (sr->here_string && !dr->here_string)) {
+                (sr->here_string && !dr->here_string) ||
+                (sr->fd_var && !dr->fd_var)) {
                 shellFreeCommand(dst);
                 free(dst);
                 return NULL;
@@ -3552,14 +3624,17 @@ static bool shellEnsureExecRedirBackup(int target_fd,
     backup.use_vproc = false;
     backup.vproc_saved_fd = -1;
     backup.slot_only = false;
+    backup.slot_empty = false;
 #if defined(PSCAL_TARGET_IOS)
     /* shellDupOntoTarget() rewrites the fd table of whatever vproc is current,
      * so snapshot that entry against the same vproc -- not `active_vp` below,
      * which is deliberately blanked for in-process pipeline stages. */
     VProc *vp_mutated = vprocCurrent();
     if (vp_mutated) {
-        backup.vproc_saved_fd = vprocDupAbove(vp_mutated, target_fd, 10);
+        /* Clear of the source too: `>&$fd` with that closed must not find this copy there. */
+        backup.vproc_saved_fd = vprocDupAbove(vp_mutated, target_fd, avoid_fd >= 10 ? avoid_fd + 1 : 10);
         backup.slot_only = target_fd > STDERR_FILENO;
+        backup.slot_empty = backup.vproc_saved_fd < 0 && vprocTranslateFd(vp_mutated, target_fd) < 0;
     }
     if (backup.slot_only) {
         goto store_backup;
@@ -3850,7 +3925,7 @@ static void shellRestoreExecRedirections(ShellExecRedirBackup *backups, size_t c
                 (void)vprocHostDup2(backup->saved_fd, backup->target_fd);
                 touched = true;
             }
-            if (backup->use_vproc && active_vp) {
+            if (backup->use_vproc && active_vp && !backup->slot_empty) {
                 (void)vprocRestoreHostFd(active_vp, backup->target_fd, backup->saved_fd);
                 touched = true;
             }
@@ -3875,8 +3950,9 @@ static void shellRestoreExecRedirections(ShellExecRedirBackup *backups, size_t c
                 (void)vprocClose(active_vp, backup->vproc_saved_fd);
             }
             backup->vproc_saved_fd = -1;
-        } else if (backup->slot_only && active_vp) {
+        } else if ((backup->slot_only || backup->slot_empty) && active_vp) {
             (void)vprocClose(active_vp, backup->target_fd);
+            touched = true;
         }
 #endif
         if (touched) {
@@ -3923,6 +3999,110 @@ static void shellRedirectionFailedForFd(int fd, int err) {
     shellRedirectionFailed(target, err);
 }
 
+/* The lowest free descriptor from 10 up, which is where bash starts. */
+static int shellFdVarPick(VProc *vp) {
+#if defined(PSCAL_TARGET_IOS)
+    if (vp) {
+        return vprocFreeFdAbove(vp, 10);
+    }
+#else
+    (void)vp;
+#endif
+    int fd = 10;
+    while (fcntl(fd, F_GETFD) != -1 || errno != EBADF) {
+        fd++;
+    }
+    return fd;
+}
+
+/* On a host only what stays in the shell comes this way: a program, a job and a stage have forked
+ * first. On iOS they come too. Under bash each of those is a process, which ends and takes the
+ * descriptor and the name with it, and the vproc made for it takes the descriptor. */
+static bool shellFdVarOutlivesCommand(const ShellCommand *cmd) {
+#if defined(PSCAL_TARGET_IOS)
+    /* A compound command's redirections: anything it is a stage of has a state of its own. */
+    if (cmd->argc == 0 || cmd->body) {
+        return true;
+    }
+    /* The command knows it is a stage: on another thread this one's pipeline is not active. */
+    const ShellPipelineContext *ctx = &gShellRuntime.pipeline;
+    if (cmd->background || (ctx->active && ctx->stage_count > 1) ||
+        (cmd->pipeline_index >= 0 && !(cmd->is_pipeline_head && cmd->is_pipeline_tail))) {
+        return false;
+    }
+    if (shellFindCompiledFunction(cmd->argv[0])) {
+        return true;
+    }
+    char lookup_buf[PATH_MAX];
+    const char *name = shellCommandLookupName(cmd->argv[0], lookup_buf, sizeof(lookup_buf));
+    if (!shellIsRuntimeBuiltin(name) || shellCommandIsFrontendToolName(name) || shellIOSFrontendHandler(name)) {
+        return false;
+    }
+    if (!smallclueFindApplet(name)) {
+        return true;
+    }
+    /* Builtins under bash too, though an applet has the name. */
+    static const char *const kBashBuiltins[] = {"echo", "false", "kill", "printf", "pwd", "test", "true", "["};
+    for (size_t i = 0; i < sizeof(kBashBuiltins) / sizeof(kBashBuiltins[0]); ++i) {
+        if (strcmp(name, kBashBuiltins[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+#else
+    (void)cmd;
+    return true;
+#endif
+}
+
+/* The descriptor is there. It stays for the script to use, and name says where. */
+static bool shellFdVarFinish(const ShellCommand *cmd, const ShellRedirection *redir, int fd) {
+    if (redir->kind == SHELL_RUNTIME_REDIR_DUP && redir->close_target) {
+#if defined(PSCAL_TARGET_IOS)
+        if (shellCommandIsExecBuiltin(cmd)) {
+            vprocShellFdFollow(fd);
+        }
+#endif
+        return true;
+    }
+    if (!shellFdVarOutlivesCommand(cmd)) {
+        return true;
+    }
+    if (!shellFdVarAssign(redir->fd_var, fd)) {
+        close(fd);
+        return false;
+    }
+    shellCommandSubKeepFdVar(fd);
+#if defined(PSCAL_TARGET_IOS)
+    vprocShellFdFollow(fd);
+#endif
+    return true;
+}
+
+/* `{fd}> f` with no command makes the file and leaves nothing behind, as `> f` does. Each is then
+ * a redirection of a free number, which goes back to being free. `{fd}>&-` closes nothing either. */
+static void shellFdVarsEndWithCommand(ShellCommand *cmd) {
+#if defined(PSCAL_TARGET_IOS)
+    VProc *vp = vprocCurrent();
+#else
+    VProc *vp = NULL;
+#endif
+    for (size_t i = 0; i < cmd->redir_count; ++i) {
+        ShellRedirection *redir = &cmd->redirs[i];
+        if (!redir->fd_var) {
+            continue;
+        }
+        int fd = (redir->kind == SHELL_RUNTIME_REDIR_DUP && redir->close_target) ? shellFdVarValue(redir->fd_var)
+                                                                                  : shellFdVarPick(vp);
+        /* Not a number: applied as it is, and that reports it. */
+        if (fd >= 0) {
+            redir->fd = fd;
+            free(redir->fd_var);
+            redir->fd_var = NULL;
+        }
+    }
+}
+
 static bool shellApplyExecRedirections(const ShellCommand *cmd,
                                        ShellExecRedirBackup **out_backups,
                                        size_t *out_count) {
@@ -3957,7 +4137,21 @@ static bool shellApplyExecRedirections(const ShellCommand *cmd,
         if (redir->kind == SHELL_RUNTIME_REDIR_DUP && !redir->close_target) {
             avoid_fd = redir->dup_target_fd;
         }
-        if (!shellEnsureExecRedirBackup(target_fd, avoid_fd, &backups, &backup_count, &backup_capacity)) {
+        bool closes_fd_var = redir->fd_var && redir->kind == SHELL_RUNTIME_REDIR_DUP && redir->close_target;
+        if (closes_fd_var) {
+            target_fd = shellFdVarValue(redir->fd_var);
+            if (target_fd < 0) {
+                fprintf(stderr, "exsh: %s: ambiguous redirect\n", redir->fd_var);
+                shellUpdateStatus(1);
+                goto redir_error;
+            }
+        } else if (redir->fd_var) {
+            /* Nothing to put back: it is the script's to close. */
+            target_fd = shellFdVarPick(vp_current);
+        }
+        /* Closing goes back after the command unless that is exec, as any `3>&-` does. */
+        if ((!redir->fd_var || closes_fd_var) &&
+            !shellEnsureExecRedirBackup(target_fd, avoid_fd, &backups, &backup_count, &backup_capacity)) {
             int err = errno;
             if (err == 0) {
                 err = ENOMEM;
@@ -4135,6 +4329,10 @@ static bool shellApplyExecRedirections(const ShellCommand *cmd,
             default:
                 shellRedirectionFailed("redirection", EINVAL);
                 goto redir_error;
+        }
+        if (redir->fd_var && !shellFdVarFinish(cmd, redir, target_fd)) {
+            shellUpdateStatus(1);
+            goto redir_error;
         }
     }
 
@@ -5940,14 +6138,6 @@ static bool shellExecuteExecBuiltin(VM *vm, ShellCommand *cmd) {
         return true;
     }
 
-    if (argv[0][0] == '\0') {
-        runtimeError(vm, "exec: expected command");
-        shellRestoreExecRedirections(backups, backup_count);
-        shellFreeExecRedirBackups(backups, backup_count);
-        shellUpdateStatus(1);
-        return true;
-    }
-
 #if defined(PSCAL_TARGET_IOS)
     /* The program runs as a call, and when it is done so is this shell, as if it had been
      * replaced: no EXIT trap. */
@@ -6300,6 +6490,7 @@ static Value shellRunExpandedCommand(VM *vm, ShellCommand *cmd) {
         if (cmd->redir_count > 0) {
             ShellExecRedirBackup *redir_backups = NULL;
             size_t redir_backup_count = 0;
+            shellFdVarsEndWithCommand(cmd);
             shellFlushStandardStreams();
             if (shellApplyExecRedirections(cmd, &redir_backups, &redir_backup_count)) {
                 shellRestoreExecRedirections(redir_backups, redir_backup_count);
