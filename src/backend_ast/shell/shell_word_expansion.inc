@@ -501,13 +501,19 @@ static void shellMarkArithmeticError(void) {
 
 #include "shell_arithmetic.inc"
 
-static char *shellExpandWord(const char *text,
-                             uint8_t flags,
-                             const char *meta,
-                             size_t meta_len,
-                             bool **out_quoted_map,
-                             size_t *out_quoted_len,
-                             bool *out_array_zero) {
+/* `out_literal_map`, for whoever splits the result, says which bytes the word itself wrote. It
+ * is as long as the quoted map, and NULL when there are none. See shellQuotedMapAddLiteral. */
+static char *shellExpandWordEx(const char *text,
+                               uint8_t flags,
+                               const char *meta,
+                               size_t meta_len,
+                               bool **out_quoted_map,
+                               size_t *out_quoted_len,
+                               bool *out_array_zero,
+                               bool **out_literal_map) {
+    if (out_literal_map) {
+        *out_literal_map = NULL;
+    }
     if (out_quoted_map) {
         *out_quoted_map = NULL;
     }
@@ -525,6 +531,10 @@ static char *shellExpandWord(const char *text,
     bool *quoted_map = NULL;
     size_t quoted_len = 0;
     size_t quoted_cap = 0;
+    bool track_literal = track_quotes && out_literal_map;
+    bool *literal_map = NULL;
+    size_t literal_len = 0;
+    size_t literal_cap = 0;
 
     ShellMetaSubstitution *subs = NULL;
     size_t sub_count = 0;
@@ -558,6 +568,9 @@ static char *shellExpandWord(const char *text,
     const char *first_eq = assignment_word ? strchr(text, '=') : NULL;
 
     bool saw_empty_array_expansion = false;
+    /* ""$@ is one empty field where "$@" is none: only the quotes around the array go with it. */
+    bool quotes_hold_array = false;
+    bool quotes_stand_alone = false;
 
     for (size_t i = 0; i < text_len;) {
         char c = text[i];
@@ -572,12 +585,15 @@ static char *shellExpandWord(const char *text,
         if (c == SHELL_QUOTE_MARK_SINGLE) {
             saw_single_marker = true;
             in_single_segment = !in_single_segment;
+            quotes_stand_alone = quotes_stand_alone || !in_single_segment;
             i++;
             continue;
         }
         if (c == SHELL_QUOTE_MARK_DOUBLE) {
             saw_double_marker = true;
             in_double_segment = !in_double_segment;
+            quotes_stand_alone = quotes_stand_alone || (!in_double_segment && !quotes_hold_array);
+            quotes_hold_array = false;
             i++;
             continue;
         }
@@ -763,7 +779,8 @@ static char *shellExpandWord(const char *text,
                 }
                 if (!treat_as_double || next == '$' || (next == '"' && !here_document) || next == '\\' ||
                     next == '`' || next == '\n') {
-                    if (!shellQuotedMapAppendRepeated(track_quotes, &quoted_map, &quoted_len, &quoted_cap,
+                    if (!shellQuotedMapMarkAt(track_literal, &literal_map, &literal_len, &literal_cap, quoted_len) ||
+                        !shellQuotedMapAppendRepeated(track_quotes, &quoted_map, &quoted_len, &quoted_cap,
                                                       quoted_flag, 1)) {
                         goto expand_error;
                     }
@@ -772,7 +789,8 @@ static char *shellExpandWord(const char *text,
                     continue;
                 }
             }
-            if (!shellQuotedMapAppendRepeated(track_quotes, &quoted_map, &quoted_len, &quoted_cap,
+            if (!shellQuotedMapMarkAt(track_literal, &literal_map, &literal_len, &literal_cap, quoted_len) ||
+                !shellQuotedMapAppendRepeated(track_quotes, &quoted_map, &quoted_len, &quoted_cap,
                                               quoted_flag, 1)) {
                 goto expand_error;
             }
@@ -799,6 +817,7 @@ static char *shellExpandWord(const char *text,
                 if (array_like && array_count == 0) {
                     saw_empty_array_expansion = true;
                 }
+                quotes_hold_array = quotes_hold_array || (array_like && in_double_segment);
                 /* ${x:-"a b"}: the quotes inside the word count. */
                 bool appended = true;
                 if (inner_map && inner_map_len == out_len) {
@@ -825,7 +844,8 @@ static char *shellExpandWord(const char *text,
             }
         }
 
-        if (!shellQuotedMapAppendRepeated(track_quotes, &quoted_map, &quoted_len, &quoted_cap,
+        if (!shellQuotedMapMarkAt(track_literal, &literal_map, &literal_len, &literal_cap, quoted_len) ||
+            !shellQuotedMapAppendRepeated(track_quotes, &quoted_map, &quoted_len, &quoted_cap,
                                           quoted_flag, 1)) {
             goto expand_error;
         }
@@ -833,6 +853,10 @@ static char *shellExpandWord(const char *text,
         i++;
     }
 
+    if (literal_map && !shellQuotedMapAppendRepeated(track_literal, &literal_map, &literal_len, &literal_cap, false,
+                                                     quoted_len - literal_len)) {
+        goto expand_error;
+    }
     shellFreeMetaSubstitutions(subs, sub_count);
     if (track_quotes) {
         *out_quoted_map = quoted_map;
@@ -840,7 +864,10 @@ static char *shellExpandWord(const char *text,
     } else {
         free(quoted_map);
     }
-    if (out_array_zero && saw_empty_array_expansion && length == 0) {
+    if (track_literal) {
+        *out_literal_map = literal_map;
+    }
+    if (out_array_zero && saw_empty_array_expansion && length == 0 && !quotes_stand_alone) {
         *out_array_zero = true;
     }
     return buffer;
@@ -849,7 +876,18 @@ expand_error:
     shellFreeMetaSubstitutions(subs, sub_count);
     free(buffer);
     free(quoted_map);
+    free(literal_map);
     return NULL;
+}
+
+static char *shellExpandWord(const char *text,
+                             uint8_t flags,
+                             const char *meta,
+                             size_t meta_len,
+                             bool **out_quoted_map,
+                             size_t *out_quoted_len,
+                             bool *out_array_zero) {
+    return shellExpandWordEx(text, flags, meta, meta_len, out_quoted_map, out_quoted_len, out_array_zero, NULL);
 }
 
 static void shellFreeRedirections(ShellCommand *cmd) {
@@ -4129,6 +4167,10 @@ static void shellParseMetadata(const char *meta, ShellCommand *cmd) {
     free(copy);
 }
 
+static bool shellWordTextHasQuotes(const char *text) {
+    return strchr(text, SHELL_QUOTE_MARK_SINGLE) || strchr(text, SHELL_QUOTE_MARK_DOUBLE);
+}
+
 /* One word's fields: brace expansion, the expansions, splitting and globbing. */
 static bool shellExpandWordFields(const char *text,
                                   uint8_t flags,
@@ -4150,21 +4192,27 @@ static bool shellExpandWordFields(const char *text,
     bool *quoted_map = NULL;
     size_t quoted_len = 0;
     bool zero_array = false;
-    char *expanded = shellExpandWord(text, flags, meta, meta_len, &quoted_map, &quoted_len, &zero_array);
+    bool *literal_map = NULL;
+    /* With no $ or ` nothing in the word can have come from a split-able expansion. */
+    bool splittable = strpbrk(text, "$`") != NULL;
+    char *expanded = shellExpandWordEx(text, flags, meta, meta_len, &quoted_map, &quoted_len, &zero_array,
+                                       splittable ? &literal_map : NULL);
     if (!expanded) {
         return false;
     }
-    if (quoted_map && !shellMarkQuotedGlobChars(&expanded, &quoted_map, &quoted_len)) {
+    bool marked = !quoted_map || shellMarkQuotedGlobChars(&expanded, &quoted_map, &quoted_len, literal_map);
+    free(literal_map);
+    if (!marked) {
         free(expanded);
         free(quoted_map);
         return false;
     }
     char **fields = NULL;
     size_t field_count = 0;
-    bool split = shellSplitExpandedWord(expanded, flags, quoted_map, quoted_len, zero_array, &fields, &field_count);
+    uint8_t split_flags = (splittable || !expanded[0]) ? flags : (uint8_t)(flags | SHELL_WORD_FLAG_DOUBLE_QUOTED);
+    bool split = shellSplitExpandedWord(expanded, split_flags, quoted_map, quoted_len, zero_array, &fields, &field_count);
     /* a=("" x): quotes make a field even with nothing in them. */
-    if (split && field_count == 0 && !zero_array && !expanded[0] &&
-        (strchr(text, SHELL_QUOTE_MARK_SINGLE) || strchr(text, SHELL_QUOTE_MARK_DOUBLE))) {
+    if (split && field_count == 0 && !zero_array && !expanded[0] && shellWordTextHasQuotes(text)) {
         fields = (char **)calloc(1, sizeof(char *));
         if (fields) {
             fields[0] = strdup("");
@@ -4506,7 +4554,7 @@ static bool shellAddDoubleBracketWord(ShellCommand *cmd, const char *text, uint8
         char *regex = shellRegexFromExpanded(expanded, quoted_map, quoted_len);
         free(expanded);
         expanded = regex;
-    } else if (quoted_map && cmd->argc > 0 && !shellMarkQuotedGlobChars(&expanded, &quoted_map, &quoted_len)) {
+    } else if (quoted_map && cmd->argc > 0 && !shellMarkQuotedGlobChars(&expanded, &quoted_map, &quoted_len, NULL)) {
         free(expanded);
         free(quoted_map);
         return false;
@@ -4656,9 +4704,14 @@ static char *decodeHexString(const char *hex, size_t *out_len) {
 static bool shellAppendCombinedRedirect(ShellCommand *cmd, const char *path, bool append);
 
 /* An unquoted expansion must leave exactly one word to open. */
-static bool shellRedirectTargetIsAmbiguous(const char *expanded, uint8_t flags, const bool *quoted_map, size_t quoted_len) {
+static bool shellRedirectTargetIsAmbiguous(const char *expanded, uint8_t flags, const char *text, const bool *quoted_map,
+                                           size_t quoted_len) {
     if (*expanded == '\0') {
-        return (flags & (SHELL_WORD_FLAG_SINGLE_QUOTED | SHELL_WORD_FLAG_DOUBLE_QUOTED)) == 0;
+        return (flags & (SHELL_WORD_FLAG_SINGLE_QUOTED | SHELL_WORD_FLAG_DOUBLE_QUOTED)) == 0 &&
+               !shellWordTextHasQuotes(text);
+    }
+    if (strchr(expanded, SHELL_ARRAY_ELEMENT_SEP)) {
+        return true;
     }
     const char *ifs = shellSafeGetenv("IFS");
     if (!ifs) {
@@ -4805,20 +4858,24 @@ static bool shellAddRedirection(ShellCommand *cmd, const char *spec) {
         }
         bool *target_quoted_map = NULL;
         size_t target_quoted_len = 0;
-        expanded_target = shellExpandWord(target_text,
-                                          target_flags,
-                                          target_meta,
-                                          target_meta_len,
-                                          &target_quoted_map,
-                                          &target_quoted_len,
-                                          NULL);
+        bool *target_literal_map = NULL;
+        expanded_target = shellExpandWordEx(target_text,
+                                            target_flags,
+                                            target_meta,
+                                            target_meta_len,
+                                            &target_quoted_map,
+                                            &target_quoted_len,
+                                            NULL,
+                                            &target_literal_map);
         if (!expanded_target) {
             free(word_encoded);
             free(copy);
             return false;
         }
+        shellQuotedMapAddLiteral(target_quoted_map, target_quoted_len, target_literal_map);
+        free(target_literal_map);
         ambiguous_target = strcmp(type_text, "<<<") != 0 &&
-                           shellRedirectTargetIsAmbiguous(expanded_target, target_flags,
+                           shellRedirectTargetIsAmbiguous(expanded_target, target_flags, target_text,
                                                           target_quoted_map, target_quoted_len);
         free(target_quoted_map);
         shellFlattenArraySeparators(expanded_target);

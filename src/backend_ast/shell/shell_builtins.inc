@@ -1424,7 +1424,7 @@ Value vmBuiltinShellCaseClause(VM *vm, int arg_count, Value *args) {
                                                 &pattern_map_len,
                                                 NULL);
         bool marked = expanded_pattern &&
-                      (!pattern_map || shellMarkQuotedGlobChars(&expanded_pattern, &pattern_map, &pattern_map_len));
+                      (!pattern_map || shellMarkQuotedGlobChars(&expanded_pattern, &pattern_map, &pattern_map_len, NULL));
         free(pattern_map);
         if (!marked) {
             free(expanded_pattern);
@@ -14233,47 +14233,16 @@ static bool shellLoopExpandEncodedWords(const char *const *encoded_words,
             word_meta = NULL;
             word_meta_len = 0;
         }
-        bool *quoted_map = NULL;
-        size_t quoted_len = 0;
-        bool zero_array = false;
-        char *expanded = shellExpandWord(text,
-                                         word_flags,
-                                         word_meta,
-                                         word_meta_len,
-                                         &quoted_map,
-                                         &quoted_len,
-                                         &zero_array);
-        if (!expanded) {
-            free(quoted_map);
+        ShellStringArray fields = (ShellStringArray){0};
+        bool ok = shellExpandWordFields(text, word_flags, word_meta, word_meta_len, true, &fields);
+        for (size_t f = 0; f < fields.count && ok; ++f) {
+            ok = shellLoopAppendWord(&words, &count, &capacity, fields.items[f]);
+        }
+        shellStringArrayFree(&fields);
+        if (!ok) {
             shellLoopFreeWordList(words, count);
             return false;
         }
-
-        char **fields = NULL;
-        size_t field_count = 0;
-        bool split_ok = shellSplitExpandedWord(expanded,
-                                               word_flags,
-                                               quoted_map,
-                                               quoted_len,
-                                               zero_array,
-                                               &fields,
-                                               &field_count);
-        free(expanded);
-        free(quoted_map);
-        if (!split_ok) {
-            shellFreeStringArray(fields, field_count);
-            shellLoopFreeWordList(words, count);
-            return false;
-        }
-
-        for (size_t f = 0; f < field_count; ++f) {
-            if (!shellLoopAppendWord(&words, &count, &capacity, fields[f])) {
-                shellFreeStringArray(fields, field_count);
-                shellLoopFreeWordList(words, count);
-                return false;
-            }
-        }
-        shellFreeStringArray(fields, field_count);
     }
 
     if (out_words) {

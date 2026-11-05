@@ -1939,8 +1939,22 @@ static bool shellFieldIsGlobPattern(const char *field) {
     return false;
 }
 
-/* Takes ownership of `expanded` and the map, which grow with the marks they gain. */
-static bool shellMarkQuotedGlobChars(char **expanded, bool **quoted_map, size_t *quoted_len) {
+/* IFS splits only what an expansion produced, so text the word itself holds stays whole: `a:b`
+ * under IFS=:. It is kept apart from the quoted map, since a literal `*` still matches and a
+ * literal `.` after =~ still means any character. Once marked, the map only says what to keep
+ * whole, and this puts that text in it. */
+static void shellQuotedMapAddLiteral(bool *map, size_t map_len, const bool *literal_map) {
+    if (!map || !literal_map) {
+        return;
+    }
+    for (size_t i = 0; i < map_len; ++i) {
+        map[i] = map[i] || literal_map[i];
+    }
+}
+
+/* Takes ownership of `expanded` and the map, which grow with the marks they gain. With a
+ * `literal_map` of the same length, the map comes back ready for shellSplitExpandedWord. */
+static bool shellMarkQuotedGlobChars(char **expanded, bool **quoted_map, size_t *quoted_len, const bool *literal_map) {
     const char *text = *expanded;
     const bool *map = *quoted_map;
     size_t marks = 0;
@@ -1951,6 +1965,7 @@ static bool shellMarkQuotedGlobChars(char **expanded, bool **quoted_map, size_t 
         }
     }
     if (marks == 0) {
+        shellQuotedMapAddLiteral(*quoted_map, *quoted_len, literal_map);
         return true;
     }
     char *new_text = (char *)malloc(length + marks + 1);
@@ -1969,7 +1984,7 @@ static bool shellMarkQuotedGlobChars(char **expanded, bool **quoted_map, size_t 
             new_map[map_out++] = true;
         }
         new_text[out++] = text[i];
-        new_map[map_out++] = quoted;
+        new_map[map_out++] = quoted || (literal_map && i < *quoted_len && literal_map[i]);
     }
     new_text[out] = '\0';
     free(*expanded);
@@ -2096,12 +2111,32 @@ static bool shellQuotedMapAppendRepeated(bool track,
     return true;
 }
 
+/* Marks the byte at `at` in a map that only says yes now and then: what it skipped is no. */
+static bool shellQuotedMapMarkAt(bool track, bool **map, size_t *length, size_t *capacity, size_t at) {
+    return shellQuotedMapAppendRepeated(track, map, length, capacity, false, at - *length) &&
+           shellQuotedMapAppendRepeated(track, map, length, capacity, true, 1);
+}
+
 static const char *shellCurrentIfs(void) {
     ShellLocalVariable *local = shellLocalScopeFind("IFS");
     if (local) {
         return local->no_value ? NULL : (local->value ? local->value : "");
     }
     return shellSafeGetenv("IFS");
+}
+
+static const char *shellSkipIfsWhitespace(const char *cursor, const char *expanded, const bool *quoted_map,
+                                          const bool *whitespace_map) {
+    while (*cursor) {
+        if (quoted_map && quoted_map[cursor - expanded]) {
+            break;
+        }
+        if (!whitespace_map[(unsigned char)*cursor]) {
+            break;
+        }
+        cursor++;
+    }
+    return cursor;
 }
 
 static bool shellSplitExpandedWord(const char *expanded, uint8_t word_flags,
@@ -2133,6 +2168,31 @@ static bool shellSplitExpandedWord(const char *expanded, uint8_t word_flags,
         const char *segment = expanded;
         bool base_quoted = (word_flags & (SHELL_WORD_FLAG_SINGLE_QUOTED | SHELL_WORD_FLAG_DOUBLE_QUOTED)) != 0;
         bool have_map = quoted_map && quoted_len == length;
+        /* Outside quotes the elements are joined with IFS's first character and then split,
+         * so under IFS=: an empty one in the middle is a field and a:, b is three, while the
+         * default IFS drops it. An empty IFS joins nothing: each stays a field. */
+        const char *join_ifs = shellCurrentIfs();
+        char join_with = join_ifs ? join_ifs[0] : ' ';
+        if (!base_quoted && join_with != '\0') {
+            char *joined = strdup(expanded);
+            if (!joined) {
+                return false;
+            }
+            bool any_joined = false;
+            for (char *sep = joined; (sep = strchr(sep, SHELL_ARRAY_ELEMENT_SEP)) != NULL; ++sep) {
+                if (!have_map || !quoted_map[sep - joined]) {
+                    *sep = join_with;
+                    any_joined = true;
+                }
+            }
+            if (any_joined) {
+                bool ok = shellSplitExpandedWord(joined, word_flags, quoted_map, quoted_len, false, out_fields,
+                                                 out_field_count);
+                free(joined);
+                return ok;
+            }
+            free(joined);
+        }
         while (1) {
             const char *next = strchr(segment, SHELL_ARRAY_ELEMENT_SEP);
             size_t seg_len = next ? (size_t)(next - segment) : strlen(segment);
@@ -2185,11 +2245,7 @@ static bool shellSplitExpandedWord(const char *expanded, uint8_t word_flags,
         *out_field_count = fields.count;
         return true;
     }
-    bool use_map = quoted_map && quoted_len == length;
-    const char *ifs = shellCurrentIfs();
-    if (!ifs) {
-        ifs = " \t\n";
-    }
+    bool use_map = quoted_map && quoted_len == length && length > 0;
     bool quoted = (word_flags & (SHELL_WORD_FLAG_SINGLE_QUOTED | SHELL_WORD_FLAG_DOUBLE_QUOTED)) != 0;
     if (!quoted && use_map) {
         quoted = true;
@@ -2199,6 +2255,14 @@ static bool shellSplitExpandedWord(const char *expanded, uint8_t word_flags,
                 break;
             }
         }
+    }
+    /* An unquoted expansion that left nothing is no field, whatever IFS holds. */
+    if (!quoted && *expanded == '\0') {
+        return true;
+    }
+    const char *ifs = quoted ? "" : shellCurrentIfs();
+    if (!ifs) {
+        ifs = " \t\n";
     }
     if (quoted || *ifs == '\0') {
         char *dup = strdup(expanded);
@@ -2215,9 +2279,6 @@ static bool shellSplitExpandedWord(const char *expanded, uint8_t word_flags,
         *out_field_count = 1;
         return true;
     }
-    if (*expanded == '\0') {
-        return true;
-    }
 
     bool delim_map[256] = {false};
     bool whitespace_map[256] = {false};
@@ -2229,20 +2290,10 @@ static bool shellSplitExpandedWord(const char *expanded, uint8_t word_flags,
         }
     }
 
+    const bool *map = use_map ? quoted_map : NULL;
     ShellStringArray fields = (ShellStringArray){0};
-    const char *cursor = expanded;
-    while (*cursor) {
-        size_t index = (size_t)(cursor - expanded);
-        if (use_map && quoted_map[index]) {
-            break;
-        }
-        if (!whitespace_map[(unsigned char)*cursor]) {
-            break;
-        }
-        cursor++;
-    }
+    const char *cursor = shellSkipIfsWhitespace(expanded, expanded, map, whitespace_map);
 
-    bool last_non_wh_delim = false;
     while (*cursor) {
         unsigned char ch = (unsigned char)*cursor;
         size_t index = (size_t)(cursor - expanded);
@@ -2254,18 +2305,7 @@ static bool shellSplitExpandedWord(const char *expanded, uint8_t word_flags,
                 shellStringArrayFree(&fields);
                 return false;
             }
-            cursor++;
-            while (*cursor) {
-                size_t ws_index = (size_t)(cursor - expanded);
-                if (use_map && quoted_map[ws_index]) {
-                    break;
-                }
-                if (!whitespace_map[(unsigned char)*cursor]) {
-                    break;
-                }
-                cursor++;
-            }
-            last_non_wh_delim = true;
+            cursor = shellSkipIfsWhitespace(cursor + 1, expanded, map, whitespace_map);
             continue;
         }
 
@@ -2295,42 +2335,14 @@ static bool shellSplitExpandedWord(const char *expanded, uint8_t word_flags,
             }
         }
 
-        if (!*cursor) {
-            last_non_wh_delim = false;
-            break;
-        }
-
-        if (!char_quoted && delim_map[(unsigned char)*cursor] && !whitespace_map[(unsigned char)*cursor]) {
-            cursor++;
-            last_non_wh_delim = true;
-        } else {
-            while (*cursor) {
-                size_t ws_index = (size_t)(cursor - expanded);
-                if (use_map && quoted_map[ws_index]) {
-                    break;
-                }
-                if (!whitespace_map[(unsigned char)*cursor]) {
-                    break;
-                }
-                cursor++;
-            }
-            last_non_wh_delim = false;
-        }
-
-        while (*cursor) {
-            size_t ws_index = (size_t)(cursor - expanded);
-            if (use_map && quoted_map[ws_index]) {
-                break;
-            }
-            if (!whitespace_map[(unsigned char)*cursor]) {
-                break;
-            }
-            cursor++;
+        /* One delimiter: IFS white space with at most one other IFS character in it, so
+         * `a : b` is two fields. At the end it closes the last field and opens no other:
+         * a,b, is two. */
+        cursor = shellSkipIfsWhitespace(cursor, expanded, map, whitespace_map);
+        if (*cursor && !(use_map && quoted_map[cursor - expanded]) && delim_map[(unsigned char)*cursor]) {
+            cursor = shellSkipIfsWhitespace(cursor + 1, expanded, map, whitespace_map);
         }
     }
-
-    /* A delimiter at the end closes the last field and opens no other: a,b, is two. */
-    (void)last_non_wh_delim;
 
     if (fields.count == 0) {
         free(fields.items);
