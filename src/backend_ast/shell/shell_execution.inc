@@ -5438,6 +5438,10 @@ static int shellPipelineRunStage(VM *vm,
     }
 #endif
 
+#if defined(PSCAL_TARGET_IOS)
+    /* Asked now: `command eval` runs a pipeline of its own in here, and that resets this one. */
+    bool alone_in_command = ctx->stage_count == 1;
+#endif
     if (adopt_failed) {
         runtimeError(vm, "pipeline: failed to attach in-process stdio");
         status = 1;
@@ -5497,7 +5501,7 @@ static int shellPipelineRunStage(VM *vm,
     vprocDeactivate();
     /* `eval` or a function alone is the shell going on with its script, no process of its own:
      * the jobs it started are the shell's, and `wait` there has to find them. */
-    if (ctx->stage_count == 1 && shellStageRunsShellCode(cmd)) {
+    if (alone_in_command && shellStageLeavesJobsToShell(cmd)) {
         vprocPassChildrenToParent(vprocPid(vp));
     }
     shellFinalizeStageVproc(vp, status);

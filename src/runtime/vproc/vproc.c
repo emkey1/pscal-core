@@ -3379,6 +3379,7 @@ typedef struct {
     bool halting;
     bool silent_to_parent;
     bool not_a_process;
+    bool orphaned; /* its parent ended first, so nothing waits for it */
     uint32_t caught_signals;
     bool sigchld_delivery_queued;
     bool shell_prompt_read_active;
@@ -6884,6 +6885,33 @@ static void vprocReparentChildrenLocked(int parent_pid, int new_parent_pid) {
     }
 }
 
+/* A parent that ended leaves no one to wait for its children, and who takes them in only waits
+ * for its own jobs. So an orphan's row goes when it ends, as init reaps it on Linux. */
+static void vprocOrphanChildrenLocked(int parent_pid, int new_parent_pid) {
+    VProcTaskEntry *entry = vprocTaskFindLocked(parent_pid);
+    if (!entry || entry->child_count == 0 || !entry->children) {
+        if (entry) {
+            entry->child_count = 0;
+        }
+        return;
+    }
+    while (entry->child_count > 0) {
+        int child_pid = entry->children[entry->child_count - 1];
+        entry->child_count--;
+        if (child_pid <= 0) {
+            continue;
+        }
+        vprocUpdateParentLocked(child_pid, new_parent_pid);
+        VProcTaskEntry *child = vprocTaskFindLocked(child_pid);
+        if (child) {
+            child->orphaned = true;
+            if (child->exited) {
+                vprocClearEntryLocked(child);
+            }
+        }
+    }
+}
+
 static void vprocNotifyPidSigchldLocked(int target_pid, VProcSigchldEvent evt) {
     if (target_pid <= 0) {
         return;
@@ -10036,6 +10064,7 @@ void vprocMarkExit(VProc *vp, int status) {
     pthread_mutex_lock(&gVProcTasks.mu);
     VProcTaskEntry *entry = vprocTaskFindLocked(vp->pid);
     if (entry) {
+        int pgid = entry->pgid;
         if (entry->exit_signal == 0) {
             entry->status = status;
         }
@@ -10050,9 +10079,9 @@ void vprocMarkExit(VProc *vp, int status) {
         entry->real_timer_deadline_ns = 0;
         entry->real_timer_interval_ns = 0;
         int adopt_parent = vprocAdoptiveParentPidLocked(entry);
-        vprocReparentChildrenLocked(vp->pid, adopt_parent);
+        vprocOrphanChildrenLocked(vp->pid, adopt_parent);
 
-        bool discard_zombie = false;
+        bool discard_zombie = entry->orphaned;
         VProcTaskEntry *parent_entry = vprocTaskFindLocked(entry->parent_pid);
         if (parent_entry) {
             struct sigaction sa = vprocGetSigactionLocked(parent_entry, SIGCHLD);
@@ -10077,7 +10106,7 @@ void vprocMarkExit(VProc *vp, int status) {
         } else {
             vprocNotifyParentSigchldLocked(entry, VPROC_SIGCHLD_EVENT_EXIT);
         }
-        vprocMaybeNotifyPgidEmptyLocked(entry->pgid);
+        vprocMaybeNotifyPgidEmptyLocked(pgid);
         pthread_cond_broadcast(&gVProcTasks.cv);
     }
     pthread_mutex_unlock(&gVProcTasks.mu);
@@ -10132,6 +10161,10 @@ void vprocSetParent(int pid, int parent_pid) {
         }
     }
     vprocUpdateParentLocked(pid, parent_pid);
+    VProcTaskEntry *adopted = vprocTaskFindLocked(pid);
+    if (adopted) {
+        adopted->orphaned = false;
+    }
     pthread_mutex_unlock(&gVProcTasks.mu);
 }
 
@@ -10487,7 +10520,7 @@ static void vprocClearEntryLocked(VProcTaskEntry *entry) {
         }
     }
     int adopt_parent = vprocAdoptiveParentPidLocked(entry);
-    vprocReparentChildrenLocked(pid, adopt_parent);
+    vprocOrphanChildrenLocked(pid, adopt_parent);
 
     if (sid > 0) {
         bool drop_session = true;
@@ -10555,6 +10588,7 @@ static void vprocClearEntryLocked(VProcTaskEntry *entry) {
     entry->halting = false;
     entry->silent_to_parent = false;
     entry->not_a_process = false;
+    entry->orphaned = false;
     entry->caught_signals = 0;
     entry->ignored_signals = 0;
     for (int i = 0; i < 32; ++i) {
@@ -11119,6 +11153,10 @@ static bool vprocKillDeliverEntryLocked(VProcTaskEntry *entry,
                 vprocCancelListAdd(cancel_list, cancel_count, cancel_capacity, tid);
             }
         }
+    }
+    /* With no thread to report its end through vprocMarkExit, this was it. */
+    if (entry->orphaned && entry->exited) {
+        vprocClearEntryLocked(entry);
     }
     return true;
 }

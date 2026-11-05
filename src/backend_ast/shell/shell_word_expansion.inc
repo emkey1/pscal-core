@@ -2708,6 +2708,33 @@ static bool shellStageRunsShellCode(const ShellCommand *cmd) {
     return strcmp(name, "eval") == 0 || strcmp(name, "source") == 0 || strcmp(name, ".") == 0;
 }
 
+/* Shell code alone in a command is the shell going on with its script, so what it leaves running
+ * is the shell's to wait for. `command` and `builtin` only pick how the name is looked up. */
+static bool shellStageLeavesJobsToShell(const ShellCommand *cmd) {
+    if (shellStageRunsShellCode(cmd)) {
+        return true;
+    }
+    if (!cmd || cmd->body || !cmd->argv) {
+        return false;
+    }
+    size_t word = 0;
+    while (word < (size_t)cmd->argc && cmd->argv[word] &&
+           (strcmp(cmd->argv[word], "command") == 0 || strcmp(cmd->argv[word], "builtin") == 0)) {
+        word++;
+        while (word < (size_t)cmd->argc && cmd->argv[word] && strcmp(cmd->argv[word], "-p") == 0) {
+            word++;
+        }
+        if (word < (size_t)cmd->argc && cmd->argv[word] && strcmp(cmd->argv[word], "--") == 0) {
+            word++;
+        }
+    }
+    if (word == 0 || word >= (size_t)cmd->argc || !cmd->argv[word]) {
+        return false;
+    }
+    const char *name = cmd->argv[word];
+    return strcmp(name, "eval") == 0 || strcmp(name, "source") == 0 || strcmp(name, ".") == 0;
+}
+
 static bool shellCommandIsFrontendToolName(const char *name);
 
 /* A job runs apart from the shell as a forked child does, so what any builtin in it changes stays
