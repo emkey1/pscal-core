@@ -3681,6 +3681,10 @@ static void shellToolStopSigintCatcher(ShellToolThreadContext *ctx) {
     stop_action.sa_flags = SA_RESTART;
     sigemptyset(&stop_action.sa_mask);
 
+    /* The join below is a cancellation point. A kill there would leave the lock held, and every
+     * tool that ended after it would wait here for ever. */
+    int cancel_state = PTHREAD_CANCEL_ENABLE;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
     pthread_mutex_lock(&stop_mu);
     ctx->sigint_catcher_stop = 1;
     bool ignored = vprocHostSigaction(SIGINT, NULL, &previous) == 0 &&
@@ -3694,6 +3698,7 @@ static void shellToolStopSigintCatcher(ShellToolThreadContext *ctx) {
         vprocHostSigaction(SIGINT, &previous, NULL);
     }
     pthread_mutex_unlock(&stop_mu);
+    pthread_setcancelstate(cancel_state, NULL);
     ctx->sigint_catcher_active = false;
 }
 #endif
