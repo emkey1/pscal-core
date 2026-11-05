@@ -6,6 +6,9 @@
 static void shellExpansionFail(void) {
     gShellExpansionFailed = true;
     shellUpdateStatus(1);
+    if (gShellExpandingJobWords) {
+        return;
+    }
     if (!shellRuntimeIsInteractive() || gShellRuntime.in_subshell) {
         shellRuntimeRequestExit();
         if (gShellCurrentVm) {

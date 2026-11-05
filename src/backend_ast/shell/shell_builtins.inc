@@ -307,6 +307,15 @@ static const char *shellTypesetArithmeticErrorFormat(void) {
     }
     return "%s: %s: syntax error: operand expected (error token is \"%s\")";
 }
+/* A job, or a stage of more than one. */
+static bool shellMetadataRunsApart(Value meta) {
+    if (VALUE_TYPE(meta) != TYPE_STRING || !AS_STRING(meta)) {
+        return false;
+    }
+    return strncmp(AS_STRING(meta), "bg=1;", 5) == 0 ||
+           (gShellRuntime.pipeline.active && gShellRuntime.pipeline.stage_count > 1);
+}
+
 Value vmBuiltinShellExec(VM *vm, int arg_count, Value *args) {
     VM *previous_vm = shellSwapCurrentVm(vm);
     Value result = makeVoid();
@@ -316,12 +325,20 @@ Value vmBuiltinShellExec(VM *vm, int arg_count, Value *args) {
         goto cleanup;
     }
     shellCollectJobs();
-    /* One of several stages had its trap when the pipeline started. */
-    if (!gShellRuntime.pipeline.active || gShellRuntime.pipeline.stage_count <= 1) {
-        shellRuntimeRunDebugTrap();
-    }
+    shellRuntimeRunDebugTrap();
     ShellCommand cmd;
-    if (!shellBuildCommand(vm, arg_count, args, &cmd)) {
+    /* A job's or stage's words failing is its own failure: under bash it has forked by then, so it
+     * reports, ends with status 1 and the shell goes on. The rest of the pipeline runs, and the
+     * shell waits for it: ended here, it would pull the pipeline from under the stages started. */
+    gShellExpandingJobWords = arg_count > 0 && shellMetadataRunsApart(args[0]);
+    bool built = shellBuildCommand(vm, arg_count, args, &cmd);
+    bool job_failed = !built && gShellExpandingJobWords && gShellExpansionFailed;
+    gShellExpandingJobWords = false;
+    if (job_failed) {
+        built = shellBuildCommand(vm, 1, args, &cmd);
+        cmd.ran_command_substitution = true;
+    }
+    if (!built) {
         goto cleanup;
     }
     char *last_word = (cmd.argc > 0 && cmd.argv && cmd.argv[cmd.argc - 1]) ? strdup(cmd.argv[cmd.argc - 1]) : NULL;
@@ -454,8 +471,8 @@ Value vmBuiltinShellPipeline(VM *vm, int arg_count, Value *args) {
         cursor = next + 1;
     }
         free(copy);
-    /* Before any stage starts: a trap sets the pipeline's state aside while it runs, and a stage's
-     * thread reads it. Run between stages, this crashed the app. */
+    /* What the one body that a background pipeline runs in on iOS holds: its copy of the trap is
+     * not the shell's. */
     for (size_t i = 0; i < debug_traps; ++i) {
         shellRuntimeRunDebugTrap();
     }

@@ -3084,6 +3084,7 @@ static PSCAL_THREAD_LOCAL bool gShellExitRequested = false;
 static volatile sig_atomic_t gShellExitOnSignalFlag = 0;
 static PSCAL_THREAD_LOCAL bool gShellArithmeticErrorPending = false;
 static PSCAL_THREAD_LOCAL bool gShellExpansionFailed = false;
+static PSCAL_THREAD_LOCAL bool gShellExpandingJobWords = false;
 static PSCAL_THREAD_LOCAL bool gShellNounsetSuppressed = false;
 static PSCAL_THREAD_LOCAL bool gShellProcSubDisabled = false;
 
@@ -3831,6 +3832,21 @@ static void shellRuntimeExecuteTrap(const char *command, const char *label) {
     }
     gShellTrapExecuting = true;
 
+#if defined(PSCAL_TARGET_IOS)
+    /* A stage's thread reads and writes the running pipeline in this context, and the commands in
+     * the trap need one of their own. They get a copy of the context to run in, so the pipeline
+     * stays where the stages have it. Nothing else here is touched by another thread. */
+    ShellRuntimeState *pipeline_owner = NULL;
+    if (gShellRuntime.pipeline.active) {
+        ShellRuntimeState *trap_context = (ShellRuntimeState *)malloc(sizeof(ShellRuntimeState));
+        if (trap_context) {
+            pipeline_owner = shellGetContext();
+            *trap_context = *pipeline_owner;
+            shellSetContext(trap_context);
+        }
+    }
+#endif
+
     ShellRunOptions opts = (ShellRunOptions){0};
     opts.no_cache = 1;
     opts.quiet = true;
@@ -3901,6 +3917,21 @@ static void shellRuntimeExecuteTrap(const char *command, const char *label) {
     }
     shellResetPipeline();
     *caller_pipeline = saved_pipeline;
+
+#if defined(PSCAL_TARGET_IOS)
+    if (pipeline_owner) {
+        ShellRuntimeState *trap_context = shellGetContext();
+        trap_context->pipeline = saved_pipeline;
+        /* All but the pipeline, whose stages have gone on meanwhile. */
+        size_t pipeline_start = offsetof(ShellRuntimeState, pipeline);
+        size_t pipeline_end = pipeline_start + sizeof(ShellPipelineContext);
+        memcpy(pipeline_owner, trap_context, pipeline_start);
+        memcpy((char *)pipeline_owner + pipeline_end, (char *)trap_context + pipeline_end,
+               sizeof(ShellRuntimeState) - pipeline_end);
+        shellSetContext(pipeline_owner);
+        free(trap_context);
+    }
+#endif
 
     if (scope_pushed) {
         shellSymbolTableScopePop(&table_scope);

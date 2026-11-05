@@ -452,7 +452,9 @@ static char *shellExpandParameterEx(const char *input,
     bool is_set = false;
     char *value = shellLookupParameterValueInternal(input, name_len, &is_set);
     if (!is_set && gShellRuntime.nounset_enabled && !gShellNounsetSuppressed) {
-        shellReportRecoverableError(gShellCurrentVm, true, "%.*s: unbound variable", (int)name_len, input);
+        /* `$1` by that name, and `${1}` by its number, as bash has it. */
+        shellReportRecoverableError(gShellCurrentVm, true, "%s%.*s: unbound variable",
+                                    isdigit((unsigned char)*input) ? "$" : "", (int)name_len, input);
         shellExpansionFail();
     }
     return value;
