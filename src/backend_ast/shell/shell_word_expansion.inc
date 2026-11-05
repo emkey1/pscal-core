@@ -1182,12 +1182,17 @@ static void shellHandleSignalCommon(int signo, bool from_status) {
 
     bool command_trap = (trap_action == SHELL_TRAP_ACTION_COMMAND);
 
+    /* A shell does not die of its own SIGQUIT, though what it runs may. */
+    if (signo == SIGQUIT && !command_trap && !from_status) {
+        return;
+    }
+
     if (!command_trap) {
         shellUpdateStatus(128 + signo);
     }
 
     if (signo == SIGINT || signo == SIGQUIT || signo == SIGTSTP) {
-        bool stop_request = (signo == SIGTSTP) && gShellRuntime.job_control_enabled && shellJobControlSupportsStops();
+        bool stop_request = (signo == SIGTSTP) && shellMonitorOn() && shellJobControlSupportsStops();
         bool dispatched = false;
         if (!from_status && (signo == SIGINT || stop_request)) {
             dispatched = shellJobControlDispatchForegroundSignal(signo);
@@ -1198,7 +1203,10 @@ static void shellHandleSignalCommon(int signo, bool from_status) {
             gShellCurrentVm->current_builtin_name = "signal";
         }
 
-        if (!gShellRuntime.job_control_enabled && !stop_request && !command_trap) {
+        /* A shell at a prompt goes on to the next line. RUN_VPROC_TESTS turns on job_control_enabled
+         * for a script, which ends here all the same. */
+        if ((!gShellRuntime.job_control_enabled || !shellRuntimeIsInteractive() || gShellRuntime.in_subshell) &&
+            !stop_request && !command_trap) {
             shellRuntimeRequestExit();
         }
 
@@ -1211,13 +1219,24 @@ static void shellHandleSignalCommon(int signo, bool from_status) {
         bool propagate_default =
             (gShellExitOnSignalFlag && (signo == SIGINT || signo == SIGQUIT || signo == SIGTSTP) &&
              !gShellRuntime.trap_enabled && !command_trap && !dispatched && !from_status);
+        bool ends_here = propagate_default;
 #if defined(PSCAL_TARGET_IOS)
         if (signo == SIGINT || signo == SIGQUIT || signo == SIGTSTP) {
             /* iOS job control is virtualized through vproc; never forward
              * default signal disposition to the host process. */
             propagate_default = false;
         }
+        ends_here = signo == SIGINT && !command_trap && !from_status &&
+                    (!shellRuntimeIsInteractive() || gShellRuntime.in_subshell) && !shellRuntimeInSubstitution();
 #endif
+
+        /* It dies of this here, whatever the EXIT trap says, and that trap runs first. */
+        if (ends_here && signo == SIGINT) {
+            int text_depth = gShellTextDepth;
+            gShellTextDepth = 0;
+            shellRuntimeRunExitTrapInPlace();
+            gShellTextDepth = text_depth;
+        }
 
         if (propagate_default) {
             struct sigaction action;
@@ -1267,6 +1286,11 @@ static void shellHandlePendingSignal(int signo) {
 }
 
 static void shellHandleStatusSignal(int signo) {
+    /* With no job control a command is in the shell's group. If a key did this the shell has it
+     * too and acts on it when it looks, and if nothing was sent to the shell, it is not its concern. */
+    if ((signo == SIGINT || signo == SIGQUIT || signo == SIGTSTP) && !shellMonitorOn()) {
+        return;
+    }
     shellHandleSignalCommon(signo, true);
 }
 
@@ -1277,6 +1301,10 @@ static uint32_t shellRuntimeCaughtSignals(int owner) {
     int fatal = vprocDeliverTaskSignals(owner);
     if (fatal > 0) {
         vprocNoteCaughtSignal(owner, fatal);
+    }
+    /* Off a prompt Ctrl-C is this shell's as much as its command's. */
+    if ((!shellRuntimeIsInteractive() || gShellRuntime.in_subshell) && vprocTakePendingSignal(owner, SIGINT)) {
+        vprocNoteCaughtSignal(owner, SIGINT);
     }
     return vprocCaughtSignals(owner);
 }
@@ -1303,8 +1331,8 @@ static bool shellRuntimeSignalEndsSubstitution(int signo) {
     }
 #if defined(PSCAL_TARGET_IOS)
     if (shellRuntimeInSubstitution() && shellRuntimeGetSignalTrapAction(signo) == SHELL_TRAP_ACTION_DEFAULT &&
-        signo != SIGINT && signo != SIGQUIT && signo != SIGTSTP) {
-        return signo != SIGTERM || !shellRuntimeIsInteractive();
+        signo != SIGQUIT && signo != SIGTSTP) {
+        return (signo != SIGTERM && signo != SIGINT) || !shellRuntimeIsInteractive();
     }
 #endif
     return false;
@@ -1374,6 +1402,32 @@ void shellRuntimeProcessPendingSignals(void) {
     }
 }
 
+static bool shellRuntimeInterruptPending(void) {
+#if defined(PSCAL_TARGET_IOS)
+    return (shellRuntimeCaughtSignals(shellRuntimeOwnPid()) & (1u << SIGINT)) != 0;
+#else
+    return gShellPendingSignals[SIGINT] != 0;
+#endif
+}
+
+/* The command the shell waited for has ended, and with no job control Ctrl-C reached them both. If
+ * the command did not die of it, it dealt with it, and the shell goes on as bash's does: a trap still
+ * runs. One that was waiting before the command started was never the command's. A substitution is
+ * a process under bash, and a shell reading from it dies at once. */
+static void shellRuntimeSettleInterrupt(bool pending_at_start, bool command_died_of_it) {
+    if (pending_at_start || command_died_of_it || gShellCommandSubFrame || shellMonitorOn() ||
+        shellRuntimeGetSignalTrapAction(SIGINT) == SHELL_TRAP_ACTION_COMMAND) {
+        return;
+    }
+#if defined(PSCAL_TARGET_IOS)
+    if (shellRuntimeInterruptPending()) {
+        (void)vprocTakeCaughtSignal(shellRuntimeOwnPid(), SIGINT);
+    }
+#else
+    gShellPendingSignals[SIGINT] = 0;
+#endif
+}
+
 /* What `wait` stops for: a signal with a trap, one that ends the shell, or Ctrl-C. */
 static int shellRuntimeSignalEndingWait(void) {
 #if defined(PSCAL_TARGET_IOS)
@@ -1426,9 +1480,32 @@ void shellRuntimeInitSignals(void) {
     action.sa_handler = shellSignalHandler;
     action.sa_flags |= SA_RESTART;
 
-    sigaction(SIGINT, &action, NULL);
-    sigaction(SIGQUIT, &action, NULL);
-    sigaction(SIGTSTP, &action, NULL);
+#if defined(PSCAL_TARGET_IOS)
+    /* A job with no job control has these ignored, and a shell it runs them with. */
+    const int keys[] = {SIGINT, SIGQUIT};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
+        struct sigaction current;
+        if (sigaction(keys[i], NULL, &current) != 0 || current.sa_handler != SIG_IGN) {
+            sigaction(keys[i], &action, NULL);
+        }
+    }
+    /* Off a prompt a shell stops with its commands, or nothing gives the terminal back. Except on
+     * the prompt's own thread, which cannot park: it ends, and the prompt shows it stopped. */
+    VProc *self = vprocCurrent();
+    if (shellRuntimeIsInteractive() || !self || vprocGetStopUnsupported(vprocPid(self))) {
+        sigaction(SIGTSTP, &action, NULL);
+    } else {
+        action.sa_handler = SIG_DFL;
+        sigaction(SIGTSTP, &action, NULL);
+    }
+#else
+    /* What it started with ignored stays so, for this shell and what it runs. */
+    (void)action;
+    gShellKeySignalsInstalled = true;
+    (void)shellRuntimeInstallSignalAction(SIGINT, shellRuntimeGetSignalTrapAction(SIGINT));
+    (void)shellRuntimeInstallSignalAction(SIGQUIT, shellRuntimeGetSignalTrapAction(SIGQUIT));
+    (void)shellRuntimeInstallSignalAction(SIGTSTP, shellRuntimeGetSignalTrapAction(SIGTSTP));
+#endif
 }
 
 static bool shellHistoryEnsureCapacity(size_t needed) {
@@ -2593,6 +2670,7 @@ static void shellBodyScopeEnter(ShellBodyState *state, ShellBodyScope *scope) {
     VProc *self = vprocCurrent();
     if (self) {
         vprocSetSubshellPid(vprocPid(self));
+        vprocSetShellTask(vprocPid(self), true);
     }
     if (state->cwd[0]) {
         (void)vprocChdirShim(state->cwd);
@@ -3076,7 +3154,7 @@ static void shellFreeJob(ShellJob *job) {
             }
         }
     }
-    if (job->pgid > 0) {
+    if (shellGroupIsItsOwn(job->pgid)) {
         vprocSetJobId(job->pgid, 0);
         vprocSetCommandLabel(job->pgid, NULL);
     }
@@ -3355,7 +3433,9 @@ static ShellJob *shellRegisterJob(pid_t pgid, const pid_t *pids, size_t pid_coun
      * numbers of its own does neither: its jobs share its group, whose row holds the number its
      * shell gave it. */
     bool own_numbers = shellNumbersItsOwnJobs();
-    int job_id = own_numbers ? 0 : vprocGetJobId(pgid);
+    /* A group's row is the job's only if the group is. */
+    bool own_group = shellGroupIsItsOwn(pgid);
+    int job_id = (own_numbers || !own_group) ? 0 : vprocGetJobId(pgid);
     if (!own_numbers && job_id <= 0 && pid_count > 0) {
         job_id = vprocGetJobId(pids[0]);
     }
@@ -3391,7 +3471,9 @@ static ShellJob *shellRegisterJob(pid_t pgid, const pid_t *pids, size_t pid_coun
     if (job_id <= 0) {
         job_id = (int)shellAllocateJobId();
         if (!own_numbers) {
-            vprocSetJobId(pgid, job_id);
+            if (own_group) {
+                vprocSetJobId(pgid, job_id);
+            }
             for (size_t i = 0; i < pid_count; ++i) {
                 vprocSetJobId(pids[i], job_id);
             }
@@ -3438,7 +3520,9 @@ static ShellJob *shellRegisterJob(pid_t pgid, const pid_t *pids, size_t pid_coun
             }
         }
     }
-    vprocSetCommandLabel(pgid, summary);
+    if (own_group) {
+        vprocSetCommandLabel(pgid, summary);
+    }
     job->running = true;
     job->stopped = false;
     job->disowned = false;
@@ -3474,7 +3558,8 @@ static bool shellJobSendSignal(const ShellJob *job, int signo, bool prefer_group
         return false;
     }
     bool delivered = false;
-    if (prefer_group && job->pgid > 0) {
+    prefer_group = prefer_group && shellGroupIsItsOwn(job->pgid);
+    if (prefer_group) {
         if (shellJobControlSendPgid(job->pgid, signo) == 0) {
             delivered = true;
         }

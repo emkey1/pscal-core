@@ -572,6 +572,15 @@ int vprocHandlerTaskPid(void);
 void vprocNoteCaughtSignal(int pid, int sig);
 uint32_t vprocCaughtSignals(int pid);
 bool vprocTakeCaughtSignal(int pid, int sig);
+/* SIGINT stays blocked across the app for what polls it, on every task. A shell that is not at a
+ * prompt takes its own at a command boundary with this, on its main thread. */
+bool vprocTakePendingSignal(int pid, int sig);
+/* What exec does: a caught signal goes back to its default, an ignored one stays. For a command the
+ * shell starts. SIGINT and SIGQUIT stay as they are: the shell's commands poll SIGINT. */
+void vprocDefaultCaughtActions(int pid);
+/* The signal that killed the current task, if its thread is still to unwind, or 0. A command on the
+ * shell's own thread is never cancelled, so it has to ask. */
+int vprocCurrentDyingSignal(void);
 /* A shell's task: a signal that would end it waits for vprocDeliverTaskSignals, since cancelling
  * the thread would leave whatever the shell holds, and what started it waiting. */
 void vprocSetUnwindsItself(int pid, bool enabled);
@@ -581,6 +590,9 @@ int vprocHaltSession(void);
 bool vprocTaskHalting(int pid);
 /* A shell started on another shell's thread, as a script run inline is: it can't be cancelled either. */
 void vprocUnwindAsThreadDoes(int pid);
+/* A shell runs under this task, off the prompt's thread. A fatal signal it sends itself waits like
+ * the prompt's own: for vprocDeliverTaskSignals. One from elsewhere cancels the thread as usual. */
+void vprocSetShellTask(int pid, bool enabled);
 /* What this task does is the parent's own work, so no SIGCHLD for it. */
 void vprocSetSilentToParent(int pid, bool silent);
 /* A stage that only does the shell's own work, as `.` and `eval` do: getppid in what it starts gives
@@ -1099,10 +1111,14 @@ static inline int vprocHandlerTaskPid(void) { return 0; }
 static inline void vprocNoteCaughtSignal(int pid, int sig) { (void)pid; (void)sig; }
 static inline uint32_t vprocCaughtSignals(int pid) { (void)pid; return 0; }
 static inline bool vprocTakeCaughtSignal(int pid, int sig) { (void)pid; (void)sig; return false; }
+static inline bool vprocTakePendingSignal(int pid, int sig) { (void)pid; (void)sig; return false; }
+static inline void vprocDefaultCaughtActions(int pid) { (void)pid; }
+static inline int vprocCurrentDyingSignal(void) { return 0; }
 static inline void vprocSetUnwindsItself(int pid, bool enabled) { (void)pid; (void)enabled; }
 static inline int vprocHaltSession(void) { return -1; }
 static inline bool vprocTaskHalting(int pid) { (void)pid; return false; }
 static inline void vprocUnwindAsThreadDoes(int pid) { (void)pid; }
+static inline void vprocSetShellTask(int pid, bool enabled) { (void)pid; (void)enabled; }
 static inline void vprocSetSilentToParent(int pid, bool silent) { (void)pid; (void)silent; }
 static inline void vprocSetNotAProcess(int pid) { (void)pid; }
 static inline void vprocResetCaughtSignals(int pid) { (void)pid; }

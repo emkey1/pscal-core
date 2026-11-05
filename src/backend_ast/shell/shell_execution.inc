@@ -487,6 +487,10 @@ static VProc *shellCreateVProcForStage(int stdin_host,
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
     VProc *parent = vprocPinCurrent();
     VProc *vp = shellMakeStageVProc(stdin_host, stdout_host, stderr_host, cols, rows, pid_hint, inherit_pscal_stdio);
+    if (vp) {
+        /* A trap is the shell's. With no job control a group signal reaches this too. */
+        vprocDefaultCaughtActions(vprocPid(vp));
+    }
     vprocUnpin(parent);
     pthread_setcancelstate(cancel_state, NULL);
     return vp;
@@ -1638,6 +1642,13 @@ static int shellRedirOpOpenOrExit(const ShellRuntimeRedirOp *op) {
     return fd;
 }
 
+static void shellChildDefaultSignal(int signo) {
+    struct sigaction current;
+    if (sigaction(signo, NULL, &current) != 0 || current.sa_handler != SIG_IGN) {
+        signal(signo, SIG_DFL);
+    }
+}
+
 static int shellSpawnProcess(VM *vm,
                              const ShellCommand *cmd,
                              int stdin_fd,
@@ -1776,6 +1787,7 @@ static int shellSpawnProcess(VM *vm,
         shellCollectJobs();
     }
     shellFinishedJobsForgetWaited();
+    bool own_group = shellMonitorOn();
     /* The child reaches its own exit with a copy of whatever is still buffered. */
     shellFlushStandardStreams();
     /* A job's own command has nothing to come back to: it takes the job's process, which is what
@@ -1792,7 +1804,7 @@ static int shellSpawnProcess(VM *vm,
             if (ctx->active && ctx->pgid > 0) {
                 desired_pgid = ctx->pgid;
             }
-            if (!gShellRuntime.in_subshell && setpgid(0, desired_pgid) != 0) {
+            if (own_group && setpgid(0, desired_pgid) != 0) {
                 /* best-effort; ignore errors */
             }
 
@@ -1802,8 +1814,10 @@ static int shellSpawnProcess(VM *vm,
                 signal(SIGINT, SIG_IGN);
                 signal(SIGQUIT, SIG_IGN);
             } else {
-                signal(SIGINT, SIG_DFL);
-                signal(SIGQUIT, SIG_DFL);
+                /* What the shell ignores stays ignored: `trap ""`, what it started with, and for
+                 * all that a job with no job control runs, Ctrl-C and Ctrl-\. */
+                shellChildDefaultSignal(SIGINT);
+                shellChildDefaultSignal(SIGQUIT);
             }
             signal(SIGTSTP, SIG_DFL);
             signal(SIGTTIN, SIG_DFL);
@@ -1943,6 +1957,14 @@ static int shellSpawnProcess(VM *vm,
             /* They are done. A builtin or a function would open them again: `f 2>&1 > out` sent
              * both streams to out, and under `set -C` the second open failed. */
             shellFreeRedirections((ShellCommand *)cmd);
+            /* A subshell is a shell. It waits for its command, and Ctrl-C ends it if that ends the command. */
+            if (cmd->body) {
+                struct sigaction current;
+                if (sigaction(SIGINT, NULL, &current) == 0 && current.sa_handler != SIG_IGN) {
+                    shellRuntimeSetExitOnSignal(true);
+                    (void)shellRuntimeInstallSignalAction(SIGINT, SHELL_TRAP_ACTION_DEFAULT);
+                }
+            }
             bool builtin_ran = shellInvokeBuiltin(vm ? vm : gShellCurrentVm, (ShellCommand *)cmd);
             if (builtin_ran) {
                 int status = gShellRuntime.last_status;
@@ -2334,6 +2356,13 @@ static bool shellShouldRunCommandInForegroundWorker(const ShellCommand *cmd) {
         }
         return true;
     }
+    /* A shell given something to run at the prompt gets a thread that can park, as a #! script
+     * does: Ctrl-Z stops it and its commands. On the prompt's own thread it could only end. Any
+     * other thread can park as it is, and a kill of what started it takes this shell with it. */
+    if (cmd->argc > 1 && vprocIsShellSelfThread() &&
+        (strcasecmp(name, "sh") == 0 || strcasecmp(name, "exsh") == 0)) {
+        return true;
+    }
     /* Keep shell builtins (fg/bg/jobs/cd/etc.) on the shell thread; they
      * manipulate shell-global state and must not run inside stage workers. */
     if (shellIsBuiltinName(name)) {
@@ -2387,6 +2416,7 @@ typedef struct {
     VM *vm;
     ShellCommand *cmd;
     int synthetic_pid;
+    int pgid; /* the group it joins; its own if not above 0 */
 #if defined(PSCAL_TARGET_IOS)
     VProc *vp;
     ShellRuntimeState *bg_shell_ctx;
@@ -3326,7 +3356,9 @@ static bool shellEnsurePipeline(size_t stages, bool negated) {
         ctx->launched = 0;
         ctx->last_status = 0;
         ctx->background = false;
-        ctx->pgid = -1;
+        /* With no job control its stages stay in this shell's group, which the terminal signals. */
+        ctx->pgid = shellMonitorOn() ? -1 : shellOwnGroup();
+        ctx->interrupt_pending_at_start = shellRuntimeInterruptPending();
 #if defined(PSCAL_TARGET_IOS)
         ctx->in_process = true;
         ctx->in_process_worker = false;
@@ -3335,10 +3367,6 @@ static bool shellEnsurePipeline(size_t stages, bool negated) {
          * that vproc, which is gone the moment the owner is killed. */
         ctx->window_cols = pscalRuntimeDetectWindowCols();
         ctx->window_rows = pscalRuntimeDetectWindowRows();
-        if (gShellRuntime.in_subshell && vprocCurrent()) {
-            /* Its stages stay in the subshell's group, which the terminal signals. */
-            ctx->pgid = vprocGetPgid(vprocPid(vprocCurrent()));
-        }
         shellPipelineSessionCloseSpool(ctx);
         shellPipelineSessionSnapshotStdStreams(ctx);
 //    fprintf(stderr, "[pipe] ensure stages=%zu in_process=1\n", stages);
@@ -3464,7 +3492,7 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd) {
     if (ctx->in_process) {
         if (ctx->in_process_worker && !ctx->background) {
             shellEnsureJobControl();
-            bool job_control = gShellRuntime.job_control_enabled && job_pgid > 0;
+            bool job_control = shellMonitorOn() && job_pgid > 0;
             bool stopped_job = false;
             bool saw_state = false;
 
@@ -3478,7 +3506,7 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd) {
                     continue;
                 }
                 ShellWaitResult wait_res;
-                int err = shellWaitPidDetailed(pid, true, &wait_res);
+                int err = shellWaitPidDetailed(pid, job_control, &wait_res);
                 if (err != 0) {
                     continue;
                 }
@@ -3490,6 +3518,7 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd) {
                     ctx->pids[i] = -1;
                 }
             }
+            shellRuntimeSettleInterrupt(ctx->interrupt_pending_at_start, final_status == 128 + SIGINT);
 
             if (job_control) {
                 shellJobControlRestoreForeground();
@@ -3600,10 +3629,16 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd) {
         bool job_control = false;
         if (!ctx->background) {
             shellEnsureJobControl();
-            job_control = gShellRuntime.job_control_enabled && job_pgid > 0;
+            job_control = shellMonitorOn() && job_pgid > 0;
             if (job_control) {
                 shellJobControlRestoreForeground();
             }
+            /* Any stage here: an applet may see the end of its pipe before it sees the signal. */
+            bool died_of_interrupt = final_status == 128 + SIGINT;
+            for (size_t i = 0; ctx->stage_status && i < ctx->stage_count; ++i) {
+                died_of_interrupt = died_of_interrupt || ctx->stage_status[i] == 128 + SIGINT;
+            }
+            shellRuntimeSettleInterrupt(ctx->interrupt_pending_at_start, died_of_interrupt);
             if (final_status >= 128 && final_status < 128 + NSIG) {
                 shellHandleStatusSignal(final_status - 128);
             }
@@ -3641,8 +3676,10 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd) {
 
     if (!ctx->background) {
         shellEnsureJobControl();
-        bool job_control = gShellRuntime.job_control_enabled && job_pgid > 0;
+        bool job_control = shellMonitorOn() && job_pgid > 0;
         bool stopped_job = false;
+        /* As bash 5: a stage that dealt with Ctrl-C speaks for the whole pipeline. */
+        bool died_of_interrupt = ctx->launched > 0;
 
         if (job_control) {
             shellJobControlSetForeground(job_pgid);
@@ -3656,7 +3693,7 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd) {
                 continue;
             }
             if (gShellExitRequested || gShellRuntime.break_requested) {
-                if (ctx->pgid > 0) {
+                if (ctx->pgid > 0 && shellGroupIsItsOwn(ctx->pgid)) {
                     shellJobControlSendPgid(ctx->pgid, SIGTERM);
                 } else {
                     shellJobControlSendPid(pid, SIGTERM);
@@ -3672,6 +3709,8 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd) {
                 stopped_job = true;
                 final_status = wait_res.status_mapped;
             } else {
+                died_of_interrupt = died_of_interrupt && WIFSIGNALED(wait_res.status_raw) &&
+                                    WTERMSIG(wait_res.status_raw) == SIGINT;
                 final_status = shellPipelineNextStatus(final_status, wait_res.status_mapped);
                 ctx->pids[i] = -1;
                 if (i < SHELL_PIPESTATUS_MAX) {
@@ -3681,6 +3720,7 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd) {
             }
         }
         gShellPipeStatusFresh = ctx->launched > 0;
+        shellRuntimeSettleInterrupt(ctx->interrupt_pending_at_start, died_of_interrupt);
 
         if (job_control) {
             shellJobControlRestoreForeground();
@@ -4791,7 +4831,7 @@ static bool shellDispatchSmallclueAppletInProcess(VM *vm, ShellCommand *cmd) {
     memset(&vproc_scope, 0, sizeof(vproc_scope));
     int saved_fg_pgid = -1;
     int session_sid = -1;
-    bool inherit_pgid = false;
+    bool inherit_pgid = !shellMonitorOn();
     bool run_scoped = vprocIsShellSelfThread();
     if (run_scoped) {
         /* Worker-stage applets already have an owning vproc. */
@@ -4819,7 +4859,7 @@ static bool shellDispatchSmallclueAppletInProcess(VM *vm, ShellCommand *cmd) {
         if (shell_pid > 0) {
             session_sid = vprocGetSid(shell_pid);
         }
-        if (session_sid > 0 && scope_pgid > 0) {
+        if (!inherit_pgid && session_sid > 0 && scope_pgid > 0) {
             saved_fg_pgid = vprocGetForegroundPgid(session_sid);
             if (saved_fg_pgid <= 0) {
                 saved_fg_pgid = vprocGetPgid(shell_pid);
@@ -5159,7 +5199,7 @@ static int shellRunBuiltinInProcess(VM *vm,
                         memset(&vproc_scope, 0, sizeof(vproc_scope));
                         int saved_fg_pgid = -1;
                         int session_sid = -1;
-                        bool inherit_pgid = false;
+                        bool inherit_pgid = !shellMonitorOn();
                         bool run_scoped = vprocIsShellSelfThread();
                         if (run_scoped) {
                             /* Worker-stage applets already have an owning vproc.
@@ -5193,7 +5233,7 @@ static int shellRunBuiltinInProcess(VM *vm,
                             if (shell_pid > 0) {
                                 session_sid = vprocGetSid(shell_pid);
                             }
-                            if (session_sid > 0 && scope_pgid > 0) {
+                            if (!inherit_pgid && session_sid > 0 && scope_pgid > 0) {
                                 saved_fg_pgid = vprocGetForegroundPgid(session_sid);
                                 if (saved_fg_pgid <= 0) {
                                     saved_fg_pgid = vprocGetPgid(shell_pid);
@@ -5472,11 +5512,8 @@ static int shellPipelineRunStage(VM *vm,
     }
 #if defined(PSCAL_TARGET_IOS)
     /* Keep foreground stage groups aligned with job control state. */
-    if (!ctx->background && !cmd->background && shellRuntimeIsInteractive()) {
-        shellEnsureJobControl();
-        if (gShellRuntime.job_control_enabled && ctx->pgid > 0) {
-            shellJobControlSetForeground(ctx->pgid);
-        }
+    if (!ctx->background && !cmd->background && shellMonitorOn() && ctx->pgid > 0) {
+        shellJobControlSetForeground(ctx->pgid);
     }
 #endif
     /* A command alone on this thread is the shell at work: `trap ... CHLD` is not for each of its
@@ -5882,9 +5919,17 @@ static VProc *shellBackgroundStageCreateVProc(ShellBackgroundStageCtx *ctx, cons
     if (shell_sid > 0) {
         vprocSetSid(pid, shell_sid);
     }
-    pid_t group = (ctx->synthetic_pid > 0) ? ctx->synthetic_pid : pid;
-    vprocSetPgid(pid, group);
-    ctx->synthetic_pid = group;
+    vprocSetPgid(pid, ctx->pgid > 0 ? ctx->pgid : pid);
+    ctx->synthetic_pid = pid;
+    /* With no job control it is in the group that gets these keys, and they are not for a job. */
+    if (!shellMonitorOn()) {
+        struct sigaction ignore_action;
+        memset(&ignore_action, 0, sizeof(ignore_action));
+        sigemptyset(&ignore_action.sa_mask);
+        ignore_action.sa_handler = SIG_IGN;
+        (void)vprocSigaction(pid, SIGINT, &ignore_action, NULL);
+        (void)vprocSigaction(pid, SIGQUIT, &ignore_action, NULL);
+    }
     /* Label the vproc for lps/ps visibility. */
     if (cmd->argc > 0 && cmd->argv) {
         char label[96] = {0};
@@ -6186,6 +6231,7 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
             shellStageCaptureState(cloned, cmd, 1);
             bg_ctx->vm = vm;
             bg_ctx->cmd = cloned;
+            bg_ctx->pgid = async_bg_pgid;
             bg_ctx->synthetic_pid = -1;
             if (async_stage_pid > 0) {
                 bg_ctx->synthetic_pid = (int)async_stage_pid;
@@ -6229,7 +6275,7 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
                     shellJobMarkRunning(job);
                     job->last_status = 0;
                 }
-                /* The job's own pid: in a subshell the group is the subshell's. */
+                /* The job's own pid: with no job control the group is the shell's. */
                 gShellRuntime.last_bg_pid = async_stage_pid;
 #if defined(PSCAL_TARGET_IOS)
                 shellPrintJobStarted(job, gShellRuntime.last_bg_pid);
@@ -7179,14 +7225,18 @@ static Value shellRunExpandedCommand(VM *vm, ShellCommand *cmd) {
     if (!cmd->body && cmd->argv && cmd->argv[0] && cmd->argv[0][0] != '\0') {
         shellHashRecordExecution(cmd->argv[0]);
     }
-    bool ignore_job_signals = background_execution &&
-                              (!gShellRuntime.job_control_enabled
-                               );
+    bool own_group = shellMonitorOn();
+    bool ignore_job_signals = background_execution && !own_group;
+    bool interrupt_pending = shellRuntimeInterruptPending();
 
     /* A substitution has no job control, whatever shell it is in. At a prompt this command
-     * would stop on the terminal, and hold the substitution's pipe for as long as it did. */
+     * would stop on the terminal, and hold the substitution's pipe for as long as it did. With
+     * none, a job shares the shell's group and would race it for the keys. A pipeline does not
+     * get this under bash. */
     int terminal_stand_in = -1;
-    if (background_execution && gShellCommandSubFrame && stdin_fd < 0 && isatty(STDIN_FILENO)) {
+    if (background_execution && stdin_fd < 0 &&
+        (gShellCommandSubFrame || (!own_group && (!ctx->active || ctx->stage_count <= 1))) &&
+        isatty(STDIN_FILENO)) {
         terminal_stand_in = open("/dev/null", O_RDONLY);
         stdin_fd = terminal_stand_in;
     }
@@ -7218,8 +7268,8 @@ static Value shellRunExpandedCommand(VM *vm, ShellCommand *cmd) {
         return makeVoid();
     }
 
-    /* Commands in a subshell stay in its process group, the one the terminal knows. */
-    if (gShellRuntime.in_subshell) {
+    /* With no job control a command stays in the shell's group, the one the terminal knows. */
+    if (!own_group) {
         /* nothing to do */
     } else if (ctx->active) {
         pid_t target_pgid = (ctx->pgid > 0) ? ctx->pgid : child;
@@ -7260,7 +7310,7 @@ static Value shellRunExpandedCommand(VM *vm, ShellCommand *cmd) {
         int status = 0;
         if (!cmd->background) {
             shellEnsureJobControl();
-            bool job_control = gShellRuntime.job_control_enabled;
+            bool job_control = own_group;
             bool stopped = false;
             if (job_control) {
                 shellJobControlSetForeground(child);
@@ -7269,6 +7319,8 @@ static Value shellRunExpandedCommand(VM *vm, ShellCommand *cmd) {
             shellWaitPidDetailed(child, job_control, &wait_res_child);
             status = wait_res_child.status_mapped;
             stopped = wait_res_child.stopped;
+            shellRuntimeSettleInterrupt(interrupt_pending, WIFSIGNALED(wait_res_child.status_raw) &&
+                                                               WTERMSIG(wait_res_child.status_raw) == SIGINT);
             if (job_control) {
                 shellJobControlRestoreForeground();
             }
@@ -7294,7 +7346,7 @@ static Value shellRunExpandedCommand(VM *vm, ShellCommand *cmd) {
         pid_t job_pids[1];
         job_pids[0] = child;
         gShellRuntime.last_bg_pid = child;
-        ShellJob *job = shellRegisterJob(child, job_pids, 1, cmd);
+        ShellJob *job = shellRegisterJob(own_group ? child : shellOwnGroup(), job_pids, 1, cmd);
         if (job) {
             shellJobMarkRunning(job);
             job->last_status = 0;

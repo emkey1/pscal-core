@@ -711,6 +711,7 @@ typedef struct {
     bool async;
     int last_status;
     pid_t pgid;
+    bool interrupt_pending_at_start;
 #if defined(PSCAL_TARGET_IOS)
     bool in_process;
     bool in_process_worker;
@@ -775,6 +776,7 @@ typedef struct ShellRuntimeState {
     bool left_stages_running;
     bool in_subshell;
     bool started_as_command; /* a shell inside its caller: the session's jobs are not its own */
+    int monitor_request; /* `set -m` is 1, `set +m` -1, otherwise 0: see shellMonitorOn */
     pid_t subshell_parent_pid; /* $$ in a subshell is its shell's */
     bool body_in_loop; /* iOS: a body started inside a loop, which `break` there has only itself to leave */
     unsigned int random_seed; /* $RANDOM: a job goes on from here, and the shell does not see that */
@@ -3977,6 +3979,7 @@ void shellRuntimeKeepLineState(ShellRuntimeState *line_ctx) {
         shell->field = line_ctx->field; \
         line_ctx->field = held; \
     } while (0)
+    KEEP(monitor_request);
     KEEP(errexit_enabled);
     KEEP(pipefail_enabled);
     KEEP(nounset_enabled);
@@ -4739,7 +4742,13 @@ static int shellRuntimeInstallSignalAction(int signo, ShellTrapAction action) {
     } else if (action == SHELL_TRAP_ACTION_IGNORE) {
         sa.sa_handler = SIG_IGN;
     } else {
-        if (signo == SIGINT || signo == SIGQUIT || signo == SIGTSTP) {
+        bool shell_takes_it = signo == SIGINT || signo == SIGQUIT;
+#if defined(PSCAL_TARGET_IOS)
+        shell_takes_it = shell_takes_it || signo == SIGTSTP;
+#else
+        shell_takes_it = shell_takes_it || (signo == SIGTSTP && shellRuntimeIsInteractive());
+#endif
+        if (shell_takes_it) {
             sa.sa_handler = shellSignalHandler;
             sa.sa_flags |= SA_RESTART;
         } else {
@@ -4889,6 +4898,11 @@ bool shellRuntimePosixMode(void) {
     return gShellRuntime.posix_mode;
 }
 
+#if !defined(PSCAL_TARGET_IOS)
+/* Set by shellRuntimeInitSignals. Before that, what it started with is still to be noted. */
+static bool gShellKeySignalsInstalled = false;
+#endif
+
 void shellRuntimeSetInteractive(bool interactive) {
     /* Scripts expand aliases only after shopt -s expand_aliases; a person at a prompt
      * always starts with them on. */
@@ -4899,11 +4913,41 @@ void shellRuntimeSetInteractive(bool interactive) {
         }
     }
     gShellInteractiveMode = interactive;
+#if defined(PSCAL_TARGET_IOS)
+    if (interactive) {
+        struct sigaction action;
+        memset(&action, 0, sizeof(action));
+        sigemptyset(&action.sa_mask);
+        action.sa_handler = shellSignalHandler;
+        action.sa_flags |= SA_RESTART;
+        sigaction(SIGTSTP, &action, NULL);
+    }
+#else
+    /* At a prompt the shell keeps SIGTSTP to itself. Anywhere else it is in the group Ctrl-Z
+     * reaches and stops with its commands, so whatever started it gets the terminal back. */
+    if (interactive) {
+        /* And a prompt takes these keys whatever it started with. */
+        const int keys[] = {SIGINT, SIGQUIT, SIGTSTP};
+        for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
+            if (gShellSignalIgnoredOnEntry[keys[i]]) {
+                gShellSignalIgnoredOnEntry[keys[i]] = false;
+                gShellSignalTraps[keys[i]].action = SHELL_TRAP_ACTION_DEFAULT;
+                (void)shellRuntimeInstallSignalAction(keys[i], SHELL_TRAP_ACTION_DEFAULT);
+            }
+        }
+    }
+    if (gShellKeySignalsInstalled) {
+        (void)shellRuntimeInstallSignalAction(SIGTSTP, shellRuntimeGetSignalTrapAction(SIGTSTP));
+    }
+#endif
 }
 
 bool shellRuntimeIsInteractive(void) {
     return gShellInteractiveMode;
 }
+
+static bool shellMonitorShown(void);
+static bool shellMonitorOn(void);
 
 /* $-: the letters in bash's order. These are the options this shell tracks, and the
  * ones it reports as always on, as a bash script sees them (`hB`). */
@@ -4923,7 +4967,7 @@ static char *shellRuntimeOptionFlags(void) {
     if (shellRuntimeIsInteractive()) {
         flags[count++] = 'i';
     }
-    if (shellRuntimeIsInteractive() && gShellRuntime.job_control_enabled) {
+    if (shellMonitorShown()) {
         flags[count++] = 'm';
     }
     if (gShellRuntime.nounset_enabled) {
@@ -5752,6 +5796,7 @@ static ShellRuntimeState *shellRuntimeCreateProgramContext(void) {
     ctx->last_bg_pid = 0;
     ctx->loops_around = 0;
     ctx->started_as_command = true;
+    ctx->monitor_request = 0;
     for (size_t i = 0; i < ctx->dir_stack_count; ++i) {
         free(ctx->dir_stack[i]);
     }
@@ -5787,9 +5832,13 @@ typedef struct {
     ShellRuntimeState *previous;
     ShellVariableAttribute *attributes;
     size_t attribute_count;
+    bool interactive;
 } ShellProgramScope;
 
 static void shellProgramScopeEnter(ShellProgramScope *scope) {
+    /* A script run as a command is at no prompt, whichever thread runs it. It has no job control. */
+    scope->interactive = shellRuntimeIsInteractive();
+    shellRuntimeSetInteractive(false);
     scope->ctx = shellRuntimeCreateProgramContext();
     scope->previous = scope->ctx ? shellRuntimeActivateContext(scope->ctx) : NULL;
     scope->attributes = gShellVariableAttributes;
@@ -5810,6 +5859,7 @@ static void shellProgramScopeLeave(ShellProgramScope *scope) {
     free(gShellVariableAttributes);
     gShellVariableAttributes = scope->attributes;
     gShellVariableAttributeCount = scope->attribute_count;
+    shellRuntimeSetInteractive(scope->interactive);
 }
 
 /* A subshell sees the locals of the function it was started in, and what it does to them
@@ -6463,13 +6513,18 @@ static SHELL_JC_UNUSED void shellJobControlRestoreShellIo(void) {
 static int shellJobControlSendPgid(pid_t pgid, int signo);
 
 static bool shellJobControlDispatchForegroundSignal(int signo) {
-    if (!gShellRuntime.job_control_enabled || gShellJobControlCtx.fg_pgid <= 0) {
+    if (!shellMonitorOn() || gShellJobControlCtx.fg_pgid <= 0) {
         return false;
     }
     if (signo == SIGTSTP && !shellJobControlSupportsStops()) {
         return false;
     }
     return shellJobControlSendPgid(gShellJobControlCtx.fg_pgid, signo) == 0;
+}
+
+static bool shellJobControlAllowedHeadless(void) {
+    return gShellRuntime.monitor_request > 0 || getenv("RUN_VPROC_TESTS") != NULL ||
+           getenv("PSCALI_SHELL_VPROC") != NULL;
 }
 
 static void shellInitJobControlState(void) {
@@ -6483,9 +6538,8 @@ static void shellInitJobControlState(void) {
 
     /* In automated harness runs we sometimes need job control without a real
      * TTY (non-interactive pipelines). Allow RUN_VPROC_TESTS/PSCALI_SHELL_VPROC
-     * to bypass TTY requirements on all platforms. */
-    bool allow_headless_jc = getenv("RUN_VPROC_TESTS") != NULL ||
-                             getenv("PSCALI_SHELL_VPROC") != NULL;
+     * to bypass TTY requirements on all platforms. `set -m` asks for it anywhere. */
+    bool allow_headless_jc = shellJobControlAllowedHeadless();
 
     if (gShellRuntime.tty_fd < 0) {
         gShellRuntime.tty_fd = -1;
@@ -6544,11 +6598,11 @@ static void shellInitJobControlState(void) {
 }
 
 static void shellEnsureJobControl(void) {
-    bool allow_headless_jc = getenv("RUN_VPROC_TESTS") != NULL ||
-                             getenv("PSCALI_SHELL_VPROC") != NULL;
+    bool allow_headless_jc = shellJobControlAllowedHeadless();
 #if !defined(PSCAL_TARGET_IOS)
-    /* A subshell has none. In one in the background, taking the terminal stopped it for good. */
-    if (gShellRuntime.in_subshell) {
+    /* A subshell has none unless it asked with `set -m`, which a script's subshells keep. In one in
+     * the background, taking the terminal stopped it for good. */
+    if (gShellRuntime.in_subshell && gShellRuntime.monitor_request <= 0) {
         gShellRuntime.job_control_enabled = false;
         gShellRuntime.job_control_caps.has_job_control = false;
         return;
@@ -6615,6 +6669,11 @@ static void shellEnsureJobControl(void) {
             gShellRuntime.job_control_enabled = true;
             return;
         }
+        /* A job with job control inside it (`set -m`) stays in the background. */
+        if (gShellRuntime.in_subshell) {
+            gShellRuntime.job_control_enabled = true;
+            return;
+        }
         if (tcsetpgrp(gShellRuntime.tty_fd, pgid) != 0) {
             if (errno == EINTR) {
                 continue;
@@ -6625,6 +6684,41 @@ static void shellEnsureJobControl(void) {
             return;
         }
     }
+}
+
+/* What `$-` and `set -o` say: what was asked for, or a shell at a prompt on a terminal. */
+static bool shellMonitorShown(void) {
+    if (gShellRuntime.monitor_request != 0) {
+        return gShellRuntime.monitor_request > 0;
+    }
+    return !gShellRuntime.in_subshell && shellRuntimeIsInteractive() && gShellRuntime.job_control_enabled;
+}
+
+/* Job control as bash means it. On, a command gets a group of its own and the terminal. Off, in
+ * a script, a subshell or a shell with no terminal, it stays in this shell's group, the one the
+ * terminal knows and `kill 0` names, so a key reaches the shell and its command alike.
+ * RUN_VPROC_TESTS turns on the rest of the machinery for a script, and not this. */
+static bool shellMonitorOn(void) {
+    if (gShellRuntime.monitor_request == 0 && !gShellRuntime.in_subshell && shellRuntimeIsInteractive()) {
+        shellEnsureJobControl();
+    }
+    return shellMonitorShown();
+}
+
+/* The group this shell's commands are in when they have none of their own. */
+static pid_t shellOwnGroup(void) {
+#if defined(PSCAL_TARGET_IOS)
+    VProc *vp = vprocCurrent();
+    int pid = vp ? vprocPid(vp) : vprocGetShellSelfPid();
+    return (pid_t)(pid > 0 ? vprocGetPgid(pid) : -1);
+#else
+    return getpgrp();
+#endif
+}
+
+/* A job started with no job control shares the shell's group: to reach it, signal its commands. */
+static bool shellGroupIsItsOwn(pid_t pgid) {
+    return pgid > 0 && pgid != shellOwnGroup();
 }
 
 static void shellJobControlSetForeground(pid_t pgid) {

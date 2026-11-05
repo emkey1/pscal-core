@@ -3302,10 +3302,11 @@ static int shellRunToolInlineWithRestore(ShellToolEntryFn entry,
     int shell_pid_for_stop = vprocGetShellSelfPid();
     int stage_pid_for_stop = prev_vproc ? vprocPid(prev_vproc) : -1;
     bool cooperative_stop_scope = false;
+    /* A shell's thread parks when it is stopped, unless that is the prompt's. */
     if (prev_vproc &&
         stage_pid_for_stop > 0 &&
         stage_pid_for_stop != shell_pid_for_stop &&
-        (pipeline_inline_stage || target_kind != FRONTEND_KIND_SHELL)) {
+        ((pipeline_inline_stage && vprocIsShellSelfThread()) || target_kind != FRONTEND_KIND_SHELL)) {
         /* Frontend stages run inside synthetic vprocs; keep SIGTSTP
          * cooperative so Ctrl-Z can unwind to shell instead of parking the
          * stage thread in a hard-stop wait. */
@@ -5489,8 +5490,8 @@ static bool shellReadTakeInterrupt(void) {
 #endif
 
 /* Up to a delimiter (-1 for none) or a number of bytes (-1 for no limit). */
-static ShellReadLineResult shellReadUntil(int fd, int delimiter, long limit, double timeout, char **out_line,
-                                          size_t *out_length) {
+static ShellReadLineResult shellReadUntilInner(int fd, int delimiter, long limit, double timeout, char **out_line,
+                                               size_t *out_length) {
     *out_line = NULL;
     *out_length = 0;
     if (fd < 0) {
@@ -5521,6 +5522,15 @@ static ShellReadLineResult shellReadUntil(int fd, int delimiter, long limit, dou
                 if (shellReadTakeInterrupt()) {
                     free(buffer);
                     return SHELL_READ_LINE_INTERRUPTED;
+                }
+#else
+                /* A trap runs and the read goes on, as under bash. Anything else ends it. */
+                if (gShellPendingSignals[SIGINT]) {
+                    shellRuntimeProcessPendingSignals();
+                    if (gShellExitRequested || (gShellCurrentVm && gShellCurrentVm->exit_requested)) {
+                        free(buffer);
+                        return SHELL_READ_LINE_INTERRUPTED;
+                    }
                 }
 #endif
                 continue;
@@ -5554,6 +5564,19 @@ static ShellReadLineResult shellReadUntil(int fd, int delimiter, long limit, dou
     *out_line = buffer;
     *out_length = length;
     return SHELL_READ_LINE_OK;
+}
+
+static ShellReadLineResult shellReadUntil(int fd, int delimiter, long limit, double timeout, char **out_line,
+                                          size_t *out_length) {
+#if !defined(PSCAL_TARGET_IOS)
+    /* The handler restarts calls, which would leave Ctrl-C waiting for a line. */
+    siginterrupt(SIGINT, 1);
+#endif
+    ShellReadLineResult result = shellReadUntilInner(fd, delimiter, limit, timeout, out_line, out_length);
+#if !defined(PSCAL_TARGET_IOS)
+    siginterrupt(SIGINT, 0);
+#endif
+    return result;
 }
 
 static const char *shellReadResolveIFS(void) {
@@ -10547,14 +10570,21 @@ static bool shellSetOptionByName(const char *name, bool enable) {
             shellRuntimeSetPosixMode(enable);
             return true;
         }
+        if (strcmp(table[i].name, "monitor") == 0) {
+            /* What a command's group follows, and what fg and bg ask. */
+            gShellRuntime.monitor_request = enable ? 1 : -1;
+            gShellRuntime.monitor_enabled = enable;
+            if (enable) {
+                gShellRuntime.job_control_gone = false;
+                shellEnsureJobControl();
+            }
+            return true;
+        }
         if (!table[i].flag) {
             gShellSetRemembered[i] = enable;
             return true;
         }
         *table[i].flag = table[i].inverted ? !enable : enable;
-        if (strcmp(table[i].name, "monitor") == 0 && enable) {
-            gShellRuntime.job_control_gone = false;
-        }
         if (strcmp(table[i].name, "errexit") == 0) {
             gShellRuntime.errexit_pending = false;
             gShellRuntime.errexit_defer_active = false;
@@ -12799,8 +12829,9 @@ static bool shellKillSignalJob(VM *vm, const char *spec_text, size_t index, int 
                      !(signo == SIGTSTP || signo == SIGSTOP || signo == SIGTTIN || signo == SIGTTOU || signo == SIGCONT);
     bool allow_headless_jc = getenv("RUN_VPROC_TESTS") != NULL ||
                              getenv("PSCALI_SHELL_VPROC") != NULL;
+    bool own_group = shellGroupIsItsOwn(job->pgid);
     if (probe) {
-        if (job->pgid > 0 && shellJobControlSendPgid(job->pgid, 0) == 0) {
+        if (own_group && shellJobControlSendPgid(job->pgid, 0) == 0) {
             return true;
         }
         for (size_t i = 0; i < job->pid_count; ++i) {
@@ -12823,16 +12854,18 @@ static bool shellKillSignalJob(VM *vm, const char *spec_text, size_t index, int 
         fprintf(stderr, "kill: %s: no associated processes\n", spec_text ? spec_text : "job");
         return false;
     }
-    bool use_group_kill = terminate && job->pgid > 0;
+    bool use_group_kill = terminate && own_group;
 #if defined(PSCAL_TARGET_IOS)
     /* iOS/vproc mode should only target tracked job members. Group-directed
      * delivery can leak to non-job tasks when synthetic pgid mappings drift.
      */
     use_group_kill = false;
 #endif
+    bool group_sent = false;
     if (use_group_kill) {
         /* Deliver to the whole synthetic group; safer for pipelines and job-spec parity. */
         if (shellJobControlSendPgid(job->pgid, signo) == 0) {
+            group_sent = true;
             sent = true;
         }
     }
@@ -12842,7 +12875,7 @@ static bool shellKillSignalJob(VM *vm, const char *spec_text, size_t index, int 
         if (pid <= 0) {
             continue;
         }
-        if (!terminate || !sent) {
+        if (!terminate || !group_sent) {
             /* If group kill failed or we are delivering non-terminating signals, send per-pid. */
             if (shellJobControlSendPid(pid, signo) != 0) {
 #if defined(PSCAL_TARGET_IOS)
@@ -13062,6 +13095,12 @@ Value vmBuiltinShellKill(VM *vm, int arg_count, Value *args) {
         return makeVoid();
     }
 
+    /* `kill -TERM -- -123`: the signal ended the options, and this says so again. */
+    if (operand_start < arg_count && VALUE_TYPE(args[operand_start]) == TYPE_STRING &&
+        AS_STRING(args[operand_start]) && strcmp(AS_STRING(args[operand_start]), "--") == 0) {
+        ++operand_start;
+    }
+
     if (operand_start >= arg_count) {
         fprintf(stderr, "kill: missing operand\n");
         shellUpdateStatus(1);
@@ -13113,22 +13152,7 @@ Value vmBuiltinShellKill(VM *vm, int arg_count, Value *args) {
         int rc = 0;
         pid_t target_pid = (pid_t)pid_value;
         if (target_pid < 0) {
-            pid_t pgid = -target_pid;
-            bool any = false;
-            for (size_t j = 0; j < gShellJobCount; ++j) {
-                ShellJob *job = &gShellJobs[j];
-                if (job->pgid == pgid) {
-                    for (size_t k = 0; k < job->pid_count; ++k) {
-                        if (job->pids[k] > 0) {
-                            any = true;
-                            shellJobControlSendPid(job->pids[k], signal_number);
-                        }
-                    }
-                }
-            }
-            if (!any) {
-                rc = shellJobControlSendPgid(pgid, signal_number);
-            }
+            rc = shellJobControlSendPgid(-target_pid, signal_number);
         }
         /* The shell's own group. shellJobControlSendPid takes 0 for a job that has no group yet. */
         else if (target_pid == 0) {
@@ -13334,7 +13358,7 @@ Value vmBuiltinShellFg(VM *vm, int arg_count, Value *args) {
         shellUpdateStatus(1);
         return makeVoid();
     }
-    bool job_control = gShellRuntime.job_control_enabled && job->pgid > 0;
+    bool job_control = shellMonitorOn() && job->pgid > 0;
     if (job_control) {
         shellJobControlSetForeground(job->pgid);
     }
@@ -14027,7 +14051,7 @@ Value vmBuiltinShellPs(VM *vm, int arg_count, Value *args) {
                     continue;
                 }
                 ShellJob *job = shellFindJobByPid((pid_t)snap->pid);
-                pid_t pgid = (job && job->pgid > 0) ? job->pgid : snap->pid;
+                pid_t pgid = snap->pgid > 0 ? snap->pgid : ((job && job->pgid > 0) ? job->pgid : snap->pid);
                 const char *cmd = shellPsCommandForEntry(job, snap);
                 const char *state = shellPsStateForEntry(job, snap);
                 shellPsPrintLineTree(snap, pgid, state, cmd, row->depth);
@@ -14045,7 +14069,7 @@ Value vmBuiltinShellPs(VM *vm, int arg_count, Value *args) {
                 continue;
             }
             ShellJob *job = shellFindJobByPid((pid_t)snap->pid);
-            pid_t pgid = (job && job->pgid > 0) ? job->pgid : snap->pid;
+            pid_t pgid = snap->pgid > 0 ? snap->pgid : ((job && job->pgid > 0) ? job->pgid : snap->pid);
             const char *cmd = shellPsCommandForEntry(job, snap);
             const char *state = shellPsStateForEntry(job, snap);
             shellPsPrintLine((pid_t)snap->pid, pgid, state, snap->rusage_utime, snap->rusage_stime, cmd);

@@ -65,6 +65,8 @@ void shellCwdScopeEnter(ShellCwdScope *scope) {
     scope->saved_subshell_pid = vprocSubshellPid();
     vprocSetSubshellPid(vprocPid(vp));
     vprocUnwindAsThreadDoes(vprocPid(vp));
+    scope->shell_task = vprocPid(vp);
+    vprocSetShellTask(scope->shell_task, true);
 #endif
     char cwd[PATH_MAX];
     scope->cwd = SHELL_GETCWD(cwd, sizeof(cwd)) ? strdup(cwd) : NULL;
@@ -90,6 +92,7 @@ void shellCwdScopeLeave(ShellCwdScope *scope) {
     }
     SHELL_UMASK(scope->mask);
 #if defined(PSCAL_TARGET_IOS)
+    vprocSetShellTask(scope->shell_task, false);
     vprocSetSubshellPid(scope->saved_subshell_pid);
 #endif
     if (scope->pwd) {

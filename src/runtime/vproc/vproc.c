@@ -3378,6 +3378,7 @@ typedef struct {
     bool cooperative_stop_wait;
     bool unwinds_itself;
     bool halting;
+    bool shell_task; /* a shell runs under it: what it sends itself waits, as on a thread that unwinds */
     bool silent_to_parent;
     bool not_a_process;
     bool orphaned; /* its parent ended first, so nothing waits for it */
@@ -3452,6 +3453,7 @@ static void vprocSyncForegroundPgidToSessionTty(int sid, int fg_pgid);
 static struct pscal_fd *vprocSessionPscalFdForStd(int fd);
 static void vprocUnregisterThreadByPid(int pid, pthread_t tid);
 static void vprocRegisterStartedThread(int pid, pthread_t tid);
+static void vprocThreadLeavesStarter(void *arg);
 static void vprocScratchTlsCleanupCurrentThread(void);
 static __thread bool gVprocPipelineStage = false;
 static __thread bool gVprocInterruptKeyRead = false;
@@ -4824,7 +4826,7 @@ static bool vprocDeliverPendingSignalsLocked(VProcTaskEntry *entry) {
              * Do not transform this into a hard stop here. */
             continue;
         }
-        if (action == VPROC_SIG_KILL && entry->unwinds_itself) {
+        if (action == VPROC_SIG_KILL && (entry->unwinds_itself || entry->shell_task)) {
             /* vprocDeliverTaskSignals hands it to the task. */
             continue;
         }
@@ -4884,7 +4886,7 @@ static bool vprocCurrentHasInterruptingSignal(void) {
             if (action == VPROC_SIG_IGNORE) {
                 continue;
             }
-            if (action == VPROC_SIG_KILL && entry->unwinds_itself) {
+            if (action == VPROC_SIG_KILL && (entry->unwinds_itself || entry->shell_task)) {
                 /* Stays queued until the task looks, so a retried read would only spin. */
                 continue;
             }
@@ -9073,6 +9075,9 @@ static void *vprocThreadTrampoline(void *arg) {
         vprocEnvActivate(thread_env);
     }
     void *res = NULL;
+    /* Threads share the owning vproc; do not mark the process as exited on
+     * thread teardown. A cancelled thread leaves its starter's list here too. */
+    pthread_cleanup_push(vprocThreadLeavesStarter, (void *)(intptr_t)(vp_activated ? vp_pid : 0));
     pthread_cleanup_push(vprocThreadEnvCleanup, thread_env);
     pthread_cleanup_push(vprocEndAllAbandoned, NULL);
     if (ctx && ctx->start_routine) {
@@ -9080,11 +9085,9 @@ static void *vprocThreadTrampoline(void *arg) {
     }
     pthread_cleanup_pop(0);
     pthread_cleanup_pop(1);
+    pthread_cleanup_pop(1);
 
     if (vp_activated) {
-        /* Threads share the owning vproc; do not mark the process as exited on
-         * thread teardown. */
-        vprocUnregisterThreadByPid(vp_pid, pthread_self());
         vprocDeactivate();
     }
 
@@ -10026,6 +10029,10 @@ static void vprocRegisterStartedThread(int pid, pthread_t tid) {
     }
 }
 
+static void vprocThreadLeavesStarter(void *arg) {
+    vprocUnregisterThreadByPid((int)(intptr_t)arg, pthread_self());
+}
+
 static void vprocUnregisterThreadByPid(int pid, pthread_t tid) {
     if (pid <= 0) {
         return;
@@ -10646,6 +10653,7 @@ static void vprocClearEntryLocked(VProcTaskEntry *entry) {
     entry->pending_signals = 0;
     entry->unwinds_itself = false;
     entry->halting = false;
+    entry->shell_task = false;
     entry->silent_to_parent = false;
     entry->not_a_process = false;
     entry->orphaned = false;
@@ -11081,6 +11089,31 @@ static bool vprocThreadUnwindsItselfLocked(pthread_t tid) {
     return false;
 }
 
+/* A command a shell runs on its own thread is not that thread: killing the command must leave the
+ * shell above it to go on, as its process would under Linux. The command notices it was killed. A
+ * shell the killed task runs, such as `sh` under `timeout`, is below it and ends with it. */
+static bool vprocThreadRunsOtherShellLocked(pthread_t tid, const VProcTaskEntry *killed) {
+    for (size_t i = 0; i < gVProcTasks.count; ++i) {
+        const VProcTaskEntry *entry = &gVProcTasks.items[i];
+        if (entry == killed || entry->pid <= 0 || !entry->shell_task || entry->exited || !entry->tid ||
+            !pthread_equal(entry->tid, tid)) {
+            continue;
+        }
+        int parent = killed->parent_pid;
+        for (int depth = 0; parent > 0 && depth < 64; ++depth) {
+            if (parent == entry->pid) {
+                return true;
+            }
+            const VProcTaskEntry *up = vprocTaskFindLocked(parent);
+            if (!up || up == killed) {
+                break;
+            }
+            parent = up->parent_pid;
+        }
+    }
+    return false;
+}
+
 /* Pending, a stop and a continue cancel each other. A task that opted out of real stops
  * keeps its SIGTSTP: that is how it learns to unwind. */
 static void vprocDropOpposingPendingLocked(VProcTaskEntry *entry, int sig) {
@@ -11175,6 +11208,10 @@ static bool vprocKillDeliverEntryLocked(VProcTaskEntry *entry,
 
     VProcSignalAction action = vprocEffectiveSignalActionLocked(entry, sig);
     bool blocked = vprocSignalBlockedLocked(entry, sig);
+    /* SIGINT is blocked on every task for what polls it. A task that ignores it does not see it. */
+    if (sig == SIGINT && action == VPROC_SIG_IGNORE) {
+        return true;
+    }
     vprocDropOpposingPendingLocked(entry, sig);
     if (sig == SIGCONT && entry->stopped && (blocked || action != VPROC_SIG_CONT)) {
         /* Blocked, caught or ignored, a continue still continues. Only its handler waits. */
@@ -11196,7 +11233,9 @@ static bool vprocKillDeliverEntryLocked(VProcTaskEntry *entry,
         return true;
     }
 
-    if (action == VPROC_SIG_KILL && entry->unwinds_itself) {
+    /* A shell's own `kill $$` or `kill 0`, on its own thread: it was going on to its next command. */
+    if (action == VPROC_SIG_KILL &&
+        (entry->unwinds_itself || (entry->shell_task && entry->tid && pthread_equal(entry->tid, self)))) {
         vprocQueuePendingSignalLocked(entry, sig);
         return true;
     }
@@ -11204,12 +11243,14 @@ static bool vprocKillDeliverEntryLocked(VProcTaskEntry *entry,
     vprocApplySignalLocked(entry, sig);
 
     if (entry->exited || entry->dying_since_ns != 0) {
-        if (entry->tid && !pthread_equal(entry->tid, self) && !vprocThreadUnwindsItselfLocked(entry->tid)) {
+        if (entry->tid && !pthread_equal(entry->tid, self) && !vprocThreadUnwindsItselfLocked(entry->tid) &&
+            !vprocThreadRunsOtherShellLocked(entry->tid, entry)) {
             vprocCancelListAdd(cancel_list, cancel_count, cancel_capacity, entry->tid);
         }
         for (size_t t = 0; t < entry->thread_count; ++t) {
             pthread_t tid = entry->threads[t];
-            if (tid && !pthread_equal(tid, self) && !vprocThreadUnwindsItselfLocked(tid)) {
+            if (tid && !pthread_equal(tid, self) && !vprocThreadUnwindsItselfLocked(tid) &&
+                !vprocThreadRunsOtherShellLocked(tid, entry)) {
                 vprocCancelListAdd(cancel_list, cancel_count, cancel_capacity, tid);
             }
         }
@@ -14173,7 +14214,7 @@ int vprocDeliverTaskSignals(int pid) {
             pthread_cond_broadcast(&gVProcTasks.cv);
         }
         exit_current = vprocDeliverPendingSignalsLocked(entry);
-        for (int sig = 1; entry->unwinds_itself && !fatal && sig < 32; ++sig) {
+        for (int sig = 1; (entry->unwinds_itself || entry->shell_task) && !fatal && sig < 32; ++sig) {
             if ((entry->pending_signals & vprocSigMask(sig)) && !vprocSignalBlockedLocked(entry, sig) &&
                 vprocEffectiveSignalActionLocked(entry, sig) == VPROC_SIG_KILL) {
                 entry->pending_signals &= ~vprocSigMask(sig);
@@ -14243,6 +14284,53 @@ bool vprocTaskHalting(int pid) {
     bool halting = entry && entry->halting;
     pthread_mutex_unlock(&gVProcTasks.mu);
     return halting;
+}
+
+bool vprocTakePendingSignal(int pid, int sig) {
+    bool taken = false;
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    if (entry && entry->tid && pthread_equal(entry->tid, pthread_self())) {
+        taken = vprocConsumePendingSignalLocked(entry, sig);
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    return taken;
+}
+
+int vprocCurrentDyingSignal(void) {
+    VProc *vp = vprocCurrent();
+    int pid = vp ? vprocPid(vp) : 0;
+    int sig = 0;
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = pid > 0 ? vprocTaskFindLocked(pid) : NULL;
+    if (entry && entry->dying_since_ns != 0) {
+        sig = entry->exit_signal;
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    return sig;
+}
+
+void vprocDefaultCaughtActions(int pid) {
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    for (int sig = 1; entry && sig < 32; ++sig) {
+        if (sig != SIGINT && sig != SIGQUIT && entry->actions[sig].sa_handler != SIG_DFL &&
+            entry->actions[sig].sa_handler != SIG_IGN) {
+            sigemptyset(&entry->actions[sig].sa_mask);
+            entry->actions[sig].sa_handler = SIG_DFL;
+            entry->actions[sig].sa_flags = 0;
+        }
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+}
+
+void vprocSetShellTask(int pid, bool enabled) {
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    if (entry) {
+        entry->shell_task = enabled;
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
 }
 
 void vprocSetUnwindsItself(int pid, bool enabled) {

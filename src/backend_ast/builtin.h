@@ -374,6 +374,7 @@ bool shellRuntimeExchangePositionalOwned(bool owned);
 typedef struct {
     bool active;
     int saved_subshell_pid;
+    int shell_task;
     char *cwd;
     mode_t mask;
     char *pwd;
