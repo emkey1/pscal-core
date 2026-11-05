@@ -1,4 +1,5 @@
 #include "common/path_truncate.h"
+#include "common/env_snapshot.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -663,17 +664,16 @@ static void pathTruncateWriteProcEnviron(const char *path) {
     if (!f) {
         return;
     }
-    extern char **environ;
-    if (environ) {
-        for (char **cursor = environ; *cursor; ++cursor) {
-            const char *entry = *cursor;
-            size_t len = strlen(entry);
-            if (len > 0) {
-                (void)fwrite(entry, 1, len, f);
-            }
-            fputc('\0', f);
+    void *walk = NULL;
+    for (char **cursor = pscalEnvironWalkBegin(&walk); cursor && *cursor; ++cursor) {
+        const char *entry = *cursor;
+        size_t len = strlen(entry);
+        if (len > 0) {
+            (void)fwrite(entry, 1, len, f);
         }
+        fputc('\0', f);
     }
+    pscalEnvironWalkEnd(walk);
     fclose(f);
 }
 

@@ -304,6 +304,8 @@ int vprocMknodShim(const char *path, mode_t mode, dev_t dev);
  * session shell's directory. */
 typedef struct VProcEnv VProcEnv;
 VProcEnv *vprocEnvCapture(void);
+/* NULL-terminated, the shape of environ, and only safe to walk on a copy no one else changes. */
+char **vprocEnvEntries(VProcEnv *env);
 /* A copy of only the entries keep says yes to, so one left out costs nothing. */
 VProcEnv *vprocEnvCaptureFiltered(bool (*keep)(const char *entry, void *arg), void *arg);
 /* What the shell knows about this environment's names. Freed with it. */

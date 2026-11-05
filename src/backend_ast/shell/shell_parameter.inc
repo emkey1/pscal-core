@@ -737,7 +737,8 @@ static char *shellParamNamesWithPrefix(const char *prefix, size_t prefix_len, ch
     subject.is_list = true;
     subject.style = style;
     size_t capacity = 0;
-    for (char **entry = environ; entry && *entry; ++entry) {
+    void *walk = NULL;
+    for (char **entry = pscalEnvironWalkBegin(&walk); entry && *entry; ++entry) {
         const char *eq = strchr(*entry, '=');
         if (!eq || strncmp(*entry, prefix, prefix_len) != 0) {
             continue;
@@ -747,6 +748,7 @@ static char *shellParamNamesWithPrefix(const char *prefix, size_t prefix_len, ch
             break;
         }
     }
+    pscalEnvironWalkEnd(walk);
     for (size_t i = 0; i < gShellArrayVarCount; ++i) {
         const char *name = gShellArrayVars[i].name;
         if (!name || strncmp(name, prefix, prefix_len) != 0 || shellSafeGetenv(name)) {

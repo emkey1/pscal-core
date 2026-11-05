@@ -7055,16 +7055,16 @@ Value vmBuiltinShellShift(VM *vm, int arg_count, Value *args) {
 
 Value vmBuiltinShellSetenv(VM *vm, int arg_count, Value *args) {
     if (arg_count == 0) {
-        if (environ) {
-            for (char **env = environ; *env; ++env) {
-                const char *eq = strchr(*env, '=');
-                char *name = strndup(*env, eq ? (size_t)(eq - *env) : strlen(*env));
-                if (name && !shellExportIsHidden(name) && !shellArrayRegistryFindConst(name)) {
-                    puts(*env);
-                }
-                free(name);
+        void *walk = NULL;
+        for (char **env = pscalEnvironWalkBegin(&walk); env && *env; ++env) {
+            const char *eq = strchr(*env, '=');
+            char *name = strndup(*env, eq ? (size_t)(eq - *env) : strlen(*env));
+            if (name && !shellExportIsHidden(name) && !shellArrayRegistryFindConst(name)) {
+                puts(*env);
             }
+            free(name);
         }
+        pscalEnvironWalkEnd(walk);
         shellUpdateStatus(0);
         return makeVoid();
     }
@@ -7682,12 +7682,14 @@ static char **shellVariableNamesSorted(size_t *out_count) {
     char **names = NULL;
     size_t count = 0;
     size_t capacity = 0;
-    for (char **env = environ; env && *env; ++env) {
+    void *walk = NULL;
+    for (char **env = pscalEnvironWalkBegin(&walk); env && *env; ++env) {
         const char *eq = strchr(*env, '=');
         if (eq && strncmp(*env, "EXSH_LAST_STATUS=", 17) != 0) {
             shellExportListAdd(&names, &count, &capacity, *env, (size_t)(eq - *env));
         }
     }
+    pscalEnvironWalkEnd(walk);
     SHELL_EXPORT_LOCK();
     const ShellNameSet *pending = &shellExportFlagsCurrent()->pending;
     for (size_t i = 0; i < pending->count; ++i) {
@@ -10222,12 +10224,14 @@ static void shellExportPrintEnvironment(void) {
     char **names = NULL;
     size_t count = 0;
     size_t capacity = 0;
-    for (char **env = environ; env && *env; ++env) {
+    void *walk = NULL;
+    for (char **env = pscalEnvironWalkBegin(&walk); env && *env; ++env) {
         const char *eq = strchr(*env, '=');
         if (eq) {
             shellExportListAdd(&names, &count, &capacity, *env, (size_t)(eq - *env));
         }
     }
+    pscalEnvironWalkEnd(walk);
     SHELL_EXPORT_LOCK();
     const ShellNameSet *pending = &shellExportFlagsCurrent()->pending;
     for (size_t i = 0; i < pending->count; ++i) {

@@ -15553,6 +15553,10 @@ static ssize_t vprocEnvFindLocked(const VProcEnv *env, const char *name, size_t 
     return -1;
 }
 
+char **vprocEnvEntries(VProcEnv *env) {
+    return env ? env->view : NULL;
+}
+
 VProcEnv *vprocEnvCapture(void) {
     return vprocEnvCaptureFiltered(NULL, NULL);
 }
