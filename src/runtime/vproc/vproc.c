@@ -9816,7 +9816,11 @@ static void vprocRegisterStartedThread(int pid, pthread_t tid) {
             if (!duplicate) {
                 entry->threads[entry->thread_count++] = tid;
             }
-            entry->tid = tid;
+            /* A thread it starts doesn't take over. On the shell's task that hid the shell's own thread,
+             * which a kill then cancelled by way of a stage running on it. */
+            if (!entry->tid) {
+                entry->tid = tid;
+            }
             rename_thread = vprocPrepareThreadNameLocked(entry, thread_name, sizeof(thread_name));
         }
     }
