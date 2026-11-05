@@ -832,11 +832,7 @@ static int shellOpenHereBody(const char *body, size_t length, bool append_newlin
 
 static char *shellRunCommandSubstitution(const char *command) {
     const char *source = command ? command : "";
-    ShellScalarCaptureFrame *capture_frame = NULL;
     bool capture_pushed = shellCaptureStackPush(NULL, source, NULL, 0, false);
-    if (capture_pushed) {
-        capture_frame = shellCaptureStackTop();
-    }
 
     char *result = NULL;
     size_t result_length = 0;
@@ -1184,6 +1180,9 @@ substitution_finish:
         shellUpdateStatus(reader->error);
     }
     free(reader);
+    /* Found again here: a substitution inside this one may have moved the stack, and keeping the
+     * pointer from before wrote into freed memory from five levels down. */
+    ShellScalarCaptureFrame *capture_frame = capture_pushed ? shellCaptureStackTop() : NULL;
     if (capture_frame) {
         capture_frame->entry = NULL;
         capture_frame->from_cache = false;
