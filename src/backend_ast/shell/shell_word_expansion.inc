@@ -1360,6 +1360,15 @@ void shellRuntimeProcessPendingSignals(void) {
             if (gShellExitRequested) {
                 return;
             }
+            /* What a CHLD trap's own commands start and finish is no news: run for that, it would
+             * run for ever. */
+            if (signo == SIGCHLD) {
+#if defined(PSCAL_TARGET_IOS)
+                (void)vprocTakeCaughtSignal(owner, SIGCHLD);
+#else
+                gShellPendingSignals[SIGCHLD] = 0;
+#endif
+            }
             again = true;
         }
     }
