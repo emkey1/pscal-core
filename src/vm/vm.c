@@ -1802,6 +1802,15 @@ static inline bool vmTypeIsInlineScalar(VarType type) {
     }
 }
 
+// Most values the interpreter frees are scalars, which own nothing. Test for
+// them here: the out-of-line call was 6% to 13% of the time in compute loops.
+static inline void vmFreeValueInline(Value* v) {
+    if (v && !vmTypeIsInlineScalar(VALUE_TYPE(*v))) {
+        (freeValue)(v);
+    }
+}
+#define freeValue(v) vmFreeValueInline(v)
+
 static void replaceValueCell(Value* target, Value replacement, AST* preserved_base_type) {
     if (!target) {
         return;
@@ -9621,6 +9630,14 @@ static bool vmStoreThroughAddress(VM* vm, Value* target_lvalue_ptr, AST* declare
         }
     }
 
+    // Same inline scalar type in and out: nothing below would convert it, and
+    // replaceValueCell's own test for this case comes after every branch.
+    if (VALUE_TYPE(*target_lvalue_ptr) == VALUE_TYPE(*value_to_set) &&
+        vmTypeIsInlineScalar(VALUE_TYPE(*value_to_set))) {
+        __atomic_store_n(&target_lvalue_ptr->bits, value_to_set->bits, __ATOMIC_RELAXED);
+        return true;
+    }
+
     // (Your existing logic for handling fixed-length strings, pointers, reals, etc. goes here)
     // Dynamic-string targets get a whole new Value installed
     // through replaceValueCell, never a free-then-rebuild of
@@ -10398,6 +10415,14 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
         freeValue(&b_val_popped); \
     } while (false)
 
+    // Ends an opcode that can only stop the program through runtimeError, and
+    // goes straight to the next fetch. The checks at the top of the loop still
+    // run after every call, builtin and backward jump, so a loop always reaches
+    // them, and any instruction that can set an exit or abort flag ends in a
+    // plain `break`. Those checks took 10% to 13% of the time in compute loops.
+#define VM_NEXT_SIMPLE() \
+    if (!__builtin_expect(vm->runtime_error_raised, 0)) goto fetch_instruction
+
     uint8_t instruction_val;
     for (;;) {
 #if defined(PSCAL_TARGET_IOS)
@@ -10486,6 +10511,7 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
             vm->abort_requested = false;
             continue;
         }
+fetch_instruction:
         vm->lastInstruction = vm->ip;
 /* #ifdef DEBUG
         if (dumpExec) {
@@ -10552,6 +10578,7 @@ dispatch_switch:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 push(vm, copyValueForStackUnlocked(&vm->chunk->constants[idx]));
+                VM_NEXT_SIMPLE();
                 break;
             }
                 
@@ -10562,24 +10589,30 @@ dispatch_switch:
                    return INTERPRET_RUNTIME_ERROR;
                 }
                 push(vm, copyValueForStackUnlocked(&vm->chunk->constants[idx]));
+                VM_NEXT_SIMPLE();
                 break;
             }
             case CONST_0:
                 FAST_PUSH(makeInt(0));
+                VM_NEXT_SIMPLE();
                 break;
             case CONST_1:
                 FAST_PUSH(makeInt(1));
+                VM_NEXT_SIMPLE();
                 break;
             case CONST_TRUE:
                 FAST_PUSH(makeBoolean(true));
+                VM_NEXT_SIMPLE();
                 break;
             case CONST_FALSE:
                 FAST_PUSH(makeBoolean(false));
+                VM_NEXT_SIMPLE();
                 break;
             case PUSH_IMMEDIATE_INT8: {
                 uint8_t raw = READ_BYTE();
                 long long imm = (raw <= 0x7F) ? (long long)raw : ((long long)raw - 0x100LL);
                 FAST_PUSH(makeInt(imm));
+                VM_NEXT_SIMPLE();
                 break;
             }
 
@@ -10692,15 +10725,16 @@ dispatch_switch:
                     if (!stored) {
                         return INTERPRET_RUNTIME_ERROR;
                     }
+                    VM_NEXT_SIMPLE();
                     break;
                 }
                 push(vm, makePointer(&frame->slots[slot], NULL));
                 break;
             }
-            case ADD:      BINARY_OP("+", instruction_val); break;
-            case SUBTRACT: BINARY_OP("-", instruction_val); break;
-            case MULTIPLY: BINARY_OP("*", instruction_val); break;
-            case DIVIDE:   BINARY_OP("/", instruction_val); break;
+            case ADD:      BINARY_OP("+", instruction_val); VM_NEXT_SIMPLE(); break;
+            case SUBTRACT: BINARY_OP("-", instruction_val); VM_NEXT_SIMPLE(); break;
+            case MULTIPLY: BINARY_OP("*", instruction_val); VM_NEXT_SIMPLE(); break;
+            case DIVIDE:   BINARY_OP("/", instruction_val); VM_NEXT_SIMPLE(); break;
 
             case NEGATE: {
                 Value val_popped = FAST_POP();
@@ -10760,6 +10794,7 @@ dispatch_switch:
                 Value temp = vm->stackTop[-1];
                 vm->stackTop[-1] = vm->stackTop[-2];
                 vm->stackTop[-2] = temp;
+                VM_NEXT_SIMPLE();
                 break;
             }
             case DUP: {
@@ -10768,6 +10803,7 @@ dispatch_switch:
                     return INTERPRET_RUNTIME_ERROR;
                 }
                 push(vm, copyValueForStackUnlocked(&vm->stackTop[-1]));
+                VM_NEXT_SIMPLE();
                 break;
             }
             case AND:
@@ -11388,6 +11424,7 @@ comparison_error_label:
                 }
                 freeValue(&a_val);
                 freeValue(&b_val);
+                VM_NEXT_SIMPLE();
                 break;
             }
             case ALLOC_OBJECT: {
@@ -13281,6 +13318,7 @@ comparison_error_label:
                 }
                 CallFrame* frame = &vm->frames[vm->frameCount - 1];
                 push(vm, copyValueForStack(&frame->slots[slot]));
+                VM_NEXT_SIMPLE();
                 break;
             }
             case RESET_LOCAL: {
@@ -13432,6 +13470,7 @@ comparison_error_label:
 
                 // Free the temporary value that was popped from the stack.
                 freeValue(&value_from_stack);
+                VM_NEXT_SIMPLE();
                 break;
             }
             case INC_LOCAL: {
@@ -13947,17 +13986,25 @@ comparison_error_label:
 
                 if (!condition_truth) {
                     vm->ip += (int32_t)offset_val;
+                    if ((int32_t)offset_val < 0) {
+                        break;
+                    }
                 }
+                VM_NEXT_SIMPLE();
                 break;
             }
             case JUMP: {
                 uint32_t offset = READ_UINT32(vm);
                 vm->ip += (int32_t)offset;
+                if ((int32_t)offset >= 0) {
+                    VM_NEXT_SIMPLE();
+                }
                 break;
             }
             case POP: {
                 Value popped_val = pop(vm);
                 freeValue(&popped_val);
+                VM_NEXT_SIMPLE();
                 break;
             }
             case CALL_BUILTIN_PROC: {
