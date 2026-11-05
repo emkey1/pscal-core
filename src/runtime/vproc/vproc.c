@@ -3393,6 +3393,7 @@ typedef struct {
     bool stop_unsupported;
     bool cooperative_stop_wait;
     bool unwinds_itself;
+    bool halting;
     bool silent_to_parent;
     bool not_a_process;
     uint32_t caught_signals;
@@ -10444,6 +10445,7 @@ static void vprocClearEntryLocked(VProcTaskEntry *entry) {
     entry->blocked_signals = 0;
     entry->pending_signals = 0;
     entry->unwinds_itself = false;
+    entry->halting = false;
     entry->silent_to_parent = false;
     entry->not_a_process = false;
     entry->caught_signals = 0;
@@ -14024,6 +14026,29 @@ bool vprocTakeCaughtSignal(int pid, int sig) {
     }
     pthread_mutex_unlock(&gVProcTasks.mu);
     return taken;
+}
+
+int vprocHaltSession(void) {
+    int sid = vprocShimHasVirtualContext() ? vprocGetSid(0) : -1;
+    if (sid <= 1) {
+        errno = ESRCH;
+        return -1;
+    }
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *leader = vprocTaskFindLocked(sid);
+    if (leader) {
+        leader->halting = true;
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    return vprocKillShim(sid, SIGKILL);
+}
+
+bool vprocTaskHalting(int pid) {
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    bool halting = entry && entry->halting;
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    return halting;
 }
 
 void vprocSetUnwindsItself(int pid, bool enabled) {

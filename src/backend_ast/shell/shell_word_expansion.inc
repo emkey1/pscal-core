@@ -1201,6 +1201,9 @@ static void shellHandleSignalCommon(int signo, bool from_status) {
      * as in bash, SIGTERM does not. */
     else if (!from_status && (signo != SIGTERM || !shellRuntimeIsInteractive())) {
         shellEndWithRequest();
+        if (vprocTaskHalting(shellRuntimeOwnPid())) {
+            shellUpdateStatus(0);
+        }
     }
 #endif
 }

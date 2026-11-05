@@ -522,6 +522,10 @@ bool vprocTakeCaughtSignal(int pid, int sig);
 /* A shell's task: a signal that would end it waits for vprocDeliverTaskSignals, since cancelling
  * the thread would leave whatever the shell holds, and what started it waiting. */
 void vprocSetUnwindsItself(int pid, bool enabled);
+/* halt, poweroff and reboot in the app, which can't stop its device: the caller's session ends. Its
+ * leader takes SIGKILL, and vprocTaskHalting tells it that this is an end it was asked for, not a death. */
+int vprocHaltSession(void);
+bool vprocTaskHalting(int pid);
 /* A shell started on another shell's thread, as a script run inline is: it can't be cancelled either. */
 void vprocUnwindAsThreadDoes(int pid);
 /* What this task does is the parent's own work, so no SIGCHLD for it. */
@@ -1018,6 +1022,8 @@ static inline void vprocNoteCaughtSignal(int pid, int sig) { (void)pid; (void)si
 static inline uint32_t vprocCaughtSignals(int pid) { (void)pid; return 0; }
 static inline bool vprocTakeCaughtSignal(int pid, int sig) { (void)pid; (void)sig; return false; }
 static inline void vprocSetUnwindsItself(int pid, bool enabled) { (void)pid; (void)enabled; }
+static inline int vprocHaltSession(void) { return -1; }
+static inline bool vprocTaskHalting(int pid) { (void)pid; return false; }
 static inline void vprocUnwindAsThreadDoes(int pid) { (void)pid; }
 static inline void vprocSetSilentToParent(int pid, bool silent) { (void)pid; (void)silent; }
 static inline void vprocSetNotAProcess(int pid) { (void)pid; }
