@@ -38,6 +38,9 @@
 #define PATH_MAX 4096
 #endif
 #include <pscal_paths.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
 
 /* Also guards the whole-struct copy in copyDynamicArraySnapshotValue()
  * below, so it must be the SAME mutex the VM's replaceValueCell() takes
@@ -4142,6 +4145,44 @@ bool isUnitDocumented(const char *unit_name) {
     return false;
 }
 
+bool pscalLibDirBesideExecutable(const char *language, char *out, size_t out_size) {
+    char exe[PATH_MAX];
+#if defined(__APPLE__)
+    uint32_t exe_size = (uint32_t)sizeof(exe);
+    if (_NSGetExecutablePath(exe, &exe_size) != 0) {
+        return false;
+    }
+#elif defined(__linux__)
+    ssize_t exe_len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (exe_len <= 0) {
+        return false;
+    }
+    exe[exe_len] = '\0';
+#else
+    (void)exe;
+    (void)language;
+    (void)out;
+    (void)out_size;
+    return false;
+#endif
+#if defined(__APPLE__) || defined(__linux__)
+    char resolved[PATH_MAX];
+    if (!realpath(exe, resolved)) {
+        return false;
+    }
+    /* Drop the binary's name, then the directory holding it. */
+    for (int i = 0; i < 2; ++i) {
+        char *slash = strrchr(resolved, '/');
+        if (!slash) {
+            return false;
+        }
+        *slash = '\0';
+    }
+    int written = snprintf(out, out_size, "%s/lib/%s", resolved, language);
+    return written > 0 && (size_t)written < out_size;
+#endif
+}
+
 char *findUnitFile(const char *unit_name) {
     const char *default_install_dir = PSCAL_PASCAL_LIB_DIR;
     const char *relative_fallbacks[] = {
@@ -4153,12 +4194,17 @@ char *findUnitFile(const char *unit_name) {
     };
     const size_t relative_count = sizeof(relative_fallbacks) / sizeof(relative_fallbacks[0]);
 
-    const char *candidates[2 + sizeof(relative_fallbacks) / sizeof(relative_fallbacks[0])];
+    const char *candidates[3 + sizeof(relative_fallbacks) / sizeof(relative_fallbacks[0])];
     size_t candidate_count = 0;
 
     const char *env_path = getenv("PASCAL_LIB_DIR");
     if (env_path && *env_path) {
         candidates[candidate_count++] = env_path;
+    }
+
+    char beside_binary[PATH_MAX];
+    if (pscalLibDirBesideExecutable("pascal", beside_binary, sizeof(beside_binary))) {
+        candidates[candidate_count++] = beside_binary;
     }
 
     candidates[candidate_count++] = default_install_dir;

@@ -565,6 +565,10 @@ int calculateArrayTotalSize(const Value* array_val);
 
 // Unit Stuff
 char *findUnitFile(const char *unit_name);
+/* <dir above the running binary>/lib/<language>, which is <prefix>/lib/<language>
+ * for an installed binary and the repo's own lib/<language> for ./build/<binary>.
+ * False if the binary's path can't be read or doesn't fit. */
+bool pscalLibDirBesideExecutable(const char *language, char *out, size_t out_size);
 void linkUnit(AST *unit_ast, int recursion_depth);
 Symbol *buildUnitSymbolTable(AST *interface_ast);
 void freeUnitSymbolTable(Symbol *symbol_table);
