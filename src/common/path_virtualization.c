@@ -453,6 +453,19 @@ DIR *pscalPathVirtualized_opendir(const char *name) {
     return opendir(target ? target : name);
 }
 
+/* A pattern that ends in a slash takes only directories, and they keep the slash, as with glob(3).
+ * Resolving the pattern and stripping the matches both drop it. */
+static const char *pathVirtualizedKeepSlash(const char *path, bool wants_slash, char *buffer, size_t size) {
+    size_t len = path ? strlen(path) : 0;
+    if (!wants_slash || len == 0 || path[len - 1] == '/' || len + 2 > size) {
+        return path;
+    }
+    memcpy(buffer, path, len);
+    buffer[len] = '/';
+    buffer[len + 1] = '\0';
+    return buffer;
+}
+
 int pscalPathVirtualized_glob(const char *pattern,
                               int flags,
                               int (*errfunc)(const char *, int),
@@ -460,6 +473,8 @@ int pscalPathVirtualized_glob(const char *pattern,
     if (!pathVirtualizationActive()) {
         return glob(pattern, flags, errfunc, pglob);
     }
+    size_t pattern_len = pattern ? strlen(pattern) : 0;
+    bool wants_dirs = pattern_len > 0 && pattern[pattern_len - 1] == '/';
 
     char resolved_pattern[PATH_MAX];
     bool relative_pattern = (pattern && pattern[0] && pattern[0] != '/');
@@ -468,7 +483,9 @@ int pscalPathVirtualized_glob(const char *pattern,
 
     char expanded_pattern[PATH_MAX];
     const char *target = pathVirtualizedExpand(resolved_input, expanded_pattern, sizeof(expanded_pattern));
-    int result = glob(target ? target : pattern, flags, errfunc, pglob);
+    char dir_pattern[PATH_MAX];
+    target = pathVirtualizedKeepSlash(target ? target : pattern, wants_dirs, dir_pattern, sizeof(dir_pattern));
+    int result = glob(target, flags, errfunc, pglob);
     if (result == GLOB_NOMATCH && relative_pattern && pattern && pattern[0] != '~') {
         const char *pwd = getenv("PWD");
         if (pwd && pwd[0] == '/') {
@@ -483,7 +500,9 @@ int pscalPathVirtualized_glob(const char *pattern,
                 char expanded_from_pwd[PATH_MAX];
                 const char *pwd_target =
                     pathVirtualizedExpand(resolved_from_pwd, expanded_from_pwd, sizeof(expanded_from_pwd));
-                result = glob(pwd_target ? pwd_target : resolved_from_pwd, flags, errfunc, pglob);
+                pwd_target = pathVirtualizedKeepSlash(pwd_target ? pwd_target : resolved_from_pwd, wants_dirs,
+                                                      dir_pattern, sizeof(dir_pattern));
+                result = glob(pwd_target, flags, errfunc, pglob);
             }
         }
     }
@@ -533,6 +552,8 @@ int pscalPathVirtualized_glob(const char *pattern,
             }
         }
 
+        char with_slash[PATH_MAX];
+        final_path = pathVirtualizedKeepSlash(final_path, wants_dirs, with_slash, sizeof(with_slash));
         char *copy = strdup(final_path);
         if (!copy) {
             continue;

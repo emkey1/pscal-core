@@ -14042,6 +14042,7 @@ comparison_error_label:
                  * stable contract — re-resolve by it. */
                 bool id_name_mismatch = handler && builtin_name &&
                                         encoded_name && *encoded_name &&
+                                        strcmp(builtin_name, encoded_name) != 0 &&
                                         strcasecmp(builtin_name, encoded_name) != 0;
                 if ((!handler || !canonical_name || id_name_mismatch) &&
                     encoded_name && *encoded_name) {

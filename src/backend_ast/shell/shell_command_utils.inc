@@ -248,10 +248,19 @@ static bool shellDecodeWordSpec(const char *encoded, const char **out_text, uint
         uint8_t stored = (uint8_t)encoded[1];
         *out_flags = stored > 0 ? (stored - 1) : 0;
     }
-    char meta_len_buf[7];
-    memcpy(meta_len_buf, encoded + 2, 6);
-    meta_len_buf[6] = '\0';
-    size_t meta_len = strtoul(meta_len_buf, NULL, 16);
+    size_t meta_len = 0;
+    for (int i = 2; i < 8; ++i) {
+        char c = encoded[i];
+        int digit = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+        if (digit < 0) {
+            char meta_len_buf[7];
+            memcpy(meta_len_buf, encoded + 2, 6);
+            meta_len_buf[6] = '\0';
+            meta_len = strtoul(meta_len_buf, NULL, 16);
+            break;
+        }
+        meta_len = meta_len * 16 + (size_t)digit;
+    }
     if (8 + meta_len > len) {
         return false;
     }
@@ -2264,7 +2273,8 @@ static bool shellSplitExpandedWord(const char *expanded, uint8_t word_flags,
     if (!ifs) {
         ifs = " \t\n";
     }
-    if (quoted || *ifs == '\0') {
+    /* Most words have nothing to split them on, and a separator is what the rest looks for. */
+    if (quoted || *ifs == '\0' || strcspn(expanded, ifs) == length) {
         char *dup = strdup(expanded);
         if (!dup) {
             return false;
@@ -4317,10 +4327,12 @@ static bool shellSetTrackedVariable(const char *name, const char *value, bool is
         return false;
     }
     const char *text = value ? value : "";
-    bool is_new = shellSafeGetenv(name) == NULL;
-    if (setenv(name, text, 1) != 0) {
+    const char *current = shellSafeGetenv(name);
+    bool is_new = current == NULL;
+    if ((is_new || strcmp(current, text) != 0) && setenv(name, text, 1) != 0) {
         return false;
     }
+    shellDebugSwitchesNoteName(name);
     if (is_new) {
         shellExportNoteNewVariable(name);
     }
@@ -4345,6 +4357,7 @@ static void shellUnsetTrackedVariable(const char *name) {
         return;
     }
     unsetenv(name);
+    shellDebugSwitchesNoteName(name);
     if (strcmp(name, "IFS") == 0) {
         gShellIfsUnset = true;
     }

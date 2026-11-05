@@ -543,6 +543,37 @@ static const char *shellSafeGetenv(const char *name) {
 
 extern char **environ;
 
+/* The debug switches are asked about on every command, and a name that isn't set costs a scan of
+ * the whole environment. Each is read once, and again after the shell sets or unsets a PSCALI_
+ * name, which is how one gets turned on at a prompt. The low bit is the answer, the rest which
+ * generation of names it came from. */
+static atomic_uint gShellDebugSwitchGeneration = 1;
+static PSCAL_THREAD_LOCAL atomic_uint gShellRedirDebugSwitch = 0;
+static PSCAL_THREAD_LOCAL atomic_uint gShellPipeDebugSwitch = 0;
+static PSCAL_THREAD_LOCAL atomic_uint gShellToolDebugSwitch = 0;
+static PSCAL_THREAD_LOCAL atomic_uint gShellKillDebugSwitch = 0;
+#define SHELL_REDIR_DEBUG() shellDebugSwitch(&gShellRedirDebugSwitch, "PSCALI_REDIR_DEBUG")
+#define SHELL_PIPE_DEBUG() shellDebugSwitch(&gShellPipeDebugSwitch, "PSCALI_PIPE_DEBUG")
+#define SHELL_TOOL_DEBUG() shellDebugSwitch(&gShellToolDebugSwitch, "PSCALI_TOOL_DEBUG")
+#define SHELL_KILL_DEBUG() shellDebugSwitch(&gShellKillDebugSwitch, "PSCALI_KILL_DEBUG")
+
+static void shellDebugSwitchesNoteName(const char *name) {
+    if (name[0] == 'P' && strncmp(name, "PSCALI_", 7) == 0) {
+        atomic_fetch_add_explicit(&gShellDebugSwitchGeneration, 1, memory_order_relaxed);
+    }
+}
+
+static bool shellDebugSwitch(atomic_uint *slot, const char *name) {
+    unsigned generation = atomic_load_explicit(&gShellDebugSwitchGeneration, memory_order_relaxed);
+    unsigned state = atomic_load_explicit(slot, memory_order_relaxed);
+    if ((state >> 1) == generation) {
+        return (state & 1u) != 0;
+    }
+    bool on = getenv(name) != NULL;
+    atomic_store_explicit(slot, (generation << 1) | (on ? 1u : 0u), memory_order_relaxed);
+    return on;
+}
+
 #define SHELL_ARRAY_ELEMENT_SEP '\x1d'
 
 typedef enum {
@@ -2322,6 +2353,22 @@ static int shellExpandUtf8GlobRecursive(const char *fs_base,
             free(segment);
             return GLOB_NOSPACE;
         }
+        /* A slash after a pattern takes only directories, and stays in what it matches. */
+        if (slash && rest[strspn(rest, "/")] == '\0') {
+            struct stat st;
+            char *with_slash = NULL;
+            if (stat(next_fs, &st) == 0 && S_ISDIR(st.st_mode)) {
+                with_slash = shellGlobJoinPath(next_display, "");
+            }
+            free(next_fs);
+            free(next_display);
+            if (with_slash && shellGlobAppendOwned(results, with_slash)) {
+                rc = 0;
+            } else {
+                free(with_slash);
+            }
+            continue;
+        }
         int child_rc = shellExpandUtf8GlobRecursive(next_fs, next_display, rest, results, flags);
         if (child_rc == 0) {
             rc = 0;
@@ -2452,6 +2499,19 @@ static int shellExpandGlobPattern(const char *pattern, char ***out_matches, size
     if (!isValidUtf8Bytes(pattern, pattern_len)) {
         return GLOB_NOMATCH;
     }
+#if !defined(PSCAL_TARGET_IOS)
+    /* glob(3) counts bytes and the fallback characters, which only `?` and a bracket can tell
+     * apart. Plain `*` and ASCII: it has read the directory, and the answer is no. */
+    if (!nocaseglob && !strpbrk(pattern, "?[\\")) {
+        bool ascii = true;
+        for (const char *cursor = pattern; *cursor && ascii; ++cursor) {
+            ascii = (unsigned char)*cursor < 0x80;
+        }
+        if (ascii) {
+            return GLOB_NOMATCH;
+        }
+    }
+#endif
     return shellExpandUtf8GlobFallback(pattern, out_matches, out_count);
 }
 
@@ -3795,6 +3855,74 @@ static bool shellTrapIsLive(const ShellTrapEntry *entry) {
     return entry->action == SHELL_TRAP_ACTION_COMMAND && entry->command && !entry->dormant;
 }
 
+/* Functions, eval, source and traps each run on a VM, and a script calls them in loops, where
+ * building and freeing one costs far more than the call. They take one from here, reset on the way
+ * out, and on the way in for what was set on it while it waited. A slot is taken by exchange, so
+ * threads can't share a VM and a fork keeps them. Deeper than the pool, they build and free. */
+#define SHELL_VM_POOL_SIZE 16
+static _Atomic(VM *) gShellVmPool[SHELL_VM_POOL_SIZE];
+
+VM *shellVmAcquire(void) {
+    for (size_t i = 0; i < SHELL_VM_POOL_SIZE; ++i) {
+        if (atomic_load_explicit(&gShellVmPool[i], memory_order_relaxed)) {
+            VM *vm = atomic_exchange_explicit(&gShellVmPool[i], NULL, memory_order_acquire);
+            if (vm) {
+                vmResetExecutionState(vm);
+                return vm;
+            }
+        }
+    }
+    VM *vm = (VM *)calloc(1, sizeof(VM));
+    if (vm) {
+        initVM(vm);
+    }
+    return vm;
+}
+
+void shellVmRelease(VM *vm) {
+    if (!vm) {
+        return;
+    }
+    pscalRuntimeVmFlushOutput();
+    vmResetExecutionState(vm);
+    vm->frontendContext = NULL;
+    for (size_t i = 0; i < SHELL_VM_POOL_SIZE; ++i) {
+        VM *empty = NULL;
+        if (atomic_compare_exchange_strong_explicit(&gShellVmPool[i], &empty, vm, memory_order_release,
+                                                    memory_order_relaxed)) {
+            return;
+        }
+    }
+    freeVM(vm);
+    free(vm);
+}
+
+/* $? as a variable. Each command sets this several times, nearly always to what it holds, and
+ * rewriting a plain global needs nothing else a tracked variable might. */
+static void shellMirrorLastStatus(int status) {
+    static const char name[] = "EXSH_LAST_STATUS";
+    char buffer[16];
+    if (status >= 0 && status <= 9) {
+        buffer[0] = (char)('0' + status);
+        buffer[1] = '\0';
+    } else {
+        snprintf(buffer, sizeof(buffer), "%d", status);
+    }
+    if (!gShellRuntime.allexport_enabled && !gShellRuntime.pipeline_subshell_active &&
+        !gShellRuntime.local_scope_active && !shellReadonlyContains(name) &&
+        !shellLocalScopeFind(name) && !shellArrayRegistryLookup(name, sizeof(name) - 1)) {
+        const char *current = shellSafeGetenv(name);
+        if (current) {
+            shellReadonlySetErrorName(NULL);
+            if (strcmp(current, buffer) != 0) {
+                setenv(name, buffer, 1);
+            }
+            return;
+        }
+    }
+    shellSetTrackedVariable(name, buffer, false);
+}
+
 void shellRuntimeSetLastStatus(int status) {
     gShellStatusVersion++;
     /* The pipeline it was in finishes with the same status. */
@@ -3806,9 +3934,7 @@ void shellRuntimeSetLastStatus(int status) {
         gShellArithmeticErrorPending = false;
     }
     gShellRuntime.last_status = status;
-    char buffer[16];
-    snprintf(buffer, sizeof(buffer), "%d", status);
-    shellSetTrackedVariable("EXSH_LAST_STATUS", buffer, false);
+    shellMirrorLastStatus(status);
     bool suppress_errexit = shellRuntimeEvaluatingCondition();
     if (status != 0) {
         if ((gShellRuntime.errexit_enabled || shellTrapIsLive(&gShellErrTrap)) && !suppress_errexit) {

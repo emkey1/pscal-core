@@ -435,6 +435,8 @@ void shellRuntimeSetLastStatusSticky(int status);
 void shellRuntimeSetPromptStatus(int status);
 void shellRuntimeIdsMayHaveChanged(void);
 bool shellRuntimeChunkLeftStages(void);
+struct VM_s *shellVmAcquire(void);
+void shellVmRelease(struct VM_s *vm);
 void shellRuntimeKeepLineState(ShellRuntimeState *line_ctx);
 bool shellRuntimeHistoryGetEntry(size_t reverse_index, char **out_line);
 bool shellRuntimeExpandHistoryReference(const char *input,

@@ -421,37 +421,22 @@ Value vmBuiltinShellPipeline(VM *vm, int arg_count, Value *args) {
     size_t debug_traps = 0;
     bool negated = false;
     bool async = false;
-    char *copy = strdup(meta);
-    if (!copy) {
-        runtimeError(vm, "shell pipeline: out of memory");
-        goto cleanup;
-    }
-    char *cursor = copy;
-    while (cursor && *cursor) {
-        char *next = strchr(cursor, ';');
-        if (next) *next = '\0';
-        char *eq = strchr(cursor, '=');
-        if (eq) {
-            *eq = '\0';
-            const char *key = cursor;
-            const char *value = eq + 1;
-            if (strcmp(key, "stages") == 0) {
-                stages = (size_t)strtoul(value, NULL, 10);
-            } else if (strcmp(key, "negated") == 0) {
-                shellParseBool(value, &negated);
-            } else if (strcmp(key, "async") == 0) {
-                shellParseBool(value, &async);
-            } else if (strcmp(key, "merge") == 0) {
-                free(merge_pattern);
-                merge_pattern = strdup(value ? value : "");
-            } else if (strcmp(key, "dbg") == 0) {
-                debug_traps = (size_t)strtoul(value, NULL, 10);
-            }
+    const char *cursor = meta;
+    ShellMetaField field;
+    while (shellMetaNextField(&cursor, &field)) {
+        if (shellMetaKeyIs(&field, "stages")) {
+            stages = (size_t)strtoul(field.value, NULL, 10);
+        } else if (shellMetaKeyIs(&field, "negated")) {
+            shellMetaBool(&field, &negated);
+        } else if (shellMetaKeyIs(&field, "async")) {
+            shellMetaBool(&field, &async);
+        } else if (shellMetaKeyIs(&field, "merge")) {
+            free(merge_pattern);
+            merge_pattern = strndup(field.value, field.value_len);
+        } else if (shellMetaKeyIs(&field, "dbg")) {
+            debug_traps = (size_t)strtoul(field.value, NULL, 10);
         }
-        if (!next) break;
-        cursor = next + 1;
     }
-        free(copy);
     /* What the one body that a background pipeline runs in on iOS holds: its copy of the trap is
      * not the shell's. */
     for (size_t i = 0; i < debug_traps; ++i) {
@@ -3207,7 +3192,7 @@ void shellToolSuspendCheckpointBeforeWait(void) {
     if (!ctx || ctx->swapped) {
         return;
     }
-    if (getenv("PSCALI_TOOL_DEBUG")) {
+    if (SHELL_TOOL_DEBUG()) {
         fprintf(stderr,
                 "[tool-checkpoint] before-wait shell_state=%p shell_params=%d/%p owned=%d pid=%d\n",
                 (void *)ctx->shell_state,
@@ -3239,7 +3224,7 @@ void shellToolSuspendCheckpointBeforeWait(void) {
         gParamValuesOwned = *ctx->shell_param_owned;
     }
     ctx->swapped = true;
-    if (getenv("PSCALI_TOOL_DEBUG")) {
+    if (SHELL_TOOL_DEBUG()) {
         fprintf(stderr,
                 "[tool-checkpoint] before-wait swapped worker_params=%d/%p owned=%d pid=%d\n",
                 ctx->worker_param_count,
@@ -3254,7 +3239,7 @@ void shellToolSuspendCheckpointAfterWait(void) {
     if (!ctx || !ctx->swapped) {
         return;
     }
-    if (getenv("PSCALI_TOOL_DEBUG")) {
+    if (SHELL_TOOL_DEBUG()) {
         fprintf(stderr,
                 "[tool-checkpoint] after-wait restoring worker_params=%d/%p owned=%d pid=%d\n",
                 ctx->worker_param_count,
@@ -3285,7 +3270,7 @@ void shellToolSuspendCheckpointAfterWait(void) {
     }
     ctx->released_globals_lock_count = 0;
     ctx->swapped = false;
-    if (getenv("PSCALI_TOOL_DEBUG")) {
+    if (SHELL_TOOL_DEBUG()) {
         fprintf(stderr,
                 "[tool-checkpoint] after-wait restored shell_params=%d/%p owned=%d pid=%d\n",
                 ctx->shell_param_count ? *ctx->shell_param_count : -1,
@@ -3510,7 +3495,7 @@ static void *shellToolThreadMain(void *arg) {
         .exited_flag = &ctx->worker_exited,
     };
     pthread_cleanup_push(shellFrontendCleanup, &cleanup_ctx);
-    bool dbg = getenv("PSCALI_TOOL_DEBUG") != NULL;
+    bool dbg = SHELL_TOOL_DEBUG();
     int worker_pid = -1;
 #if defined(PSCAL_TARGET_IOS)
     ShellToolSuspendCheckpoint *previous_checkpoint = gShellToolSuspendCheckpoint;
@@ -3699,7 +3684,7 @@ static void *shellToolWaiterMain(void *arg) {
     }
     ctx->finished = 1;
     pthread_kill(ctx->main_thread, SIGURG);
-    if (getenv("PSCALI_TOOL_DEBUG")) {
+    if (SHELL_TOOL_DEBUG()) {
         fprintf(stderr, "[tool-thread] waiter signaled main\n");
     }
     return NULL;
@@ -4092,11 +4077,11 @@ static Value shellRunToolInEnvironment(VM *vm,
                                        FrontendKind target_kind,
                                        int arg_count,
                                        Value *args) {
-    if (getenv("PSCALI_PIPE_DEBUG")) {
+    if (SHELL_PIPE_DEBUG()) {
         fprintf(stderr, "[tool-dispatch] name=%s argc=%d\n", tool_name ? tool_name : "<null>", arg_count + 1);
     }
 #if defined(PSCAL_TARGET_IOS)
-    bool tool_dbg = getenv("PSCALI_TOOL_DEBUG") != NULL;
+    bool tool_dbg = SHELL_TOOL_DEBUG();
     /* Special-case exsh: on iOS we cannot exec a new process, so run exsh_main inline
      * with the provided arguments to preserve -c/script execution. */
     if (tool_name && strcmp(tool_name, "exsh") == 0 && entry) {
@@ -4185,7 +4170,7 @@ static Value shellRunToolInEnvironment(VM *vm,
             bool needs_shell_ctx = (target_kind == FRONTEND_KIND_SHELL);
             bool background = shellRuntimeCurrentBuiltinBackground();
 #if defined(PSCAL_TARGET_IOS)
-            if (getenv("PSCALI_PIPE_DEBUG")) {
+            if (SHELL_PIPE_DEBUG()) {
                 fprintf(stderr, "[tool-dispatch] name=%s bg=%d worker=%d argc=%d\n",
                     tool_name ? tool_name : "<null>", (int)background, (int)gShellBackgroundWorkerActive, argc);
             }
@@ -4278,7 +4263,7 @@ static Value shellRunToolInEnvironment(VM *vm,
      * Use that value when available to avoid a default 127 on success. */
     int final_status = shellRuntimeLastStatus();
     shellUpdateStatus(final_status);
-    if (getenv("PSCALI_PIPE_DEBUG")) {
+    if (SHELL_PIPE_DEBUG()) {
         fprintf(stderr, "[tool-dispatch] %s final status=%d\n", tool_name ? tool_name : "<null>", final_status);
     }
     frontendPopKind(previous_kind);
@@ -12948,7 +12933,7 @@ static bool shellKillSignalJob(VM *vm, const char *spec_text, size_t index, int 
 
 Value vmBuiltinShellKill(VM *vm, int arg_count, Value *args) {
     shellCollectJobs();
-    bool kill_dbg = getenv("PSCALI_KILL_DEBUG") != NULL;
+    bool kill_dbg = SHELL_KILL_DEBUG();
     if (kill_dbg) {
         fprintf(stderr, "[kill] job_count=%zu args=%d\n", gShellJobCount, arg_count);
         for (size_t i = 0; i < gShellJobCount; ++i) {
@@ -13211,7 +13196,7 @@ static bool shellJobHasThreadlessSnapshot(const ShellJob *job, bool *out_has_non
         }
         return false;
     }
-    bool dbg = getenv("PSCALI_KILL_DEBUG") != NULL;
+    bool dbg = SHELL_KILL_DEBUG();
     size_t snap_cap = vprocSnapshot(NULL, 0);
     if (snap_cap == 0) {
         if (out_has_nonresumable) {

@@ -400,7 +400,7 @@ static VProc *shellMakeStageVProc(int stdin_host,
     if (stderr_use_pscal && stderr_host < 0) {
         stderr_host = -2;
     }
-    bool tool_dbg = getenv("PSCALI_TOOL_DEBUG") != NULL;
+    bool tool_dbg = SHELL_TOOL_DEBUG();
     if (tool_dbg) {
         fprintf(stderr,
                 "[vproc-stage] stdin_host=%d stdout_host=%d stderr_host=%d force_null=%d pscal=%d/%d/%d\n",
@@ -1080,7 +1080,7 @@ static bool shellBuildCommand(VM *vm, int arg_count, Value *args, ShellCommand *
     if (!out_cmd) {
         return false;
     }
-    bool redir_dbg = getenv("PSCALI_REDIR_DEBUG") != NULL;
+    bool redir_dbg = SHELL_REDIR_DEBUG();
     memset(out_cmd, 0, sizeof(*out_cmd));
     if (arg_count <= 0) {
         runtimeError(vm, "shell exec: missing metadata argument");
@@ -2308,7 +2308,7 @@ static bool shellCommandResolvesToShebang(const char *name) {
 }
 
 static bool shellShouldRunCommandInForegroundWorker(const ShellCommand *cmd) {
-    bool dbg = getenv("PSCALI_PIPE_DEBUG") != NULL;
+    bool dbg = SHELL_PIPE_DEBUG();
     if (!cmd || !cmd->argv || !cmd->argv[0]) {
         return false;
     }
@@ -2861,8 +2861,8 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
     VM *vm = ctx->vm ? ctx->vm : gShellCurrentVm;
 #endif
     ShellCommand *cmd = ctx->cmd;
-    bool tool_dbg = getenv("PSCALI_TOOL_DEBUG") != NULL;
-    bool pipe_dbg = getenv("PSCALI_PIPE_DEBUG") != NULL;
+    bool tool_dbg = SHELL_TOOL_DEBUG();
+    bool pipe_dbg = SHELL_PIPE_DEBUG();
 #if defined(PSCAL_TARGET_IOS)
     if (tool_dbg) {
         fprintf(stderr, "[bg-stage] start cmd=%s bg=%d stage_count=%zu ctx=%p\n",
@@ -2873,7 +2873,7 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
     }
 #endif
     size_t redir_count = cmd ? cmd->redir_count : 0;
-    bool redir_dbg = getenv("PSCALI_REDIR_DEBUG") != NULL;
+    bool redir_dbg = SHELL_REDIR_DEBUG();
     if (tool_dbg || redir_dbg || pipe_dbg) {
         fprintf(stderr, "[bg-stage] redir_count=%zu\n", redir_count);
         if (cmd && cmd->redirs && (redir_dbg || tool_dbg)) {
@@ -2944,7 +2944,7 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
             }
         }
     }
-    if (getenv("PSCALI_PIPE_DEBUG")) {
+    if (SHELL_PIPE_DEBUG()) {
         fprintf(stderr, "[pipeline-bg] command '%s' status=%d\n",
                 (cmd && cmd->argv && cmd->argv[0]) ? cmd->argv[0] : "<nil>", bg_status);
     }
@@ -3367,7 +3367,7 @@ static bool shellEnsurePipeline(size_t stages, bool negated) {
                 use_pscal_pipes = false;
             }
         }
-        if (getenv("PSCALI_PIPE_DEBUG")) {
+        if (SHELL_PIPE_DEBUG()) {
             fprintf(stderr, "[pipe] iOS mode=%s stages=%zu\n",
                     use_pscal_pipes ? "pscal" : "host",
                     stages);
@@ -4387,7 +4387,7 @@ static void shellFdVarsEndWithCommand(ShellCommand *cmd) {
 static bool shellApplyExecRedirections(const ShellCommand *cmd,
                                        ShellExecRedirBackup **out_backups,
                                        size_t *out_count) {
-    bool dbg = (getenv("PSCALI_REDIR_DEBUG") != NULL) || (getenv("PSCALI_PIPE_DEBUG") != NULL);
+    bool dbg = SHELL_REDIR_DEBUG() || SHELL_PIPE_DEBUG();
 #if defined(PSCAL_TARGET_IOS)
     VProc *vp_current = vprocCurrent();
 #else
@@ -4854,9 +4854,9 @@ static int shellRunBuiltinInProcess(VM *vm,
                                     int stdout_fd,
                                     int stderr_fd,
                                     bool apply_exec_redirs) {
-    bool tool_dbg = (getenv("PSCALI_TOOL_DEBUG") != NULL) || (cmd && cmd->background);
-    bool pipe_dbg = getenv("PSCALI_PIPE_DEBUG") != NULL;
-    bool redir_dbg = getenv("PSCALI_REDIR_DEBUG") != NULL;
+    bool tool_dbg = SHELL_TOOL_DEBUG() || (cmd && cmd->background);
+    bool pipe_dbg = SHELL_PIPE_DEBUG();
+    bool redir_dbg = SHELL_REDIR_DEBUG();
 #if defined(PSCAL_TARGET_IOS)
     bool pipeline_in_process = gShellRuntime.pipeline.active &&
                                gShellRuntime.pipeline.in_process &&
@@ -4932,7 +4932,7 @@ static int shellRunBuiltinInProcess(VM *vm,
     }
 
     if (apply_exec_redirs) {
-        if (getenv("PSCALI_PIPE_DEBUG")) {
+        if (SHELL_PIPE_DEBUG()) {
             fprintf(stderr, "[pipeline-bg] apply redirs count=%zu\n", cmd ? cmd->redir_count : 0);
         }
         if (!shellApplyExecRedirections(cmd, &backups, &backup_count)) {
@@ -5075,8 +5075,8 @@ static int shellRunBuiltinInProcess(VM *vm,
     }
 #endif
     if (!builtin_ran) {
-        bool kill_dbg = getenv("PSCALI_KILL_DEBUG") != NULL;
-        bool pipe_dbg = getenv("PSCALI_PIPE_DEBUG") != NULL;
+        bool kill_dbg = SHELL_KILL_DEBUG();
+        bool pipe_dbg = SHELL_PIPE_DEBUG();
         const char *cmd_name_raw = (cmd && cmd->argv) ? cmd->argv[0] : NULL;
         char lookup_buf[PATH_MAX];
         const char *cmd_name = shellCommandLookupName(cmd_name_raw, lookup_buf, sizeof(lookup_buf));
@@ -5338,7 +5338,7 @@ static int shellPipelineRunStage(VM *vm,
     struct pscal_fd *stderr_pscal = NULL;
     int status = 0;
     bool apply_exec_redirs = cmd && cmd->redir_count > 0;
-    bool pipe_dbg = getenv("PSCALI_PIPE_DEBUG") != NULL;
+    bool pipe_dbg = SHELL_PIPE_DEBUG();
     bool adopt_failed = false;
 
     bool pipeline_in_process = ctx && ctx->in_process;
@@ -5752,7 +5752,7 @@ static void *shellPipelineStageThreadMain(void *arg) {
     int status = 1;
 #if defined(PSCAL_TARGET_IOS)
     if (!worker_ctx_ready) {
-        if (getenv("PSCALI_PIPE_DEBUG")) {
+        if (SHELL_PIPE_DEBUG()) {
             fprintf(stderr,
                     "[pipe-thread] stage=%zu cmd=%s: unable to allocate isolated worker context\n",
                     tctx->stage_pos,
@@ -5775,7 +5775,7 @@ static void *shellPipelineStageThreadMain(void *arg) {
         tctx->stage_pos < tctx->ctx->stage_count) {
         tctx->ctx->stage_status[tctx->stage_pos] = status;
     }
-    if (getenv("PSCALI_PIPE_DEBUG")) {
+    if (SHELL_PIPE_DEBUG()) {
         fprintf(stderr,
                 "[pipe-thread] stage=%zu cmd=%s status=%d tail=%d bg=%d worker=%d\n",
                 tctx->stage_pos,
@@ -6107,7 +6107,7 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
             shellAbortPipeline();
             return false;
         }
-        if (getenv("PSCALI_PIPE_DEBUG")) {
+        if (SHELL_PIPE_DEBUG()) {
             fprintf(stderr,
                     "[pipe-worker] fg-stage thread launched stage=%zu pid=%d pgid=%d\n",
                     stage_pos,
@@ -6352,12 +6352,12 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
 
     for (size_t i = 0; i < stage_pos; ++i) {
         if (ctx->thread_started && ctx->thread_started[i]) {
-            if (getenv("PSCALI_PIPE_DEBUG")) {
+            if (SHELL_PIPE_DEBUG()) {
                 fprintf(stderr, "[pipe-join] waiting stage=%zu\n", i);
             }
             pthread_join(ctx->threads[i], NULL);
             ctx->thread_started[i] = false;
-            if (getenv("PSCALI_PIPE_DEBUG")) {
+            if (SHELL_PIPE_DEBUG()) {
                 fprintf(stderr, "[pipe-join] joined stage=%zu\n", i);
             }
         }
@@ -6818,7 +6818,7 @@ static Value shellRunExpandedCommand(VM *vm, ShellCommand *cmd) {
             cmd->pipeline_index = 0;
             cmd->is_pipeline_head = true;
             cmd->is_pipeline_tail = true;
-            if (getenv("PSCALI_PIPE_DEBUG")) {
+            if (SHELL_PIPE_DEBUG()) {
                 fprintf(stderr, "[pipeline-bg] auto in-process pipeline reset for background '%s'\n",
                         (cmd->argv && cmd->argv[0]) ? cmd->argv[0] : "<null>");
             }

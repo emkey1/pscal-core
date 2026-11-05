@@ -2204,13 +2204,7 @@ static bool shellInvokeFunction(VM *vm, ShellCommand *cmd) {
         gShellPositionalOwned = saved_owned;
         return true;
     }
-    static VM function_vm;
-    static bool function_vm_initialized = false;
-    static bool function_vm_in_use = false;
     VM *invoke_vm = NULL;
-    VM *nested_vm = NULL;
-    bool using_cached_vm = false;
-    bool nested_vm_initialized = false;
     bool frame_pushed = false;
     bool caller_traps_back = false;
     InterpretResult result = INTERPRET_OK;
@@ -2234,28 +2228,10 @@ static bool shellInvokeFunction(VM *vm, ShellCommand *cmd) {
         memset(caller_pipeline, 0, sizeof(*caller_pipeline));
         caller_pipeline->pgid = -1;
     }
-    if (!__atomic_test_and_set(&function_vm_in_use, __ATOMIC_ACQUIRE)) {
-        if (!function_vm_initialized) {
-            initVM(&function_vm);
-            function_vm_initialized = true;
-        } else {
-            vmResetExecutionState(&function_vm);
-        }
-        using_cached_vm = true;
-        invoke_vm = &function_vm;
-    } else {
-        nested_vm = (VM *)malloc(sizeof(VM));
-        if (!nested_vm) {
-            runtimeError(vm, "%s: out of memory", name);
-            shellUpdateStatus(1);
-            goto invoke_cleanup;
-        }
-        initVM(nested_vm);
-        invoke_vm = nested_vm;
-        nested_vm_initialized = true;
-    }
-
+    invoke_vm = shellVmAcquire();
     if (!invoke_vm) {
+        runtimeError(vm, "%s: out of memory", name);
+        shellUpdateStatus(1);
         goto invoke_cleanup;
     }
     invoke_vm->frontendContext = vm ? vm->frontendContext : NULL;
@@ -2310,15 +2286,7 @@ invoke_cleanup:
         }
         *caller_pipeline = saved_pipeline;
     }
-    if (using_cached_vm) {
-        vmResetExecutionState(&function_vm);
-        __atomic_clear(&function_vm_in_use, __ATOMIC_RELEASE);
-    } else if (nested_vm) {
-        if (nested_vm_initialized) {
-            freeVM(nested_vm);
-        }
-        free(nested_vm);
-    }
+    shellVmRelease(invoke_vm);
     if (frame_pushed) {
         shellRuntimePopCallFrame();
     }
@@ -3549,7 +3517,7 @@ static int shellCollectJobs(void) {
      * shell-managed background pipelines. We only mirror entries that already
      * carry a non-zero vproc job id, otherwise core session entities (kernel,
      * shell, pumps, etc.) pollute the job table and break job-spec semantics. */
-    bool dbg = getenv("PSCALI_KILL_DEBUG") != NULL;
+    bool dbg = SHELL_KILL_DEBUG();
     prompt_dbg = getenv("PSCALI_PROMPT_DEBUG") != NULL;
     if (prompt_dbg) {
         fprintf(stderr, "[jobs] collect begin count=%zu\n", gShellJobCount);
@@ -3986,7 +3954,7 @@ static bool shellJobFindVisibleIndex(size_t visible_number, size_t *out_index) {
     if (!out_index || visible_number == 0) {
         return false;
     }
-    bool dbg = getenv("PSCALI_KILL_DEBUG") != NULL;
+    bool dbg = SHELL_KILL_DEBUG();
     size_t ordinal = 0;
     for (size_t i = 0; i < gShellJobCount; ++i) {
         ShellJob *job = &gShellJobs[i];
@@ -4136,51 +4104,101 @@ static bool shellResolveJobIndex(VM *vm, const char *name, int arg_count, Value 
 #endif
 }
 
+/* Every command comes with a `key=value;key=value` string, so it is read where it lies. */
+typedef struct {
+    const char *key;
+    size_t key_len;
+    const char *value;
+    size_t value_len;
+} ShellMetaField;
+
+static bool shellMetaNextField(const char **cursor, ShellMetaField *field) {
+    const char *at = *cursor;
+    while (*at) {
+        const char *end = at;
+        const char *eq = NULL;
+        while (*end && *end != ';') {
+            if (*end == '=' && !eq) {
+                eq = end;
+            }
+            end++;
+        }
+        *cursor = *end ? end + 1 : end;
+        if (eq) {
+            field->key = at;
+            field->key_len = (size_t)(eq - at);
+            field->value = eq + 1;
+            field->value_len = (size_t)(end - (eq + 1));
+            return true;
+        }
+        at = *cursor;
+    }
+    return false;
+}
+
+static inline bool shellMetaKeyIs(const ShellMetaField *field, const char *key) {
+    size_t len = strlen(key);
+    return field->key_len == len && memcmp(field->key, key, len) == 0;
+}
+
+static void shellMetaBool(const ShellMetaField *field, bool *out_flag) {
+    if (field->value_len == 1 && (field->value[0] == '0' || field->value[0] == '1')) {
+        *out_flag = field->value[0] == '1';
+        return;
+    }
+    char text[16];
+    if (field->value_len < sizeof(text)) {
+        memcpy(text, field->value, field->value_len);
+        text[field->value_len] = '\0';
+        shellParseBool(text, out_flag);
+    }
+}
+
+/* atoi for what the compiler writes, and atoi itself for anything else. */
+static int shellMetaInt(const ShellMetaField *field) {
+    size_t start = field->value_len > 0 && field->value[0] == '-' ? 1 : 0;
+    size_t digits = field->value_len - start;
+    if (digits == 0 || digits > 9) {
+        return atoi(field->value);
+    }
+    int number = 0;
+    for (size_t i = start; i < field->value_len; ++i) {
+        char c = field->value[i];
+        if (c < '0' || c > '9') {
+            return atoi(field->value);
+        }
+        number = number * 10 + (c - '0');
+    }
+    return start ? -number : number;
+}
+
 static void shellParseMetadata(const char *meta, ShellCommand *cmd) {
     if (!meta || !cmd) {
         return;
     }
-    char *copy = strdup(meta);
-    if (!copy) {
-        return;
+    const char *cursor = meta;
+    ShellMetaField field;
+    while (shellMetaNextField(&cursor, &field)) {
+        if (shellMetaKeyIs(&field, "bg")) {
+            shellMetaBool(&field, &cmd->background);
+        } else if (shellMetaKeyIs(&field, "pipe")) {
+            cmd->pipeline_index = shellMetaInt(&field);
+        } else if (shellMetaKeyIs(&field, "head")) {
+            shellMetaBool(&field, &cmd->is_pipeline_head);
+        } else if (shellMetaKeyIs(&field, "tail")) {
+            shellMetaBool(&field, &cmd->is_pipeline_tail);
+        } else if (shellMetaKeyIs(&field, "line")) {
+            cmd->line = shellMetaInt(&field);
+        } else if (shellMetaKeyIs(&field, "col")) {
+            cmd->column = shellMetaInt(&field);
+        } else if (shellMetaKeyIs(&field, "simple")) {
+            shellMetaBool(&field, &cmd->body_is_job);
+        } else if (shellMetaKeyIs(&field, "job")) {
+            shellMetaBool(&field, &cmd->job_tail);
+        } else if (shellMetaKeyIs(&field, "jobnull")) {
+            shellMetaBool(&field, &cmd->job_stdin_null);
+        }
     }
-    char *cursor = copy;
-    while (cursor && *cursor) {
-        char *next = strchr(cursor, ';');
-        if (next) {
-            *next = '\0';
-        }
-        char *eq = strchr(cursor, '=');
-        if (eq) {
-            *eq = '\0';
-            const char *key = cursor;
-            const char *value = eq + 1;
-            if (strcmp(key, "bg") == 0) {
-                shellParseBool(value, &cmd->background);
-            } else if (strcmp(key, "pipe") == 0) {
-                cmd->pipeline_index = atoi(value);
-            } else if (strcmp(key, "head") == 0) {
-                shellParseBool(value, &cmd->is_pipeline_head);
-            } else if (strcmp(key, "tail") == 0) {
-                shellParseBool(value, &cmd->is_pipeline_tail);
-            } else if (strcmp(key, "line") == 0) {
-                cmd->line = atoi(value);
-            } else if (strcmp(key, "col") == 0) {
-                cmd->column = atoi(value);
-            } else if (strcmp(key, "simple") == 0) {
-                shellParseBool(value, &cmd->body_is_job);
-            } else if (strcmp(key, "job") == 0) {
-                shellParseBool(value, &cmd->job_tail);
-            } else if (strcmp(key, "jobnull") == 0) {
-                shellParseBool(value, &cmd->job_stdin_null);
-            }
-        }
-        if (!next) {
-            break;
-        }
-        cursor = next + 1;
-    }
-    free(copy);
 }
 
 static bool shellWordTextHasQuotes(const char *text) {
