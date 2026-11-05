@@ -15224,6 +15224,21 @@ ssize_t vprocReadShim(int fd, void *buf, size_t count) {
     return vprocHostRead(host, buf, count);
 }
 
+static _Thread_local int gVprocStdioWriteError[2];
+
+void vprocStdioSetWriteError(int fd, int err) {
+    if (fd == STDOUT_FILENO || fd == STDERR_FILENO) {
+        gVprocStdioWriteError[fd - STDOUT_FILENO] = err;
+    }
+}
+
+int vprocStdioWriteError(int fd) {
+    if (fd == STDOUT_FILENO || fd == STDERR_FILENO) {
+        return gVprocStdioWriteError[fd - STDOUT_FILENO];
+    }
+    return 0;
+}
+
 ssize_t vprocWriteShim(int fd, const void *buf, size_t count) {
     vprocDeliverPendingSignalsForCurrent();
     VProc *vp = vprocForThread();

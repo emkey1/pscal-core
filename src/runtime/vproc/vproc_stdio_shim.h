@@ -19,6 +19,16 @@ static inline int pscalStdioFdForStream(FILE *stream) {
     return (stream == stderr) ? STDERR_FILENO : STDOUT_FILENO;
 }
 
+/* What the stream's flag would have said, for ferror and fflush below. Not a reader that left:
+ * a stage writing to a pipe's closed end goes on ending quietly. */
+static inline void pscalStdioNoteWriteFailure(int fd) {
+    int err = errno;
+    if (err != EPIPE) {
+        vprocStdioSetWriteError(fd, err);
+    }
+    errno = err;
+}
+
 static inline int pscalStdioWriteAll(int fd, const void *buf, size_t count) {
     const unsigned char *bytes = (const unsigned char *)buf;
     size_t offset = 0;
@@ -28,10 +38,12 @@ static inline int pscalStdioWriteAll(int fd, const void *buf, size_t count) {
             if (errno == EINTR) {
                 continue;
             }
+            pscalStdioNoteWriteFailure(fd);
             return -1;
         }
         if (written == 0) {
             errno = EIO;
+            pscalStdioNoteWriteFailure(fd);
             return -1;
         }
         offset += (size_t)written;
@@ -73,6 +85,18 @@ static inline int pscalLibcFputs(const char *s, FILE *stream) {
 
 static inline int pscalLibcFputc(int c, FILE *stream) {
     return fputc(c, stream);
+}
+
+static inline int pscalLibcFflush(FILE *stream) {
+    return fflush(stream);
+}
+
+static inline int pscalLibcFerror(FILE *stream) {
+    return ferror(stream);
+}
+
+static inline void pscalLibcClearerr(FILE *stream) {
+    clearerr(stream);
 }
 
 static inline int pscalVfprintf(FILE *stream, const char *fmt, va_list ap) {
@@ -217,15 +241,49 @@ static inline size_t pscalFwrite(const void *ptr, size_t size, size_t nmemb, FIL
             if (errno == EINTR) {
                 continue;
             }
+            pscalStdioNoteWriteFailure(fd);
             break;
         }
         if (chunk == 0) {
             errno = EIO;
+            pscalStdioNoteWriteFailure(fd);
             break;
         }
         written += (size_t)chunk;
     }
     return written / size;
+}
+
+/* A write went past the stream and failed there, so the stream knows nothing of it. Tools check
+ * these two when they finish, as they must where stdio buffers. */
+static inline int pscalFflush(FILE *stream) {
+    int result = pscalLibcFflush(stream);
+    if (result == 0 && pscalStdioIsStdStream(stream)) {
+        int err = vprocStdioWriteError(pscalStdioFdForStream(stream));
+        if (err != 0) {
+            errno = err;
+            return EOF;
+        }
+    }
+    return result;
+}
+
+static inline int pscalFerror(FILE *stream) {
+    if (pscalStdioIsStdStream(stream)) {
+        int err = vprocStdioWriteError(pscalStdioFdForStream(stream));
+        if (err != 0) {
+            errno = err;
+            return 1;
+        }
+    }
+    return pscalLibcFerror(stream);
+}
+
+static inline void pscalClearerr(FILE *stream) {
+    if (pscalStdioIsStdStream(stream)) {
+        vprocStdioSetWriteError(pscalStdioFdForStream(stream), 0);
+    }
+    pscalLibcClearerr(stream);
 }
 
 static inline void pscalPerror(const char *label) {
@@ -248,6 +306,9 @@ static inline void pscalPerror(const char *label) {
 #undef putchar
 #undef fwrite
 #undef perror
+#undef fflush
+#undef ferror
+#undef clearerr
 
 #define vfprintf(stream, fmt, ap) pscalVfprintf((stream), (fmt), (ap))
 #define fprintf(stream, ...) pscalFprintf((stream), __VA_ARGS__)
@@ -260,6 +321,9 @@ static inline void pscalPerror(const char *label) {
 #define putchar(c) pscalPutchar((c))
 #define fwrite(ptr, size, nmemb, stream) pscalFwrite((ptr), (size), (nmemb), (stream))
 #define perror(label) pscalPerror((label))
+#define fflush(stream) pscalFflush((stream))
+#define ferror(stream) pscalFerror((stream))
+#define clearerr(stream) pscalClearerr((stream))
 
 #endif /* PSCAL_TARGET_IOS && !VPROC_SHIM_DISABLED */
 

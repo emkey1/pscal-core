@@ -279,6 +279,11 @@ int vprocDupShim(int fd);
 int vprocDup2Shim(int fd, int target);
 int vprocCloseShim(int fd);
 int vprocFsyncShim(int fd);
+
+// The error flag of stdout or stderr, for this thread: vproc_stdio_shim.h writes past
+// the stream, whose own flag never sees a failure. Holds the errno of the failed write.
+void vprocStdioSetWriteError(int fd, int err);
+int vprocStdioWriteError(int fd);
 int vprocPipeShim(int pipefd[2]);
 int vprocSocketShim(int domain, int type, int protocol);
 int vprocAcceptShim(int fd, struct sockaddr *addr, socklen_t *addrlen);
