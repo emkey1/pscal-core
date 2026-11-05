@@ -6667,7 +6667,9 @@ static Value shellRunExpandedCommand(VM *vm, ShellCommand *cmd) {
         bool invalid_assignment = false;
         if (cmd->assignment_count > 0) {
             if (!shellApplyAssignmentsPermanently(cmd, &failed_assignment, &invalid_assignment)) {
-                if (invalid_assignment) {
+                if (gShellExpansionFailed) {
+                    /* The subscript's arithmetic has said all there is to say. */
+                } else if (invalid_assignment) {
                     runtimeError(vm, "shell exec: invalid assignment '%s'",
                                  failed_assignment ? failed_assignment : "<assignment>");
                     shellUpdateStatus(1);
@@ -6681,8 +6683,10 @@ static Value shellRunExpandedCommand(VM *vm, ShellCommand *cmd) {
                     shellUpdateStatus(1);
                 }
                 /* Readonly and the like: with no command to fail, a script ends here, as under bash. */
-                shellExitUnlessInteractive(vm, "assignment");
-            } else if (!cmd->ran_command_substitution) {
+                if (!gShellExpansionFailed) {
+                    shellExitUnlessInteractive(vm, "assignment");
+                }
+            } else if (!cmd->ran_command_substitution && !gShellExpansionFailed) {
                 /* `d=$(mktemp -d) || exit 1`: otherwise the status stays that of the
                  * last substitution, which shellRunCommandSubstitution has set. */
                 shellUpdateStatus(0);

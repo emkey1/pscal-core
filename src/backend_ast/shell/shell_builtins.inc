@@ -257,56 +257,6 @@ static void shellInvalidateFrontendState(FrontendKind kind) {
 #define perror(label) shellVprocPerror((label))
 #endif
 
-static const char *shellTypesetArithmeticErrorFormat(void) {
-    static int cached_style = -1;
-    if (cached_style < 0) {
-        cached_style = 0;
-        const char *bash_path = shellSafeGetenv("BASH");
-        if (!bash_path || bash_path[0] == '\0') {
-            bash_path = "/bin/bash";
-        }
-        if (bash_path && bash_path[0] != '\0') {
-            char quoted[768];
-            size_t qlen = 0;
-            quoted[qlen++] = '\'';
-            const char *p = bash_path;
-            for (; *p && qlen + 4 < sizeof(quoted); ++p) {
-                if (*p == '\'') {
-                    quoted[qlen++] = '\'';
-                    quoted[qlen++] = '\\';
-                    quoted[qlen++] = '\'';
-                    quoted[qlen++] = '\'';
-                } else {
-                    quoted[qlen++] = *p;
-                }
-            }
-            if (*p == '\0' && qlen + 2 < sizeof(quoted)) {
-                quoted[qlen++] = '\'';
-                quoted[qlen] = '\0';
-
-                char command[1024];
-                snprintf(command,
-                         sizeof(command),
-                         "%s --noprofile --norc -c 'typeset -i __pscaltmp=1+' 2>&1",
-                         quoted);
-                FILE *pipe = popen(command, "r");
-                if (pipe) {
-                    char buffer[256];
-                    size_t length = fread(buffer, 1, sizeof(buffer) - 1, pipe);
-                    buffer[length] = '\0';
-                    if (strstr(buffer, "arithmetic syntax error") != NULL) {
-                        cached_style = 1;
-                    }
-                    pclose(pipe);
-                }
-            }
-        }
-    }
-    if (cached_style == 1) {
-        return "%s: %s: arithmetic syntax error: operand expected (error token is \"%s\")";
-    }
-    return "%s: %s: syntax error: operand expected (error token is \"%s\")";
-}
 /* A job, or a stage of more than one. */
 static bool shellMetadataRunsApart(Value meta) {
     if (VALUE_TYPE(meta) != TYPE_STRING || !AS_STRING(meta)) {
@@ -532,17 +482,6 @@ cleanup:
     return result;
 }
 
-static bool shellArithmeticCommandEvaluateExpression(const char *expr, long long *out_value) {
-    char error[256];
-    if (!shellArithmeticEvaluate(expr, out_value, error, sizeof(error))) {
-        if (error[0]) {
-            shellReportRecoverableError(gShellCurrentVm, true, "((: %s: %s", expr ? expr : "", error);
-        }
-        return false;
-    }
-    return true;
-}
-
 Value vmBuiltinShellArithmetic(VM *vm, int arg_count, Value *args) {
     VM *previous_vm = shellSwapCurrentVm(vm);
     Value result = makeVoid();
@@ -632,7 +571,7 @@ dispatch_cleanup:
     const char *expression = AS_STRING(args[0]) ? AS_STRING(args[0]) : "";
 
     long long expr_value = 0;
-    if (!shellArithmeticCommandEvaluateExpression(expression, &expr_value)) {
+    if (!shellArithmeticEvaluate(expression, &expr_value, "((")) {
         shellMarkArithmeticError();
         shellUpdateStatus(1);
         goto cleanup;
@@ -823,6 +762,7 @@ Value vmBuiltinShellSubshell(VM *vm, int arg_count, Value *args) {
 }
 
 Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
+    shellNoteChunkLine(vm);
     VM *previous_vm = shellSwapCurrentVm(vm);
     Value result = makeVoid();
     const char *meta = NULL;
@@ -1272,8 +1212,12 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
     }
 
     if (!ok) {
-        frame->status = 1;
-        shellUpdateStatus(1);
+        if (frame->kind == SHELL_LOOP_KIND_CFOR) {
+            shellLoopCForFailed(frame);
+        } else {
+            frame->status = 1;
+            shellUpdateStatus(1);
+        }
     }
 
     if (redir_backups) {
@@ -1363,6 +1307,7 @@ Value vmBuiltinShellIf(VM *vm, int arg_count, Value *args) {
 }
 
 Value vmBuiltinShellCase(VM *vm, int arg_count, Value *args) {
+    shellNoteChunkLine(vm);
     VM *previous_vm = shellSwapCurrentVm(vm);
     Value result = makeVoid();
     if (arg_count != 2 || VALUE_TYPE(args[1]) != TYPE_STRING || !AS_STRING(args[1])) {
@@ -1792,10 +1737,9 @@ bool shellBuiltinArithmeticFastEval(const char *expression, int *out_status) {
         return false;
     }
     long long expr_value = 0;
-    if (!shellArithmeticCommandEvaluateExpression(expression, &expr_value)) {
-        return false;
-    }
-    *out_status = (expr_value != 0) ? 0 : 1;
+    /* A failure has been reported and has run the expression's side effects: it is the answer,
+     * and nothing may evaluate it again. */
+    *out_status = (shellArithmeticEvaluate(expression, &expr_value, "((") && expr_value != 0) ? 0 : 1;
     return true;
 }
 
@@ -2447,8 +2391,9 @@ static bool shellCondEvaluateBinary(ShellCondParser *parser, char *left, const c
             /* [[ -eq ]] takes arithmetic: [[ x -eq 3 ]]. */
             long long lhs = 0;
             long long rhs = 0;
-            if (!shellArithmeticEvaluate(left, &lhs, NULL, 0) || !shellArithmeticEvaluate(right, &rhs, NULL, 0)) {
-                parser->error = true;
+            if (!shellArithmeticEvaluateText(left, 0, &lhs, "[[") || !shellArithmeticEvaluateText(right, 0, &rhs, "[[")) {
+                /* Reported, and it is false. The rest of the test goes on. */
+                result = false;
             } else if (strcmp(op, "-eq") == 0) {
                 result = lhs == rhs;
             } else if (strcmp(op, "-ne") == 0) {
@@ -5313,7 +5258,7 @@ Value vmBuiltinShellLet(VM *vm, int arg_count, Value *args) {
             break;
         }
         long long expr_value = 0;
-        if (!shellLetEvaluateExpression(vm, AS_STRING(value), &expr_value)) {
+        if (!shellLetEvaluateExpression(AS_STRING(value), &expr_value)) {
             ok = false;
             break;
         }
@@ -7528,58 +7473,6 @@ Value vmBuiltinShellShopt(VM *vm, int arg_count, Value *args) {
     return makeVoid();
 }
 
-static void shellDeclareExtractErrorToken(const char *start,
-                                          const char *end,
-                                          char *buffer,
-                                          size_t buffer_size) {
-    if (!buffer || buffer_size == 0) {
-        return;
-    }
-    buffer[0] = '\0';
-    if (!start || !end || end <= start) {
-        return;
-    }
-    const char *cursor = end;
-    while (cursor > start) {
-        cursor--;
-        unsigned char ch = (unsigned char)*cursor;
-        if (isspace(ch)) {
-            continue;
-        }
-        const char *token_start = cursor;
-        if (isalnum(ch) || ch == '_') {
-            while (token_start > start) {
-                unsigned char prev = (unsigned char)token_start[-1];
-                if (!isalnum(prev) && prev != '_') {
-                    break;
-                }
-                token_start--;
-            }
-        } else {
-            bool two_char_op = false;
-            if (token_start > start) {
-                unsigned char prev = (unsigned char)token_start[-1];
-                if ((ch == '=' && (prev == '!' || prev == '=' || prev == '<' || prev == '>')) ||
-                    (ch == '&' && prev == '&') || (ch == '|' && prev == '|') ||
-                    (ch == '+' && prev == '+') || (ch == '-' && prev == '-')) {
-                    token_start--;
-                    two_char_op = true;
-                }
-            }
-            if (!two_char_op && (ch == '+' || ch == '-' || ch == '*' || ch == '/' || ch == '%')) {
-                token_start = cursor;
-            }
-        }
-        size_t token_len = (size_t)((cursor + 1) - token_start);
-        if (token_len >= buffer_size) {
-            token_len = buffer_size - 1;
-        }
-        memcpy(buffer, token_start, token_len);
-        buffer[token_len] = '\0';
-        return;
-    }
-}
-
 static void shellDeclarePrintQuoted(const char *value) {
     fputc('"', stdout);
     for (const char *cursor = value; *cursor; ++cursor) {
@@ -8148,9 +8041,8 @@ Value vmBuiltinShellDeclare(VM *vm, int arg_count, Value *args) {
                             exists = (existing != NULL);
                         }
                         if (!exists) {
-                            const char *initial = integer_attribute ? "0" : "";
                             errno = 0;
-                            if (!shellSetTrackedVariable(spec, initial, false)) {
+                            if (!shellSetTrackedVariable(spec, "", false)) {
                                 if (errno != 0) {
                                     runtimeError(vm,
                                                 "declare: unable to set '%s': %s",
@@ -8196,58 +8088,26 @@ Value vmBuiltinShellDeclare(VM *vm, int arg_count, Value *args) {
             }
         }
         if (integer_attribute && !array_literal) {
-            const char *trim_start = value_text;
-            while (trim_start && *trim_start && isspace((unsigned char)*trim_start)) {
-                trim_start++;
-            }
-            const char *trim_end = value_text + strlen(value_text);
-            while (trim_end > trim_start && isspace((unsigned char)trim_end[-1])) {
-                trim_end--;
-            }
-            size_t trimmed_len = (size_t)(trim_end - trim_start);
-            if (trimmed_len == 0) {
-                coerced_value = strdup("0");
-                if (!coerced_value) {
-                    runtimeError(vm, "declare: out of memory");
-                    free(name);
-                    ok = false;
-                    break;
+            long long number = 0;
+            if (!shellArithmeticEvaluateText(value_text, 0, &number, builtin_name)) {
+                shellArithmeticExpansionFail();
+                if (exit_status == 0) {
+                    exit_status = 1;
                 }
-                value_to_store = coerced_value;
-            } else {
-                bool eval_error = false;
-                char *result = shellEvaluateArithmetic(value_text, &eval_error);
-                if (!result || eval_error) {
-                    char expr_buffer[256];
-                    if (trimmed_len >= sizeof(expr_buffer)) {
-                        trimmed_len = sizeof(expr_buffer) - 1;
-                    }
-                    memcpy(expr_buffer, trim_start, trimmed_len);
-                    expr_buffer[trimmed_len] = '\0';
-
-                    char token_buffer[256];
-                    shellDeclareExtractErrorToken(trim_start, trim_end, token_buffer, sizeof(token_buffer));
-                    const char *error_fragment = (token_buffer[0] != '\0') ? token_buffer : expr_buffer;
-
-                    const char *error_format = shellTypesetArithmeticErrorFormat();
-                    shellReportRecoverableError(vm,
-                                                true,
-                                                error_format,
-                                                builtin_name,
-                                                expr_buffer,
-                                                error_fragment);
-                    shellMarkArithmeticError();
-                    if (exit_status == 0) {
-                        exit_status = 1;
-                    }
-                    free(result);
-                    free(name);
-                    ok = false;
-                    break;
-                }
-                coerced_value = result;
-                value_to_store = coerced_value;
+                free(name);
+                ok = false;
+                break;
             }
+            char buffer[32];
+            snprintf(buffer, sizeof(buffer), "%lld", number);
+            coerced_value = strdup(buffer);
+            if (!coerced_value) {
+                runtimeError(vm, "declare: out of memory");
+                free(name);
+                ok = false;
+                break;
+            }
+            value_to_store = coerced_value;
         }
         if (associative) {
             if (use_local_scope) {
@@ -8298,6 +8158,16 @@ Value vmBuiltinShellDeclare(VM *vm, int arg_count, Value *args) {
                     runtimeError(vm, "declare: unable to set '%s': %s", name, strerror(errno));
                 } else {
                     runtimeError(vm, "declare: unable to set '%s'", name);
+                }
+                free(coerced_value);
+                free(name);
+                ok = false;
+                break;
+            }
+            /* A subscript in its literal has reported, and the rest goes. */
+            if (array_literal && gShellExpansionFailed) {
+                if (exit_status == 0) {
+                    exit_status = 1;
                 }
                 free(coerced_value);
                 free(name);
@@ -10191,7 +10061,10 @@ Value vmBuiltinShellUnset(VM *vm, int arg_count, Value *args) {
             char *base = strndup(name, name_len);
             size_t subscript_len = strlen(open) - 2;
             if (base && strcmp(open + 1, "@]") != 0 && strcmp(open + 1, "*]") != 0) {
-                char *key = shellParamSubscriptKey(base, name_len, open + 1, subscript_len);
+                char *key = NULL;
+                if (!shellParamSubscriptKeyChecked(base, name_len, open + 1, subscript_len, &key)) {
+                    ok = false;
+                }
                 if (key) {
                     shellArrayRegistryUnsetElement(base, key);
                     free(key);
@@ -10924,9 +10797,14 @@ Value vmBuiltinShellLocal(VM *vm, int arg_count, Value *args) {
             continue;
         }
         char *coerced = NULL;
-        if (!literal && integer_attribute) {
+        if (!literal && integer_attribute && eq) {
             long long number = 0;
-            (void)shellArithmeticEvaluate(value, &number, NULL, 0);
+            if (!shellArithmeticEvaluateText(value, 0, &number, "local")) {
+                shellArithmeticExpansionFail();
+                free(name);
+                ok = false;
+                break;
+            }
             char buffer[32];
             snprintf(buffer, sizeof(buffer), "%lld", number);
             coerced = strdup(buffer);
@@ -11099,8 +10977,20 @@ static void shellFdPrintf(int fd, const char *fmt, ...) {
 static void shellReportRecoverableError(VM *vm, bool with_location, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    char message[512];
-    vsnprintf(message, sizeof(message), fmt, args);
+    char fixed[512];
+    char *message = fixed;
+    va_list measure;
+    va_copy(measure, args);
+    int needed = vsnprintf(fixed, sizeof(fixed), fmt, measure);
+    va_end(measure);
+    /* An expression can be any length. */
+    if (needed >= (int)sizeof(fixed)) {
+        char *grown = (char *)malloc((size_t)needed + 1);
+        if (grown) {
+            vsnprintf(grown, (size_t)needed + 1, fmt, args);
+            message = grown;
+        }
+    }
     va_end(args);
 
     const char *script = NULL;
@@ -11120,6 +11010,9 @@ static void shellReportRecoverableError(VM *vm, bool with_location, const char *
         shellFdPrintf(STDERR_FILENO, "%s: %s\n", script, message);
     } else {
         shellFdPrintf(STDERR_FILENO, "%s\n", message);
+    }
+    if (message != fixed) {
+        free(message);
     }
 
     if (vm) {
@@ -13975,6 +13868,7 @@ static int shellLoopEvaluateArithmeticExpression(const char *expression) {
 
 static bool shellLoopEvaluateConditionSimple(ShellLoopFrame *frame, int *status_out) {
     int status = 1;
+    shellNoteChunkLine(gShellCurrentVm);
     switch (frame->cond_kind) {
         case SHELL_LOOP_CONDITION_TEST:
         case SHELL_LOOP_CONDITION_BRACKET:
@@ -14161,8 +14055,7 @@ Value vmHostShellLoopIsReady(VM *vm) {
             } else if (!shellLoopEvaluateCForCondition(frame, &condition_ready)) {
                 frame->skip_body = true;
                 frame->break_pending = true;
-                frame->status = 1;
-                shellUpdateStatus(1);
+                shellLoopCForFailed(frame);
                 ready = false;
             } else {
                 ready = condition_ready;
@@ -14231,8 +14124,7 @@ Value vmHostShellLoopAdvance(VM *vm) {
         }
     } else if (frame->kind == SHELL_LOOP_KIND_CFOR) {
         if (!shellLoopExecuteCForUpdate(frame)) {
-            frame->status = 1;
-            shellUpdateStatus(1);
+            shellLoopCForFailed(frame);
             frame->skip_body = false;
             frame->break_pending = true;
             shellMaybeResetPipeline();
@@ -14240,8 +14132,7 @@ Value vmHostShellLoopAdvance(VM *vm) {
         }
         bool condition_ready = false;
         if (!shellLoopEvaluateCForCondition(frame, &condition_ready)) {
-            frame->status = 1;
-            shellUpdateStatus(1);
+            shellLoopCForFailed(frame);
             frame->skip_body = false;
             frame->break_pending = true;
             shellMaybeResetPipeline();

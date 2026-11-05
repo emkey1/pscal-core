@@ -1565,6 +1565,7 @@ static bool shellApplyAssignmentsPermanently(const ShellCommand *cmd,
     if (!cmd) {
         return true;
     }
+    gShellExpansionFailed = false;
     for (size_t i = 0; i < cmd->assignment_count; ++i) {
         const ShellAssignmentEntry *entry = &cmd->assignments[i];
         const char *assignment = entry->text;
@@ -1600,6 +1601,14 @@ static bool shellApplyAssignmentsPermanently(const ShellCommand *cmd,
         }
         bool set_ok;
         char *attributed = entry->is_array_literal ? NULL : shellApplyVariableAttributes(effective_name, value);
+        if (gShellExpansionFailed) {
+            /* Its arithmetic failed: this one and those after it are not assigned. */
+            free(attributed);
+            free(name);
+            free(base_name);
+            free(subscript_text);
+            return true;
+        }
         const char *assigned = attributed ? attributed : value;
         if (is_element) {
             set_ok = shellArrayRegistrySetElement(effective_name, subscript_text, assigned);
@@ -3779,6 +3788,26 @@ static void shellArrayRegistryAssignFromText(const char *name, const char *value
     }
     const ShellArrayVariable *before = shellArrayRegistryFindConst(name);
     bool declared_associative = before && before->kind == SHELL_ARRAY_KIND_ASSOCIATIVE && !before->sparse;
+    /* Only declare -A makes a keyed array: elsewhere a subscript is arithmetic, a=([1+1]=x). */
+    if (kind == SHELL_ARRAY_KIND_ASSOCIATIVE && !declared_associative && keys) {
+        for (size_t i = 0; i < count; ++i) {
+            if (shellSubscriptIsNumeric(keys[i])) {
+                continue;
+            }
+            long long index = 0;
+            if (!shellArithmeticEvaluateText(keys[i], 0, &index, "")) {
+                shellArithmeticExpansionFail();
+                shellArrayRegistryStore(name, NULL, NULL, 0, SHELL_ARRAY_KIND_INDEXED);
+                shellFreeArrayValues(items, count);
+                shellFreeArrayValues(keys, count);
+                return;
+            }
+            char buffer[32];
+            snprintf(buffer, sizeof(buffer), "%lld", index);
+            free(keys[i]);
+            keys[i] = strdup(buffer);
+        }
+    }
     if (!shellArrayRegistryStore(name, items, keys, count, kind)) {
         shellArrayRegistryRemove(name);
     } else if (kind == SHELL_ARRAY_KIND_ASSOCIATIVE && !declared_associative && keys) {

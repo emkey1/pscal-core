@@ -21,7 +21,7 @@ static char *shellExpandWord(const char *text,
                              bool **out_quoted_map,
                              size_t *out_quoted_len,
                              bool *out_array_zero);
-static bool shellArithmeticEvaluate(const char *expr, long long *out_value, char *error, size_t error_size);
+static bool shellArithmeticEvaluate(const char *expr, long long *out_value, const char *label);
 
 static char *shellNormalizeDollarCommandInline(const char *command, size_t len) {
     if (!command) {
@@ -645,12 +645,8 @@ static char *shellExpandWord(const char *text,
                 memcpy(expr, text + i + 3, expr_len);
                 expr[expr_len] = '\0';
                 long long value = 0;
-                char error[256];
-                if (!shellArithmeticEvaluate(expr, &value, error, sizeof(error))) {
-                    if (!gShellExpansionFailed) {
-                        shellReportRecoverableError(gShellCurrentVm, true, "%s: %s", expr, error);
-                        shellExpansionFail();
-                    }
+                if (!shellArithmeticEvaluate(expr, &value, "")) {
+                    shellArithmeticExpansionFail();
                     free(expr);
                     i = text_len;
                     continue;
@@ -4172,17 +4168,14 @@ static bool shellResolveAppendAssignment(char **assignment) {
     shellBufferAppendChar(&out, &length, &capacity, '=');
     if (name && shellVariableHasAttribute(name, SHELL_VAR_ATTR_INTEGER)) {
         /* Evaluated here, so the plain assignment sees a number. */
-        size_t n = strlen(old_value) + strlen(value) + 8;
-        char *expr = (char *)malloc(n);
-        long long total = 0;
-        if (expr) {
-            snprintf(expr, n, "(%s)+(%s)", *old_value ? old_value : "0", *value ? value : "0");
-            if (shellArithmeticEvaluateText(expr, 0, &total, NULL, 0)) {
-                char buffer[32];
-                snprintf(buffer, sizeof(buffer), "%lld", total);
-                shellBufferAppendString(&out, &length, &capacity, buffer);
-            }
-            free(expr);
+        long long old_number = 0;
+        long long number = 0;
+        if (shellArithmeticEvaluateText(old_value, 0, &old_number, "") && shellArithmeticEvaluateText(value, 0, &number, "")) {
+            char buffer[32];
+            snprintf(buffer, sizeof(buffer), "%lld", (long long)((unsigned long long)old_number + (unsigned long long)number));
+            shellBufferAppendString(&out, &length, &capacity, buffer);
+        } else {
+            shellArithmeticExpansionFail();
         }
     } else {
         shellBufferAppendString(&out, &length, &capacity, old_value);

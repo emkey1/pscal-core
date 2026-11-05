@@ -1182,8 +1182,6 @@ static void shellReadonlyPrintVariables(void);
 static bool shellIsValidEnvName(const char *name);
 static void shellExportPrintEnvironment(void);
 static bool shellParseReturnStatus(const char *text, int *out_status);
-static bool shellArithmeticParseValueString(const char *text, long long *out_value);
-static char *shellEvaluateArithmetic(const char *expr, bool *out_error);
 static void shellMarkArithmeticError(void);
 static const char *shellCurrentIfs(void);
 static bool shellArrayRegistryIndexedExists(const char *name);
@@ -3122,6 +3120,7 @@ static PSCAL_THREAD_LOCAL bool gShellReturnPending = false;
 static PSCAL_THREAD_LOCAL int gShellReturnPriorStatus = 0;
 /* `return 1 2` and the like: everything running goes, down to what the shell last read. */
 static PSCAL_THREAD_LOCAL bool gShellDiscardPending = false;
+static PSCAL_THREAD_LOCAL bool gShellDiscardInText = false; /* eval and source read on, for arithmetic */
 /* $? when the running trap broke in, for a bare `return` in its text. */
 static PSCAL_THREAD_LOCAL bool gShellTrapStatusValid = false;
 static PSCAL_THREAD_LOCAL int gShellTrapStatus = 0;
@@ -3415,7 +3414,9 @@ static void shellVariableSetAttribute(const char *name, unsigned set_flags, unsi
     }
 }
 
-static bool shellArithmeticEvaluateText(const char *text, int depth, long long *out_value, char *error, size_t error_size);
+static bool shellArithmeticEvaluateText(const char *text, int depth, long long *out_value, const char *label);
+static bool shellArithmeticEvaluate(const char *expr, long long *out_value, const char *label);
+static void shellArithmeticExpansionFail(void);
 
 /* The value after a variable's attributes, or NULL if they leave it as it is. */
 static char *shellApplyVariableAttributes(const char *name, const char *value) {
@@ -3424,8 +3425,11 @@ static char *shellApplyVariableAttributes(const char *name, const char *value) {
     }
     if (shellVariableHasAttribute(name, SHELL_VAR_ATTR_INTEGER)) {
         long long number = 0;
-        if (!shellArithmeticEvaluateText(value, 0, &number, NULL, 0)) {
-            number = 0;
+        if (!shellArithmeticEvaluateText(value, 0, &number, "")) {
+            /* Nothing is assigned: it keeps what it had. */
+            shellArithmeticExpansionFail();
+            char *kept = shellLookupParameterValue(name, strlen(name));
+            return kept ? kept : strdup("");
         }
         char buffer[32];
         snprintf(buffer, sizeof(buffer), "%lld", number);
@@ -5914,521 +5918,31 @@ static bool shellAssignLoopVariable(const char *name, const char *value) {
     return shellSetTrackedVariable(name, value, false);
 }
 
-static void shellLoopTrimBounds(const char **start_ptr, const char **end_ptr) {
-    if (!start_ptr || !end_ptr) {
-        return;
+/* A loop's or case's own words have no command to say which line they are on. */
+static void shellNoteChunkLine(VM *vm) {
+    if (vm && vm->chunk && vm->chunk->lines && vm->lastInstruction) {
+        int line = vm->chunk->lines[vm->lastInstruction - vm->chunk->code];
+        if (line > 0) {
+            gShellCurrentCommandLine = line;
+        }
     }
-    const char *start = *start_ptr;
-    const char *end = *end_ptr;
-    while (start < end && isspace((unsigned char)*start)) {
-        start++;
-    }
-    while (end > start && isspace((unsigned char)end[-1])) {
-        end--;
-    }
-    *start_ptr = start;
-    *end_ptr = end;
 }
 
-static bool shellLoopGetNumericVariable(const char *name, long long *out_value) {
-    if (!name || !out_value) {
-        return false;
-    }
-    char *raw = shellLookupParameterValue(name, strlen(name));
-    bool ok = shellArithmeticParseValueString(raw ? raw : "0", out_value);
-    free(raw);
+/* A clause of for ((;;)) is one expression, and a failure is reported as for ((...)). The loop
+ * ends with status 1, which set -e does not take for a command that failed. */
+static bool shellLoopExecuteCForExpression(const char *expr) {
+    long long value = 0;
+    shellRuntimeEnterCondition();
+    bool ok = shellArithmeticEvaluate(expr, &value, "((");
+    shellRuntimeLeaveCondition();
     return ok;
 }
 
-static bool shellLoopEvalNumeric(const char *expr, long long *out_value) {
-    if (!expr) {
-        if (out_value) {
-            *out_value = 0;
-        }
-        return true;
-    }
-    bool eval_error = false;
-    char *result = shellEvaluateArithmetic(expr, &eval_error);
-    if (eval_error || !result) {
-        if (result) {
-            free(result);
-        }
-        shellMarkArithmeticError();
-        return false;
-    }
-    long long value = 0;
-    bool ok = shellArithmeticParseValueString(result, &value);
-    free(result);
-    if (!ok) {
-        shellMarkArithmeticError();
-        return false;
-    }
-    if (out_value) {
-        *out_value = value;
-    }
-    return true;
-}
-
-static bool shellLoopEvalSubstring(const char *start, const char *end, long long *out_value) {
-    if (!start || !end || end < start) {
-        return false;
-    }
-    shellLoopTrimBounds(&start, &end);
-    size_t len = (size_t)(end - start);
-    char *copy = (char *)malloc(len + 1);
-    if (!copy) {
-        return false;
-    }
-    memcpy(copy, start, len);
-    copy[len] = '\0';
-    long long value = 0;
-    bool ok = shellLoopEvalNumeric(copy, &value);
-    free(copy);
-    if (!ok) {
-        return false;
-    }
-    if (out_value) {
-        *out_value = value;
-    }
-    return true;
-}
-
-static bool shellLoopAssignNumericValue(const char *name, long long value) {
-    if (!name) {
-        return false;
-    }
-    char buffer[64];
-    int written = snprintf(buffer, sizeof(buffer), "%lld", value);
-    if (written < 0 || written >= (int)sizeof(buffer)) {
-        return false;
-    }
-    return shellSetTrackedVariable(name, buffer, false);
-}
-
-static const char *shellLoopParseVariableName(const char *start, const char *end, char **out_name) {
-    if (!start || !end || start >= end) {
-        return NULL;
-    }
-    while (start < end && isspace((unsigned char)*start)) {
-        start++;
-    }
-    size_t name_len = 0;
-    if (!consumeShellIdentifier(start, (size_t)(end - start), &name_len, false)) {
-        return NULL;
-    }
-    const char *cursor = start + name_len;
-    char *name = (char *)malloc(name_len + 1);
-    if (!name) {
-        return NULL;
-    }
-    memcpy(name, start, name_len);
-    name[name_len] = '\0';
-    while (cursor < end && isspace((unsigned char)*cursor)) {
-        cursor++;
-    }
-    if (out_name) {
-        *out_name = name;
-    } else {
-        free(name);
-    }
-    return cursor;
-}
-
-static bool shellLoopExecuteCForExpressionRange(const char *start, const char *end);
-
-static bool shellLoopExecuteCForSingleExpression(const char *start, const char *end) {
-    shellLoopTrimBounds(&start, &end);
-    if (!start || !end || start >= end) {
-        return true;
-    }
-
-    size_t length = (size_t)(end - start);
-    if (length >= 2 && start[0] == '+' && start[1] == '+') {
-        const char *after_op = start + 2;
-        char *name = NULL;
-        const char *rest = shellLoopParseVariableName(after_op, end, &name);
-        if (!rest || !name) {
-            free(name);
-            return false;
-        }
-        if (rest != end) {
-            free(name);
-            return false;
-        }
-        long long value = 0;
-        if (!shellLoopGetNumericVariable(name, &value)) {
-            free(name);
-            return false;
-        }
-        value += 1;
-        bool ok = shellLoopAssignNumericValue(name, value);
-        free(name);
-        return ok;
-    }
-    if (length >= 2 && start[0] == '-' && start[1] == '-') {
-        const char *after_op = start + 2;
-        char *name = NULL;
-        const char *rest = shellLoopParseVariableName(after_op, end, &name);
-        if (!rest || !name) {
-            free(name);
-            return false;
-        }
-        if (rest != end) {
-            free(name);
-            return false;
-        }
-        long long value = 0;
-        if (!shellLoopGetNumericVariable(name, &value)) {
-            free(name);
-            return false;
-        }
-        value -= 1;
-        bool ok = shellLoopAssignNumericValue(name, value);
-        free(name);
-        return ok;
-    }
-
-    char *name = NULL;
-    const char *rest = shellLoopParseVariableName(start, end, &name);
-    if (rest && name) {
-        const char *cursor = rest;
-        if (cursor < end && cursor + 1 <= end && cursor[0] == '+' && cursor + 1 < end && cursor[1] == '+') {
-            cursor += 2;
-            while (cursor < end && isspace((unsigned char)*cursor)) {
-                cursor++;
-            }
-            if (cursor != end) {
-                free(name);
-                return false;
-            }
-            long long value = 0;
-            if (!shellLoopGetNumericVariable(name, &value)) {
-                free(name);
-                return false;
-            }
-            value += 1;
-            bool ok = shellLoopAssignNumericValue(name, value);
-            free(name);
-            return ok;
-        }
-        if (cursor < end && cursor + 1 <= end && cursor[0] == '-' && cursor + 1 < end && cursor[1] == '-') {
-            cursor += 2;
-            while (cursor < end && isspace((unsigned char)*cursor)) {
-                cursor++;
-            }
-            if (cursor != end) {
-                free(name);
-                return false;
-            }
-            long long value = 0;
-            if (!shellLoopGetNumericVariable(name, &value)) {
-                free(name);
-                return false;
-            }
-            value -= 1;
-            bool ok = shellLoopAssignNumericValue(name, value);
-            free(name);
-            return ok;
-        }
-
-        char assign_op = '\0';
-        if (cursor < end) {
-            if (cursor + 1 < end && (cursor[0] == '+' || cursor[0] == '-' || cursor[0] == '*' || cursor[0] == '/' || cursor[0] == '%') &&
-                cursor[1] == '=') {
-                assign_op = cursor[0];
-                cursor += 2;
-            } else if (*cursor == '=') {
-                assign_op = '=';
-                cursor++;
-            }
-        }
-
-        if (assign_op != '\0') {
-            const char *rhs_start = cursor;
-            const char *rhs_end = end;
-            shellLoopTrimBounds(&rhs_start, &rhs_end);
-            if (rhs_start >= rhs_end) {
-                free(name);
-                return false;
-            }
-            long long rhs_value = 0;
-            if (!shellLoopEvalSubstring(rhs_start, rhs_end, &rhs_value)) {
-                free(name);
-                return false;
-            }
-            long long result = rhs_value;
-            if (assign_op != '=') {
-                long long current = 0;
-                if (!shellLoopGetNumericVariable(name, &current)) {
-                    free(name);
-                    return false;
-                }
-                switch (assign_op) {
-                    case '+':
-                        result = current + rhs_value;
-                        break;
-                    case '-':
-                        result = current - rhs_value;
-                        break;
-                    case '*':
-                        result = current * rhs_value;
-                        break;
-                    case '/':
-                        if (rhs_value == 0) {
-                            free(name);
-                            return false;
-                        }
-                        result = current / rhs_value;
-                        break;
-                    case '%':
-                        if (rhs_value == 0) {
-                            free(name);
-                            return false;
-                        }
-                        result = current % rhs_value;
-                        break;
-                    default:
-                        free(name);
-                        return false;
-                }
-            }
-            bool ok = shellLoopAssignNumericValue(name, result);
-            free(name);
-            return ok;
-        }
-        if (cursor == end) {
-            long long value = 0;
-            bool ok = shellLoopGetNumericVariable(name, &value);
-            free(name);
-            return ok;
-        }
-    }
-    free(name);
-
-    long long value = 0;
-    return shellLoopEvalSubstring(start, end, &value);
-}
-
-static bool shellLoopExecuteCForExpressionRange(const char *start, const char *end) {
-    shellLoopTrimBounds(&start, &end);
-    if (!start || !end || start >= end) {
-        return true;
-    }
-    int depth = 0;
-    const char *segment_start = start;
-    for (const char *cursor = start; cursor < end; ++cursor) {
-        char ch = *cursor;
-        if (ch == '(') {
-            depth++;
-        } else if (ch == ')') {
-            if (depth > 0) {
-                depth--;
-            }
-        } else if (ch == ',' && depth == 0) {
-            if (!shellLoopExecuteCForSingleExpression(segment_start, cursor)) {
-                return false;
-            }
-            segment_start = cursor + 1;
-        }
-    }
-    return shellLoopExecuteCForSingleExpression(segment_start, end);
-}
-
-static bool shellLoopExecuteCForExpression(const char *expr) {
-    if (!expr) {
-        return true;
-    }
-    const char *start = expr;
-    const char *end = expr + strlen(expr);
-    return shellLoopExecuteCForExpressionRange(start, end);
-}
-
-static const char *shellLoopFindTopLevelOperator(const char *start, const char *end,
-                                                const char **ops,
-                                                const size_t *lengths,
-                                                size_t count,
-                                                size_t *out_index) {
-    if (out_index) {
-        *out_index = SIZE_MAX;
-    }
-    if (!start || !end || start >= end || !ops || !lengths) {
-        return NULL;
-    }
-    int depth = 0;
-    for (const char *cursor = start; cursor < end; ++cursor) {
-        char ch = *cursor;
-        if (ch == '(') {
-            depth++;
-            continue;
-        }
-        if (ch == ')') {
-            if (depth > 0) {
-                depth--;
-            }
-            continue;
-        }
-        if (depth != 0) {
-            continue;
-        }
-        for (size_t i = 0; i < count; ++i) {
-            size_t len = lengths[i];
-            if (len == 0 || cursor + len > end) {
-                continue;
-            }
-            if (strncmp(cursor, ops[i], len) == 0) {
-                if (out_index) {
-                    *out_index = i;
-                }
-                return cursor;
-            }
-        }
-    }
-    return NULL;
-}
-
-static bool shellLoopEvaluateConditionRange(const char *start, const char *end, bool *out_ready) {
-    shellLoopTrimBounds(&start, &end);
-    if (!start || !end || start >= end) {
-        if (out_ready) {
-            *out_ready = true;
-        }
-        return true;
-    }
-
-    if (*start == '(') {
-        int depth = 0;
-        const char *cursor = start;
-        bool enclosed = false;
-        while (cursor < end) {
-            char ch = *cursor;
-            if (ch == '(') {
-                depth++;
-            } else if (ch == ')') {
-                depth--;
-                if (depth == 0) {
-                    enclosed = (cursor == end - 1);
-                    break;
-                }
-            }
-            cursor++;
-        }
-        if (enclosed) {
-            return shellLoopEvaluateConditionRange(start + 1, end - 1, out_ready);
-        }
-    }
-
-    while (start < end && *start == '!') {
-        const char *next = start + 1;
-        while (next < end && isspace((unsigned char)*next)) {
-            next++;
-        }
-        bool inner = false;
-        if (!shellLoopEvaluateConditionRange(next, end, &inner)) {
-            return false;
-        }
-        if (out_ready) {
-            *out_ready = !inner;
-        }
-        return true;
-    }
-
-    const char *or_ops[] = {"||"};
-    size_t or_lens[] = {2};
-    size_t op_index = SIZE_MAX;
-    const char *pos = shellLoopFindTopLevelOperator(start, end, or_ops, or_lens, 1, &op_index);
-    if (pos) {
-        bool left = false;
-        if (!shellLoopEvaluateConditionRange(start, pos, &left)) {
-            return false;
-        }
-        if (left) {
-            if (out_ready) {
-                *out_ready = true;
-            }
-            return true;
-        }
-        bool right = false;
-        if (!shellLoopEvaluateConditionRange(pos + or_lens[0], end, &right)) {
-            return false;
-        }
-        if (out_ready) {
-            *out_ready = right;
-        }
-        return true;
-    }
-
-    const char *and_ops[] = {"&&"};
-    size_t and_lens[] = {2};
-    pos = shellLoopFindTopLevelOperator(start, end, and_ops, and_lens, 1, &op_index);
-    if (pos) {
-        bool left = false;
-        if (!shellLoopEvaluateConditionRange(start, pos, &left)) {
-            return false;
-        }
-        if (!left) {
-            if (out_ready) {
-                *out_ready = false;
-            }
-            return true;
-        }
-        bool right = false;
-        if (!shellLoopEvaluateConditionRange(pos + and_lens[0], end, &right)) {
-            return false;
-        }
-        if (out_ready) {
-            *out_ready = right;
-        }
-        return true;
-    }
-
-    const char *equality_ops[] = {"==", "!="};
-    size_t equality_lens[] = {2, 2};
-    pos = shellLoopFindTopLevelOperator(start, end, equality_ops, equality_lens, 2, &op_index);
-    if (pos) {
-        long long lhs = 0;
-        long long rhs = 0;
-        if (!shellLoopEvalSubstring(start, pos, &lhs) ||
-            !shellLoopEvalSubstring(pos + equality_lens[op_index], end, &rhs)) {
-            return false;
-        }
-        bool truth = (op_index == 0) ? (lhs == rhs) : (lhs != rhs);
-        if (out_ready) {
-            *out_ready = truth;
-        }
-        return true;
-    }
-
-    const char *rel_ops[] = {"<=", ">=", "<", ">"};
-    size_t rel_lens[] = {2, 2, 1, 1};
-    pos = shellLoopFindTopLevelOperator(start, end, rel_ops, rel_lens, 4, &op_index);
-    if (pos) {
-        long long lhs = 0;
-        long long rhs = 0;
-        if (!shellLoopEvalSubstring(start, pos, &lhs) ||
-            !shellLoopEvalSubstring(pos + rel_lens[op_index], end, &rhs)) {
-            return false;
-        }
-        bool truth = false;
-        switch (op_index) {
-            case 0: truth = (lhs <= rhs); break;
-            case 1: truth = (lhs >= rhs); break;
-            case 2: truth = (lhs < rhs); break;
-            case 3: truth = (lhs > rhs); break;
-        }
-        if (out_ready) {
-            *out_ready = truth;
-        }
-        return true;
-    }
-
-    long long value = 0;
-    if (!shellLoopEvalSubstring(start, end, &value)) {
-        return false;
-    }
-    if (out_ready) {
-        *out_ready = (value != 0);
-    }
-    return true;
+static void shellLoopCForFailed(ShellLoopFrame *frame) {
+    frame->status = 1;
+    shellRuntimeEnterCondition();
+    shellUpdateStatus(1);
+    shellRuntimeLeaveCondition();
 }
 
 static bool shellLoopEvaluateConditionText(const char *expr, bool *out_ready) {
@@ -6439,16 +5953,15 @@ static bool shellLoopEvaluateConditionText(const char *expr, bool *out_ready) {
         shellUpdateStatus(0);
         return true;
     }
-    const char *start = expr;
-    const char *end = expr + strlen(expr);
     shellRuntimeEnterCondition();
-    bool ready = true;
-    if (!shellLoopEvaluateConditionRange(start, end, &ready)) {
+    /* No condition at all is true. */
+    long long value = 1;
+    if (*expr && !shellArithmeticEvaluate(expr, &value, "((")) {
         shellRuntimeLeaveCondition();
         return false;
     }
     if (out_ready) {
-        *out_ready = ready;
+        *out_ready = value != 0;
     }
     shellUpdateStatus(0);
     if (!gShellExitRequested) {
@@ -7055,21 +6568,35 @@ static void shellUnwindChunk(size_t loop_depth, size_t case_depth) {
 bool shellRuntimeConsumeDiscard(void) {
     bool pending = gShellDiscardPending;
     gShellDiscardPending = false;
+    gShellDiscardInText = false;
     return pending;
 }
 
-/* What the shell last read has been dropped, part way through, and it reads on. Only the
- * outermost chunk of a context comes here, so all of this was that command's. */
-void shellRuntimeAbandonCommand(void) {
-    shellUnwindChunk(0, 0);
-    gShellConditionDepth = 0;
+bool shellRuntimeDiscardStaysInText(void) {
+    return gShellDiscardPending && gShellDiscardInText;
+}
+
+void shellRuntimeDiscardBase(ShellDiscardBase *out) {
+    out->loop_depth = gShellLoopStackSize;
+    out->case_depth = gShellCaseStack.count;
+    out->condition_depth = gShellConditionDepth;
+}
+
+/* What the shell last read has been dropped, part way through, and it reads on. The outermost
+ * chunk of a context comes here with NULL, and all of it was that command's. Eval, a sourced
+ * file or a trap's text gives what was there when it started, which goes on running. */
+void shellRuntimeAbandonCommand(const ShellDiscardBase *base) {
+    shellUnwindChunk(base ? base->loop_depth : 0, base ? base->case_depth : 0);
+    gShellConditionDepth = base ? base->condition_depth : 0;
     gShellRuntime.break_requested = false;
     gShellRuntime.break_requested_levels = 0;
     gShellRuntime.continue_requested = false;
     gShellRuntime.continue_requested_levels = 0;
     gShellRuntime.errexit_pending = false;
     gShellRuntime.errexit_defer_active = false;
-    shellResetPipeline();
+    if (!base) {
+        shellResetPipeline();
+    }
 }
 
 /* A substitution sees the caller's ERR and RETURN traps only under set -E and set -T, and what

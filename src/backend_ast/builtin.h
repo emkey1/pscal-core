@@ -354,9 +354,16 @@ typedef enum {
 bool shellRuntimeConsumeExitRequested(void);
 size_t shellRuntimeRedirectScopeDepth(void);
 void shellRuntimeUnwindRedirectScopes(size_t depth);
+typedef struct {
+    size_t loop_depth;
+    size_t case_depth;
+    int condition_depth;
+} ShellDiscardBase;
 bool shellRuntimeConsumeDiscard(void);
 bool shellRuntimeReturnPending(void);
-void shellRuntimeAbandonCommand(void);
+bool shellRuntimeDiscardStaysInText(void);
+void shellRuntimeDiscardBase(ShellDiscardBase *out);
+void shellRuntimeAbandonCommand(const ShellDiscardBase *base);
 void shellRuntimeFinishChunk(struct VM_s *vm);
 void *shellRuntimeSubstitutionTrapsPutAside(void);
 void shellRuntimeSubstitutionTrapsBack(void *saved);

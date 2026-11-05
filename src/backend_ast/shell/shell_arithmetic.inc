@@ -8,58 +8,45 @@ typedef struct {
     const char *input;
     size_t length;
     size_t pos;
+    size_t last_token; /* where the token read last starts */
     int noeval; /* inside the side of && || ?: that is not taken */
     int depth;
-    char *error;
-    size_t error_size;
+    const char *label; /* what a report starts with: "((", "let", "" for nothing */
     bool failed;
 } ShellArithmeticParser;
 
 static bool shellArithmeticParseComma(ShellArithmeticParser *parser, long long *out_value);
 static bool shellArithmeticParseAssignment(ShellArithmeticParser *parser, long long *out_value);
-static bool shellArithmeticEvaluateText(const char *text, int depth, long long *out_value, char *error, size_t error_size);
+static bool shellArithmeticEvaluateText(const char *text, int depth, long long *out_value, const char *label);
 
-static bool shellArithmeticFail(ShellArithmeticParser *parser, const char *message) {
-    if (!parser->failed && parser->error && parser->error_size > 0) {
-        const char *rest = parser->pos < parser->length ? parser->input + parser->pos : "";
-        snprintf(parser->error, parser->error_size, "%s (error token is \"%s\")", message, rest);
+/* Bash's report: the expression this level is reading, up to `expr_end`, and from `token` to there. */
+static bool shellArithmeticFailAt(ShellArithmeticParser *parser, const char *message, size_t token, size_t expr_end) {
+    if (!parser->failed) {
+        size_t start = 0;
+        while (start < expr_end && (parser->input[start] == ' ' || parser->input[start] == '\t')) {
+            start++;
+        }
+        shellReportRecoverableError(gShellCurrentVm, true, "%s%s%.*s: %s (error token is \"%.*s\")", parser->label,
+                                    parser->label[0] ? ": " : "", (int)(expr_end - start), parser->input + start, message,
+                                    (int)(expr_end - token), parser->input + token);
     }
     parser->failed = true;
     return false;
 }
 
-static void shellArithmeticSkipWhitespace(ShellArithmeticParser *parser) {
-    /* Double quotes mean nothing here and bash drops them: $(("1" + 1)). */
-    while (parser->pos < parser->length &&
-           (isspace((unsigned char)parser->input[parser->pos]) || parser->input[parser->pos] == '"')) {
-        parser->pos++;
-    }
+static bool shellArithmeticFail(ShellArithmeticParser *parser, const char *message) {
+    return shellArithmeticFailAt(parser, message, parser->last_token, parser->length);
 }
 
-static bool shellArithmeticParseValueString(const char *text, long long *out_value) {
-    if (!out_value) {
-        return false;
+/* Every token comes after one of these, so this is where the last one read starts. At the end
+ * there is no token, and the last one stands: `1+` names `+`. */
+static void shellArithmeticSkipWhitespace(ShellArithmeticParser *parser) {
+    while (parser->pos < parser->length && isspace((unsigned char)parser->input[parser->pos])) {
+        parser->pos++;
     }
-    if (!text || *text == '\0') {
-        *out_value = 0;
-        return true;
+    if (parser->pos < parser->length) {
+        parser->last_token = parser->pos;
     }
-    errno = 0;
-    char *endptr = NULL;
-    long long value = strtoll(text, &endptr, 0);
-    if (errno != 0) {
-        return false;
-    }
-    if (endptr && *endptr != '\0') {
-        while (endptr && *endptr && isspace((unsigned char)*endptr)) {
-            endptr++;
-        }
-        if (endptr && *endptr != '\0') {
-            return false;
-        }
-    }
-    *out_value = value;
-    return true;
 }
 
 static bool shellArithmeticPeek(const ShellArithmeticParser *parser, const char *op) {
@@ -94,13 +81,21 @@ static bool shellArithmeticParseNumber(ShellArithmeticParser *parser, long long 
     int base = 10;
     unsigned long long value = 0;
     size_t digits_start = i;
+    /* A number is all of this to a report, which stops there: 1+09+1 says `1+09` and `09`. */
+    size_t token = i;
+    size_t token_end = i;
+    while (token_end < end && (isalnum((unsigned char)s[token_end]) || s[token_end] == '#' || s[token_end] == '@' ||
+                               s[token_end] == '_')) {
+        token_end++;
+    }
     while (i < end && isdigit((unsigned char)s[i])) {
         i++;
     }
-    if (i < end && s[i] == '#') {
+    bool based = i < end && s[i] == '#';
+    if (based) {
         long parsed = strtol(s + digits_start, NULL, 10);
         if (parsed < 2 || parsed > 64) {
-            return shellArithmeticFail(parser, "invalid arithmetic base");
+            return shellArithmeticFailAt(parser, parsed == 0 ? "invalid number" : "invalid arithmetic base", token, token_end);
         }
         base = (int)parsed;
         i++;
@@ -115,14 +110,13 @@ static bool shellArithmeticParseNumber(ShellArithmeticParser *parser, long long 
     while (i < end && (isalnum((unsigned char)s[i]) || s[i] == '@' || s[i] == '_')) {
         int digit = shellArithmeticDigitValue(s[i], base);
         if (digit < 0 || digit >= base) {
-            parser->pos = digits_start;
-            return shellArithmeticFail(parser, "value too great for base");
+            return shellArithmeticFailAt(parser, "value too great for base", token, token_end);
         }
         value = value * (unsigned)base + (unsigned)digit;
         i++;
     }
-    if (i == digits_start && base != 8) {
-        return shellArithmeticFail(parser, "invalid number");
+    if (i == digits_start && based) {
+        return shellArithmeticFailAt(parser, "invalid integer constant", token, token_end);
     }
     parser->pos = i;
     *out_value = (long long)value;
@@ -169,8 +163,6 @@ static bool shellArithmeticParseLvalue(ShellArithmeticParser *parser, ShellArith
     return true;
 }
 
-static char *shellParamSubscriptKey(const char *name, size_t name_len, const char *subscript, size_t subscript_len);
-
 static bool shellArithmeticReadVariable(ShellArithmeticParser *parser, const ShellArithmeticLvalue *lvalue,
                                         long long *out_value) {
     if (parser->noeval > 0) {
@@ -179,7 +171,11 @@ static bool shellArithmeticReadVariable(ShellArithmeticParser *parser, const She
     }
     char *text = NULL;
     if (lvalue->subscript) {
-        char *key = shellParamSubscriptKey(lvalue->name, lvalue->name_len, lvalue->subscript, lvalue->subscript_len);
+        char *key = NULL;
+        if (!shellParamSubscriptKeyChecked(lvalue->name, lvalue->name_len, lvalue->subscript, lvalue->subscript_len, &key)) {
+            parser->failed = true;
+            return false;
+        }
         if (key) {
             text = shellExpandArraySubscriptValue(lvalue->name, lvalue->name_len, key, strlen(key), NULL, NULL);
             free(key);
@@ -189,10 +185,9 @@ static bool shellArithmeticReadVariable(ShellArithmeticParser *parser, const She
         text = shellLookupParameterValueInternal(lvalue->name, lvalue->name_len, &is_set);
         if (!is_set && gShellRuntime.nounset_enabled) {
             free(text);
-            if (parser->error && parser->error_size > 0) {
-                snprintf(parser->error, parser->error_size, "%.*s: unbound variable",
-                         (int)lvalue->name_len, lvalue->name);
-            }
+            /* It ends a script from any command, with no expression and no label. */
+            shellReportRecoverableError(gShellCurrentVm, true, "%.*s: unbound variable", (int)lvalue->name_len, lvalue->name);
+            shellExpansionFail();
             parser->failed = true;
             return false;
         }
@@ -205,7 +200,7 @@ static bool shellArithmeticReadVariable(ShellArithmeticParser *parser, const She
         free(text);
         return shellArithmeticFail(parser, "expression recursion level exceeded");
     }
-    bool ok = shellArithmeticEvaluateText(text, parser->depth + 1, out_value, parser->error, parser->error_size);
+    bool ok = shellArithmeticEvaluateText(text, parser->depth + 1, out_value, parser->label);
     free(text);
     if (!ok) {
         parser->failed = true;
@@ -218,31 +213,32 @@ static bool shellArithmeticStoreVariable(ShellArithmeticParser *parser, const Sh
     if (parser->noeval > 0) {
         return true;
     }
-    char name[256];
-    if (lvalue->name_len >= sizeof(name)) {
-        return shellArithmeticFail(parser, "name too long");
-    }
-    memcpy(name, lvalue->name, lvalue->name_len);
-    name[lvalue->name_len] = '\0';
     char buffer[32];
     snprintf(buffer, sizeof(buffer), "%lld", value);
-    bool ok;
+    char *key = NULL;
     if (lvalue->subscript) {
-        char *key = shellParamSubscriptKey(lvalue->name, lvalue->name_len, lvalue->subscript, lvalue->subscript_len);
+        if (!shellParamSubscriptKeyChecked(lvalue->name, lvalue->name_len, lvalue->subscript, lvalue->subscript_len, &key)) {
+            parser->failed = true;
+            return false;
+        }
         if (!key) {
             return shellArithmeticFail(parser, "bad array subscript");
         }
-        ok = shellArrayRegistrySetElement(name, key, buffer);
-        free(key);
-    } else {
-        ok = shellSetTrackedVariable(name, buffer, false);
     }
+    char *name = strndup(lvalue->name, lvalue->name_len);
+    if (!name) {
+        free(key);
+        parser->failed = true;
+        return false;
+    }
+    bool ok = key ? shellArrayRegistrySetElement(name, key, buffer) : shellSetTrackedVariable(name, buffer, false);
+    free(key);
     if (!ok) {
-        if (parser->error && parser->error_size > 0) {
-            snprintf(parser->error, parser->error_size, "%s: readonly variable", name);
-        }
+        /* No expression and no label either. */
+        shellReportRecoverableError(gShellCurrentVm, true, "%s: readonly variable", name);
         parser->failed = true;
     }
+    free(name);
     return ok;
 }
 
@@ -305,7 +301,17 @@ static bool shellArithmeticParseUnary(ShellArithmeticParser *parser, long long *
             }
             value += increment ? 1 : -1;
             *out_value = value;
-            return shellArithmeticStoreVariable(parser, &lvalue, value);
+            if (!shellArithmeticStoreVariable(parser, &lvalue, value)) {
+                return false;
+            }
+            shellArithmeticSkipWhitespace(parser);
+            if (shellArithmeticPeek(parser, "++")) {
+                return shellArithmeticFail(parser, "++: assignment requires lvalue");
+            }
+            if (shellArithmeticPeek(parser, "--")) {
+                return shellArithmeticFail(parser, "--: assignment requires lvalue");
+            }
+            return true;
         }
         if (parser->failed) {
             return false;
@@ -342,15 +348,23 @@ static const ShellArithmeticBinaryOp gShellArithmeticOps[] = {
 };
 
 static const ShellArithmeticBinaryOp *shellArithmeticPeekBinaryOp(ShellArithmeticParser *parser) {
+    bool after_paren = parser->input[parser->last_token] == ')';
     shellArithmeticSkipWhitespace(parser);
+    if (parser->pos < parser->length) {
+        unsigned char c = (unsigned char)parser->input[parser->pos];
+        if (c < 0x80 && !isalnum(c) && c != '_' && !strchr("+-*/%<>=!&|^~?:,()", c)) {
+            shellArithmeticFail(parser, after_paren ? "syntax error: operand expected" : "syntax error: invalid arithmetic operator");
+            return NULL;
+        }
+    }
     for (size_t i = 0; i < sizeof(gShellArithmeticOps) / sizeof(gShellArithmeticOps[0]); ++i) {
         const ShellArithmeticBinaryOp *op = &gShellArithmeticOps[i];
         if (!shellArithmeticPeek(parser, op->text)) {
             continue;
         }
-        /* `a += 1` belongs to the assignment level above. */
+        /* `a += 1` belongs to the assignment level above. There is no **=, &&= or ||=. */
         size_t n = strlen(op->text);
-        if (op->precedence != 6 && !(op->text[0] == '<' && op->text[1] == '=') &&
+        if (op->precedence != 6 && op->precedence != 11 && op->precedence > 2 && !(op->text[0] == '<' && op->text[1] == '=') &&
             !(op->text[0] == '>' && op->text[1] == '=') && parser->pos + n < parser->length &&
             parser->input[parser->pos + n] == '=') {
             return NULL;
@@ -361,7 +375,7 @@ static const ShellArithmeticBinaryOp *shellArithmeticPeekBinaryOp(ShellArithmeti
 }
 
 static bool shellArithmeticApply(ShellArithmeticParser *parser, const char *op, long long lhs, long long rhs,
-                                 long long *out_value) {
+                                 size_t divisor, long long *out_value) {
     unsigned long long ul = (unsigned long long)lhs;
     unsigned long long ur = (unsigned long long)rhs;
     switch (op[0]) {
@@ -397,7 +411,7 @@ static bool shellArithmeticApply(ShellArithmeticParser *parser, const char *op, 
                     *out_value = 0;
                     return true;
                 }
-                return shellArithmeticFail(parser, "division by 0");
+                return shellArithmeticFailAt(parser, "division by 0", divisor, parser->length);
             }
             if (rhs == -1) {
                 /* LLONG_MIN / -1 traps. */
@@ -438,10 +452,18 @@ static bool shellArithmeticParseBinary(ShellArithmeticParser *parser, int min_pr
     }
     while (true) {
         const ShellArithmeticBinaryOp *op = shellArithmeticPeekBinaryOp(parser);
+        if (parser->failed) {
+            return false;
+        }
         if (!op || op->precedence < min_precedence) {
             break;
         }
         parser->pos += strlen(op->text);
+        /* Bash 5 names all that is left from the divisor on: 1/0+1 says `0+1`. Blanks go, a newline stays. */
+        size_t operand = parser->pos;
+        while (operand < parser->length && (parser->input[operand] == ' ' || parser->input[operand] == '\t')) {
+            operand++;
+        }
         long long rhs = 0;
         bool logical_or = op->precedence == 1;
         bool logical_and = op->precedence == 2;
@@ -462,7 +484,7 @@ static bool shellArithmeticParseBinary(ShellArithmeticParser *parser, int min_pr
             lhs = lhs != 0 || rhs != 0;
         } else if (logical_and) {
             lhs = lhs != 0 && rhs != 0;
-        } else if (!shellArithmeticApply(parser, op->text, lhs, rhs, &lhs)) {
+        } else if (!shellArithmeticApply(parser, op->text, lhs, rhs, operand, &lhs)) {
             return false;
         }
     }
@@ -483,6 +505,10 @@ static bool shellArithmeticParseTernary(ShellArithmeticParser *parser, long long
     parser->pos++;
     long long when_true = 0;
     long long when_false = 0;
+    shellArithmeticSkipWhitespace(parser);
+    if (parser->pos >= parser->length || parser->input[parser->pos] == ':') {
+        return shellArithmeticFail(parser, "expression expected");
+    }
     if (!condition) {
         parser->noeval++;
     }
@@ -498,10 +524,15 @@ static bool shellArithmeticParseTernary(ShellArithmeticParser *parser, long long
         return shellArithmeticFail(parser, "`:' expected for conditional expression");
     }
     parser->pos++;
+    shellArithmeticSkipWhitespace(parser);
+    if (parser->pos >= parser->length) {
+        return shellArithmeticFail(parser, "expression expected");
+    }
     if (condition) {
         parser->noeval++;
     }
-    ok = shellArithmeticParseAssignment(parser, &when_false);
+    /* Not an assignment: a?b:c=1 is (a?b:c)=1, which is an error. */
+    ok = shellArithmeticParseTernary(parser, &when_false);
     if (condition) {
         parser->noeval--;
     }
@@ -512,22 +543,28 @@ static bool shellArithmeticParseTernary(ShellArithmeticParser *parser, long long
     return true;
 }
 
-static bool shellArithmeticParseAssignment(ShellArithmeticParser *parser, long long *out_value) {
+/* The assignment operator at the cursor, compound or not. */
+static bool shellArithmeticPeekAssignment(const ShellArithmeticParser *parser, const char **out_op) {
     static const char *const kOps[] = {"<<=", ">>=", "+=", "-=", "*=", "/=", "%=", "&=", "^=", "|="};
+    *out_op = NULL;
+    for (size_t i = 0; i < sizeof(kOps) / sizeof(kOps[0]); ++i) {
+        if (shellArithmeticPeek(parser, kOps[i])) {
+            *out_op = kOps[i];
+            return true;
+        }
+    }
+    return shellArithmeticPeek(parser, "=") && !shellArithmeticPeek(parser, "==");
+}
+
+static bool shellArithmeticParseAssignment(ShellArithmeticParser *parser, long long *out_value) {
     shellArithmeticSkipWhitespace(parser);
     size_t saved = parser->pos;
     ShellArithmeticLvalue lvalue;
     if (shellArithmeticParseLvalue(parser, &lvalue)) {
         shellArithmeticSkipWhitespace(parser);
         const char *op = NULL;
-        for (size_t i = 0; i < sizeof(kOps) / sizeof(kOps[0]); ++i) {
-            if (shellArithmeticPeek(parser, kOps[i])) {
-                op = kOps[i];
-                break;
-            }
-        }
-        bool plain = !op && shellArithmeticPeek(parser, "=") && !shellArithmeticPeek(parser, "==");
-        if (op || plain) {
+        if (shellArithmeticPeekAssignment(parser, &op)) {
+            bool plain = !op;
             parser->pos += plain ? 1 : strlen(op);
             long long rhs = 0;
             if (!shellArithmeticParseAssignment(parser, &rhs)) {
@@ -540,7 +577,7 @@ static bool shellArithmeticParseAssignment(ShellArithmeticParser *parser, long l
                     return false;
                 }
                 char binary[3] = {op[0], strlen(op) == 3 ? op[1] : '\0', '\0'};
-                if (!shellArithmeticApply(parser, binary, current, rhs, &value)) {
+                if (!shellArithmeticApply(parser, binary, current, rhs, parser->last_token, &value)) {
                     return false;
                 }
             }
@@ -552,7 +589,15 @@ static bool shellArithmeticParseAssignment(ShellArithmeticParser *parser, long l
         return false;
     }
     parser->pos = saved;
-    return shellArithmeticParseTernary(parser, out_value);
+    if (!shellArithmeticParseTernary(parser, out_value)) {
+        return false;
+    }
+    shellArithmeticSkipWhitespace(parser);
+    const char *op = NULL;
+    if (shellArithmeticPeekAssignment(parser, &op)) {
+        return shellArithmeticFail(parser, "attempted assignment to non-variable");
+    }
+    return true;
 }
 
 static bool shellArithmeticParseComma(ShellArithmeticParser *parser, long long *out_value) {
@@ -571,15 +616,15 @@ static bool shellArithmeticParseComma(ShellArithmeticParser *parser, long long *
     }
 }
 
-/* Text with its expansions already done. Empty text is 0. */
-static bool shellArithmeticEvaluateText(const char *text, int depth, long long *out_value, char *error, size_t error_size) {
+/* Text with its expansions already done. Empty text is 0. What goes wrong is reported under
+ * `label`: "((" or "let" for `((: 1/0: division by 0`, and "" for no label. */
+static bool shellArithmeticEvaluateText(const char *text, int depth, long long *out_value, const char *label) {
     ShellArithmeticParser parser;
     memset(&parser, 0, sizeof(parser));
     parser.input = text ? text : "";
     parser.length = strlen(parser.input);
     parser.depth = depth;
-    parser.error = error;
-    parser.error_size = error_size;
+    parser.label = label;
     *out_value = 0;
     shellArithmeticSkipWhitespace(&parser);
     if (parser.pos >= parser.length) {
@@ -595,54 +640,73 @@ static bool shellArithmeticEvaluateText(const char *text, int depth, long long *
     return true;
 }
 
+/* An expression as written, without its double quotes, which mean nothing here. Those in a
+ * substitution are its own, and those in a value are an error when the value is read. NULL if there
+ * are none to drop. */
+static char *shellArithmeticDropQuotes(const char *expr) {
+    if (!strchr(expr, '"')) {
+        return NULL;
+    }
+    size_t len = strlen(expr);
+    char *out = (char *)malloc(len + 1);
+    if (!out) {
+        return NULL;
+    }
+    size_t used = 0;
+    for (size_t i = 0; i < len; ) {
+        size_t stop = i + 1;
+        if (expr[i] == '$') {
+            stop = shellScanDollar(expr, len, i, true);
+        } else if (expr[i] == '`') {
+            stop = shellScanBacktick(expr, len, i + 1);
+        } else if (expr[i] == '"') {
+            i++;
+            continue;
+        }
+        if (stop == SHELL_SCAN_UNTERMINATED) {
+            stop = len;
+        }
+        memcpy(out + used, expr + i, stop - i);
+        used += stop - i;
+        i = stop;
+    }
+    out[used] = '\0';
+    return out;
+}
+
 /* An expression as written: `$x` and `$(cmd)` first, as text. The flag keeps `~1` from
  * being taken for a tilde and treats backslashes as in double quotes. */
-static bool shellArithmeticEvaluate(const char *expr, long long *out_value, char *error, size_t error_size) {
-    if (error && error_size > 0) {
-        error[0] = '\0';
-    }
+static bool shellArithmeticEvaluate(const char *expr, long long *out_value, const char *label) {
     if (!expr) {
         *out_value = 0;
         return true;
     }
-    if (!strpbrk(expr, "$`")) {
-        return shellArithmeticEvaluateText(expr, 0, out_value, error, error_size);
+    char *unquoted = shellArithmeticDropQuotes(expr);
+    const char *text = unquoted ? unquoted : expr;
+    char *expanded = NULL;
+    if (strpbrk(text, "$`")) {
+        bool failed_before = gShellExpansionFailed;
+        gShellExpansionFailed = false;
+        expanded = shellExpandWord(text, SHELL_WORD_FLAG_HERE_DOCUMENT, NULL, 0, NULL, NULL, NULL);
+        bool failed = gShellExpansionFailed;
+        gShellExpansionFailed = failed_before || failed;
+        /* It has said why, and there is no expression to read: $(($((1/0))+1)). */
+        if (!expanded || failed) {
+            *out_value = 0;
+            free(expanded);
+            free(unquoted);
+            return false;
+        }
+        text = expanded;
     }
-    char *expanded = shellExpandWord(expr, SHELL_WORD_FLAG_HERE_DOCUMENT, NULL, 0, NULL, NULL, NULL);
-    if (!expanded) {
-        return false;
-    }
-    bool ok = shellArithmeticEvaluateText(expanded, 0, out_value, error, error_size);
+    bool ok = shellArithmeticEvaluateText(text, 0, out_value, label);
     free(expanded);
+    free(unquoted);
     return ok;
 }
 
-static char *shellEvaluateArithmetic(const char *expr, bool *out_error) {
-    if (out_error) {
-        *out_error = false;
-    }
-    long long value = 0;
-    if (!expr || !shellArithmeticEvaluate(expr, &value, NULL, 0)) {
-        if (out_error) {
-            *out_error = true;
-        }
-        return NULL;
-    }
-    char buffer[32];
-    snprintf(buffer, sizeof(buffer), "%lld", value);
-    char *result = strdup(buffer);
-    if (!result && out_error) {
-        *out_error = true;
-    }
-    return result;
-}
-
-static bool shellLetEvaluateExpression(VM *vm, const char *text, long long *out_value) {
-    char error[256];
-    if (!shellArithmeticEvaluate(text, out_value, error, sizeof(error))) {
-        if (error[0]) {
-            shellReportRecoverableError(vm, true, "let: %s: %s", text ? text : "", error);
-        }
+static bool shellLetEvaluateExpression(const char *text, long long *out_value) {
+    if (!shellArithmeticEvaluateText(text, 0, out_value, "let")) {
         shellMarkArithmeticError();
         return false;
     }

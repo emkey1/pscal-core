@@ -1,8 +1,8 @@
 /* What bash does between the braces of ${...}, the word-splitting helpers around it, tilde
  * and brace expansion. Included from shell_word_expansion.inc. */
 
-/* An expansion error ends a script, as under bash: ${x:?msg}, $((1/0)), set -u, a bad
- * substitution. A prompt just drops the command. */
+/* An expansion error ends a script, as under bash: ${x:?msg}, set -u, a bad substitution. A
+ * prompt just drops the command. */
 static void shellExpansionFail(void) {
     gShellExpansionFailed = true;
     shellUpdateStatus(1);
@@ -15,6 +15,28 @@ static void shellExpansionFail(void) {
             gShellCurrentVm->exit_requested = true;
             gShellCurrentVm->current_builtin_name = "expansion";
         }
+    }
+}
+
+/* Bash takes arithmetic in a word more lightly: all that is running goes, the rest of its line
+ * with it, and it reads on from the text it is reading, be that eval's or a sourced file's. A
+ * subshell ends. */
+static void shellArithmeticExpansionFail(void) {
+    if (gShellRuntime.in_subshell) {
+        shellExpansionFail();
+        return;
+    }
+    gShellExpansionFailed = true;
+    shellUpdateStatus(1);
+    /* set -u has ended the script by now. */
+    if (gShellExpandingJobWords || gShellExitRequested) {
+        return;
+    }
+    gShellDiscardPending = true;
+    gShellDiscardInText = gShellCommandSubFrame == NULL;
+    if (gShellCurrentVm) {
+        gShellCurrentVm->exit_requested = true;
+        gShellCurrentVm->current_builtin_name = "return";
     }
 }
 
@@ -248,15 +270,12 @@ static char *shellParamSubscriptKey(const char *name, size_t name_len, const cha
     memcpy(expr, subscript, subscript_len);
     expr[subscript_len] = '\0';
     long long value = 0;
-    char error[200];
-    bool ok = shellArithmeticEvaluate(expr, &value, error, sizeof(error));
+    bool ok = shellArithmeticEvaluate(expr, &value, "");
+    free(expr);
     if (!ok) {
-        shellReportRecoverableError(gShellCurrentVm, true, "%s: %s", expr, error);
-        free(expr);
-        shellExpansionFail();
+        shellArithmeticExpansionFail();
         return NULL;
     }
-    free(expr);
     if (value < 0) {
         value += var ? (long long)var->count : 0;
         if (value < 0) {
@@ -268,6 +287,18 @@ static char *shellParamSubscriptKey(const char *name, size_t name_len, const cha
     return strdup(buffer);
 }
 
+/* False if the subscript's own arithmetic failed, reported by then. With no key and no failure
+ * the index is before the start of the array. */
+static bool shellParamSubscriptKeyChecked(const char *name, size_t name_len, const char *subscript, size_t subscript_len,
+                                          char **out_key) {
+    bool failed_before = gShellExpansionFailed;
+    gShellExpansionFailed = false;
+    *out_key = shellParamSubscriptKey(name, name_len, subscript, subscript_len);
+    bool failed = gShellExpansionFailed;
+    gShellExpansionFailed = failed_before || failed;
+    return !failed;
+}
+
 typedef struct {
     bool is_list; /* $@ $* a[@] a[*] */
     char style;
@@ -275,6 +306,7 @@ typedef struct {
     size_t count;
     char *value;
     bool is_set;
+    bool failed; /* its subscript's arithmetic, reported by then */
 } ShellParamSubject;
 
 static void shellParamSubjectFree(ShellParamSubject *subject) {
@@ -339,6 +371,8 @@ static bool shellParamLoadSubject(const char *name, size_t name_len, const char 
         return shellParamLoadList(name, name_len, name[0], subject);
     }
     if (subscript) {
+        const char *as_written = subscript;
+        size_t as_written_len = subscript_len;
         while (subscript_len > 0 && isspace((unsigned char)subscript[0])) {
             subscript++;
             subscript_len--;
@@ -350,8 +384,14 @@ static bool shellParamLoadSubject(const char *name, size_t name_len, const char 
             return shellParamLoadList(name, name_len, subscript[0], subject);
         }
         shellRefreshSpecialArray(name, name_len);
-        char *key = shellParamSubscriptKey(name, name_len, subscript, subscript_len);
+        /* An expression is reported as written. */
+        const ShellArrayVariable *keyed = shellArrayRegistryLookup(name, name_len);
+        bool arithmetic = !(keyed && keyed->kind == SHELL_ARRAY_KIND_ASSOCIATIVE && !keyed->sparse);
+        char *key = NULL;
+        bool key_ok = shellParamSubscriptKeyChecked(name, name_len, arithmetic ? as_written : subscript,
+                                                    arithmetic ? as_written_len : subscript_len, &key);
         if (!key) {
+            subject->failed = !key_ok;
             subject->value = strdup("");
             return subject->value != NULL;
         }
@@ -593,7 +633,7 @@ static size_t shellParamPatternEnd(const char *raw, size_t len) {
 }
 
 /* The offset and length of ${x:offset:length}. */
-static bool shellParamEvalSlice(const char *raw, size_t len, long long *out_offset, bool *out_has_length,
+static bool shellParamEvalSlice(const char *label, const char *raw, size_t len, long long *out_offset, bool *out_has_length,
                                 long long *out_length) {
     size_t split = len;
     int depth = 0;
@@ -615,25 +655,23 @@ static bool shellParamEvalSlice(const char *raw, size_t len, long long *out_offs
             }
         }
     }
-    char error[200];
     char *expr = (char *)malloc(len + 1);
     if (!expr) {
         return false;
     }
     memcpy(expr, raw, split);
     expr[split] = '\0';
-    bool ok = shellArithmeticEvaluate(expr, out_offset, error, sizeof(error));
+    bool ok = shellArithmeticEvaluate(expr, out_offset, label);
     if (ok) {
         *out_has_length = split < len;
         if (*out_has_length) {
             memcpy(expr, raw + split + 1, len - split - 1);
             expr[len - split - 1] = '\0';
-            ok = shellArithmeticEvaluate(expr, out_length, error, sizeof(error));
+            ok = shellArithmeticEvaluate(expr, out_length, label);
         }
     }
     if (!ok) {
-        shellReportRecoverableError(gShellCurrentVm, true, "%s: %s", expr, error);
-        shellExpansionFail();
+        shellArithmeticExpansionFail();
     }
     free(expr);
     return ok;
@@ -1056,6 +1094,10 @@ static char *shellExpandBraceParameter(const char *inner, size_t inner_len, bool
     if (!shellParamLoadSubject(inner, name_len, subscript, subscript_len, &subject)) {
         return NULL;
     }
+    if (subject.failed) {
+        shellParamSubjectFree(&subject);
+        return strdup("");
+    }
 
     /* ${x:-word} ${x-word} ${x:=word} ${x=word} ${x:?word} ${x?word} ${x:+word} ${x+word} */
     bool colon = op_len >= 2 && op[0] == ':' && strchr("-=?+", op[1]);
@@ -1144,7 +1186,11 @@ static char *shellExpandBraceParameter(const char *inner, size_t inner_len, bool
         long long length = 0;
         bool has_length = false;
         char *result = NULL;
-        if (shellParamEvalSlice(op + 1, op_len - 1, &offset, &has_length, &length)) {
+        /* It reports under the name as written. Nothing to slice, and it is not worked out. */
+        char *label = strndup(inner, (size_t)(op - inner));
+        if (!subject.is_set && !(name_len == 1 && (inner[0] == '@' || inner[0] == '*'))) {
+            result = subject.is_list ? shellParamFinishList(&subject, in_double, out_array, out_count) : strdup("");
+        } else if (shellParamEvalSlice(label ? label : "", op + 1, op_len - 1, &offset, &has_length, &length)) {
             if (subject.is_list) {
                 shellParamSliceList(&subject, name_len == 1 && (inner[0] == '@' || inner[0] == '*'), offset, has_length,
                                     length);
@@ -1155,6 +1201,7 @@ static char *shellExpandBraceParameter(const char *inner, size_t inner_len, bool
         } else {
             result = strdup("");
         }
+        free(label);
         shellParamSubjectFree(&subject);
         return result;
     }
