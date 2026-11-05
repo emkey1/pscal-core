@@ -65,6 +65,7 @@ typedef struct {
     dev_t host_dev;
     ino_t host_ino;
     bool host_identity_valid;
+    bool write_out_at_thread_end;
 } VmVprocStream;
 
 typedef struct {
@@ -79,12 +80,74 @@ typedef struct VmShimCookieNode {
     struct VmShimCookieNode *next;
 } VmShimCookieNode;
 
-static __thread VmVprocStream gVmVprocStdout = { NULL, -1, STDOUT_FILENO };
-static __thread VmVprocStream gVmVprocStderr = { NULL, -1, STDERR_FILENO };
-static __thread VmVprocStream gVmVprocStdin = { NULL, -1, STDIN_FILENO };
-/* The thread's stdin while fd 0 is a file or pipe, apart from the terminal's FILE so
- * that neither sees the other's buffer. */
-static __thread VmVprocStream gVmVprocRedirectedStdin = { NULL, -1, STDIN_FILENO };
+/* A thread's streams, closed when it ends, or each frontend run with stdout on a host
+ * descriptor left that descriptor open for the life of the app. On the heap because a key's
+ * destructor is the one thing that sees every end, exit() and cancel too, and by then Darwin
+ * has already cleared the thread's __thread variables. */
+typedef struct {
+    VmVprocStream out;
+    VmVprocStream err;
+    VmVprocStream in;
+    /* The thread's stdin while fd 0 is a file or pipe, apart from the terminal's FILE so
+     * that neither sees the other's buffer. */
+    VmVprocStream redirected_in;
+} VmVprocThreadStreams;
+
+#define VM_VPROC_THREAD_STREAMS_INIT { \
+    .out = { NULL, -1, STDOUT_FILENO }, \
+    .err = { NULL, -1, STDERR_FILENO }, \
+    .in = { NULL, -1, STDIN_FILENO }, \
+    .redirected_in = { NULL, -1, STDIN_FILENO } }
+
+static __thread VmVprocThreadStreams *gVmVprocThreadStreams = NULL;
+/* Out of memory: the streams work, and stay open. */
+static __thread VmVprocThreadStreams gVmVprocThreadStreamsNoHeap = VM_VPROC_THREAD_STREAMS_INIT;
+static pthread_key_t gVmVprocThreadStreamsKey;
+static pthread_once_t gVmVprocThreadStreamsOnce = PTHREAD_ONCE_INIT;
+
+static void vmVprocThreadStreamEnd(VmVprocStream *stream) {
+    if (stream->fp) {
+        vprocStreamEndWithThread(stream->fp, stream->write_out_at_thread_end);
+    }
+}
+
+static void vmVprocThreadStreamsEnd(void *arg) {
+    VmVprocThreadStreams *streams = (VmVprocThreadStreams *)arg;
+    vmVprocThreadStreamEnd(&streams->out);
+    vmVprocThreadStreamEnd(&streams->err);
+    vmVprocThreadStreamEnd(&streams->in);
+    vmVprocThreadStreamEnd(&streams->redirected_in);
+    free(streams);
+    /* A destructor after this one that prints gets a new set, and the key runs again. */
+    gVmVprocThreadStreams = NULL;
+}
+
+static void vmVprocThreadStreamsMakeKey(void) {
+    (void)pthread_key_create(&gVmVprocThreadStreamsKey, vmVprocThreadStreamsEnd);
+}
+
+static VmVprocThreadStreams *vmVprocThreadStreams(void) {
+    if (gVmVprocThreadStreams) {
+        return gVmVprocThreadStreams;
+    }
+    VmVprocThreadStreams *streams = (VmVprocThreadStreams *)malloc(sizeof(VmVprocThreadStreams));
+    if (!streams) {
+        return &gVmVprocThreadStreamsNoHeap;
+    }
+    *streams = (VmVprocThreadStreams)VM_VPROC_THREAD_STREAMS_INIT;
+    (void)pthread_once(&gVmVprocThreadStreamsOnce, vmVprocThreadStreamsMakeKey);
+    if (pthread_setspecific(gVmVprocThreadStreamsKey, streams) != 0) {
+        free(streams);
+        return &gVmVprocThreadStreamsNoHeap;
+    }
+    gVmVprocThreadStreams = streams;
+    return streams;
+}
+
+#define gVmVprocStdout (vmVprocThreadStreams()->out)
+#define gVmVprocStderr (vmVprocThreadStreams()->err)
+#define gVmVprocStdin (vmVprocThreadStreams()->in)
+#define gVmVprocRedirectedStdin (vmVprocThreadStreams()->redirected_in)
 static VmVprocStream gVmStdoutSharedShim = { NULL, -1, STDOUT_FILENO };
 static VmVprocStream gVmStderrSharedShim = { NULL, -1, STDERR_FILENO };
 static VmVprocStream gVmStdinSharedShim = { NULL, -1, STDIN_FILENO };
@@ -214,6 +277,7 @@ static FILE *vmVprocStreamOpenShim(int std_fd,
     }
     cache->host_fd = -1;
     cache->host_identity_valid = false;
+    cache->write_out_at_thread_end = false;
 
     VmVprocShimCookie *cookie = (VmVprocShimCookie *)calloc(1, sizeof(VmVprocShimCookie));
     if (!cookie) {
@@ -298,6 +362,7 @@ static FILE *vmVprocStreamOpen(int std_fd,
     }
     cache->host_fd = -1;
     cache->host_identity_valid = false;
+    cache->write_out_at_thread_end = false;
 
     int dup_fd = -1;
 #ifdef F_DUPFD_CLOEXEC
@@ -330,6 +395,7 @@ static FILE *vmVprocStreamOpen(int std_fd,
         cache->host_dev = host_st.st_dev;
         cache->host_ino = host_st.st_ino;
         cache->host_identity_valid = true;
+        cache->write_out_at_thread_end = S_ISREG(host_st.st_mode) && strchr(mode, 'r') == NULL;
     }
     return fp;
 }

@@ -163,6 +163,22 @@ static inline void vprocStreamSkipFlushAll(FILE *stream) {
     (void)stream;
 #endif
 }
+/* Closes a thread's own stream as the thread ends, from a key's destructor. Every normal
+ * end has flushed already (halt, freeVM, a worker's job, a stage's end), so what's left is
+ * mostly a kill's, which a real process would lose too. WRITE_OUT says the stream is on a
+ * regular file, which can't block: on a pipe a stalled reader would keep this thread from
+ * ever ending, and through a vproc slot the vproc may be gone and the data would reach the
+ * host's descriptor of that number. Nothing here may use the thread's vproc. */
+static inline void vprocStreamEndWithThread(FILE *stream, bool write_out) {
+    if (write_out) {
+        (void)fflush(stream);
+    } else {
+#if defined(__APPLE__)
+        (void)fpurge(stream);
+#endif
+    }
+    (void)fclose(stream);
+}
 /* Virtual isatty shim for session-backed TTYs. */
 int vprocIsattyShim(int fd);
 /* True when the current vproc's fd 0 is a file, pipe, socket or other non-terminal

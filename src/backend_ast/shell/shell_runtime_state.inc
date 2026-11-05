@@ -54,6 +54,7 @@ typedef struct {
     dev_t host_dev;
     ino_t host_ino;
     bool host_identity_valid;
+    bool write_out_at_thread_end;
 } ShellVprocStream;
 
 typedef struct {
@@ -67,9 +68,67 @@ typedef struct ShellShimCookieNode {
     struct ShellShimCookieNode *next;
 } ShellShimCookieNode;
 
-static __thread ShellVprocStream gShellVprocStdout = { NULL, -1, STDOUT_FILENO };
-static __thread ShellVprocStream gShellVprocStderr = { NULL, -1, STDERR_FILENO };
-static __thread ShellVprocStream gShellVprocStdin = { NULL, -1, STDIN_FILENO };
+/* A thread's streams, closed when it ends. See VmVprocThreadStreams in builtin.c: a stage
+ * closes its own as it finishes, but not one ended by a kill or exit(), and no other thread did. */
+typedef struct {
+    ShellVprocStream out;
+    ShellVprocStream err;
+    ShellVprocStream in;
+} ShellVprocThreadStreams;
+
+#define SHELL_VPROC_THREAD_STREAMS_INIT { \
+    .out = { NULL, -1, STDOUT_FILENO }, \
+    .err = { NULL, -1, STDERR_FILENO }, \
+    .in = { NULL, -1, STDIN_FILENO } }
+
+static __thread ShellVprocThreadStreams *gShellVprocThreadStreams = NULL;
+/* Out of memory: the streams work, and stay open. */
+static __thread ShellVprocThreadStreams gShellVprocThreadStreamsNoHeap = SHELL_VPROC_THREAD_STREAMS_INIT;
+static pthread_key_t gShellVprocThreadStreamsKey;
+static pthread_once_t gShellVprocThreadStreamsOnce = PTHREAD_ONCE_INIT;
+
+static void shellVprocThreadStreamEnd(ShellVprocStream *stream) {
+    if (stream->fp) {
+        vprocStreamEndWithThread(stream->fp, stream->write_out_at_thread_end);
+    }
+}
+
+static void shellVprocThreadStreamsEnd(void *arg) {
+    ShellVprocThreadStreams *streams = (ShellVprocThreadStreams *)arg;
+    shellVprocThreadStreamEnd(&streams->out);
+    shellVprocThreadStreamEnd(&streams->err);
+    shellVprocThreadStreamEnd(&streams->in);
+    free(streams);
+    /* A destructor after this one that prints gets a new set, and the key runs again. */
+    gShellVprocThreadStreams = NULL;
+}
+
+static void shellVprocThreadStreamsMakeKey(void) {
+    (void)pthread_key_create(&gShellVprocThreadStreamsKey, shellVprocThreadStreamsEnd);
+}
+
+static ShellVprocThreadStreams *shellVprocThreadStreams(void) {
+    if (gShellVprocThreadStreams) {
+        return gShellVprocThreadStreams;
+    }
+    ShellVprocThreadStreams *streams = (ShellVprocThreadStreams *)malloc(sizeof(ShellVprocThreadStreams));
+    if (!streams) {
+        return &gShellVprocThreadStreamsNoHeap;
+    }
+    *streams = (ShellVprocThreadStreams)SHELL_VPROC_THREAD_STREAMS_INIT;
+    (void)pthread_once(&gShellVprocThreadStreamsOnce, shellVprocThreadStreamsMakeKey);
+    if (pthread_setspecific(gShellVprocThreadStreamsKey, streams) != 0) {
+        free(streams);
+        return &gShellVprocThreadStreamsNoHeap;
+    }
+    gShellVprocThreadStreams = streams;
+    return streams;
+}
+
+#define gShellVprocStdout (shellVprocThreadStreams()->out)
+#define gShellVprocStderr (shellVprocThreadStreams()->err)
+#define gShellVprocStdin (shellVprocThreadStreams()->in)
+
 static pthread_mutex_t gShellShimCookieLock = PTHREAD_MUTEX_INITIALIZER;
 static ShellShimCookieNode *gShellShimCookieHead = NULL;
 
@@ -183,6 +242,7 @@ static FILE *shellVprocStreamOpenShim(int std_fd,
     }
     cache->host_fd = -1;
     cache->host_identity_valid = false;
+    cache->write_out_at_thread_end = false;
 
     ShellVprocShimCookie *cookie = (ShellVprocShimCookie *)calloc(1, sizeof(ShellVprocShimCookie));
     if (!cookie) {
@@ -264,6 +324,7 @@ static FILE *shellVprocStreamOpen(int std_fd,
     }
     cache->host_fd = -1;
     cache->host_identity_valid = false;
+    cache->write_out_at_thread_end = false;
 
     int dup_fd = -1;
 #ifdef F_DUPFD_CLOEXEC
@@ -296,6 +357,7 @@ static FILE *shellVprocStreamOpen(int std_fd,
         cache->host_dev = host_st.st_dev;
         cache->host_ino = host_st.st_ino;
         cache->host_identity_valid = true;
+        cache->write_out_at_thread_end = S_ISREG(host_st.st_mode) && strchr(mode, 'r') == NULL;
     }
     return fp;
 }
