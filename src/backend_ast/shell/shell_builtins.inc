@@ -316,7 +316,10 @@ Value vmBuiltinShellExec(VM *vm, int arg_count, Value *args) {
         goto cleanup;
     }
     shellCollectJobs();
-    shellRuntimeRunDebugTrap();
+    /* One of several stages had its trap when the pipeline started. */
+    if (!gShellRuntime.pipeline.active || gShellRuntime.pipeline.stage_count <= 1) {
+        shellRuntimeRunDebugTrap();
+    }
     ShellCommand cmd;
     if (!shellBuildCommand(vm, arg_count, args, &cmd)) {
         goto cleanup;
@@ -369,7 +372,6 @@ Value vmBuiltinShellExecBody(VM *vm, int arg_count, Value *args) {
         goto cleanup;
     }
     shellCollectJobs();
-    shellRuntimeRunDebugTrap();
     ShellCommand cmd;
     if (!shellBuildCommand(vm, 1, &args[1], &cmd)) {
         shellUpdateStatus(1);
@@ -421,6 +423,7 @@ Value vmBuiltinShellPipeline(VM *vm, int arg_count, Value *args) {
     }
     const char *meta = AS_STRING(args[0]);
     size_t stages = 0;
+    size_t debug_traps = 0;
     bool negated = false;
     char *copy = strdup(meta);
     if (!copy) {
@@ -443,12 +446,19 @@ Value vmBuiltinShellPipeline(VM *vm, int arg_count, Value *args) {
             } else if (strcmp(key, "merge") == 0) {
                 free(merge_pattern);
                 merge_pattern = strdup(value ? value : "");
+            } else if (strcmp(key, "dbg") == 0) {
+                debug_traps = (size_t)strtoul(value, NULL, 10);
             }
         }
         if (!next) break;
         cursor = next + 1;
     }
         free(copy);
+    /* Before any stage starts: a trap sets the pipeline's state aside while it runs, and a stage's
+     * thread reads it. Run between stages, this crashed the app. */
+    for (size_t i = 0; i < debug_traps; ++i) {
+        shellRuntimeRunDebugTrap();
+    }
     bool skip_pipeline = false;
     ShellPipelineContext *ctx = &gShellRuntime.pipeline;
     if (ctx->active && stages == 1 && !negated) {
