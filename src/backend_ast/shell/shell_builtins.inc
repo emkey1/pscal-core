@@ -979,6 +979,7 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
     }
 
     if (kind == SHELL_LOOP_KIND_FOR) {
+        bool bad_for_name = false;
         if (payload_without_redirs < 1 || payload_cursor >= redir_start_index ||
             VALUE_TYPE(args[payload_cursor]) != TYPE_STRING || !AS_STRING(args[payload_cursor])) {
             runtimeError(vm, "shell loop: expected iterator name");
@@ -995,6 +996,19 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
             frame->for_variable = strdup(text ? text : "");
             if (!frame->for_variable) {
                 ok = false;
+            } else if (!parent_skip && !shellIsValidEnvName(frame->for_variable)) {
+                /* The loop doesn't run and the script goes on, with status 1 and whatever `set -e`
+                 * says. The loop ends at its first advance, as one started under a skip does, and
+                 * leaves the status alone. */
+                if (vm->chunk && vm->chunk->lines && vm->lastInstruction) {
+                    gShellCurrentCommandLine = vm->chunk->lines[vm->lastInstruction - vm->chunk->code];
+                }
+                shellReportRecoverableError(vm, true, "`%s': not a valid identifier", frame->for_variable);
+                shellRuntimeEnterCondition();
+                shellUpdateStatus(1);
+                shellRuntimeLeaveCondition();
+                bad_for_name = true;
+                frame->keep_status = true;
             }
         }
 
@@ -1006,7 +1020,7 @@ Value vmBuiltinShellLoop(VM *vm, int arg_count, Value *args) {
             value_count = (size_t)(redir_start_index - (int)value_start_index);
         }
         size_t values_capacity = 0;
-        if (ok && value_count > 0 && !parent_skip) {
+        if (ok && value_count > 0 && !parent_skip && !bad_for_name) {
             for (size_t offset = 0; offset < value_count; ++offset) {
                 Value *val = &args[value_start_index + offset];
                 if (VALUE_TYPE(*val) != TYPE_STRING || !AS_STRING(*val)) {

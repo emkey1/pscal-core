@@ -4152,6 +4152,11 @@ void shellRuntimeFinishChunk(VM *vm) {
     shellRuntimeMaybeRequestPendingExit(vm);
 }
 
+/* A `return` ended the chunk, and whoever ran the chunk has yet to see it. */
+bool shellRuntimeReturnPending(void) {
+    return gShellReturnPending;
+}
+
 const volatile bool *shellRuntimePendingExitFlag(void) {
     return &gShellRuntime.errexit_pending;
 }

@@ -355,6 +355,7 @@ bool shellRuntimeConsumeExitRequested(void);
 size_t shellRuntimeRedirectScopeDepth(void);
 void shellRuntimeUnwindRedirectScopes(size_t depth);
 bool shellRuntimeConsumeDiscard(void);
+bool shellRuntimeReturnPending(void);
 void shellRuntimeAbandonCommand(void);
 void shellRuntimeFinishChunk(struct VM_s *vm);
 void *shellRuntimeSubstitutionTrapsPutAside(void);

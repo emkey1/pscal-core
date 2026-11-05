@@ -1879,8 +1879,13 @@ static ShellHistoryExpandResult shellExpandHistoryDesignatorAt(const char *input
     return SHELL_HISTORY_EXPAND_OK;
 }
 
-/* Bash's own exceptions: $!, ${!name} and [!...] are not history references. */
+/* Bash's own exceptions: $!, ${!name} and [!...] are not history references, and nor is a `!`
+ * with nothing to name after it, so `! cmd` and `!` alone reach the parser. */
 static bool shellBangIsShellSyntax(const char *input, size_t at) {
+    char next = input[at + 1];
+    if (next == '\0' || next == ' ' || next == '\t' || next == '\r' || next == '\n' || next == '=') {
+        return true;
+    }
     if (at > 0 && input[at - 1] == '$') {
         return true;
     }
