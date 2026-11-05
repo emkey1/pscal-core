@@ -5759,6 +5759,22 @@ static bool shellPrintfParseSigned(const char *text, long long *out_value) {
     return false;
 }
 
+/* Whether the format has a %n, which asks how much has gone out. */
+static bool shellPrintfCountsOutput(const char *fmt) {
+    for (const char *cursor = strchr(fmt, '%'); cursor; cursor = strchr(cursor, '%')) {
+        cursor++;
+        if (*cursor == '%') {
+            cursor++;
+            continue;
+        }
+        cursor += strspn(cursor, "-+ #0'123456789*.hlLjzt");
+        if (*cursor == 'n') {
+            return true;
+        }
+    }
+    return false;
+}
+
 Value vmBuiltinShellPrintf(VM *vm, int arg_count, Value *args) {
     int first = 0;
     const char *variable = NULL;
@@ -5782,10 +5798,13 @@ Value vmBuiltinShellPrintf(VM *vm, int arg_count, Value *args) {
         shellUpdateStatus(2);
         return makeVoid();
     }
+    const char *fmt = AS_STRING(args[first]);
     FILE *out = stdout;
     char *captured = NULL;
     size_t captured_size = 0;
-    if (variable) {
+    /* Only a memory stream can say how much has gone out, so %n goes through one too. */
+    bool buffered = variable || shellPrintfCountsOutput(fmt);
+    if (buffered) {
         out = open_memstream(&captured, &captured_size);
         if (!out) {
             shellUpdateStatus(1);
@@ -5793,7 +5812,6 @@ Value vmBuiltinShellPrintf(VM *vm, int arg_count, Value *args) {
         }
     }
 
-    const char *fmt = AS_STRING(args[first]);
     int arg_index = first + 1;
     bool ok = true;
     bool stop_output = false;
@@ -5801,6 +5819,12 @@ Value vmBuiltinShellPrintf(VM *vm, int arg_count, Value *args) {
     bool repeat = false;
     do {
         bool consumed_conversion = false;
+        /* %n counts from the start of this pass over the format, as in bash. */
+        size_t pass_start = 0;
+        if (buffered) {
+            fflush(out);
+            pass_start = captured_size;
+        }
         for (size_t i = 0; fmt && fmt[i] != '\0'; ++i) {
             char c = fmt[i];
             if (c == '\\' && fmt[i + 1] != '\0') {
@@ -5895,6 +5919,12 @@ Value vmBuiltinShellPrintf(VM *vm, int arg_count, Value *args) {
                     shellReportRecoverableError(vm, true, "printf: incomplete format specifier");
                     ok = false;
                     break;
+                }
+                /* As bash 5 takes them, not as wide characters in a string that holds none. */
+                if (spec == 'S') {
+                    spec = 's';
+                } else if (spec == 'C') {
+                    spec = 'c';
                 }
 
                 char fmtbuf[32];
@@ -6195,19 +6225,31 @@ Value vmBuiltinShellPrintf(VM *vm, int arg_count, Value *args) {
                     }
                     break;
                 }
-                default: {
-                    const char *sv = arg_text ? arg_text : "";
-                    if (width_from_arg && precision_from_arg) {
-                        fprintf(out, fmtbuf, width_value, precision_value, sv);
-                    } else if (width_from_arg) {
-                        fprintf(out, fmtbuf, width_value, sv);
-                    } else if (precision_from_arg) {
-                        fprintf(out, fmtbuf, precision_value, sv);
-                    } else {
-                        fprintf(out, fmtbuf, sv);
+                case 'n': {
+                    /* Never libc's: its %n writes through the argument, and Darwin's aborts on
+                     * it, which on iOS ends the whole app. */
+                    if (!arg_text[0]) {
+                        break;
+                    }
+                    if (!shellIsValidEnvName(arg_text)) {
+                        shellReportRecoverableError(vm, false, "printf: `%s': not a valid identifier", arg_text);
+                        ok = false;
+                        goto printf_done;
+                    }
+                    fflush(out);
+                    char count[32];
+                    snprintf(count, sizeof(count), "%zu", captured_size - pass_start);
+                    if (!shellSetTrackedVariable(arg_text, count, false)) {
+                        ok = false;
                     }
                     break;
                 }
+                default:
+                    /* Nothing else goes to libc with a string for its argument: %D would print
+                     * its address. */
+                    shellReportRecoverableError(vm, false, "printf: `%c': invalid format character", spec);
+                    ok = false;
+                    goto printf_done;
             }
 
             i = j;
@@ -6226,13 +6268,21 @@ Value vmBuiltinShellPrintf(VM *vm, int arg_count, Value *args) {
 printf_done:
 
     fflush(out);
-    if (variable) {
+    if (buffered) {
         fclose(out);
+    }
+    if (variable) {
         char *value = captured ? captured : strdup("");
         if (!value || !shellSetTrackedVariable(variable, value, false)) {
             ok = false;
         }
         free(value);
+    } else if (buffered) {
+        if (captured) {
+            fwrite(captured, 1, captured_size, stdout);
+            fflush(stdout);
+        }
+        free(captured);
     }
     shellUpdateStatus(ok ? 0 : 1);
     return makeVoid();
