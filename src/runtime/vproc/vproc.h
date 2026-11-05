@@ -352,6 +352,14 @@ char *vprocTtynameShim(int fd);
 int vprocIoctlShim(int fd, unsigned long request, ...);
 off_t vprocLseekShim(int fd, off_t offset, int whence);
 int vprocOpenShim(const char *path, int flags, ...);
+/* The descriptor a path names, however it is spelled: /dev/stdin, /dev/stdout, /dev/stderr,
+ * /dev/fd/N, /proc/self/fd/N and /proc/<pid>/fd/N of any vproc. -1 for any other path, and with
+ * no vproc. Only tells that it is one, and which: the slot is this vproc's unless the path has
+ * another's pid. Opening one acts as Linux's /proc links do: see vprocOpenNamedFd. */
+int vprocPathNamedFd(const char *path);
+/* What /proc/<pid>/fd/<fd> reads as on Linux: a path (the host's, for a file), pipe:[N] or
+ * socket:[N]. False if that vproc has no such descriptor. */
+bool vprocFdLinkTarget(int pid, int fd, char *out, size_t size);
 int vprocPollShim(struct pollfd *fds, nfds_t nfds, int timeout);
 int vprocSelectShim(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout);
 pid_t vprocWaitPidShim(pid_t pid, int *status_out, int options);

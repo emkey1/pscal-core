@@ -14,6 +14,9 @@
 #include "vm/string_sentinels.h"
 #include "common/frontend_kind.h"
 #include "ast/ast.h"
+#if defined(PSCAL_TARGET_IOS)
+#include "runtime/vproc/vproc.h"
+#endif
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <fcntl.h>
@@ -2921,6 +2924,19 @@ static bool psb3Write(FILE* f, const BytecodeChunk* chunk,
     return ok;
 }
 
+/* `sh /dev/stdin` or `pascal /dev/stdin` on a pipe: hashing would take the source from the
+ * compiler, and every such program would hash alike. Only a file has contents to key on. */
+static bool cacheSourceIsFile(const char* source_path) {
+#if defined(PSCAL_TARGET_IOS)
+    /* A command's own descriptors, which this file's stat and fopen would take for the host's. */
+    if (vprocPathNamedFd(source_path) >= 0) {
+        return false;
+    }
+#endif
+    struct stat st;
+    return source_path && stat(source_path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
 bool loadBytecodeFromCache(const char* source_path,
                            const char* compiler_id,
                            const char* frontend_path,
@@ -2932,6 +2948,10 @@ bool loadBytecodeFromCache(const char* source_path,
         // By design (f844805): the Pascal frontend compiles used units into
         // the chunk while parsing, and a cached chunk cannot replace them.
         return loadFail("the chunk already holds bytecode (units compiled while parsing)");
+    }
+
+    if (!cacheSourceIsFile(source_path)) {
+        return loadFail("the source %s is not a file", source_path ? source_path : "(none)");
     }
 
     char safe_id[32];
@@ -3226,7 +3246,7 @@ static bool serializeBytecodeChunk(FILE* f,
 }
 
 void saveBytecodeToCache(const char* source_path, const char* compiler_id, const BytecodeChunk* chunk) {
-    if (!chunk) return;
+    if (!chunk || !cacheSourceIsFile(source_path)) return;
 
     uint64_t source_hash = 0, combined_hash = 0;
     if (!computeSourceHash(source_path, true, &source_hash)) {

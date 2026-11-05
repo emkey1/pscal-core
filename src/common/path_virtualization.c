@@ -144,6 +144,14 @@ static int vprocStreamClose(void *cookie) {
     return vprocCloseShim(fd);
 }
 
+static fpos_t vprocStreamSeek(void *cookie, fpos_t offset, int whence) {
+    return (fpos_t)vprocLseekShim((int)(intptr_t)cookie, (off_t)offset, whence);
+}
+
+int pscalPathVirtualized_streamSlot(FILE *stream) {
+    return (stream && stream->_close == vprocStreamClose) ? (int)(intptr_t)stream->_cookie : -1;
+}
+
 static FILE *vprocFdopenCompat(int fd, const char *mode) {
     /* With a vproc current, fd is a slot in its table, whatever the slot holds.
      * fdopen would use and later close the host descriptor with that number. */
@@ -157,7 +165,7 @@ static FILE *vprocFdopenCompat(int fd, const char *mode) {
     FILE *fp = funopen((void *)(intptr_t)fd,
                        vprocStreamRead,
                        vprocStreamWrite,
-                       NULL,
+                       vprocStreamSeek,
                        vprocStreamClose);
     if (!fp) {
         vprocCloseShim(fd);
@@ -314,6 +322,9 @@ char *pscalPathVirtualized_getcwd(char *buffer, size_t size) {
 }
 
 int pscalPathVirtualized_stat(const char *path, struct stat *buf) {
+    if (vprocPathNamedFd(path) >= 0) {
+        return vprocStatShim(path, buf);
+    }
     if (pathVirtualizedIsVprocDevicePath(path)) {
         return stat(path, buf);
     }
@@ -340,6 +351,9 @@ int pscalPathVirtualized_lstat(const char *path, struct stat *buf) {
 }
 
 int pscalPathVirtualized_access(const char *path, int mode) {
+    if (vprocPathNamedFd(path) >= 0) {
+        return vprocAccessShim(path, mode);
+    }
     if (pathVirtualizedIsVprocDevicePath(path)) {
         return access(path, mode);
     }
@@ -537,6 +551,13 @@ ssize_t pscalPathVirtualized_readlink(const char *path, char *buf, size_t size) 
     if (!pathVirtualizationActive()) {
         return readlink(path, buf, size);
     }
+    /* Its expansion goes on through the link, to the directory. */
+    if (path && strcmp(path, "/dev/fd") == 0) {
+        static const char kProcFd[] = "/proc/self/fd";
+        size_t length = strlen(kProcFd) < size ? strlen(kProcFd) : size;
+        memcpy(buf, kProcFd, length);
+        return (ssize_t)length;
+    }
     char expanded[PATH_MAX];
     const char *target = pathVirtualizedPrepare(path, expanded);
     ssize_t result = readlink(target ? target : path, buf, size);
@@ -549,6 +570,9 @@ ssize_t pscalPathVirtualized_readlink(const char *path, char *buf, size_t size) 
 }
 
 char *pscalPathVirtualized_realpath(const char *path, char *resolved_path) {
+    if (vprocPathNamedFd(path) >= 0) {
+        return vprocRealpathShim(path, resolved_path);
+    }
     if (pathVirtualizedIsVprocDevicePath(path)) {
         return realpath(path, resolved_path);
     }
@@ -613,7 +637,7 @@ int pscalPathVirtualized_open(const char *path, int oflag, ...) {
         has_mode = true;
     }
 #if defined(PSCAL_TARGET_IOS)
-    if (pathVirtualizedIsVprocDevicePath(path)) {
+    if (pathVirtualizedIsVprocDevicePath(path) || vprocPathNamedFd(path) >= 0) {
         return has_mode ? vprocOpenShim(path, oflag, mode) : vprocOpenShim(path, oflag);
     }
 #endif
@@ -658,12 +682,18 @@ FILE *pscalPathVirtualized_fopen(const char *path, const char *mode) {
 #ifdef O_CLOEXEC
     flags |= O_CLOEXEC;
 #endif
-    if (pathVirtualizedIsVprocDevicePath(path)) {
+    int named_fd = vprocPathNamedFd(path);
+    if (pathVirtualizedIsVprocDevicePath(path) || named_fd >= 0) {
         int fd = vprocOpenShim(path, flags);
         if (fd < 0) {
             return NULL;
         }
-        return vprocFdopenCompat(fd, mode);
+        FILE *stream = vprocFdopenCompat(fd, mode);
+        /* fflush(NULL) passes this stream by and halt never closes it, so a write can't wait. */
+        if (stream && named_fd >= 0 && (flags & O_ACCMODE) == O_WRONLY) {
+            setvbuf(stream, NULL, _IONBF, 0);
+        }
+        return stream;
     }
     /* libc's fopen opens where nothing can reach it, and a FIFO's open waits for the other end.
      * This open can be interrupted, and the stream is a host descriptor's, as fopen's would be.
@@ -692,7 +722,7 @@ FILE *pscalPathVirtualized_fopen(const char *path, const char *mode) {
 }
 
 FILE *pscalPathVirtualized_freopen(const char *path, const char *mode, FILE *stream) {
-    if (pathVirtualizedIsVprocDevicePath(path)) {
+    if (pathVirtualizedIsVprocDevicePath(path) || vprocPathNamedFd(path) >= 0) {
         if (stream) {
             fclose(stream);
         }

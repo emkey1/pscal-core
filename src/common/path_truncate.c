@@ -2299,6 +2299,15 @@ static size_t pathTruncateCollectProcFds(pid_t pid, VProcFdSnapshot *out, size_t
     return count;
 }
 
+static bool pathTruncateVprocFdTarget(pid_t pid, int fd, char *out, size_t size) {
+#if defined(PSCAL_TARGET_IOS) || defined(VPROC_ENABLE_STUBS_FOR_TESTS)
+    return vprocFdLinkTarget((int)pid, fd, out, size);
+#else
+    (void)pid; (void)fd; (void)out; (void)size;
+    return false;
+#endif
+}
+
 static void pathTruncateWriteProcPidEntries(const char *procdir,
                                             const char *prefix,
                                             pid_t pid,
@@ -2695,10 +2704,10 @@ static void pathTruncateWriteProcPidEntries(const char *procdir,
             continue;
         }
         ssize_t n = host_table ? readlink(host_ref, host_target, sizeof(host_target) - 1) : -1;
-        if (n < 0) {
-            snprintf(host_target, sizeof(host_target), "/dev/fd/%ld", fd);
-        } else {
+        if (n >= 0) {
             host_target[n] = '\0';
+        } else if (host_table || !pathTruncateVprocFdTarget(pid, (int)fd, host_target, sizeof(host_target))) {
+            snprintf(host_target, sizeof(host_target), "/dev/fd/%ld", fd);
         }
         char virtual_target[PATH_MAX];
         if (host_target[0] == '/') {
@@ -4321,7 +4330,13 @@ void pathTruncateProvisionDev(const char *prefix) {
         { "zero", "/dev/zero" },
         { "random", "/dev/random" },
         { "urandom", "/dev/urandom" },
-        { "ptmx", "/dev/null" }
+        { "ptmx", "/dev/null" },
+        /* As on Linux. An open goes to the descriptor by name (vprocPathNamedFd), so these
+         * are what readlink and a directory listing see. */
+        { "fd", "/proc/self/fd" },
+        { "stdin", "/proc/self/fd/0" },
+        { "stdout", "/proc/self/fd/1" },
+        { "stderr", "/proc/self/fd/2" }
     };
     for (size_t i = 0; i < sizeof(links) / sizeof(links[0]); ++i) {
         char link_path[PATH_MAX];
@@ -4600,6 +4615,12 @@ bool pathTruncateExpand(const char *input_path, char *out, size_t out_size) {
     if (input_path[0] == '/' &&
         pathTruncateNormalizeAbsolute(input_path, normalized, sizeof(normalized))) {
         source_path = normalized;
+    }
+    /* /dev/fd is /proc/self/fd, as on Linux. */
+    char proc_fd[PATH_MAX];
+    if (strncmp(source_path, "/dev/fd", 7) == 0 && (source_path[7] == '\0' || source_path[7] == '/')) {
+        snprintf(proc_fd, sizeof(proc_fd), "/proc/self/fd%s", source_path + 7);
+        source_path = proc_fd;
     }
     if (pathTruncateIsProcRequestPath(source_path)) {
         pathTruncateRefreshProc(prefix, source_path);

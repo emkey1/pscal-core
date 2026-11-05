@@ -7453,6 +7453,70 @@ static bool vprocResolveVirtualPath(VProc *vp, const char *path, char *out, size
     return vprocNormalizeAbsolutePath(joined, out, out_size);
 }
 
+/* The number a path names and the vproc whose table it is in. */
+static int vprocPathNamedFdOf(const char *path, int *out_pid) {
+    if (!path || !path[0]) {
+        return -1;
+    }
+    /* Nearly every absolute path stops here, before anything is built. A relative one can be
+     * a bare number in /dev/fd. */
+    if (path[0] == '/' && !strstr(path, "/std") && !strstr(path, "/fd/")) {
+        return -1;
+    }
+    VProc *vp = vprocForThread();
+    char resolved[PATH_MAX];
+    if (!vp || !vprocResolveVirtualPath(vp, path, resolved, sizeof(resolved))) {
+        return -1;
+    }
+    if (out_pid) {
+        *out_pid = vprocPid(vp);
+    }
+    const char *name = resolved;
+    if (strncmp(name, "/private/dev/", 13) == 0 || strncmp(name, "/private/proc/", 14) == 0) {
+        name += 8;
+    }
+    if (strcmp(name, "/dev/stdin") == 0) {
+        return STDIN_FILENO;
+    }
+    if (strcmp(name, "/dev/stdout") == 0) {
+        return STDOUT_FILENO;
+    }
+    if (strcmp(name, "/dev/stderr") == 0) {
+        return STDERR_FILENO;
+    }
+    const char *digits = NULL;
+    if (strncmp(name, "/dev/fd/", 8) == 0) {
+        digits = name + 8;
+    } else if (strncmp(name, "/proc/self/fd/", 14) == 0) {
+        digits = name + 14;
+    } else if (strncmp(name, "/proc/", 6) == 0) {
+        char *end = NULL;
+        long pid = strtol(name + 6, &end, 10);
+        if (end != name + 6 && strncmp(end, "/fd/", 4) == 0 && pid > 0 && pid <= INT_MAX &&
+            vprocFindByPid((int)pid)) {
+            digits = end + 4;
+            if (out_pid) {
+                *out_pid = (int)pid;
+            }
+        }
+    }
+    if (!digits || !*digits) {
+        return -1;
+    }
+    long fd = 0;
+    for (; *digits; ++digits) {
+        if (*digits < '0' || *digits > '9' || fd > INT_MAX / 10) {
+            return -1;
+        }
+        fd = fd * 10 + (*digits - '0');
+    }
+    return fd <= INT_MAX ? (int)fd : -1;
+}
+
+int vprocPathNamedFd(const char *path) {
+    return vprocPathNamedFdOf(path, NULL);
+}
+
 static void vprocInitializeVirtualCwd(VProc *vp, VProc *active) {
     if (!vp) {
         return;
@@ -9088,6 +9152,19 @@ int vprocHostDup(int fd) {
 #endif
 }
 
+static int vprocReopenHostFd(int host, int flags);
+static int vprocCopyFdOfTask(VProc *vp, int pid, int fd);
+
+/* A slot with no host side: a terminal or an in-process pipe. */
+static bool vprocSlotIsPscal(VProc *vp, int fd) {
+    struct pscal_fd *pscal_fd = vprocGetPscalFd(vp, fd);
+    if (pscal_fd) {
+        pscal_fd_close(pscal_fd);
+        return true;
+    }
+    return false;
+}
+
 int vprocHostOpen(const char *path, int flags, ...) {
     int mode = 0;
     if (flags & O_CREAT) {
@@ -9102,6 +9179,36 @@ int vprocHostOpen(const char *path, int flags, ...) {
         VProc *vp = vprocForThread();
         if (vp && fd >= 0) {
             vprocResourceTrack(vp, fd, VPROC_RESOURCE_GENERIC);
+        }
+        return fd;
+    }
+    /* The virtualized open answers these with a slot, and this returns a host descriptor. */
+    int named_pid = 0;
+    int named_fd = vprocPathNamedFdOf(path, &named_pid);
+    if (named_fd >= 0) {
+        VProc *named_vp = vprocForThread();
+        int copy = -1;
+        if (named_pid != vprocPid(named_vp)) {
+            copy = vprocCopyFdOfTask(named_vp, named_pid, named_fd);
+            if (copy < 0) {
+                return -1;
+            }
+            named_fd = copy;
+        }
+        int fd = -1;
+        int named_host = vprocTranslateFd(named_vp, named_fd);
+        if (named_host < 0) {
+            errno = vprocSlotIsPscal(named_vp, named_fd) ? ENXIO : ENOENT;
+        } else {
+            fd = vprocReopenHostFd(named_host, flags);
+            if (fd >= 0) {
+                vprocResourceTrack(named_vp, fd, VPROC_RESOURCE_GENERIC);
+            }
+        }
+        if (copy >= 0) {
+            int err = errno;
+            vprocCloseShim(copy);
+            errno = err;
         }
         return fd;
     }
@@ -9553,6 +9660,8 @@ int vprocPipe(VProc *vp, int pipefd[2]) {
     return 0;
 }
 
+static int vprocOpenNamedFd(VProc *vp, int pid, int fd, int flags);
+
 int vprocOpenAt(VProc *vp, const char *path, int flags, int mode) {
     if (!vp || !path) {
         errno = EINVAL;
@@ -9564,6 +9673,11 @@ int vprocOpenAt(VProc *vp, const char *path, int flags, int mode) {
     }
     if (vprocPathIsLocationDevice(path)) {
         return vprocLocationDeviceOpen(vp, flags);
+    }
+    int named_pid = 0;
+    int named_fd = vprocPathNamedFdOf(path, &named_pid);
+    if (named_fd >= 0) {
+        return vprocOpenNamedFd(vp, named_pid, named_fd, flags);
     }
     char expanded[PATH_MAX];
     const char *target = vprocPathExpandForShim(path, expanded, sizeof(expanded));
@@ -14295,6 +14409,10 @@ static int shimTranslate(int fd, int allow_real) {
 
 int vprocFilenoShim(FILE *stream) {
     int fd = (fileno)(stream);
+    /* A stream on a device has no host number, and its slot is what the shims take. */
+    if (fd < 0) {
+        return pscalPathVirtualized_streamSlot(stream);
+    }
     /* The standard streams' numbers are slots already. */
     if (stream == stdin || stream == stdout || stream == stderr) {
         return fd;
@@ -14382,6 +14500,223 @@ static int vprocFcntlPscalFd(struct pscal_fd *pscal_fd, int cmd, int arg) {
             errno = EINVAL;
             return -1;
     }
+}
+
+/* A closed descriptor's link is not there, on Linux, and that is what the path says. */
+static bool vprocNamedFdOpen(VProc *vp, int fd) {
+    if (vprocSlotIsPscal(vp, fd) || vprocTranslateFd(vp, fd) >= 0) {
+        return true;
+    }
+    errno = ENOENT;
+    return false;
+}
+
+/* Opening /proc/self/fd/N on Linux opens the file again: its own offset, and O_TRUNC and
+ * O_APPEND mean what they say, whatever the descriptor was opened with. So `> /dev/stdout` on a
+ * file redirection truncates it, and `cat /dev/stdin` reads from the top. The name is only used
+ * for the file it still names, so the truncation waits until that is known. A pipe or a socket
+ * has no name, and what it can be is a copy, in the direction it already goes. */
+static int vprocReopenHostFd(int host, int flags) {
+    struct stat st;
+    if (vprocHostFstatRaw(host, &st) != 0) {
+        return -1;
+    }
+    int access_mode = flags & O_ACCMODE;
+    bool truncates = (flags & O_TRUNC) && access_mode != O_RDONLY;
+#if defined(F_GETPATH)
+    if (!S_ISFIFO(st.st_mode) && !S_ISSOCK(st.st_mode)) {
+        char path[PATH_MAX];
+        if ((fcntl)(host, F_GETPATH, path) == 0) {
+            int plain = flags & ~(O_CREAT | O_EXCL | O_TRUNC);
+            int reopened = vprocHostOpenRawInternal(path, S_ISCHR(st.st_mode) ? (plain | O_NOCTTY) : plain, 0, false);
+            if (reopened < 0 && errno != ENOENT) {
+                return -1;
+            }
+            if (reopened >= 0) {
+                struct stat now;
+                if (vprocHostFstatRaw(reopened, &now) == 0 &&
+                    now.st_dev == st.st_dev && now.st_ino == st.st_ino) {
+                    if (truncates && S_ISREG(st.st_mode)) {
+                        (void)ftruncate(reopened, 0);
+                    }
+                    return reopened;
+                }
+                vprocHostCloseRaw(reopened);
+            }
+        }
+    }
+#endif
+    /* No name, or the name is another file's by now. */
+    int have = (fcntl)(host, F_GETFL);
+    if (have < 0) {
+        return -1;
+    }
+    have &= O_ACCMODE;
+    if (have != O_RDWR && access_mode != have) {
+        errno = EACCES;
+        return -1;
+    }
+    int copy = vprocCloneFd(host);
+    if (copy >= 0 && truncates && S_ISREG(st.st_mode)) {
+        (void)ftruncate(copy, 0);
+    }
+    return copy;
+}
+
+/* A descriptor of another vproc, as /proc/<pid>/fd/N reaches it, copied to a slot of this one. */
+static int vprocCopyFdOfTask(VProc *vp, int pid, int fd) {
+    struct pscal_fd *pscal_fd = NULL;
+    int host = -1;
+    /* fcntl is a cancellation point, and a thread killed there would keep both locks. */
+    int cancel_state = PTHREAD_CANCEL_ENABLE;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+    pthread_mutex_lock(&gVProcRegistryMu);
+    for (size_t i = 0; i < gVProcRegistryCount; ++i) {
+        VProc *owner = gVProcRegistry[i];
+        if (!owner || owner->pid != pid) {
+            continue;
+        }
+        pthread_mutex_lock(&owner->mu);
+        if ((size_t)fd < owner->capacity) {
+            const VProcFdEntry *entry = &owner->entries[fd];
+            if (entry->kind == VPROC_FD_PSCAL && entry->pscal_fd) {
+                pscal_fd = pscal_fd_retain(entry->pscal_fd);
+            } else if (entry->kind == VPROC_FD_HOST) {
+                host = vprocCloneFd(entry->host_fd);
+            }
+        }
+        pthread_mutex_unlock(&owner->mu);
+        break;
+    }
+    pthread_mutex_unlock(&gVProcRegistryMu);
+    int slot = -1;
+    if (pscal_fd) {
+        slot = vprocInsertPscalFd(vp, pscal_fd);
+        /* The table retains. */
+        pscal_fd_close(pscal_fd);
+    } else if (host >= 0) {
+        slot = vprocInsert(vp, host);
+        if (slot < 0) {
+            vprocHostClose(host);
+        }
+    } else {
+        errno = ENOENT;
+    }
+    pthread_setcancelstate(cancel_state, NULL);
+    return slot;
+}
+
+static int vprocOpenNamedFd(VProc *vp, int pid, int fd, int flags) {
+    if (pid != vprocPid(vp)) {
+        int copy = vprocCopyFdOfTask(vp, pid, fd);
+        if (copy < 0) {
+            return -1;
+        }
+        int slot = vprocOpenNamedFd(vp, vprocPid(vp), copy, flags);
+        int err = errno;
+        vprocCloseShim(copy);
+        errno = err;
+        return slot;
+    }
+    if (!vprocNamedFdOpen(vp, fd)) {
+        return -1;
+    }
+    if ((flags & O_CREAT) && (flags & O_EXCL)) {
+        errno = EEXIST;
+        return -1;
+    }
+    struct pscal_fd *pscal_fd = vprocGetPscalFd(vp, fd);
+    if (pscal_fd) {
+        /* A terminal does both. An end of an in-process pipe has one direction, where Linux
+         * would open the other end. */
+        int mode = vprocFcntlPscalFd(pscal_fd, F_GETFL, 0) & O_ACCMODE;
+        int want = flags & O_ACCMODE;
+        if (!pscal_fd->tty && mode != O_RDWR && want != mode) {
+            pscal_fd_close(pscal_fd);
+            errno = EACCES;
+            return -1;
+        }
+        int slot = vprocInsertPscalFd(vp, pscal_fd);
+        /* The table retains. */
+        pscal_fd_close(pscal_fd);
+        return slot;
+    }
+    int reopened = vprocReopenHostFd(vprocTranslateFd(vp, fd), flags);
+    if (reopened < 0) {
+        return -1;
+    }
+    int slot = vprocInsert(vp, reopened);
+    if (slot < 0) {
+        vprocHostClose(reopened);
+    }
+    return slot;
+}
+
+static void vprocDescribeHostFd(int host, char *out, size_t size) {
+    struct stat st;
+    out[0] = '\0';
+    if (vprocHostFstatRaw(host, &st) != 0) {
+        return;
+    }
+    if (S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode)) {
+        snprintf(out, size, "%s:[%llu]", S_ISFIFO(st.st_mode) ? "pipe" : "socket", (unsigned long long)st.st_ino);
+        return;
+    }
+#if defined(F_GETPATH)
+    char path[PATH_MAX];
+    if ((fcntl)(host, F_GETPATH, path) == 0) {
+        snprintf(out, size, "%s", path);
+    }
+#endif
+}
+
+static void vprocDescribePscalFd(struct pscal_fd *pscal_fd, char *out, size_t size) {
+    if (pscalPtyIsMaster(pscal_fd)) {
+        snprintf(out, size, "/dev/ptmx");
+    } else if (pscal_fd->tty) {
+        snprintf(out, size, pscalPtyIsSlave(pscal_fd) ? "/dev/pts/%d" : "/dev/tty%d", pscal_fd->tty->num);
+    } else {
+        snprintf(out, size, "pipe:[%llu]", (unsigned long long)(uintptr_t)pscal_fd);
+    }
+}
+
+bool vprocFdLinkTarget(int pid, int fd, char *out, size_t size) {
+    if (pid <= 0 || fd < 0 || !out || size == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    bool found = false;
+    struct pscal_fd *pscal_fd = NULL;
+    /* fcntl is a cancellation point, and a thread killed there would keep both locks. */
+    int cancel_state = PTHREAD_CANCEL_ENABLE;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+    pthread_mutex_lock(&gVProcRegistryMu);
+    for (size_t i = 0; i < gVProcRegistryCount; ++i) {
+        VProc *vp = gVProcRegistry[i];
+        if (!vp || vp->pid != pid) {
+            continue;
+        }
+        pthread_mutex_lock(&vp->mu);
+        if ((size_t)fd < vp->capacity) {
+            const VProcFdEntry *entry = &vp->entries[fd];
+            if (entry->kind == VPROC_FD_PSCAL && entry->pscal_fd) {
+                pscal_fd = pscal_fd_retain(entry->pscal_fd);
+                found = true;
+            } else if (entry->kind == VPROC_FD_HOST) {
+                vprocDescribeHostFd(entry->host_fd, out, size);
+                found = true;
+            }
+        }
+        pthread_mutex_unlock(&vp->mu);
+        break;
+    }
+    pthread_mutex_unlock(&gVProcRegistryMu);
+    if (pscal_fd) {
+        vprocDescribePscalFd(pscal_fd, out, size);
+        pscal_fd_close(pscal_fd);
+    }
+    pthread_setcancelstate(cancel_state, NULL);
+    return found && out[0] != '\0';
 }
 
 int vprocFcntlShim(int fd, int cmd, ...) {
@@ -15314,6 +15649,23 @@ static int vprocStatShimInternal(const char *path, struct stat *st, bool follow)
     if (!vp) {
         return follow ? vprocHostStatRaw(path, st) : vprocHostLstatRaw(path, st);
     }
+    /* lstat goes on to the link itself, under the root's /dev and /proc. */
+    int named_pid = 0;
+    int named_fd = follow ? vprocPathNamedFdOf(path, &named_pid) : -1;
+    if (named_fd >= 0) {
+        if (named_pid != vprocPid(vp)) {
+            int copy = vprocCopyFdOfTask(vp, named_pid, named_fd);
+            if (copy < 0) {
+                return -1;
+            }
+            int rc = vprocFstatShim(copy, st);
+            int err = errno;
+            vprocCloseShim(copy);
+            errno = err;
+            return rc;
+        }
+        return vprocNamedFdOpen(vp, named_fd) ? vprocFstatShim(named_fd, st) : -1;
+    }
     char virtual_path_buf[PATH_MAX];
     if (!vprocResolveVirtualPath(vp, path, virtual_path_buf, sizeof(virtual_path_buf))) {
         return -1;
@@ -16046,6 +16398,21 @@ int vprocAccessShim(const char *path, int mode) {
     if (!vp) {
         return vprocHostAccessRaw(path, mode);
     }
+    /* What the link leads to answers, not how the descriptor was opened. */
+    int named_fd = vprocPathNamedFd(path);
+    if (named_fd >= 0) {
+        struct stat st;
+        if (vprocStatShim(path, &st) != 0) {
+            return -1;
+        }
+        if (((mode & R_OK) && !(st.st_mode & S_IRUSR)) ||
+            ((mode & W_OK) && !(st.st_mode & S_IWUSR)) ||
+            ((mode & X_OK) && !(st.st_mode & S_IXUSR))) {
+            errno = EACCES;
+            return -1;
+        }
+        return 0;
+    }
     char expanded[PATH_MAX];
     const char *target = vprocPathExpandForShim(path, expanded, sizeof(expanded));
     return vprocHostAccessRaw(target ? target : path, mode);
@@ -16268,6 +16635,27 @@ char *vprocRealpathShim(const char *path, char *resolved_path) {
     VProc *vp = vprocForThread();
     if (!vp) {
         return vprocHostRealpathRaw(path, resolved_path);
+    }
+    int named_pid = 0;
+    int named_fd = vprocPathNamedFdOf(path, &named_pid);
+    if (named_fd >= 0) {
+        /* Where the link leads. On Linux a pipe's ends up as a name under /proc. */
+        char target[PATH_MAX];
+        char final[PATH_MAX];
+        if (!vprocFdLinkTarget(named_pid, named_fd, target, sizeof(target))) {
+            errno = ENOENT;
+            return NULL;
+        }
+        if (target[0] != '/') {
+            snprintf(final, sizeof(final), "/proc/%d/fd/%s", named_pid, target);
+        } else if (!pathTruncateEnabled() || !pathTruncateStrip(target, final, sizeof(final))) {
+            snprintf(final, sizeof(final), "%s", target);
+        }
+        if (!resolved_path) {
+            return strdup(final);
+        }
+        memcpy(resolved_path, final, strlen(final) + 1);
+        return resolved_path;
     }
     char expanded[PATH_MAX];
     const char *target = vprocPathExpandForShim(path, expanded, sizeof(expanded));
@@ -17515,6 +17903,11 @@ int vprocOpenShim(const char *path, int flags, ...) {
     VProc *vp = vprocForThread();
     if (!vp) {
         return vprocHostOpenRawInternal(path, flags, (mode_t)mode, (flags & O_CREAT) != 0);
+    }
+    int named_pid = 0;
+    int named_fd = vprocPathNamedFdOf(path, &named_pid);
+    if (named_fd >= 0) {
+        return vprocOpenNamedFd(vp, named_pid, named_fd, flags);
     }
     if (vprocPathIsSystemPath(path)) {
         int host_fd = vprocHostOpenRawInternal(path, flags, (mode_t)mode, (flags & O_CREAT) != 0);

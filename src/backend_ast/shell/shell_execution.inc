@@ -4338,12 +4338,26 @@ static bool shellApplyExecRedirections(const ShellCommand *cmd,
                 const char *open_path = redir->path;
 #endif
                 int fd = -1;
+                int vfd = -1;
 #if defined(PSCAL_TARGET_IOS)
-                fd = vprocHostOpen(open_path, redir->flags, redir->mode);
+                /* /dev/stdout and the like are descriptors the command already has, which may
+                 * have no host side at all. */
+                if (vp_current && vprocPathNamedFd(redir->path) >= 0) {
+                    /* set -C stops only at a regular file. */
+                    int named_flags = redir->flags;
+                    struct stat named_st;
+                    if ((named_flags & O_EXCL) && stat(redir->path, &named_st) == 0 &&
+                        !S_ISREG(named_st.st_mode)) {
+                        named_flags &= ~(O_CREAT | O_EXCL);
+                    }
+                    vfd = vprocOpenShim(redir->path, named_flags, redir->mode);
+                } else {
+                    fd = vprocHostOpen(open_path, redir->flags, redir->mode);
+                }
 #else
                 fd = open(open_path, redir->flags, redir->mode);
 #endif
-                if (fd < 0) {
+                if (fd < 0 && vfd < 0) {
                     int err = errno;
                     if (dbg) {
                         fprintf(stderr, "[redir] open failed: %s\n", strerror(err));
@@ -4351,9 +4365,8 @@ static bool shellApplyExecRedirections(const ShellCommand *cmd,
                     shellRedirectionFailed(redir->path, err);
                     goto redir_error;
                 }
-                int vfd = -1;
 #if defined(PSCAL_TARGET_IOS)
-                if (vp_current) {
+                if (vp_current && vfd < 0) {
                     vfd = vprocAdoptHostFd(vp_current, fd);
                     if (vfd < 0) {
                         int err = errno;

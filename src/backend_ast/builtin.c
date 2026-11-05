@@ -6175,7 +6175,8 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, VmLineBuf *line) {
 #else
     bool tool_dbg = false;
 #endif
-    if (fd < 0) {
+    /* A stream on a device has no number of its own, and getline below takes it as it is. */
+    if (fd < 0 && is_stdin_stream) {
         return false;
     }
 

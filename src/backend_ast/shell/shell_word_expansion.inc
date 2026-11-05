@@ -4588,7 +4588,12 @@ static bool shellAddRedirection(ShellCommand *cmd, const char *spec) {
         if (gShellRuntime.noclobber_enabled) {
             /* set -C: a regular file stays as it is, and /dev/null still works. */
             struct stat st;
-            if (stat(expanded_target, &st) != 0 || S_ISREG(st.st_mode)) {
+            if (stat(expanded_target, &st) != 0 || S_ISREG(st.st_mode)
+#if defined(PSCAL_TARGET_IOS)
+                /* What a descriptor's name leads to is known when it opens. */
+                || vprocPathNamedFd(expanded_target) >= 0
+#endif
+            ) {
                 redir.flags = O_WRONLY | O_CREAT | O_EXCL;
             }
         }

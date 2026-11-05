@@ -43,6 +43,9 @@ char *pscalPathVirtualized_realpath(const char *path, char *resolved_path);
 /* For a library that opens the file itself, which the macros below cannot reach: the host
  * path to hand it. A relative path starts from the vproc's directory, not the process's. */
 const char *pscalPathVirtualized_hostPath(const char *path, char expanded[PATH_MAX]);
+/* The vproc slot behind a stream pscalPathVirtualized_fopen made on a device, whose fileno is
+ * -1 because it has no host descriptor. -1 for any other stream. */
+int pscalPathVirtualized_streamSlot(FILE *stream);
 
 #if !defined(PATH_VIRTUALIZATION_NO_MACROS)
 #define chdir(path) pscalPathVirtualized_chdir(path)
