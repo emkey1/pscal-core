@@ -6,6 +6,7 @@
 
 #if defined(PSCAL_TARGET_IOS) && !defined(VPROC_SHIM_DISABLED)
 #include <libgen.h>
+#include <locale.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #define VPROC_SHIM_PRESENT 1
@@ -67,6 +68,7 @@
 #undef environ
 #undef basename
 #undef dirname
+#undef setlocale
 
 #define getenv vprocGetenvShim
 #define setenv vprocSetenvShim
@@ -76,6 +78,8 @@
 /* libc answers these in one buffer for the whole process. */
 #define basename(path) vprocBasenameShim((path))
 #define dirname(path) vprocDirnameShim((path))
+/* libc's is the whole app's, and it crashes if two threads load a locale at once. */
+#define setlocale(category, name) vprocSetlocaleShim((category), (name))
 
 #define read  vprocReadShim
 #define write vprocWriteShim

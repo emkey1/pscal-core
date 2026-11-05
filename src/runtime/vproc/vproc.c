@@ -34,9 +34,11 @@
 #include <pwd.h>
 #include <grp.h>
 #include <libgen.h>
+#include <locale.h>
 #include <sys/param.h>
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
+#include <xlocale.h>
 #include <sys/syscall.h>
 #include <sys/event.h>
 #include <os/log.h>
@@ -15444,6 +15446,9 @@ struct VProcEnv {
 };
 
 static _Thread_local VProcEnv *gVprocEnvTls = NULL;
+/* libc's environment is the whole app's, and libc locks only its own calls. A capture walks it,
+ * so that and what changes it here hold this. */
+static pthread_mutex_t gVprocHostEnvMu = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local int gVprocSubshellPid = 0;
 static _Thread_local bool gVprocClosedPipe = false;
 extern char **environ;
@@ -15550,14 +15555,123 @@ char *vprocDirnameShim(char *path) {
 #endif
 }
 
-VProcEnv *vprocEnvCaptureFiltered(bool (*keep)(const char *entry, void *arg), void *arg) {
+#if defined(__APPLE__)
+/* The locale a thread made, freed when it makes another or ends. A thread using a locale holds
+ * its own reference in libc, so this can go while that is still in use. */
+static pthread_key_t gVprocLocaleKey;
+static pthread_once_t gVprocLocaleOnce = PTHREAD_ONCE_INIT;
+static pthread_mutex_t gVprocLocaleMu = PTHREAD_MUTEX_INITIALIZER;
+
+static void vprocLocaleThreadEnd(void *locale) {
+    (void)freelocale((locale_t)locale);
+}
+
+static void vprocLocaleMakeKey(void) {
+    (void)pthread_key_create(&gVprocLocaleKey, vprocLocaleThreadEnd);
+}
+
+/* From here NEXT is this thread's to free, unless it is LC_GLOBAL_LOCALE. */
+static void vprocLocaleInstall(locale_t next) {
+    (void)pthread_once(&gVprocLocaleOnce, vprocLocaleMakeKey);
+    locale_t previous = (locale_t)pthread_getspecific(gVprocLocaleKey);
+    (void)uselocale(next);
+    (void)pthread_setspecific(gVprocLocaleKey, next == LC_GLOBAL_LOCALE ? NULL : next);
+    if (previous) {
+        (void)freelocale(previous);
+    }
+}
+
+static int vprocLocaleMask(int category, const char **env_name) {
+    *env_name = NULL;
+    switch (category) {
+        case LC_ALL:
+            return LC_ALL_MASK;
+        case LC_COLLATE:
+            *env_name = "LC_COLLATE";
+            return LC_COLLATE_MASK;
+        case LC_CTYPE:
+            *env_name = "LC_CTYPE";
+            return LC_CTYPE_MASK;
+        case LC_MESSAGES:
+            *env_name = "LC_MESSAGES";
+            return LC_MESSAGES_MASK;
+        case LC_MONETARY:
+            *env_name = "LC_MONETARY";
+            return LC_MONETARY_MASK;
+        case LC_NUMERIC:
+            *env_name = "LC_NUMERIC";
+            return LC_NUMERIC_MASK;
+        case LC_TIME:
+            *env_name = "LC_TIME";
+            return LC_TIME_MASK;
+        default:
+            return 0;
+    }
+}
+#endif
+
+char *vprocSetlocaleShim(int category, const char *name) {
+#if defined(__APPLE__)
+    const char *env_name = NULL;
+    int mask = vprocLocaleMask(category, &env_name);
+    if (mask == 0) {
+        errno = EINVAL;
+        return NULL;
+    }
+    if (name) {
+        if (!*name) {
+            /* The program's environment, which libc's may not be. */
+            const char *value = vprocGetenvShim("LC_ALL");
+            if ((!value || !*value) && env_name) {
+                value = vprocGetenvShim(env_name);
+            }
+            if (!value || !*value) {
+                value = vprocGetenvShim("LANG");
+            }
+            name = (value && *value && !strchr(value, '/')) ? value : "C";
+        }
+        pthread_mutex_lock(&gVprocLocaleMu);
+        locale_t made = newlocale(mask, name, uselocale((locale_t)0));
+        pthread_mutex_unlock(&gVprocLocaleMu);
+        if (!made) {
+            return NULL;
+        }
+        vprocLocaleInstall(made);
+    }
+    return (char *)querylocale(mask, uselocale((locale_t)0));
+#else
+    return setlocale(category, name);
+#endif
+}
+
+void *vprocLocaleSave(void) {
+#if defined(__APPLE__)
+    locale_t current = uselocale((locale_t)0);
+    /* A copy of its own, as a program inside this one may free what is current. */
+    return current == LC_GLOBAL_LOCALE ? (void *)LC_GLOBAL_LOCALE : (void *)duplocale(current);
+#else
+    return NULL;
+#endif
+}
+
+void vprocLocaleRestore(void *saved) {
+#if defined(__APPLE__)
+    locale_t locale = (locale_t)saved;
+    if (locale && (locale != LC_GLOBAL_LOCALE || uselocale((locale_t)0) != LC_GLOBAL_LOCALE)) {
+        vprocLocaleInstall(locale);
+    }
+#else
+    (void)saved;
+#endif
+}
+
+static VProcEnv *vprocEnvCopyView(char **source, bool (*keep)(const char *entry, void *arg), void *arg) {
     VProcEnv *env = (VProcEnv *)calloc(1, sizeof(VProcEnv));
     if (!env) {
         return NULL;
     }
     env->refcount = 1;
     pthread_mutex_init(&env->mu, NULL);
-    char **source = *vprocEnvironShim();
     size_t count = 0;
     while (source && source[count]) {
         count++;
@@ -15566,7 +15680,8 @@ VProcEnv *vprocEnvCaptureFiltered(bool (*keep)(const char *entry, void *arg), vo
         vprocEnvRelease(env);
         return NULL;
     }
-    for (size_t i = 0; i < count; ++i) {
+    /* The NULL is for what the lock can't cover: libc's own callers, in the system libraries. */
+    for (size_t i = 0; i < count && source[i]; ++i) {
         if (keep && !keep(source[i], arg)) {
             continue;
         }
@@ -15579,6 +15694,15 @@ VProcEnv *vprocEnvCaptureFiltered(bool (*keep)(const char *entry, void *arg), vo
         env->caps[env->count] = strlen(copy) + 1;
         env->count++;
     }
+    return env;
+}
+
+VProcEnv *vprocEnvCaptureFiltered(bool (*keep)(const char *entry, void *arg), void *arg) {
+    VProcEnv *current = gVprocEnvTls;
+    pthread_mutex_t *mu = current ? &current->mu : &gVprocHostEnvMu;
+    pthread_mutex_lock(mu);
+    VProcEnv *env = vprocEnvCopyView(*vprocEnvironShim(), keep, arg);
+    pthread_mutex_unlock(mu);
     return env;
 }
 
@@ -15652,7 +15776,10 @@ char *vprocGetenvShim(const char *name) {
 int vprocSetenvShim(const char *name, const char *value, int overwrite) {
     VProcEnv *env = gVprocEnvTls;
     if (!env) {
-        return setenv(name, value, overwrite);
+        pthread_mutex_lock(&gVprocHostEnvMu);
+        int result = setenv(name, value, overwrite);
+        pthread_mutex_unlock(&gVprocHostEnvMu);
+        return result;
     }
     if (!name || !*name || strchr(name, '=')) {
         errno = EINVAL;
@@ -15703,7 +15830,10 @@ int vprocSetenvShim(const char *name, const char *value, int overwrite) {
 int vprocUnsetenvShim(const char *name) {
     VProcEnv *env = gVprocEnvTls;
     if (!env) {
-        return unsetenv(name);
+        pthread_mutex_lock(&gVprocHostEnvMu);
+        int result = unsetenv(name);
+        pthread_mutex_unlock(&gVprocHostEnvMu);
+        return result;
     }
     if (!name || !*name || strchr(name, '=')) {
         errno = EINVAL;

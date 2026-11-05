@@ -307,6 +307,12 @@ VProcEnv *vprocEnvActivate(VProcEnv *env);
 /* As basename and dirname, with an answer that is the calling thread's until it next asks. */
 char *vprocBasenameShim(char *path);
 char *vprocDirnameShim(char *path);
+/* As setlocale, for the calling thread alone. libc's is the whole app's, and it crashes if two
+ * threads load a locale at once. */
+char *vprocSetlocaleShim(int category, const char *name);
+/* A program on the shell's thread has its locale end with it. */
+void *vprocLocaleSave(void);
+void vprocLocaleRestore(void *saved);
 char *vprocGetenvShim(const char *name);
 int vprocSetenvShim(const char *name, const char *value, int overwrite);
 int vprocUnsetenvShim(const char *name);
