@@ -6228,8 +6228,9 @@ static bool shellExecuteExecBuiltin(VM *vm, ShellCommand *cmd) {
     shellRestoreExecRedirections(backups, backup_count);
     shellFreeExecRedirBackups(backups, backup_count);
     shellUpdateStatus((err == ENOENT) ? 127 : 126);
-    /* Neither a script nor a subshell outlives a failed exec, as under bash. */
-    if (gShellRuntime.in_subshell) {
+    /* Neither a script nor a subshell outlives a failed exec, as under bash. A substitution is a
+     * subshell there, at a prompt too. */
+    if (gShellRuntime.in_subshell || gShellCommandSubFrame) {
         shellRuntimeRequestExit();
         if (vm) {
             vm->exit_requested = true;
