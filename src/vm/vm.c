@@ -8214,6 +8214,19 @@ static void vmThreadFreeOwnedVm(Thread* thread) {
 }
 
 // --- VM Initialization and Cleanup ---
+
+// A shell function and an eval reset a VM on every call. If it has had no worker
+// and no job, there is nothing to stop and its slots and queue are as new.
+static bool vmThreadPoolIsUntouched(VM* vm) {
+    if (vm->threadCount > 1 || vm->workerCount > 0 || !vm->jobQueue) {
+        return false;
+    }
+    pthread_mutex_lock(&vm->jobQueue->mutex);
+    bool untouched = vm->jobQueue->pending == 0 && !vm->jobQueue->shuttingDown;
+    pthread_mutex_unlock(&vm->jobQueue->mutex);
+    return untouched;
+}
+
 void vmResetExecutionState(VM* vm) {
     if (!vm) return;
 
@@ -8241,43 +8254,45 @@ void vmResetExecutionState(VM* vm) {
     freeValue(&vm->threadMyself);
     vm->threadMyself = makeNil();
 
-    atomic_store(&vm->shuttingDownWorkers, true);
-    if (vm->jobQueue) {
-        pthread_mutex_lock(&vm->jobQueue->mutex);
-        vm->jobQueue->shuttingDown = true;
-        pthread_cond_broadcast(&vm->jobQueue->cond);
-        pthread_mutex_unlock(&vm->jobQueue->mutex);
-    }
-    for (size_t i = 1; i < vm->threadsCommittedCount; ++i) {
-        Thread* thread = &vm->threads[i];
-        if (atomic_load(&thread->inPool)) {
-            // Reaches a job that is still running, too (see
-            // vmThreadRequestStop): setting killRequested alone left a busy
-            // or channel-blocked task running and this join waiting forever.
-            vmThreadRequestStop(thread, true);
+    if (!vmThreadPoolIsUntouched(vm)) {
+        atomic_store(&vm->shuttingDownWorkers, true);
+        if (vm->jobQueue) {
+            pthread_mutex_lock(&vm->jobQueue->mutex);
+            vm->jobQueue->shuttingDown = true;
+            pthread_cond_broadcast(&vm->jobQueue->cond);
+            pthread_mutex_unlock(&vm->jobQueue->mutex);
         }
-        // Gate on needsJoin, not inPool/active: the global shutdown flags
-        // just set above already let any idle worker wake and fully exit
-        // (clearing inPool/active) before this loop reaches its slot, so
-        // reading those here would race and skip the join, leaking the
-        // already-finished OS thread (see needsJoin's vm.h comment).
-        if (atomic_load(&thread->needsJoin)) {
-            pthread_join(thread->handle, NULL);
-            atomic_store(&thread->active, false);
-            atomic_store(&thread->needsJoin, false);
+        for (size_t i = 1; i < vm->threadsCommittedCount; ++i) {
+            Thread* thread = &vm->threads[i];
+            if (atomic_load(&thread->inPool)) {
+                // Reaches a job that is still running, too (see
+                // vmThreadRequestStop): setting killRequested alone left a busy
+                // or channel-blocked task running and this join waiting forever.
+                vmThreadRequestStop(thread, true);
+            }
+            // Gate on needsJoin, not inPool/active: the global shutdown flags
+            // just set above already let any idle worker wake and fully exit
+            // (clearing inPool/active) before this loop reaches its slot, so
+            // reading those here would race and skip the join, leaking the
+            // already-finished OS thread (see needsJoin's vm.h comment).
+            if (atomic_load(&thread->needsJoin)) {
+                pthread_join(thread->handle, NULL);
+                atomic_store(&thread->active, false);
+                atomic_store(&thread->needsJoin, false);
+            }
+            vmThreadFreeOwnedVm(thread);
+            vmThreadDestroySlot(thread);
+            memset(thread, 0, sizeof(*thread));
+            vmThreadInitSlot(thread);
         }
-        vmThreadFreeOwnedVm(thread);
-        vmThreadDestroySlot(thread);
-        memset(thread, 0, sizeof(*thread));
-        vmThreadInitSlot(thread);
+        if (vm->jobQueue) {
+            vmThreadJobQueueDestroy(vm->jobQueue);
+        }
+        vm->jobQueue = vmThreadJobQueueCreate();
+        vm->workerCount = 0;
+        vm->availableWorkers = 0;
+        atomic_store(&vm->shuttingDownWorkers, false);
     }
-    if (vm->jobQueue) {
-        vmThreadJobQueueDestroy(vm->jobQueue);
-    }
-    vm->jobQueue = vmThreadJobQueueCreate();
-    vm->workerCount = 0;
-    vm->availableWorkers = 0;
-    atomic_store(&vm->shuttingDownWorkers, false);
     vm->threadCount = 1;
     vm->threadOwner = vm;
     atomic_store(&vm->threads[0].active, false);
