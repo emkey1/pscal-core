@@ -5833,7 +5833,7 @@ void pscalRuntimeRequestSigint(void) {
          * virtual process-group signal instead of broadcasting a shell/VM-wide
          * interrupt request. */
         errno = 0;
-        int rc = vprocKillShim(-fg_pgid, SIGINT);
+        int rc = vprocKillLive(-fg_pgid, SIGINT);
         int kill_errno = errno;
         if (rc == 0) {
             delivered_to_foreground = true;
@@ -5888,7 +5888,7 @@ void pscalRuntimeRequestSigtstp(void) {
                     shell_pid, shell_pgid, sid, fg_pgid);
         }
         errno = 0;
-        int rc = vprocKillShim(-fg_pgid, SIGTSTP);
+        int rc = vprocKillLive(-fg_pgid, SIGTSTP);
         int kill_errno = errno;
         if (rc == 0) {
             delivered = true;
@@ -5906,7 +5906,7 @@ void pscalRuntimeRequestSigtstp(void) {
      * a VM-wide suspend request. */
     if (!delivered && shell_pgid > 0) {
         errno = 0;
-        int rc = vprocKillShim(-shell_pgid, SIGTSTP);
+        int rc = vprocKillLive(-shell_pgid, SIGTSTP);
         int kill_errno = errno;
         if (rc == 0) {
             delivered = true;
@@ -6278,10 +6278,10 @@ static bool vmRequestHardSuspendCurrentVproc(void) {
      * Prefer direct pid delivery first so Ctrl-Z results in a real stoppage
      * that fg/bg can later resume.
      */
-    if (pid > 0 && vprocKillShim(pid, SIGTSTP) == 0) {
+    if (pid > 0 && vprocKillLive(pid, SIGTSTP) == 0) {
         return true;
     }
-    if (pgid > 0 && vprocKillShim(-pgid, SIGTSTP) == 0) {
+    if (pgid > 0 && vprocKillLive(-pgid, SIGTSTP) == 0) {
         return true;
     }
     if (vprocRequestControlSignal(SIGTSTP)) {

@@ -1215,6 +1215,13 @@ static void shellHandleSignalCommon(int signo, bool from_status) {
     if (!command_trap) {
         shellUpdateStatus(128 + signo);
     }
+#if defined(PSCAL_TARGET_IOS)
+    /* A process ends on these with nothing more run: bash catches the others to run its EXIT trap. */
+    if (!command_trap && !from_status && (signo == SIGKILL || signo == SIGQUIT) &&
+        (!shellRuntimeIsInteractive() || gShellRuntime.in_subshell)) {
+        shellRuntimeSetExitTrap(SHELL_TRAP_ACTION_DEFAULT, NULL);
+    }
+#endif
 
     if (signo == SIGINT || signo == SIGQUIT || signo == SIGTSTP) {
         bool stop_request = (signo == SIGTSTP) && shellMonitorOn() && shellJobControlSupportsStops();
@@ -1296,8 +1303,9 @@ static void shellHandleSignalCommon(int signo, bool from_status) {
     }
 #if defined(PSCAL_TARGET_IOS)
     /* A signal noted with no trap: vprocDeliverTaskSignals said it ends this shell. At a prompt,
-     * as in bash, SIGTERM does not. */
-    else if (!from_status && (signo != SIGTERM || !shellRuntimeIsInteractive())) {
+     * as in bash, SIGTERM does not, though it ends a subshell of that prompt. */
+    else if (!from_status && (signo != SIGTERM || !shellRuntimeIsInteractive() || gShellRuntime.in_subshell)) {
+        gShellEndingOnSignal = true;
         shellEndWithRequest();
         if (vprocTaskHalting(shellRuntimeOwnPid())) {
             shellUpdateStatus(0);

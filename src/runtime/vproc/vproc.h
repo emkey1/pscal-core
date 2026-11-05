@@ -409,6 +409,9 @@ int vprocPollShim(struct pollfd *fds, nfds_t nfds, int timeout);
 int vprocSelectShim(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds, struct timeval *timeout);
 pid_t vprocWaitPidShim(pid_t pid, int *status_out, int options);
 int vprocKillShim(pid_t pid, int sig);
+/* kill(), for the kernel's own use: a task that has ended doesn't count, where to a program it does.
+ * Ctrl-C and Ctrl-Z have other ways to stop a command when no one in a group is alive to take them. */
+int vprocKillLive(pid_t pid, int sig);
 /* kill() for a task and everything under it, for what a host does with a process group: a
  * stage's group is its own here, so a group kill does not reach what a nested shell runs. */
 int vprocKillTree(pid_t pid, int sig);
@@ -596,11 +599,32 @@ void vprocSetUnwindsItself(int pid, bool enabled);
  * leader takes SIGKILL, and vprocTaskHalting tells it that this is an end it was asked for, not a death. */
 int vprocHaltSession(void);
 bool vprocTaskHalting(int pid);
+/* For a long-running program that makes no other shim call: what has come for it acts here. */
+void vprocDeliverSignalsHere(void);
+/* The VM asks after vprocWaitIfStopped: its task has been killed and its thread has not been cancelled,
+ * as for a frontend on the shell's thread. */
+bool vprocTaskKilledHere(void);
+/* What ended this task, or 0. A stage on a thread that can't be cancelled may not have stopped for it. */
+int vprocTaskExitSignal(int pid);
+/* Where a program goes that has ended itself with a signal on a thread that has to go on, as with a
+ * stage on the shell's thread. setjmp on env, then push: setjmp returns 128 + the signal. */
+typedef struct VProcProgramFrame {
+    jmp_buf env;
+    int pid;
+    int handler_task;
+    bool pushed;
+    void *cleanup_stack;
+    struct VProcProgramFrame *prev;
+} VProcProgramFrame;
+void vprocProgramFramePush(VProcProgramFrame *frame);
+/* Safe on a frame that was not pushed, if pushed starts false. */
+void vprocProgramFramePop(VProcProgramFrame *frame);
 /* A shell started on another shell's thread, as a script run inline is: it can't be cancelled either. */
 void vprocUnwindAsThreadDoes(int pid);
 /* A shell runs under this task, off the prompt's thread. A fatal signal it sends itself waits like
- * the prompt's own: for vprocDeliverTaskSignals. One from elsewhere cancels the thread as usual. */
-void vprocSetShellTask(int pid, bool enabled);
+ * the prompt's own: for vprocDeliverTaskSignals, as does one from elsewhere when a thread that can't
+ * be cancelled carries it. Otherwise that cancels the thread as usual. Returns what it was. */
+bool vprocSetShellTask(int pid, bool enabled);
 /* What this task does is the parent's own work, so no SIGCHLD for it. */
 void vprocSetSilentToParent(int pid, bool silent);
 /* A stage that only does the shell's own work, as `.` and `eval` do: getppid in what it starts gives
@@ -877,6 +901,7 @@ static inline int vprocOpenShim(const char *path, int flags, ...) {
 }
 static inline pid_t vprocWaitPidShim(pid_t pid, int *status_out, int options) { return waitpid(pid, status_out, options); }
 static inline int vprocKillShim(pid_t pid, int sig) { return kill(pid, sig); }
+static inline int vprocKillLive(pid_t pid, int sig) { return kill(pid, sig); }
 static inline int vprocKillTree(pid_t pid, int sig) { return kill(pid, sig); }
 static inline pid_t vprocGetPidShim(void) { return getpid(); }
 static inline pid_t vprocGetPpidShim(void) { return getppid(); }
@@ -1125,8 +1150,11 @@ static inline int vprocCurrentDyingSignal(void) { return 0; }
 static inline void vprocSetUnwindsItself(int pid, bool enabled) { (void)pid; (void)enabled; }
 static inline int vprocHaltSession(void) { return -1; }
 static inline bool vprocTaskHalting(int pid) { (void)pid; return false; }
+static inline void vprocDeliverSignalsHere(void) {}
+static inline bool vprocTaskKilledHere(void) { return false; }
+static inline int vprocTaskExitSignal(int pid) { (void)pid; return 0; }
 static inline void vprocUnwindAsThreadDoes(int pid) { (void)pid; }
-static inline void vprocSetShellTask(int pid, bool enabled) { (void)pid; (void)enabled; }
+static inline bool vprocSetShellTask(int pid, bool enabled) { (void)pid; (void)enabled; return false; }
 static inline void vprocSetSilentToParent(int pid, bool silent) { (void)pid; (void)silent; }
 static inline void vprocSetNotAProcess(int pid) { (void)pid; }
 static inline void vprocResetCaughtSignals(int pid) { (void)pid; }

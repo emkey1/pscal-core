@@ -611,10 +611,10 @@ static bool vmRequestHardSuspendCurrentVproc(void) {
     if (vprocRequestControlSignal(SIGTSTP)) {
         return true;
     }
-    if (pgid > 0 && vprocKillShim(-pgid, SIGTSTP) == 0) {
+    if (pgid > 0 && vprocKillLive(-pgid, SIGTSTP) == 0) {
         return true;
     }
-    if (pid > 0 && vprocKillShim(pid, SIGTSTP) == 0) {
+    if (pid > 0 && vprocKillLive(pid, SIGTSTP) == 0) {
         return true;
     }
     return false;
@@ -10448,6 +10448,11 @@ InterpretResult interpretBytecode(VM* vm, BytecodeChunk* chunk, HashTable* globa
                                    vm->suspend_unwind_requested ? 1 : 0);
                 }
                 continue;
+            }
+            /* A frontend on the shell's thread can't be cancelled, so it stops here. */
+            if (vprocTaskKilledHere() && !vm->exit_requested) {
+                vm->exit_requested = true;
+                vm->current_builtin_name = "signal";
             }
         }
 #endif

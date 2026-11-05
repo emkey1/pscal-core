@@ -482,7 +482,8 @@ static VProc *shellCreateVProcForStage(int stdin_host,
                                        int cols,
                                        int rows,
                                        int pid_hint,
-                                       bool inherit_pscal_stdio) {
+                                       bool inherit_pscal_stdio,
+                                       bool sigpipe_ignored) {
     int cancel_state;
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
     VProc *parent = vprocPinCurrent();
@@ -492,6 +493,10 @@ static VProc *shellCreateVProcForStage(int stdin_host,
         vprocDefaultCaughtActions(vprocPid(vp));
     }
     vprocUnpin(parent);
+    /* The shell ignores it for itself. What it starts takes it as a child does on a host. */
+    if (vp && !sigpipe_ignored) {
+        vprocDefaultSignal(vprocPid(vp), 1 << SIGPIPE);
+    }
     pthread_setcancelstate(cancel_state, NULL);
     return vp;
 }
@@ -2552,12 +2557,24 @@ static void shellFinalizeStageVproc(VProc *vp, int status) {
     shellFinalizeStageVprocEx(vp, status, false);
 }
 
+typedef struct {
+    VProc *vp;
+    ShellPipelineContext *ctx;
+    size_t stage_pos;
+} ShellStageCancelArg;
+
 /* The thread running this stage was cancelled with the stage's job. Nothing else would end the
- * stage or close what it holds, such as the write end of a pipe. */
+ * stage or close what it holds, such as the write end of a pipe, or give PIPESTATUS its status. */
 static void shellInlineStageCancelled(void *arg) {
-    vprocEndAbandoned((VProc *)arg);
+    ShellStageCancelArg *stage = (ShellStageCancelArg *)arg;
+    int sig = vprocTaskExitSignal(vprocPid(stage->vp));
+    int status = 128 + (sig > 0 ? sig : SIGKILL);
+    if (stage->ctx && stage->ctx->stage_status && stage->stage_pos < stage->ctx->stage_count) {
+        stage->ctx->stage_status[stage->stage_pos] = status;
+    }
+    vprocEndAbandoned(stage->vp);
     vprocDeactivate();
-    shellFinalizeStageVproc((VProc *)arg, 128 + SIGKILL);
+    shellFinalizeStageVproc(stage->vp, status);
 }
 
 static void shellInProcessWorkerCleanup(void *arg) {
@@ -3369,6 +3386,7 @@ static bool shellEnsurePipeline(size_t stages, bool negated) {
          * that vproc, which is gone the moment the owner is killed. */
         ctx->window_cols = pscalRuntimeDetectWindowCols();
         ctx->window_rows = pscalRuntimeDetectWindowRows();
+        ctx->sigpipe_ignored = shellRuntimeGetSignalTrapAction(SIGPIPE) == SHELL_TRAP_ACTION_IGNORE;
         shellPipelineSessionCloseSpool(ctx);
         shellPipelineSessionSnapshotStdStreams(ctx);
 //    fprintf(stderr, "[pipe] ensure stages=%zu in_process=1\n", stages);
@@ -5486,7 +5504,8 @@ static int shellPipelineRunStage(VM *vm,
                                          ctx->window_cols > 0 ? ctx->window_cols : pscalRuntimeDetectWindowCols(),
                                          ctx->window_rows > 0 ? ctx->window_rows : pscalRuntimeDetectWindowRows(),
                                          pid_hint,
-                                         inherit_pscal_stdio);
+                                         inherit_pscal_stdio,
+                                         ctx->sigpipe_ignored);
     if (!vp) {
         runtimeError(vm, "pipeline: failed to allocate vproc");
         shellUpdateStatus(1);
@@ -5620,7 +5639,8 @@ static int shellPipelineRunStage(VM *vm,
         status = 1;
     } else {
 #if defined(PSCAL_TARGET_IOS)
-        pthread_cleanup_push(shellInlineStageCancelled, vp);
+        ShellStageCancelArg cancel_arg = { vp, ctx, stage_pos };
+        pthread_cleanup_push(shellInlineStageCancelled, &cancel_arg);
 #endif
         status = shellRunBuiltinInProcess(vm, cmd, stdin_fd, stdout_fd, stderr_fd, apply_exec_redirs);
 #if defined(PSCAL_TARGET_IOS)
@@ -5632,6 +5652,11 @@ static int shellPipelineRunStage(VM *vm,
     if (vprocTakeTerminalInterrupted() && status < 128) {
         status = 128 + SIGINT;
         ctx->key_interrupted = true;
+    }
+    /* Killed where its thread couldn't be cancelled, it ran on as far as its next look. */
+    int killed_by = vprocTaskExitSignal(vprocPid(vp));
+    if (killed_by > 0) {
+        status = 128 + killed_by;
     }
 #endif
 
@@ -5712,6 +5737,7 @@ static ShellPipelineContext *shellCloneSingleStagePipelineContext(const ShellPip
     clone->session_stdio = src ? src->session_stdio : NULL;
     clone->window_cols = src ? src->window_cols : 0;
     clone->window_rows = src ? src->window_rows : 0;
+    clone->sigpipe_ignored = src ? src->sigpipe_ignored : false;
 #endif
     clone->pids = (pid_t *)calloc(1, sizeof(pid_t));
     if (!clone->pids) {
@@ -5913,7 +5939,8 @@ static VProc *shellBackgroundStageCreateVProc(ShellBackgroundStageCtx *ctx, cons
                                          pscalRuntimeDetectWindowCols(),
                                          pscalRuntimeDetectWindowRows(),
                                          ctx->synthetic_pid > 0 ? ctx->synthetic_pid : -1,
-                                         true);
+                                         true,
+                                         shellRuntimeGetSignalTrapAction(SIGPIPE) == SHELL_TRAP_ACTION_IGNORE);
     if (!vp) {
         return NULL;
     }
@@ -6061,7 +6088,8 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
                                              pscalRuntimeDetectWindowCols(),
                                              pscalRuntimeDetectWindowRows(),
                                              pid_hint,
-                                             true);
+                                             true,
+                                             shellRuntimeGetSignalTrapAction(SIGPIPE) == SHELL_TRAP_ACTION_IGNORE);
         if (!vp) {
             shellFreeCommand(cloned);
             free(cloned);
@@ -6591,9 +6619,14 @@ static bool shellExecuteExecBuiltin(VM *vm, ShellCommand *cmd) {
         if (clear_env) {
             program.program_env = vprocEnvCaptureFiltered(shellEnvEntryNone, NULL);
         }
-        /* As any stage, or a subshell's `cat < f` stops itself for reading in the background. */
+        /* As any stage, or a subshell's `cat < f` stops itself for reading in the background.
+         * The task is this program now, with no shell code left to look for a signal. */
         vprocSetPipelineStage(true);
+        VProc *exec_vp = vprocCurrent();
+        int exec_pid = exec_vp ? vprocPid(exec_vp) : 0;
+        bool ran_shell_code = vprocSetShellTask(exec_pid, false);
         shellRunBuiltinInProcess(vm, &program, -1, -1, -1, false);
+        vprocSetShellTask(exec_pid, ran_shell_code);
         vprocSetPipelineStage(false);
         shellFreeExecRedirBackups(backups, backup_count);
         int status = gShellRuntime.last_status;

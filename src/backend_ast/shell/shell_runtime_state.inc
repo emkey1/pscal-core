@@ -728,6 +728,7 @@ typedef struct {
     struct pscal_fd **pscal_pipe_write_hold;
     int window_cols;
     int window_rows;
+    bool sigpipe_ignored; /* by the shell's trap, which a stage's own thread can't read */
 #endif
 } ShellPipelineContext;
 
@@ -817,6 +818,7 @@ typedef struct ShellRuntimeState {
     ShellTrapEntry exit_trap;
     bool trap_executing;
     int script_depth;
+    bool ending_on_signal; /* what this shell is dying of, whatever its EXIT trap says */
     int return_scope_depth; /* functions and sourced files around what runs: where `return` means something */
     int text_depth; /* eval, source and a trap's text around what runs; a substitution counts as one */
     int condition_depth;
@@ -878,6 +880,7 @@ static void shellSetContext(ShellRuntimeState *ctx);
 #define gShellExitTrap (SC()->exit_trap)
 #define gShellTrapExecuting (SC()->trap_executing)
 #define gShellScriptDepth (SC()->script_depth)
+#define gShellEndingOnSignal (SC()->ending_on_signal)
 #define gShellReturnScopeDepth (SC()->return_scope_depth)
 #define gShellTextDepth (SC()->text_depth)
 #define gShellConditionDepth (SC()->condition_depth)
@@ -4486,7 +4489,11 @@ void shellRuntimeRunExitTrap(void) {
         return;
     }
     shellLoopsOverForExitTrap();
+    int status = gShellRuntime.last_status;
     shellRuntimeExecuteTrap(gShellExitTrap.command, "<exit-trap>");
+    if (gShellEndingOnSignal) {
+        gShellRuntime.last_status = status;
+    }
 }
 
 bool shellRuntimeSetExitTrap(ShellTrapAction action, const char *command) {
@@ -5747,6 +5754,8 @@ static ShellRuntimeState *shellRuntimeCreateProgramContext(void) {
     if (ctx->exit_trap.action == SHELL_TRAP_ACTION_COMMAND) {
         shellTrapClearEntry(&ctx->exit_trap);
     }
+    /* Its script is the outermost one in this shell, and its EXIT trap runs when that ends. */
+    ctx->script_depth = 0;
     for (size_t i = 0; i < ctx->array_var_count; ++i) {
         shellArrayVariableClear(&ctx->array_vars[i]);
     }
