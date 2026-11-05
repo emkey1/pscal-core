@@ -2432,6 +2432,7 @@ typedef struct {
     ShellRuntimeState *prev_shell_ctx;
     VM *prev_vm;
     ShellThreadLink link;
+    bool procsub; /* <(cmd) or >(cmd): not a job, so nothing asks for its status. */
 #endif
 } ShellBackgroundStageCtx;
 
@@ -2666,7 +2667,7 @@ static void shellInProcessBackgroundCancelCleanup(void *arg) {
         vprocDeactivate();
         /* `wait` asks for the status, and this thread can get here before it does. The job
          * table reaps it, as on the normal way out. A signal's status is already recorded. */
-        shellFinalizeStageVprocEx(ctx->vp, 128 + SIGKILL, true);
+        shellFinalizeStageVprocEx(ctx->vp, 128 + SIGKILL, !ctx->procsub);
         ctx->vp = NULL;
     }
     if (ctx->bg_vm) {
@@ -2981,7 +2982,7 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
     vprocDeactivate();
     if (vp) {
         /* `wait` asks for the status. The job table reaps it, as it would a process. */
-        shellFinalizeStageVprocEx(vp, bg_status, true);
+        shellFinalizeStageVprocEx(vp, bg_status, !ctx->procsub);
         ctx->vp = NULL;
     }
 #endif
@@ -6245,6 +6246,8 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
                 ? PSCALRuntimeGetCurrentRuntimeContext()
                 : NULL;
             bg_ctx->link = shellThreadLinkCapture();
+            bool procsub = gShellProcSubStarting;
+            bg_ctx->procsub = procsub;
             bg_ctx->vp = shellBackgroundStageCreateVProc(bg_ctx, cloned);
 
             pthread_t stage_thread = 0;
@@ -6267,7 +6270,7 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
             }
             pthread_detach(stage_thread);
 
-            if (async_stage_pid > 0) {
+            if (async_stage_pid > 0 && !procsub) {
                 pid_t bg_pgid = (async_bg_pgid > 0) ? async_bg_pgid : async_stage_pid;
                 pid_t bg_pids[1] = { async_stage_pid };
                 ShellJob *job = shellRegisterJob(bg_pgid, bg_pids, 1, cmd);

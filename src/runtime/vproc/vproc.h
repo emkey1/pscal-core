@@ -102,6 +102,8 @@ ssize_t vprocSnapshotFds(int pid, VProcFdSnapshot *out, size_t capacity);
 int vprocTranslateFd(VProc *vp, int fd);
 struct pscal_fd *vprocGetPscalFd(VProc *vp, int fd);
 int vprocCreateInprocPipe(struct pscal_fd **out_read, struct pscal_fd **out_write);
+/* The lowest free slot from next_fd up; the table retains the descriptor. */
+int vprocInsertPscalFd(VProc *vp, struct pscal_fd *fd);
 int vprocDup(VProc *vp, int fd);
 int vprocDup2(VProc *vp, int fd, int target);
 int vprocDupAbove(VProc *vp, int fd, int min);

@@ -7127,7 +7127,7 @@ int vprocAdoptHostFd(VProc *vp, int host_fd) {
     return vprocInsert(vp, host_fd);
 }
 
-static int vprocInsertPscalFd(VProc *vp, struct pscal_fd *fd) {
+int vprocInsertPscalFd(VProc *vp, struct pscal_fd *fd) {
     if (!vp || !fd) {
         errno = EBADF;
         return -1;

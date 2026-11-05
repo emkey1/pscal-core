@@ -177,19 +177,19 @@ static char *shellExpandHereDocument(const char *body, bool quoted) {
     return expanded;
 }
 
-/* <(cmd) and >(cmd). A host gives the command a pipe and the word a /dev/fd path. iOS
- * has no process to run it in and no such path to open, so a file stands in: <(cmd)
- * runs now and >(cmd) reads the file when the command that named it is done. */
+/* <(cmd) and >(cmd). The command gets a pipe and the word a /dev/fd path, as on Linux. On a host
+ * the command is a forked child. On iOS it is a job nobody is told about, on a thread and a task
+ * of its own, and the pipe is an in-process one in slots of the two tasks. */
 typedef struct {
     int fd;
     pid_t pid;
-    char *path;
-    char *command;
     VM *owner;
 } ShellProcSub;
 
 static PSCAL_THREAD_LOCAL ShellProcSub *gShellProcSubs = NULL;
 static PSCAL_THREAD_LOCAL size_t gShellProcSubCount = 0;
+/* The next job started on this thread is such a command: no number, no $!, and nobody to wait. */
+static PSCAL_THREAD_LOCAL bool gShellProcSubStarting = false;
 
 static bool shellProcSubRemember(ShellProcSub entry) {
     ShellProcSub *grown = (ShellProcSub *)realloc(gShellProcSubs, (gShellProcSubCount + 1) * sizeof(ShellProcSub));
@@ -215,37 +215,72 @@ static int shellProcSubRun(const char *source, const char *label) {
     return shellRunSource(source, label, &opts, &exit_requested);
 }
 
+#if defined(PSCAL_TARGET_IOS)
+/* A pipe's end in a slot clear of what a script picks for itself. What this task starts gets it,
+ * as across a fork, or a program could not open the name it was given. */
+static int shellProcSubSlot(VProc *vp, struct pscal_fd *end) {
+    int low = vprocInsertPscalFd(vp, end);
+    /* The table retains. */
+    pscal_fd_close(end);
+    if (low < 0) {
+        return -1;
+    }
+    int slot = vprocDupAbove(vp, low, 64);
+    vprocClose(vp, low);
+    if (slot >= 0) {
+        vprocMarkFdInherited(vp, slot);
+    }
+    return slot;
+}
+#endif
+
 static char *shellProcessSubstitution(char direction, const char *command) {
     fflush(stdout);
     fflush(stderr);
 #if defined(PSCAL_TARGET_IOS)
-    const char *dir = shellSafeGetenv("TMPDIR");
-    char path[PATH_MAX];
-    static atomic_uint counter;
-    snprintf(path, sizeof(path), "%s/.exsh-procsub-%d-%u", (dir && *dir) ? dir : "/tmp", (int)getpid(),
-             atomic_fetch_add(&counter, 1));
-    size_t size = strlen(command) + strlen(path) + 32;
-    char *script = (char *)malloc(size);
-    if (!script) {
+    VProc *vp = vprocCurrent();
+    struct pscal_fd *read_end = NULL;
+    struct pscal_fd *write_end = NULL;
+    if (!vp || vprocCreateInprocPipe(&read_end, &write_end) != 0) {
+        shellReportRecoverableError(gShellCurrentVm, true, "process substitution: %s",
+                                    vp ? strerror(errno) : "no task to run it in");
         return NULL;
     }
-    ShellProcSub entry = {.fd = -1, .pid = -1, .path = strdup(path), .command = NULL, .owner = gShellCurrentVm};
-    if (direction == '<') {
-        snprintf(script, size, "{ %s\n} > '%s'", command, path);
-        int saved_status = gShellRuntime.last_status;
-        shellProcSubRun(script, "<process-substitution>");
-        shellUpdateStatus(saved_status);
-    } else {
-        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
-        if (fd >= 0) {
-            close(fd);
+    int keep = shellProcSubSlot(vp, direction == '<' ? read_end : write_end);
+    int give = shellProcSubSlot(vp, direction == '<' ? write_end : read_end);
+    /* The command's own end goes on its stdio, and it holds no other pipe's: those commands end
+     * when they are done with, not when this one is. */
+    size_t size = strlen(command) + 64 + gShellProcSubCount * 16;
+    char *script = (char *)malloc(size);
+    if (keep < 0 || give < 0 || !script) {
+        shellReportRecoverableError(gShellCurrentVm, true, "process substitution: %s", strerror(ENOMEM));
+        free(script);
+        if (keep >= 0) {
+            vprocClose(vp, keep);
         }
-        snprintf(script, size, "{ %s\n} < '%s'", command, path);
-        entry.command = script;
-        script = NULL;
+        if (give >= 0) {
+            vprocClose(vp, give);
+        }
+        return NULL;
     }
+    size_t used = (size_t)snprintf(script, size, "{ %s\n} %s&%d %d>&- %d>&-", command, direction == '<' ? ">" : "<",
+                                   give, give, keep);
+    for (size_t i = 0; i < gShellProcSubCount; ++i) {
+        used += (size_t)snprintf(script + used, size - used, " %d>&-", gShellProcSubs[i].fd);
+    }
+    snprintf(script + used, size - used, " &");
+    int saved_status = gShellRuntime.last_status;
+    gShellProcSubStarting = true;
+    shellProcSubRun(script, "<process-substitution>");
+    gShellProcSubStarting = false;
+    shellUpdateStatus(saved_status);
     free(script);
+    /* The job took its copy when it started. */
+    vprocClose(vp, give);
+    ShellProcSub entry = {.fd = keep, .pid = -1, .owner = gShellCurrentVm};
     shellProcSubRemember(entry);
+    char path[64];
+    snprintf(path, sizeof(path), "/dev/fd/%d", keep);
     return strdup(path);
 #else
     int fds[2];
@@ -303,7 +338,7 @@ static char *shellProcessSubstitution(char direction, const char *command) {
     }
     int keep = direction == '<' ? fds[0] : fds[1];
     close(direction == '<' ? fds[1] : fds[0]);
-    ShellProcSub entry = {.fd = keep, .pid = pid, .path = NULL, .command = NULL, .owner = gShellCurrentVm};
+    ShellProcSub entry = {.fd = keep, .pid = pid, .owner = gShellCurrentVm};
     shellProcSubRemember(entry);
     char path[64];
     snprintf(path, sizeof(path), "/dev/fd/%d", keep);
@@ -314,7 +349,7 @@ static char *shellProcessSubstitution(char direction, const char *command) {
 /* The command that named them is done. What it opened it holds on its own. */
 static void shellProcessSubstitutionsFinish(VM *vm) {
 #if defined(PSCAL_TARGET_IOS)
-    /* A stage on a thread may not have opened its file yet. */
+    /* A stage on a thread may not have taken its copy of the slot yet. */
     if (gShellRuntime.pipeline.active && gShellRuntime.pipeline.stage_count > 1) {
         return;
     }
@@ -332,16 +367,6 @@ static void shellProcessSubstitutionsFinish(VM *vm) {
         if (entry->pid > 0) {
             int status = 0;
             (void)waitpid(entry->pid, &status, WNOHANG);
-        }
-        if (entry->command) {
-            int saved_status = gShellRuntime.last_status;
-            shellProcSubRun(entry->command, "<process-substitution>");
-            shellUpdateStatus(saved_status);
-            free(entry->command);
-        }
-        if (entry->path) {
-            unlink(entry->path);
-            free(entry->path);
         }
     }
     gShellProcSubCount = kept;
@@ -2561,6 +2586,8 @@ static ShellBodyState *shellBodyStateCapture(void) {
         pthread_mutex_unlock(&gShellFunctionTableMutex);
     }
     shellRuntimeContextInheritLocals(state->ctx, 0);
+    /* <(cmd) or >(cmd): copies of the shell's jobs, as in a command substitution. */
+    state->lists_jobs = gShellProcSubStarting;
     ShellExportFlags *flags = shellExportFlagsSnapshot();
     if (flags) {
         vprocEnvSetAttachment(state->env, flags, shellExportFlagsFree);
