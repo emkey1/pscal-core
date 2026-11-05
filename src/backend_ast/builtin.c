@@ -8675,7 +8675,15 @@ Value vmBuiltinEof(VM* vm, int arg_count, Value* args) {
         return makeBoolean(true);
     }
 
+#if defined(PSCAL_TARGET_IOS)
+    /* Eof runs under globals_mutex, which every VM in the app takes to start, and this
+     * read can wait as long as its input likes. */
+    int released_globals_locks = vmSuspendReleaseGlobalsMutex();
+#endif
     int c = fgetc(stream);
+#if defined(PSCAL_TARGET_IOS)
+    vmSuspendReacquireGlobalsMutex(released_globals_locks);
+#endif
     if (c == EOF) {
         return makeBoolean(true);
     }

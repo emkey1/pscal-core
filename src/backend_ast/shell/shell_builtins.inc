@@ -3072,6 +3072,7 @@ extern VProcSessionStdio *PSCALRuntimeGetCurrentRuntimeStdio(void) __attribute__
 typedef struct {
     FrontendKind kind;
     bool *reset_flag; /* optional */
+    volatile int *exited_flag; /* optional: set last, however the thread ends */
 } ShellFrontendCleanupCtx;
 
 static void shellFrontendCleanup(void *arg) {
@@ -3079,12 +3080,14 @@ static void shellFrontendCleanup(void *arg) {
     if (!ctx) {
         return;
     }
-    if (ctx->reset_flag && *ctx->reset_flag) {
-        return;
+    if (!ctx->reset_flag || !*ctx->reset_flag) {
+        shellInvalidateFrontendState(ctx->kind);
+        if (ctx->reset_flag) {
+            *ctx->reset_flag = true;
+        }
     }
-    shellInvalidateFrontendState(ctx->kind);
-    if (ctx->reset_flag) {
-        *ctx->reset_flag = true;
+    if (ctx->exited_flag) {
+        *ctx->exited_flag = 1;
     }
 }
 
@@ -3423,6 +3426,7 @@ typedef struct {
     int status;
     bool entry_returned;
     volatile int finished;
+    volatile int worker_exited;
     pthread_t worker_thread;
     pthread_t main_thread;
     bool use_shell_context;
@@ -3433,6 +3437,7 @@ typedef struct {
     pthread_t sigint_catcher_thread;
     volatile sig_atomic_t sigint_catcher_stop;
     bool sigint_catcher_active;
+    pthread_t waiter_thread;
 #endif
 } ShellToolThreadContext;
 
@@ -3456,6 +3461,7 @@ static void *shellToolThreadMain(void *arg) {
     ShellFrontendCleanupCtx cleanup_ctx = {
         .kind = ctx->frontend_kind,
         .reset_flag = &ctx->frontend_reset_done,
+        .exited_flag = &ctx->worker_exited,
     };
     pthread_cleanup_push(shellFrontendCleanup, &cleanup_ctx);
     bool dbg = getenv("PSCALI_TOOL_DEBUG") != NULL;
@@ -3730,6 +3736,32 @@ static void shellToolStopSigintCatcher(ShellToolThreadContext *ctx) {
 }
 #endif
 
+#if defined(PSCAL_TARGET_IOS)
+/* The thread that started a tool has been cancelled. A kill can reach it and not the
+ * worker: killing a background pipeline's subshell cancels the threads started under that
+ * subshell, and the worker started under its stage. The worker's suspend checkpoint is in
+ * this thread's stack, which went on its way out, and the worker's next read ended the
+ * app. So the kill goes on to the worker, and this thread outlasts it. */
+static void shellToolStarterCancelled(void *arg) {
+    ShellToolThreadContext *context = (ShellToolThreadContext *)arg;
+    /* The worker's own flag: the same kill may have cancelled the waiter that sets finished. */
+    if (!context->worker_exited) {
+        pthread_cancel(context->worker_thread);
+    }
+    while (!context->worker_exited) {
+        struct timespec ts;
+        ts.tv_sec = 0;
+        ts.tv_nsec = 10 * 1000 * 1000;
+        nanosleep(&ts, NULL);
+    }
+    if (context->sigint_catcher_active) {
+        shellToolStopSigintCatcher(context);
+    }
+    pthread_join(context->waiter_thread, NULL);
+    free(context);
+}
+#endif
+
 static int shellRunToolInThread(ShellToolEntryFn entry,
                                 int argc,
                                 char **argv,
@@ -3782,9 +3814,7 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
         context->runtime_ctx = PSCALRuntimeGetCurrentRuntimeContext
             ? PSCALRuntimeGetCurrentRuntimeContext()
             : NULL;
-#if defined(PSCAL_TARGET_IOS)
-        context->suspend_checkpoint = gShellToolSuspendCheckpoint;
-#endif
+        /* No suspend checkpoint: it lives in the caller's frame, which ends as this returns. */
         context->stdout_fd = dup(STDOUT_FILENO);
         context->stderr_fd = dup(STDERR_FILENO);
         if (getenv("PSCALI_VPROC_DEBUG")) {
@@ -3896,11 +3926,13 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
     }
 
 #if defined(PSCAL_TARGET_IOS)
+    context->waiter_thread = waiter_thread;
     /* Dedicated SIGINT catcher (sigwait): owns the foreground Ctrl-C. */
     context->sigint_catcher_stop = 0;
     context->sigint_catcher_active =
         (pthread_create(&context->sigint_catcher_thread, NULL,
                         shellToolSigintCatcherMain, context) == 0);
+    pthread_cleanup_push(shellToolStarterCancelled, context);
 #endif
 
     /* Main Loop */
@@ -3937,6 +3969,7 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
     }
 
 #if defined(PSCAL_TARGET_IOS)
+    pthread_cleanup_pop(0);
     if (context->sigint_catcher_active) {
         shellToolStopSigintCatcher(context);
     }
