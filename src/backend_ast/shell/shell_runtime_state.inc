@@ -745,6 +745,9 @@ typedef struct ShellRuntimeState {
     bool in_subshell;
     bool started_as_command; /* a shell inside its caller: the session's jobs are not its own */
     pid_t subshell_parent_pid; /* $$ in a subshell is its shell's */
+    bool body_in_loop; /* iOS: a body started inside a loop, which `break` there has only itself to leave */
+    unsigned int random_seed; /* $RANDOM: a job goes on from here, and the shell does not see that */
+    bool random_seeded;
     int break_requested_levels;
     int continue_requested_levels;
     char **dir_stack;
@@ -2574,6 +2577,12 @@ typedef struct {
     int column;
     /* A compound command run apart from the shell; argv[0] only names it. */
     ShellCompiledFunction *body;
+    /* A body holding one simple job, whose words had to expand in it. */
+    bool body_is_job;
+    /* A simple command that is all a body does, so it becomes the job or the stage. */
+    bool job_tail;
+    /* It is a job on its own: its words see the stdin it was started with, and it does not. */
+    bool job_stdin_null;
 #if defined(PSCAL_TARGET_IOS)
     ShellBodyState *body_state;
     /* {name}> f on a stage or job with a state of its own: name goes there, once it has one. */
@@ -3615,8 +3624,6 @@ static pid_t shellRuntimeDollarPid(void) {
 bool shellRuntimeCurrentBuiltinBackground(void) {
     return gShellCurrentBuiltinBackground;
 }
-static unsigned int gShellRandomSeed = 0;
-static bool gShellRandomSeedInitialized = false;
 /* Whether this shell is at a prompt. Per thread: a shell run as a command shares the process
  * with the prompt that ran it, is not interactive itself, and if killed never puts anything
  * back. The shell's own threads take it from the one that started them (ShellThreadLink). */
@@ -3847,6 +3854,8 @@ void shellRuntimeKeepLineState(ShellRuntimeState *line_ctx) {
     KEEP(errexit_enabled);
     KEEP(pipefail_enabled);
     KEEP(nounset_enabled);
+    KEEP(random_seed);
+    KEEP(random_seeded);
     KEEP(noglob_enabled);
     KEEP(noclobber_enabled);
     KEEP(xtrace_enabled);
@@ -4857,20 +4866,20 @@ void shellRuntimeEnsureStandardFds(void) {
 }
 
 static void shellRandomEnsureSeeded(void) {
-    if (gShellRandomSeedInitialized) {
+    if (gShellRuntime.random_seeded) {
         return;
     }
     unsigned int seed = (unsigned int)time(NULL) ^ (unsigned int)getpid();
     if (seed == 0) {
         seed = 1;
     }
-    gShellRandomSeed = seed;
-    gShellRandomSeedInitialized = true;
+    gShellRuntime.random_seed = seed;
+    gShellRuntime.random_seeded = true;
 }
 
 static void shellRandomReseed(unsigned int seed) {
-    gShellRandomSeed = seed;
-    gShellRandomSeedInitialized = true;
+    gShellRuntime.random_seed = seed;
+    gShellRuntime.random_seeded = true;
 }
 
 static void shellRandomAssignFromText(const char *value) {
@@ -4889,8 +4898,8 @@ static void shellRandomAssignFromText(const char *value) {
 
 static unsigned int shellRandomNextValue(void) {
     shellRandomEnsureSeeded();
-    gShellRandomSeed = gShellRandomSeed * 1103515245u + 12345u;
-    return (gShellRandomSeed / 65536u) % 32768u;
+    gShellRuntime.random_seed = gShellRuntime.random_seed * 1103515245u + 12345u;
+    return (gShellRuntime.random_seed / 65536u) % 32768u;
 }
 
 static bool shellHandleSpecialAssignment(const char *name, const char *value) {
@@ -5581,6 +5590,10 @@ static ShellRuntimeState *shellRuntimeCreateProgramContext(void) {
     ctx->readonly_var_capacity = 0;
     ctx->local_scope_active = false;
     ctx->pipeline_subshell_active = false;
+    /* A program in a subshell is no part of it: `$$` is its own, and `kill $$` does not reach the
+     * shell that started the subshell. */
+    ctx->in_subshell = false;
+    ctx->random_seeded = false;
     ctx->errexit_enabled = false;
     ctx->pipefail_enabled = false;
     ctx->nounset_enabled = false;

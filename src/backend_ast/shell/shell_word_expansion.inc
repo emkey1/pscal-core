@@ -2587,6 +2587,7 @@ static void shellBodyScopeEnter(ShellBodyState *state, ShellBodyScope *scope) {
         return;
     }
     scope->previous_ctx = shellRuntimeActivateContext(state->ctx);
+    gShellRuntime.body_in_loop = state->in_loop;
     /* The body may run on the shell's own thread, whose traps come back with it. */
     scope->saved_err_trap = gShellErrTrap;
     scope->saved_debug_trap = gShellDebugTrap;
@@ -4157,6 +4158,12 @@ static void shellParseMetadata(const char *meta, ShellCommand *cmd) {
                 cmd->line = atoi(value);
             } else if (strcmp(key, "col") == 0) {
                 cmd->column = atoi(value);
+            } else if (strcmp(key, "simple") == 0) {
+                shellParseBool(value, &cmd->body_is_job);
+            } else if (strcmp(key, "job") == 0) {
+                shellParseBool(value, &cmd->job_tail);
+            } else if (strcmp(key, "jobnull") == 0) {
+                shellParseBool(value, &cmd->job_stdin_null);
             }
         }
         if (!next) {

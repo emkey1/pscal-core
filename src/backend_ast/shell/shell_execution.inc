@@ -1778,7 +1778,9 @@ static int shellSpawnProcess(VM *vm,
     shellFinishedJobsForgetWaited();
     /* The child reaches its own exit with a copy of whatever is still buffered. */
     shellFlushStandardStreams();
-    pid_t child = fork();
+    /* A job's own command has nothing to come back to: it takes the job's process, which is what
+     * `$!`, `kill` and `wait` know, and keeps what that process was started with. */
+    pid_t child = cmd->job_tail ? 0 : fork();
         if (child < 0) {
             prep_error = errno;
             goto spawn_cleanup;
@@ -1794,7 +1796,9 @@ static int shellSpawnProcess(VM *vm,
                 /* best-effort; ignore errors */
             }
 
-            if (ignore_job_signals) {
+            if (cmd->job_tail) {
+                /* Set when the job was forked. */
+            } else if (ignore_job_signals) {
                 signal(SIGINT, SIG_IGN);
                 signal(SIGQUIT, SIG_IGN);
             } else {
@@ -2746,6 +2750,7 @@ static ShellCommand *shellCloneCommandForBackground(const ShellCommand *src) {
     dst->disable_field_splitting = src->disable_field_splitting;
     dst->ignore_functions = src->ignore_functions;
     dst->empty_stage_status = src->empty_stage_status;
+    dst->body_is_job = src->body_is_job;
     dst->pipeline_index = src->pipeline_index;
     dst->is_pipeline_head = src->is_pipeline_head;
     dst->is_pipeline_tail = src->is_pipeline_tail;
@@ -5850,9 +5855,12 @@ static bool shellCommandRedirectsStdin(const ShellCommand *cmd) {
 static VProc *shellBackgroundStageCreateVProc(ShellBackgroundStageCtx *ctx, const ShellCommand *cmd) {
     /* A simple command's stdin is /dev/null unless it redirects stdin. A compound command keeps
      * its own, unless that is the terminal and it is in a substitution: with no job control
-     * there, it would stop holding the pipe. */
+     * there, it would stop holding the pipe. A simple job started as a body keeps it for its words,
+     * and the command then lets go of it, unless that is the terminal: a job does not stop on a
+     * read here yet, so it would take the prompt's keys. */
     bool keeps_stdin = shellCommandRedirectsStdin(cmd) ||
-                       (cmd->body && !(gShellCommandSubFrame && isatty(STDIN_FILENO)));
+                       (cmd->body && !(cmd->body_is_job ? isatty(STDIN_FILENO)
+                                                        : gShellCommandSubFrame && isatty(STDIN_FILENO)));
     VProc *vp = shellCreateVProcForStage(keeps_stdin ? -1 : -2,
                                          -1,
                                          -1,
@@ -5888,6 +5896,23 @@ static VProc *shellBackgroundStageCreateVProc(ShellBackgroundStageCtx *ctx, cons
     return vp;
 }
 #endif
+
+/* What bash does between a job's words and its command. */
+static void shellJobLeaveStdin(void) {
+    VProc *vp = vprocCurrent();
+    int host = vp ? vprocHostOpen("/dev/null", O_RDONLY, 0) : -1;
+    int slot = host >= 0 ? vprocAdoptHostFd(vp, host) : -1;
+    if (slot < 0) {
+        if (host >= 0) {
+            vprocHostClose(host);
+        }
+        return;
+    }
+    if (slot != STDIN_FILENO) {
+        (void)shellDupOntoTarget(vp, slot, STDIN_FILENO, false, "job stdin");
+        vprocCloseShim(slot);
+    }
+}
 
 static bool shellPipelineExecuteStageInProcess(VM *vm,
                                                ShellPipelineContext *ctx,
@@ -5934,6 +5959,30 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
                                    shellShouldRunCommandInForegroundWorker(cmd));
     pid_t async_bg_pgid = -1;
     pid_t async_stage_pid = -1;
+
+    /* A job's own command: nothing comes after it, so it runs as a simple job does, on the job's
+     * task and thread, rather than as a child of that. `$!`, `kill` and `wait` know this task. */
+    if (cmd && cmd->job_tail && pipeline_tail && ctx->stage_count == 1) {
+        shellStageCaptureState(cmd, cmd, 1);
+        int status;
+        /* `break $(x) &` in a loop has only itself to leave, and says nothing, as under bash. */
+        if (gShellRuntime.body_in_loop && (strcmp(cmd->argv[0], "break") == 0 || strcmp(cmd->argv[0], "continue") == 0)) {
+            status = 0;
+        } else if (gShellProcSubCount > 0) {
+            /* `>(cmd)` runs when this is done, and its stdout is not what this redirected. */
+            status = shellRunBuiltinInProcess(vm, cmd, -1, -1, -1, cmd->redir_count > 0);
+        } else {
+            /* Nothing to go back to, so the job lets go of what it replaced. */
+            bool redirected = shellApplyExecRedirections(cmd, NULL, NULL);
+            shellFreeRedirections(cmd);
+            status = redirected ? shellRunBuiltinInProcess(vm, cmd, -1, -1, -1, false) : 1;
+        }
+        ctx->last_status = status;
+        if (ctx->stage_status) {
+            ctx->stage_status[stage_pos] = status;
+        }
+        return true;
+    }
 
     if (foreground_worker_tail) {
         ShellCommand *cloned = shellCloneCommandForBackground(cmd);
@@ -6682,7 +6731,8 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
         shellScalarCacheInvalidate();
         return makeVoid();
     }
-    if (gShellRuntime.xtrace_enabled) {
+    /* A body's commands trace themselves. */
+    if (gShellRuntime.xtrace_enabled && !cmd->body) {
         shellTraceCommand(cmd);
     }
     if (!shellExpandAliasesIfNeeded(vm, cmd)) {
@@ -6716,6 +6766,9 @@ static Value shellRunExpandedCommand(VM *vm, ShellCommand *cmd) {
         cmd->empty_stage_status = cmd->ran_command_substitution ? gShellRuntime.last_status : 0;
     }
 #if defined(PSCAL_TARGET_IOS)
+    if (cmd->job_stdin_null && cmd->argc > 0 && !shellCommandRedirectsStdin(cmd)) {
+        shellJobLeaveStdin();
+    }
     bool prefer_worker = shellShouldRunCommandInForegroundWorker(cmd);
     bool force_pipeline_builtin = false;
     if (cmd->argc > 0 && !shellCommandIsExecBuiltin(cmd)) {

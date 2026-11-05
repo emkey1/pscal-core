@@ -296,7 +296,9 @@ Value vmBuiltinShellExec(VM *vm, int arg_count, Value *args) {
     if (!built) {
         goto cleanup;
     }
-    char *last_word = (cmd.argc > 0 && cmd.argv && cmd.argv[cmd.argc - 1]) ? strdup(cmd.argv[cmd.argc - 1]) : NULL;
+    /* What runs apart has its arguments to itself, and `$_` stays as it was. */
+    bool runs_apart = cmd.background || (gShellRuntime.pipeline.active && gShellRuntime.pipeline.stage_count > 1);
+    char *last_word = (!runs_apart && cmd.argc > 0 && cmd.argv && cmd.argv[cmd.argc - 1]) ? strdup(cmd.argv[cmd.argc - 1]) : NULL;
     result = shellExecuteCommand(vm, &cmd);
     if (last_word) {
         free(gShellLastWord);
@@ -335,7 +337,7 @@ cleanup:
 Value vmBuiltinShellExecBody(VM *vm, int arg_count, Value *args) {
     VM *previous_vm = shellSwapCurrentVm(vm);
     Value result = makeVoid();
-    if (arg_count != 2 || VALUE_TYPE(args[0]) != TYPE_POINTER || !AS_POINTER(args[0])) {
+    if ((arg_count != 2 && arg_count != 3) || VALUE_TYPE(args[0]) != TYPE_POINTER || !AS_POINTER(args[0])) {
         runtimeError(vm, "shell exec: expected a compiled body and metadata");
         shellUpdateStatus(1);
         goto cleanup;
@@ -344,12 +346,22 @@ Value vmBuiltinShellExecBody(VM *vm, int arg_count, Value *args) {
         goto cleanup;
     }
     shellCollectJobs();
+    /* A simple job's words as written name it, and it is a simple command for a DEBUG trap too. A
+     * compound one has none of its own. The trap's `exit` comes before the command. */
+    bool has_label = arg_count == 3 && VALUE_TYPE(args[2]) == TYPE_STRING && AS_STRING(args[2]);
+    if (has_label) {
+        bool exit_before_trap = gShellExitRequested;
+        shellRuntimeRunDebugTrap();
+        if (gShellExitRequested && !exit_before_trap) {
+            goto cleanup;
+        }
+    }
     ShellCommand cmd;
     if (!shellBuildCommand(vm, 1, &args[1], &cmd)) {
         shellUpdateStatus(1);
         goto cleanup;
     }
-    char *name = strdup("(subshell)");
+    char *name = strdup(has_label ? AS_STRING(args[2]) : "(subshell)");
     if (!shellCommandAppendArgOwned(&cmd, name)) {
         runtimeError(vm, "shell exec: out of memory");
         shellUpdateStatus(1);
