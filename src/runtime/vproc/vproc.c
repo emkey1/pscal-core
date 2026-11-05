@@ -16085,8 +16085,8 @@ struct VProcEnv {
     size_t *caps;   /* each entry's allocation */
     size_t count;
     size_t capacity;
-    /* getenv's result and an iterated view stay valid for the environment's life, and a
-     * value that fits overwrites in place, so this stays small however often a loop assigns. */
+    /* getenv's result and an iterated view stay valid well past what POSIX asks, and a value that
+     * fits overwrites in place. A tab's shell has one of these for days, so only so many stay. */
     void **retired;
     size_t retired_count;
     size_t retired_capacity;
@@ -16102,7 +16102,18 @@ static _Thread_local int gVprocSubshellPid = 0;
 static _Thread_local bool gVprocClosedPipe = false;
 extern char **environ;
 
+#define VPROC_ENV_RETIRED_MAX 4096
+
 static void vprocEnvRetireLocked(VProcEnv *env, void *ptr) {
+    if (env->retired_count == VPROC_ENV_RETIRED_MAX) {
+        /* A function's `local` retires an entry with every call. */
+        size_t dropped = VPROC_ENV_RETIRED_MAX / 2;
+        for (size_t i = 0; i < dropped; ++i) {
+            free(env->retired[i]);
+        }
+        memmove(env->retired, env->retired + dropped, (env->retired_count - dropped) * sizeof(void *));
+        env->retired_count -= dropped;
+    }
     if (env->retired_count == env->retired_capacity) {
         size_t cap = env->retired_capacity ? env->retired_capacity * 2 : 16;
         void **resized = (void **)realloc(env->retired, cap * sizeof(void *));
