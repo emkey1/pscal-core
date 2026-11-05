@@ -2315,6 +2315,87 @@ static void shellSubshellResetState(pid_t dollar_pid) {
 }
 
 #if defined(PSCAL_TARGET_IOS)
+static void shellCallStackFree(ShellCallStack *stack) {
+    for (size_t i = 0; i < stack->frame_count; ++i) {
+        shellRuntimeFreeCallFrame(&stack->frames[i]);
+    }
+    free(stack->frames);
+    for (size_t i = 0; i < stack->source_count; ++i) {
+        free(stack->sources[i]);
+    }
+    free(stack->sources);
+    free(stack->function_names);
+    free(stack->source_names);
+    for (size_t i = 0; i < stack->held_count; ++i) {
+        free(stack->held[i]);
+    }
+    free(stack->held);
+    memset(stack, 0, sizeof(*stack));
+}
+
+static char *shellCallStackDup(const char *text) {
+    return text ? strdup(text) : NULL;
+}
+
+static char **shellCallStackHoldNames(ShellCallStack *stack, char **names, size_t count) {
+    char **copy = count > 0 ? (char **)calloc(count, sizeof(char *)) : NULL;
+    for (size_t i = 0; copy && i < count; ++i) {
+        copy[i] = strdup(names[i] ? names[i] : "");
+        stack->held[stack->held_count++] = copy[i];
+    }
+    return copy;
+}
+
+static void shellCallStackCapture(ShellCallStack *stack) {
+    memset(stack, 0, sizeof(*stack));
+    if (gShellCallStackCount > 0) {
+        stack->frames = (ShellCallFrame *)calloc(gShellCallStackCount, sizeof(ShellCallFrame));
+        for (size_t i = 0; stack->frames && i < gShellCallStackCount; ++i) {
+            stack->frames[i].function = shellCallStackDup(gShellCallStack[i].function);
+            stack->frames[i].caller_function = shellCallStackDup(gShellCallStack[i].caller_function);
+            stack->frames[i].source = shellCallStackDup(gShellCallStack[i].source);
+            stack->frames[i].line = gShellCallStack[i].line;
+            stack->frames[i].column = gShellCallStack[i].column;
+            stack->frame_count = i + 1;
+        }
+    }
+    if (gShellSourceDepth > 0) {
+        stack->sources = (char **)calloc(gShellSourceDepth, sizeof(char *));
+        for (size_t i = 0; stack->sources && i < gShellSourceDepth; ++i) {
+            stack->sources[i] = strdup(gShellSourceStack[i] ? gShellSourceStack[i] : "");
+            stack->source_count = i + 1;
+        }
+    }
+    size_t names = gShellFunctionNameCount + gShellSourceNameCount;
+    stack->held = names > 0 ? (char **)calloc(names, sizeof(char *)) : NULL;
+    if (stack->held) {
+        stack->function_names = shellCallStackHoldNames(stack, gShellFunctionNames, gShellFunctionNameCount);
+        stack->function_name_count = stack->function_names ? gShellFunctionNameCount : 0;
+        stack->source_names = shellCallStackHoldNames(stack, gShellSourceNames, gShellSourceNameCount);
+        stack->source_name_count = stack->source_names ? gShellSourceNameCount : 0;
+    }
+}
+
+/* This thread takes the copy on, and what it had goes in the copy's place. A push grows any of
+ * them again, so a count will do as a capacity. */
+static void shellCallStackSwap(ShellCallStack *stack) {
+    ShellCallStack had = {gShellCallStack, gShellCallStackCount, gShellSourceStack, gShellSourceDepth,
+                          gShellFunctionNames, gShellFunctionNameCount, gShellSourceNames, gShellSourceNameCount,
+                          stack->held, stack->held_count};
+    gShellCallStack = stack->frames;
+    gShellCallStackCount = stack->frame_count;
+    gShellCallStackCapacity = stack->frame_count;
+    gShellSourceStack = stack->sources;
+    gShellSourceDepth = stack->source_count;
+    gShellSourceCapacity = stack->source_count;
+    gShellFunctionNames = stack->function_names;
+    gShellFunctionNameCount = stack->function_name_count;
+    gShellFunctionNameCapacity = stack->function_name_count;
+    gShellSourceNames = stack->source_names;
+    gShellSourceNameCount = stack->source_name_count;
+    *stack = had;
+}
+
 static void shellVariableAttributesFree(ShellVariableAttribute *attributes, size_t count) {
     for (size_t i = 0; i < count; ++i) {
         free(attributes[i].name);
@@ -2336,6 +2417,7 @@ static void shellBodyStateFree(ShellBodyState *state) {
     shellVariableAttributesFree(state->attributes, state->attribute_count);
     free(state->err_trap);
     free(state->return_trap);
+    shellCallStackFree(&state->calls);
     free(state);
 }
 
@@ -2349,6 +2431,17 @@ static ShellBodyState *shellBodyStateCapture(void) {
     if (!state->ctx || !state->env) {
         shellBodyStateFree(state);
         return NULL;
+    }
+    /* Now, not when the thread gets going: `f & unset -f f` still runs f. */
+    if (!state->ctx->has_private_tables) {
+        pthread_mutex_lock(&gShellFunctionTableMutex);
+        shellCopyDefinitionTables(state->ctx,
+                                  gShellFunctionTable,
+                                  gShellFunctionTableCount,
+                                  gShellAliasTable,
+                                  gShellAliasTableCount,
+                                  gShellOptionTable);
+        pthread_mutex_unlock(&gShellFunctionTableMutex);
     }
     shellRuntimeContextInheritLocals(state->ctx, 0);
     ShellExportFlags *flags = shellExportFlagsSnapshot();
@@ -2385,6 +2478,8 @@ static ShellBodyState *shellBodyStateCapture(void) {
         state->return_trap = strdup(gShellReturnTrap.command);
         state->traps_dormant_return = gShellReturnTrap.dormant;
     }
+    shellCallStackCapture(&state->calls);
+    state->in_loop = gShellLoopStackSize > 0;
     if (gShellVariableAttributeCount > 0) {
         state->attributes = (ShellVariableAttribute *)calloc(gShellVariableAttributeCount, sizeof(ShellVariableAttribute));
         if (!state->attributes) {
@@ -2411,7 +2506,6 @@ typedef struct {
     char **saved_params;
     int saved_param_count;
     bool saved_params_owned;
-    mode_t saved_umask;
     ShellVariableAttribute *saved_attributes;
     size_t saved_attribute_count;
     bool saved_ifs_unset;
@@ -2426,8 +2520,6 @@ static void shellBodyScopeEnter(ShellBodyState *state, ShellBodyScope *scope) {
     scope->saved_params = gParamValues;
     scope->saved_param_count = gParamCount;
     scope->saved_params_owned = gShellPositionalOwned;
-    scope->saved_umask = umask(0);
-    umask(scope->saved_umask);
     if (!state) {
         return;
     }
@@ -2472,6 +2564,7 @@ static void shellBodyScopeEnter(ShellBodyState *state, ShellBodyScope *scope) {
     state->attribute_count = 0;
     scope->saved_ifs_unset = gShellIfsUnset;
     gShellIfsUnset = state->ifs_unset;
+    shellCallStackSwap(&state->calls);
     (void)vprocConsumeClosedPipe();
 }
 
@@ -2495,11 +2588,11 @@ static void shellBodyScopeLeave(ShellBodyState *state, const ShellBodyScope *sco
     gShellErrTrap = scope->saved_err_trap;
     gShellDebugTrap = scope->saved_debug_trap;
     gShellReturnTrap = scope->saved_return_trap;
+    shellCallStackSwap(&state->calls);
     vprocEnvActivate(scope->previous_env);
     vprocSetSubshellPid(scope->previous_subshell_pid);
     shellRuntimeActivateContext(scope->previous_ctx);
     shellBodyStateFree(state);
-    umask(scope->saved_umask);
 }
 #endif
 
@@ -2568,9 +2661,10 @@ static bool shellStageRunsShellCode(const ShellCommand *cmd) {
 
 static bool shellCommandIsFrontendToolName(const char *name);
 
-/* A builtin on a stage's thread would read the shell's environment, which keeps what the
- * command set for itself only until the shell's thread goes on. */
-static bool shellStageNeedsOwnState(const ShellCommand *cmd) {
+/* A job runs apart from the shell as a forked child does, so what any builtin in it changes stays
+ * there: `cd d &`, `read v <<< x &`, `alias a=b &`. printf (-v), pwd and kill (%n) are applets too,
+ * but run as builtins here. What is only a program keeps to what it was handed. */
+static bool shellJobNeedsOwnState(const ShellCommand *cmd) {
     if (shellStageRunsShellCode(cmd)) {
         return true;
     }
@@ -2579,16 +2673,17 @@ static bool shellStageNeedsOwnState(const ShellCommand *cmd) {
     }
     char lookup_buf[PATH_MAX];
     const char *name = shellCommandLookupName(cmd->argv[0], lookup_buf, sizeof(lookup_buf));
-    /* These ask about the shell's variables, a function's locals among them. */
-    static const char *const about_variables[] = {"export", "declare", "typeset", "readonly", "local", "unset",
-                                                  "read", "getopts", "set"};
-    for (size_t i = 0; i < sizeof(about_variables) / sizeof(about_variables[0]); ++i) {
-        if (strcmp(name, about_variables[i]) == 0) {
-            return true;
-        }
+    if (!shellIsRuntimeBuiltin(name) || shellCommandIsFrontendToolName(name) || shellIOSFrontendHandler(name)) {
+        return false;
     }
-    return cmd->assignment_count > 0 && shellIsRuntimeBuiltin(name) && !shellCommandIsFrontendToolName(name) &&
-           !smallclueFindApplet(name);
+    return !smallclueFindApplet(name) || strcmp(name, "printf") == 0 || strcmp(name, "pwd") == 0 ||
+           strcmp(name, "kill") == 0;
+}
+
+/* So does a stage: `cd d | cat`, `echo x | read v`. Only `jobs | wc -l` lists the shell's, as
+ * under bash; a stage's `kill %1` finds no such job there either. */
+static bool shellStageNeedsOwnState(const ShellCommand *cmd) {
+    return shellJobNeedsOwnState(cmd) && (shellStageRunsShellCode(cmd) || strcmp(cmd->argv[0], "jobs") != 0);
 }
 
 static bool shellRunShellCodeStage(VM *vm, ShellCommand *cmd) {
@@ -2603,8 +2698,16 @@ static bool shellRunShellCodeStage(VM *vm, ShellCommand *cmd) {
     cmd->body_state = NULL;
     stage_vm->frontendContext = state->ctx;
     ShellBodyScope scope;
+    /* `true | break` in a loop has only itself to leave, and says nothing, as under bash. */
+    bool leaves_itself = state->in_loop && !shellStageRunsShellCode(cmd) &&
+                         (strcmp(cmd->argv[0], "break") == 0 || strcmp(cmd->argv[0], "continue") == 0);
     shellBodyScopeEnter(state, &scope);
-    bool ran = shellInvokeBuiltin(stage_vm, cmd);
+    bool ran = true;
+    if (leaves_itself) {
+        shellUpdateStatus(0);
+    } else {
+        ran = shellInvokeBuiltin(stage_vm, cmd);
+    }
     (void)shellRuntimeConsumeExitRequested();
     int status = shellRuntimeLastStatus();
     shellRuntimeRunExitTrap();

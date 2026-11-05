@@ -28,6 +28,9 @@
 #include <time.h>
 #include <poll.h>
 #include <dlfcn.h>
+#undef umask
+#undef mkfifo
+#undef mknod
 #include <pwd.h>
 #include <grp.h>
 #include <libgen.h>
@@ -1580,9 +1583,39 @@ static _Thread_local bool gVprocFifoOpenDirect = false;
 static int vprocHostOpenFifoKillable(const char *path, int flags, mode_t mode, bool has_mode);
 #endif
 
+/* A task's file mask is the VM's, kept with its directory, and a task asks the host for what is
+ * left of a mode after it. The host still takes away what its own mask says from anything, so
+ * that follows the session shell's: what does not come through here obeys that one. */
+static int gVprocHostMask = -1;
+
+static mode_t vprocHostMaskSet(mode_t mask) {
+    mode_t previous = umask(mask);
+    __atomic_store_n(&gVprocHostMask, (int)mask, __ATOMIC_RELAXED);
+    return previous;
+}
+
+static mode_t vprocHostMaskGet(void) {
+    int mask = __atomic_load_n(&gVprocHostMask, __ATOMIC_RELAXED);
+    if (mask < 0) {
+        mode_t current = vprocHostMaskSet(0);
+        vprocHostMaskSet(current);
+        mask = (int)current;
+    }
+    return (mode_t)mask;
+}
+
+/* It can only be read by setting it: do that before there is another thread to see it. */
+__attribute__((constructor)) static void vprocHostMaskInit(void) {
+    (void)vprocHostMaskGet();
+}
+
+/* True when the host would take away some of what is left: the caller then puts it back, on
+ * what it made and nothing else. */
+static bool vprocCreateModeApply(mode_t *mode);
+
+static int vprocHostOpenCall(const char *path, int flags, mode_t mode, bool has_mode);
+
 static int vprocHostOpenRawInternal(const char *path, int flags, mode_t mode, bool has_mode) {
-    static int (*fn)(const char *, int, ...) = NULL;
-    static int (*openat_fn)(int, const char *, int, ...) = NULL;
 #if defined(PSCAL_TARGET_IOS)
     if (!gVprocFifoOpenDirect && !(flags & O_NONBLOCK) && (flags & O_ACCMODE) != O_RDWR) {
         struct stat fifo_st;
@@ -1591,6 +1624,29 @@ static int vprocHostOpenRawInternal(const char *path, int flags, mode_t mode, bo
         }
     }
 #endif
+    if (has_mode && (flags & O_CREAT) && vprocCreateModeApply(&mode)) {
+        /* Only O_EXCL says the file is new. */
+        for (int tries = 0; tries < 4; ++tries) {
+            int fd = vprocHostOpenCall(path, flags | O_EXCL, mode, true);
+            if (fd >= 0) {
+                (void)vprocHostFchmodRaw(fd, mode);
+                return fd;
+            }
+            if (errno != EEXIST || (flags & O_EXCL)) {
+                return -1;
+            }
+            fd = vprocHostOpenCall(path, flags & ~O_CREAT, 0, false);
+            if (fd >= 0 || errno != ENOENT) {
+                return fd;
+            }
+        }
+    }
+    return vprocHostOpenCall(path, flags, mode, has_mode);
+}
+
+static int vprocHostOpenCall(const char *path, int flags, mode_t mode, bool has_mode) {
+    static int (*fn)(const char *, int, ...) = NULL;
+    static int (*openat_fn)(int, const char *, int, ...) = NULL;
 #if defined(__APPLE__)
     if (&__open_nocancel) {
         vprocInterposeBypassEnter();
@@ -2055,6 +2111,7 @@ struct VProc {
     VProcWinsize winsize;
     int pid;
     char cwd[PATH_MAX];
+    mode_t file_mask;
     VProcResourceEntry *resources;
     size_t resource_count;
     size_t resource_capacity;
@@ -8249,6 +8306,7 @@ static VProc *vprocCreateFrom(const VProcOptions *opts, VProc *active) {
         vp->entries[i].kind = VPROC_FD_NONE;
     }
     vprocInitializeVirtualCwd(vp, active);
+    vp->file_mask = active ? active->file_mask : vprocHostMaskGet();
     vp->next_fd = 3;
     vp->winsize.cols = (local.winsize_cols > 0) ? local.winsize_cols : 80;
     vp->winsize.rows = (local.winsize_rows > 0) ? local.winsize_rows : 24;
@@ -15748,6 +15806,84 @@ int vprocShellChdirShim(const char *path) {
     return rc;
 }
 
+static bool vprocCreateModeApply(mode_t *mode) {
+    VProc *vp = vprocForThread();
+    if (!vp) {
+        return false;
+    }
+    *mode &= ~vp->file_mask;
+    return (*mode & vprocHostMaskGet()) != 0;
+}
+
+mode_t vprocUmaskShim(mode_t mask) {
+    VProc *vp = vprocForThread();
+    if (!vp) {
+        return vprocHostMaskSet(mask & 0777);
+    }
+    mode_t previous = vp->file_mask;
+    vp->file_mask = mask & 0777;
+    return previous;
+}
+
+/* The shell's, down the stack of vprocs its builtins run under, as cd's goes. A subshell's or a
+ * job's stays with it. The session shell's is the host's too. */
+mode_t vprocShellUmaskShim(mode_t mask) {
+    VProc *owner = vprocResolvePathOpsVproc(true);
+    if (!owner) {
+        return vprocHostMaskSet(mask & 0777);
+    }
+    mode_t previous = owner->file_mask;
+    owner->file_mask = mask & 0777;
+    VProc *vp = gVProcCurrent;
+    size_t depth = gVProcStackDepth;
+    while (vp && vp != owner) {
+        if (vprocRegistryContains(vp)) {
+            vp->file_mask = mask & 0777;
+        }
+        vp = (depth > 0) ? gVProcStack[--depth] : NULL;
+    }
+    if (gVprocSubshellPid <= 0) {
+        vprocHostMaskSet(mask & 0777);
+    }
+    return previous;
+}
+
+bool vprocFileMaskIsHostMask(void) {
+    VProc *vp = vprocForThread();
+    return !vp || vp->file_mask == vprocHostMaskGet();
+}
+
+/* What makes a directory, a FIFO or a node gets no descriptor, so it has only the name to put
+ * back what the host took away. These fail if the name is already there, so it is theirs. */
+int vprocHostMkdirMasked(const char *path, mode_t mode) {
+    bool restore = vprocCreateModeApply(&mode);
+    int rc = vprocHostMkdirRaw(path, mode);
+    if (rc == 0 && restore) {
+        (void)vprocHostChmodRaw(path, mode);
+    }
+    return rc;
+}
+
+int vprocMkfifoShim(const char *path, mode_t mode) {
+    bool restore = vprocCreateModeApply(&mode);
+    int rc = mkfifo(path, mode);
+    if (rc == 0 && restore) {
+        (void)vprocHostChmodRaw(path, mode);
+    }
+    return rc;
+}
+
+int vprocMknodShim(const char *path, mode_t mode, dev_t dev) {
+    mode_t type = mode & S_IFMT;
+    mode_t perms = mode & ~(mode_t)S_IFMT;
+    bool restore = vprocCreateModeApply(&perms);
+    int rc = mknod(path, type | perms, dev);
+    if (rc == 0 && restore) {
+        (void)vprocHostChmodRaw(path, perms);
+    }
+    return rc;
+}
+
 char *vprocShellGetcwdShim(char *buffer, size_t size) {
     VProc *vp = vprocResolvePathOpsVproc(true);
     if (!vp) {
@@ -15891,7 +16027,7 @@ int vprocMkdirShim(const char *path, mode_t mode) {
     }
     char expanded[PATH_MAX];
     const char *target = vprocPathExpandForShim(path, expanded, sizeof(expanded));
-    return vprocHostMkdirRaw(target ? target : path, mode);
+    return vprocHostMkdirMasked(target ? target : path, mode);
 }
 
 int vprocRmdirShim(const char *path) {

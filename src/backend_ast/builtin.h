@@ -365,6 +365,7 @@ typedef struct {
     bool active;
     int saved_subshell_pid;
     char *cwd;
+    mode_t mask;
     char *pwd;
     char *oldpwd;
 } ShellCwdScope;

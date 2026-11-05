@@ -28,6 +28,9 @@
 #undef fstat
 #undef stat
 #undef lstat
+#undef umask
+#undef mkfifo
+#undef mknod
 #undef chmod
 #undef chown
 #undef fchmod
@@ -87,6 +90,9 @@
 #define fstat vprocFstatShim
 #define stat(path, buf) vprocStatShim((path), (buf))
 #define lstat(path, buf) vprocLstatShim((path), (buf))
+#define umask(mask) vprocUmaskShim((mask))
+#define mkfifo(path, mode) vprocMkfifoShim((path), (mode))
+#define mknod(path, mode, dev) vprocMknodShim((path), (mode), (dev))
 #define chmod(path, mode) vprocChmodShim((path), (mode))
 #define chown(path, uid, gid) vprocChownShim((path), (uid), (gid))
 #define fchmod(fd, mode) vprocFchmodShim((fd), (mode))

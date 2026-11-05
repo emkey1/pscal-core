@@ -9096,7 +9096,7 @@ Value vmBuiltinShellUmask(VM *vm, int arg_count, Value *args) {
             shellUpdateStatus(1);
             return makeVoid();
         }
-        umask(new_mask);
+        SHELL_UMASK(new_mask);
         shellUpdateStatus(0);
         return makeVoid();
     }

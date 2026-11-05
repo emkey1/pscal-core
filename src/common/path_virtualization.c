@@ -356,11 +356,11 @@ int pscalPathVirtualized_mkdir(const char *path, mode_t mode) {
         return mkdir(path, mode);
     }
     if (!pathVirtualizationActive()) {
-        return mkdir(path, mode);
+        return vprocHostMkdirMasked(path, mode);
     }
     char expanded[PATH_MAX];
     const char *target = pathVirtualizedPrepare(path, expanded);
-    return mkdir(target ? target : path, mode);
+    return vprocHostMkdirMasked(target ? target : path, mode);
 }
 
 int pscalPathVirtualized_rmdir(const char *path) {
@@ -666,9 +666,11 @@ FILE *pscalPathVirtualized_fopen(const char *path, const char *mode) {
         return vprocFdopenCompat(fd, mode);
     }
     /* libc's fopen opens where nothing can reach it, and a FIFO's open waits for the other end.
-     * This open can be interrupted, and the stream is a host descriptor's, as fopen's would be. */
+     * This open can be interrupted, and the stream is a host descriptor's, as fopen's would be.
+     * libc's would also make the file with the host's mask, not this task's. */
     struct stat fifo_st;
-    if (pscalPathVirtualized_stat(path, &fifo_st) == 0 && S_ISFIFO(fifo_st.st_mode)) {
+    if (((flags & O_CREAT) && !vprocFileMaskIsHostMask()) ||
+        (pscalPathVirtualized_stat(path, &fifo_st) == 0 && S_ISFIFO(fifo_st.st_mode))) {
         int fd = pscalPathVirtualized_open(path, flags, 0666);
         if (fd < 0) {
             return NULL;

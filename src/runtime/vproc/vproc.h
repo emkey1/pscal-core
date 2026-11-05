@@ -281,6 +281,14 @@ int vprocChdirShim(const char *path);
 char *vprocGetcwdShim(char *buffer, size_t size);
 int vprocShellChdirShim(const char *path);
 char *vprocShellGetcwdShim(char *buffer, size_t size);
+/* A task's file mask, as umask() would have it: the first for the task itself, the second for
+ * the shell it is running, as a cd reaches it. The mask is not the host's. */
+mode_t vprocUmaskShim(mode_t mask);
+mode_t vprocShellUmaskShim(mode_t mask);
+bool vprocFileMaskIsHostMask(void);
+int vprocHostMkdirMasked(const char *path, mode_t mode);
+int vprocMkfifoShim(const char *path, mode_t mode);
+int vprocMknodShim(const char *path, mode_t mode, dev_t dev);
 /* A subshell's environment and directory. There is no fork here, so a subshell is a
  * thread and a vproc, and these keep what a process would keep for itself. A thread with
  * no environment of its own sees the process's, and one with no subshell pid the
@@ -724,6 +732,8 @@ static inline int vprocChdirShim(const char *path) { return chdir(path); }
 static inline char *vprocGetcwdShim(char *buffer, size_t size) { return getcwd(buffer, size); }
 static inline int vprocShellChdirShim(const char *path) { return chdir(path); }
 static inline char *vprocShellGetcwdShim(char *buffer, size_t size) { return getcwd(buffer, size); }
+static inline mode_t vprocUmaskShim(mode_t mask) { return umask(mask); }
+static inline mode_t vprocShellUmaskShim(mode_t mask) { return umask(mask); }
 static inline int vprocAccessShim(const char *path, int mode) { return access(path, mode); }
 static inline int vprocChmodShim(const char *path, mode_t mode) { return chmod(path, mode); }
 static inline int vprocChownShim(const char *path, uid_t uid, gid_t gid) { return chown(path, uid, gid); }

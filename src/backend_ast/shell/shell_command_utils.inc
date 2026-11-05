@@ -33,15 +33,17 @@ extern void pscalRuntimeDebugLog(const char *message);
 #if defined(PSCAL_TARGET_IOS)
 #define SHELL_GETCWD(buf, len) vprocShellGetcwdShim((buf), (len))
 #define SHELL_CHDIR(path) vprocShellChdirShim((path))
+#define SHELL_UMASK(mask) vprocShellUmaskShim((mask))
 #else
 #define SHELL_GETCWD(buf, len) getcwd((buf), (len))
 #define SHELL_CHDIR(path) chdir((path))
+#define SHELL_UMASK(mask) umask((mask))
 #endif
 
-/* A shell or script run as a command has its own directory: its cd reaches what it runs,
- * and its caller stays where it was. On iOS it shares the process with its caller, so the
- * vproc it runs under owns that directory while it runs, as a subshell's does, and PWD and
- * OLDPWD go back by hand. */
+/* A shell or script run as a command has its own directory and file mask: its cd reaches
+ * what it runs, and its caller stays where it was. On iOS it shares the process with its
+ * caller, so the vproc it runs under owns them while it runs, as a subshell's does, and PWD
+ * and OLDPWD go back by hand. */
 void shellCwdScopeEnter(ShellCwdScope *scope) {
     if (!scope) {
         return;
@@ -58,6 +60,8 @@ void shellCwdScopeEnter(ShellCwdScope *scope) {
 #endif
     char cwd[PATH_MAX];
     scope->cwd = SHELL_GETCWD(cwd, sizeof(cwd)) ? strdup(cwd) : NULL;
+    scope->mask = SHELL_UMASK(0);
+    SHELL_UMASK(scope->mask);
     const char *value = getenv("PWD");
     scope->pwd = value ? strdup(value) : NULL;
     value = getenv("OLDPWD");
@@ -73,6 +77,7 @@ void shellCwdScopeLeave(ShellCwdScope *scope) {
     if (scope->cwd) {
         (void)SHELL_CHDIR(scope->cwd);
     }
+    SHELL_UMASK(scope->mask);
 #if defined(PSCAL_TARGET_IOS)
     vprocSetSubshellPid(scope->saved_subshell_pid);
 #endif

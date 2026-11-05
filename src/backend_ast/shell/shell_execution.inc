@@ -4836,7 +4836,7 @@ static int shellPipelineRunStage(VM *vm,
     bool pipeline_in_process = ctx && ctx->in_process;
 #if defined(PSCAL_TARGET_IOS)
     /* The last stage runs right here, on the shell's thread. */
-    if (ctx && ctx->stage_count > 1 && cmd && !cmd->body_state && shellStageRunsShellCode(cmd)) {
+    if (ctx && ctx->stage_count > 1 && cmd && !cmd->body_state && shellStageNeedsOwnState(cmd)) {
         cmd->body_state = shellBodyStateCapture();
     }
 #endif
@@ -5624,6 +5624,9 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
                 return false;
             }
 
+            if (!cloned->body_state && shellJobNeedsOwnState(cloned)) {
+                cloned->body_state = shellBodyStateCapture();
+            }
             shellStageCaptureState(cloned, cmd, 1);
             bg_ctx->vm = vm;
             bg_ctx->cmd = cloned;

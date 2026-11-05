@@ -984,6 +984,24 @@ static const ShellCallFrame *shellRuntimeCallFrameAtDepth(size_t depth) {
     return &gShellCallStack[gShellCallStackCount - 1 - depth];
 }
 
+#if defined(PSCAL_TARGET_IOS)
+/* Where a job or a stage was started from. It runs on a thread of its own, and caller, FUNCNAME
+ * and BASH_SOURCE show what a forked child would have. */
+typedef struct {
+    ShellCallFrame *frames;
+    size_t frame_count;
+    char **sources;
+    size_t source_count;
+    /* The two name stacks point at strings someone else owns, and here that is `held`. */
+    char **function_names;
+    size_t function_name_count;
+    char **source_names;
+    size_t source_name_count;
+    char **held;
+    size_t held_count;
+} ShellCallStack;
+#endif
+
 static const char *shellResolveBashPath(void) {
     static char resolved[PATH_MAX];
     static bool initialised = false;
@@ -2428,6 +2446,8 @@ typedef struct {
     char *return_trap;
     bool traps_dormant_err;
     bool traps_dormant_return;
+    ShellCallStack calls;
+    bool in_loop;
 } ShellBodyState;
 
 /* What a thread started by a shell takes from it, beyond the vproc every new thread starts
