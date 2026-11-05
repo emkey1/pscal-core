@@ -1721,42 +1721,6 @@ static pid_t vprocHostWaitpidRaw(pid_t pid, int *status_out, int options) {
     return (pid_t)-1;
 }
 
-#if defined(VPROC_ENABLE_STUBS_FOR_TESTS)
-static int (*gVProcHostKillHookForTests)(pid_t, int) = NULL;
-
-void vprocSetHostKillHookForTests(int (*hook)(pid_t, int)) {
-    gVProcHostKillHookForTests = hook;
-}
-#endif
-
-/* Only a single process goes to the host. The other forms mean something else there, as the task
- * table's ids are synthetic and on iOS start at 1: group 1 arrives as -1, which the host reads as
- * every process the user owns, 0 is the host's group around this process, and -N a real group that
- * merely has the same number. */
-static int vprocHostKillRaw(pid_t pid, int sig) {
-    static int (*fn)(pid_t, int) = NULL;
-    if (pid <= 0) {
-        errno = ESRCH;
-        return -1;
-    }
-#if defined(VPROC_ENABLE_STUBS_FOR_TESTS)
-    if (gVProcHostKillHookForTests) {
-        return gVProcHostKillHookForTests(pid, sig);
-    }
-#endif
-    if (!fn) {
-        fn = (int (*)(pid_t, int))vprocResolveSymbol("kill");
-    }
-    if (fn) {
-        vprocInterposeBypassEnter();
-        int res = fn(pid, sig);
-        vprocInterposeBypassExit();
-        return res;
-    }
-    errno = ENOSYS;
-    return -1;
-}
-
 static pid_t vprocHostGetpidRaw(void) {
     static pid_t (*fn)(void) = NULL;
     if (!fn) {
@@ -4370,27 +4334,6 @@ static bool vprocSignalIgnoredLocked(VProcTaskEntry *entry, int sig) {
     }
     uint32_t mask = vprocSigMask(sig);
     return mask != 0 && (entry->ignored_signals & mask);
-}
-
-static bool vprocSignalRequiresVirtualDispatch(int sig) {
-#if defined(PSCAL_TARGET_IOS)
-    switch (sig) {
-        case SIGINT:
-        case SIGQUIT:
-        case SIGTSTP:
-        case SIGTERM:
-        case SIGCONT:
-        case SIGSTOP:
-        case SIGTTIN:
-        case SIGTTOU:
-            return true;
-        default:
-            return false;
-    }
-#else
-    (void)sig;
-    return false;
-#endif
 }
 
 static void vprocMaybeStampRusageLocked(VProcTaskEntry *entry) {
@@ -11052,20 +10995,9 @@ int vprocKillShim(pid_t pid, int sig) {
         errno = EINVAL;
         return -1;
     }
-    bool require_virtual = vprocSignalRequiresVirtualDispatch(sig);
-    /* The VM is the kernel: a group or everything means its task table, whoever asks. */
-    if (pid > 0 && !vprocShimHasVirtualContext() && !require_virtual) {
-#if defined(VPROC_ENABLE_STUBS_FOR_TESTS)
-        pthread_mutex_lock(&gVProcTasks.mu);
-        bool has_target = vprocHasKillTargetLocked(pid, -1);
-        pthread_mutex_unlock(&gVProcTasks.mu);
-        if (!has_target) {
-            return vprocHostKillRaw(pid, sig);
-        }
-#else
-        return vprocHostKillRaw(pid, sig);
-#endif
-    }
+    /* The VM is the kernel: every pid here means its task table, whoever asks. Its ids are synthetic,
+     * so to the host they are other processes, and host code on a thread of its own never gets here:
+     * the app's interposer sends that to the real kill. */
     bool target_group = (pid <= 0);
     bool broadcast_all = (pid == -1);
     int target = target_group ? -pid : pid;
