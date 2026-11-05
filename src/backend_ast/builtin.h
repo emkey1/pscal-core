@@ -269,6 +269,7 @@ Value vmBuiltinShellShift(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinShellSetenv(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinShellExport(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinShellUmask(struct VM_s* vm, int arg_count, Value* args);
+Value vmBuiltinShellUlimit(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinShellTimes(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinShellCommand(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinShellHash(struct VM_s* vm, int arg_count, Value* args);
@@ -376,6 +377,7 @@ typedef struct {
     mode_t mask;
     char *pwd;
     char *oldpwd;
+    size_t depth;
 } ShellCwdScope;
 void shellCwdScopeEnter(ShellCwdScope *scope);
 void shellCwdScopeLeave(ShellCwdScope *scope);

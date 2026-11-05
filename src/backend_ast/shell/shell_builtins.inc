@@ -397,6 +397,7 @@ Value vmBuiltinShellPipeline(VM *vm, int arg_count, Value *args) {
     size_t stages = 0;
     size_t debug_traps = 0;
     bool negated = false;
+    bool async = false;
     char *copy = strdup(meta);
     if (!copy) {
         runtimeError(vm, "shell pipeline: out of memory");
@@ -415,6 +416,8 @@ Value vmBuiltinShellPipeline(VM *vm, int arg_count, Value *args) {
                 stages = (size_t)strtoul(value, NULL, 10);
             } else if (strcmp(key, "negated") == 0) {
                 shellParseBool(value, &negated);
+            } else if (strcmp(key, "async") == 0) {
+                shellParseBool(value, &async);
             } else if (strcmp(key, "merge") == 0) {
                 free(merge_pattern);
                 merge_pattern = strdup(value ? value : "");
@@ -459,6 +462,7 @@ Value vmBuiltinShellPipeline(VM *vm, int arg_count, Value *args) {
             free(merge_pattern);
             goto cleanup;
         }
+        ctx->async = async;
 
         if (merge_pattern) {
             size_t pattern_len = strlen(merge_pattern);
@@ -5045,15 +5049,7 @@ Value vmBuiltinShellSource(VM *vm, int arg_count, Value *args) {
         memset(caller_pipeline, 0, sizeof(*caller_pipeline));
         caller_pipeline->pgid = -1;
     }
-    char **grown_names = (char **)realloc(gShellSourceNames, (gShellSourceNameCount + 1) * sizeof(char *));
-    bool source_name_pushed = false;
-    if (grown_names) {
-        gShellSourceNames = grown_names;
-        memmove(gShellSourceNames + 1, gShellSourceNames, gShellSourceNameCount * sizeof(char *));
-        gShellSourceNames[0] = (char *)path;
-        gShellSourceNameCount++;
-        source_name_pushed = true;
-    }
+    bool frame_pushed = shellRuntimePushCallFrame("source", path, gShellCurrentCommandLine, false);
     int condition_depth = gShellConditionDepth;
     size_t loop_depth = gShellLoopStackSize;
     size_t case_depth = gShellCaseStack.count;
@@ -5081,9 +5077,8 @@ Value vmBuiltinShellSource(VM *vm, int arg_count, Value *args) {
         }
         *caller_pipeline = saved_pipeline;
     }
-    if (source_name_pushed) {
-        gShellSourceNameCount--;
-        memmove(gShellSourceNames, gShellSourceNames + 1, gShellSourceNameCount * sizeof(char *));
+    if (frame_pushed) {
+        shellRuntimePopCallFrame();
     }
     free(source);
 
@@ -9069,6 +9064,247 @@ static void shellUmaskFormatSymbolic(mode_t mask, char *buffer, size_t buffer_si
     buffer[offset] = '\0';
 }
 
+/* Bash's list, in its order, of what this system has. Sizes count in 1024 bytes, and -p (read only)
+ * in 512. */
+typedef struct {
+    char option;
+    const char *label;
+    const char *unit;
+    int resource; /* -1: not one the system keeps */
+    rlim_t factor;
+} ShellUlimitEntry;
+
+static const ShellUlimitEntry kShellUlimits[] = {
+    {'c', "core file size", "blocks", RLIMIT_CORE, 1024},
+    {'d', "data seg size", "kbytes", RLIMIT_DATA, 1024},
+#ifdef RLIMIT_NICE
+    {'e', "scheduling priority", NULL, RLIMIT_NICE, 1},
+#endif
+    {'f', "file size", "blocks", RLIMIT_FSIZE, 1024},
+#ifdef RLIMIT_SIGPENDING
+    {'i', "pending signals", NULL, RLIMIT_SIGPENDING, 1},
+#endif
+    {'l', "max locked memory", "kbytes", RLIMIT_MEMLOCK, 1024},
+    {'m', "max memory size", "kbytes", RLIMIT_RSS, 1024},
+    {'n', "open files", NULL, RLIMIT_NOFILE, 1},
+    {'p', "pipe size", "512 bytes", -1, 512},
+#ifdef RLIMIT_MSGQUEUE
+    {'q', "POSIX message queues", "bytes", RLIMIT_MSGQUEUE, 1},
+#endif
+#ifdef RLIMIT_RTPRIO
+    {'r', "real-time priority", NULL, RLIMIT_RTPRIO, 1},
+#endif
+#ifdef RLIMIT_RTTIME
+    {'R', "real-time non-blocking time", "microseconds", RLIMIT_RTTIME, 1},
+#endif
+    {'s', "stack size", "kbytes", RLIMIT_STACK, 1024},
+    {'t', "cpu time", "seconds", RLIMIT_CPU, 1},
+    {'u', "max user processes", NULL, RLIMIT_NPROC, 1},
+    {'v', "virtual memory", "kbytes", RLIMIT_AS, 1024},
+#ifdef RLIMIT_LOCKS
+    {'x', "file locks", NULL, RLIMIT_LOCKS, 1},
+#endif
+};
+#define SHELL_ULIMIT_ENTRIES (sizeof(kShellUlimits) / sizeof(kShellUlimits[0]))
+
+static const ShellUlimitEntry *shellUlimitFind(char option) {
+    for (size_t i = 0; i < SHELL_ULIMIT_ENTRIES; ++i) {
+        if (kShellUlimits[i].option == option) {
+            return &kShellUlimits[i];
+        }
+    }
+    return NULL;
+}
+
+/* A substitution or a nested shell runs in this process, where under bash it is one of its own:
+ * what it sets ends with it. Most never set any, so this is kept only when one does. */
+typedef struct ShellLimitsSaved {
+    struct ShellLimitsSaved *outer;
+    size_t depth;
+    struct rlimit limits[SHELL_ULIMIT_ENTRIES];
+} ShellLimitsSaved;
+
+static PSCAL_THREAD_LOCAL ShellLimitsSaved *gShellLimitsSaved = NULL;
+
+static void shellCwdScopeRestoreLimits(size_t depth) {
+    while (gShellLimitsSaved && gShellLimitsSaved->depth >= depth) {
+        ShellLimitsSaved *saved = gShellLimitsSaved;
+        for (size_t i = 0; i < SHELL_ULIMIT_ENTRIES; ++i) {
+            if (kShellUlimits[i].resource >= 0) {
+                (void)vprocShellSetrlimitShim(kShellUlimits[i].resource, &saved->limits[i], true);
+            }
+        }
+        gShellLimitsSaved = saved->outer;
+        free(saved);
+    }
+}
+
+static void shellCwdScopeSaveLimits(void) {
+    if (gShellCwdScopeDepth == 0 || (gShellLimitsSaved && gShellLimitsSaved->depth == gShellCwdScopeDepth)) {
+        return;
+    }
+    ShellLimitsSaved *saved = (ShellLimitsSaved *)calloc(1, sizeof(ShellLimitsSaved));
+    if (!saved) {
+        return;
+    }
+    for (size_t i = 0; i < SHELL_ULIMIT_ENTRIES; ++i) {
+        if (kShellUlimits[i].resource >= 0) {
+            (void)vprocGetrlimitShim(kShellUlimits[i].resource, &saved->limits[i]);
+        }
+    }
+    saved->depth = gShellCwdScopeDepth;
+    saved->outer = gShellLimitsSaved;
+    gShellLimitsSaved = saved;
+}
+
+static void shellUlimitPrint(const ShellUlimitEntry *entry, bool hard, bool labelled) {
+    if (labelled) {
+        char what[32];
+        if (entry->unit) {
+            snprintf(what, sizeof(what), "(%s, -%c)", entry->unit, entry->option);
+        } else {
+            snprintf(what, sizeof(what), "(-%c)", entry->option);
+        }
+        printf("%-20s%20s ", entry->label, what);
+    }
+    if (entry->resource < 0) {
+        printf("%ld\n", (long)(PIPE_BUF / 512));
+        return;
+    }
+    struct rlimit limit;
+    if (vprocGetrlimitShim(entry->resource, &limit) != 0) {
+        printf("unlimited\n");
+        return;
+    }
+    rlim_t value = hard ? limit.rlim_max : limit.rlim_cur;
+    if (value == RLIM_INFINITY) {
+        printf("unlimited\n");
+    } else {
+        printf("%llu\n", (unsigned long long)(value / entry->factor));
+    }
+}
+
+static bool shellUlimitSet(VM *vm, const ShellUlimitEntry *entry, const char *text, bool soft, bool hard) {
+    struct rlimit limit = {RLIM_INFINITY, RLIM_INFINITY};
+    if (entry->resource >= 0) {
+        (void)vprocGetrlimitShim(entry->resource, &limit);
+    }
+    rlim_t value;
+    if (strcmp(text, "unlimited") == 0) {
+        value = RLIM_INFINITY;
+    } else if (strcmp(text, "hard") == 0) {
+        value = limit.rlim_max;
+    } else if (strcmp(text, "soft") == 0) {
+        value = limit.rlim_cur;
+    } else {
+        const char *digit = text;
+        while (*digit && isdigit((unsigned char)*digit)) {
+            digit++;
+        }
+        errno = 0;
+        char *end = NULL;
+        unsigned long long parsed = *text ? strtoull(text, &end, 10) : 0;
+        if (!*text || *digit || errno != 0 || (end && *end)) {
+            runtimeError(vm, "ulimit: %s: invalid number", text);
+            return false;
+        }
+        if (parsed > (unsigned long long)(RLIM_INFINITY / entry->factor)) {
+            runtimeError(vm, "ulimit: %s: limit out of range", text);
+            return false;
+        }
+        value = (rlim_t)parsed * entry->factor;
+    }
+    if (entry->resource < 0) {
+        runtimeError(vm, "ulimit: %s: cannot modify limit: %s", entry->label, strerror(EINVAL));
+        return false;
+    }
+    shellCwdScopeSaveLimits();
+    if (soft) {
+        limit.rlim_cur = value;
+    }
+#if defined(PSCAL_TARGET_IOS)
+    if (hard) {
+        limit.rlim_max = value;
+    }
+#else
+    /* Not here in a substitution, which is this process: a hard limit could not come back up. */
+    if (hard && gShellCwdScopeDepth == 0) {
+        limit.rlim_max = value;
+    }
+#endif
+    if (vprocShellSetrlimitShim(entry->resource, &limit, false) != 0) {
+        runtimeError(vm, "ulimit: %s: cannot modify limit: %s", entry->label, strerror(errno));
+        return false;
+    }
+    return true;
+}
+
+Value vmBuiltinShellUlimit(VM *vm, int arg_count, Value *args) {
+    bool soft = false;
+    bool hard = false;
+    bool all = false;
+    const ShellUlimitEntry *wanted[SHELL_ULIMIT_ENTRIES];
+    size_t wanted_count = 0;
+    int index = 0;
+    for (; index < arg_count; ++index) {
+        const char *text = VALUE_TYPE(args[index]) == TYPE_STRING ? AS_STRING(args[index]) : NULL;
+        if (!text || text[0] != '-' || !text[1]) {
+            break;
+        }
+        if (strcmp(text, "--") == 0) {
+            index++;
+            break;
+        }
+        for (const char *flag = text + 1; *flag; ++flag) {
+            const ShellUlimitEntry *entry = shellUlimitFind(*flag);
+            if (*flag == 'S') {
+                soft = true;
+            } else if (*flag == 'H') {
+                hard = true;
+            } else if (*flag == 'a') {
+                all = true;
+            } else if (!entry) {
+                runtimeError(vm, "ulimit: -%c: invalid option", *flag);
+                fprintf(stderr, "ulimit: usage: ulimit [-SHabcdefiklmnpqrstuvxPRT] [limit]\n");
+                shellUpdateStatus(2);
+                return makeVoid();
+            } else {
+                bool seen = false;
+                for (size_t i = 0; i < wanted_count; ++i) {
+                    seen = seen || wanted[i] == entry;
+                }
+                if (!seen) {
+                    wanted[wanted_count++] = entry;
+                }
+            }
+        }
+    }
+    if (all) {
+        for (size_t i = 0; i < SHELL_ULIMIT_ENTRIES; ++i) {
+            shellUlimitPrint(&kShellUlimits[i], hard && !soft, true);
+        }
+        shellUpdateStatus(0);
+        return makeVoid();
+    }
+    if (wanted_count == 0) {
+        wanted[wanted_count++] = shellUlimitFind('f');
+    }
+    const char *value = index < arg_count && VALUE_TYPE(args[index]) == TYPE_STRING ? AS_STRING(args[index]) : NULL;
+    if (!value) {
+        for (size_t i = 0; i < wanted_count; ++i) {
+            shellUlimitPrint(wanted[i], hard && !soft, wanted_count > 1);
+        }
+        shellUpdateStatus(0);
+        return makeVoid();
+    }
+    bool ok = true;
+    for (size_t i = 0; i < wanted_count; ++i) {
+        ok = shellUlimitSet(vm, wanted[i], value, soft || !hard, hard || !soft) && ok;
+    }
+    shellUpdateStatus(ok ? 0 : 1);
+    return makeVoid();
+}
+
 Value vmBuiltinShellUmask(VM *vm, int arg_count, Value *args) {
     bool symbolic = false;
     bool parsing_options = true;
@@ -10844,16 +11080,31 @@ Value vmBuiltinShellLocal(VM *vm, int arg_count, Value *args) {
     return makeVoid();
 }
 
+/* Asked to leave a loop around a command substitution: it ends there, and the loop goes on. */
+static void shellLoopControlEndSubstitution(VM *vm) {
+    shellUpdateStatus(0);
+    shellRuntimeRequestExit();
+    if (vm) {
+        vm->exit_requested = true;
+        vm->current_builtin_name = "exit";
+    }
+}
+
 /* What break and continue say about their argument. False means it is dealt with. */
 static bool shellLoopControlLevels(VM *vm, const char *name, int arg_count, Value *args, int *levels) {
     *levels = 1;
-    if (gShellLoopStackSize == 0) {
+    size_t loops_around = gShellRuntime.loops_around;
+    if (gShellLoopStackSize == 0 && loops_around == 0) {
         runtimeError(vm, "%s: only meaningful in a `for', `while', or `until' loop", name);
         shellUpdateStatus(0);
         return false;
     }
     int first = shellSkipDoubleDash(arg_count, args);
     if (arg_count <= first) {
+        if (gShellLoopStackSize == 0) {
+            shellLoopControlEndSubstitution(vm);
+            return false;
+        }
         return true;
     }
     const char *text = VALUE_TYPE(args[first]) == TYPE_STRING ? AS_STRING(args[first]) : NULL;
@@ -10877,10 +11128,19 @@ static bool shellLoopControlLevels(VM *vm, const char *name, int arg_count, Valu
     if (value <= 0) {
         /* Every loop ends, continue or not. */
         runtimeError(vm, "%s: %s: loop count out of range", name, text);
+        if (loops_around > 0) {
+            shellLoopControlEndSubstitution(vm);
+            shellUpdateStatus(1);
+            return false;
+        }
         gShellRuntime.break_requested = true;
         gShellRuntime.break_requested_levels = (int)gShellLoopStackSize;
         shellLoopRequestBreakLevels((int)gShellLoopStackSize);
         shellUpdateStatus(1);
+        return false;
+    }
+    if (value > (long)gShellLoopStackSize && loops_around > 0) {
+        shellLoopControlEndSubstitution(vm);
         return false;
     }
     /* More than there are means them all. What is left over would stay asked for. */
@@ -11303,6 +11563,16 @@ static const ShellHelpTopic kShellHelpTopics[] = {
         "Marks each NAME as read-only. When assignments are provided the "
         "variable is set before being protected. With no arguments or when "
         "invoked with -p the current read-only definitions are printed.",
+        NULL,
+        0
+    },
+    {
+        "ulimit",
+        "Show or set resource limits.",
+        "ulimit [-SHabcdefiklmnpqrstuvxPRT] [limit]",
+        "With no limit prints the current one, for -f when no resource is named; -a prints them all."
+        " A limit is a number, unlimited, hard or soft. -S and -H pick the soft and the hard limit;"
+        " setting takes both unless one is named. Sizes count in 1024 bytes, -p in 512.",
         NULL,
         0
     },
@@ -11959,63 +12229,68 @@ Value vmBuiltinShellUnalias(VM *vm, int arg_count, Value *args) {
     return makeVoid();
 }
 
+static void shellCallerUsage(void) {
+    fprintf(stderr, "caller: usage: caller [expr]\n");
+}
+
+/* An entry of the list the three arrays show: the frames, then the script under them. */
+static bool shellCallStackEntry(size_t index, const char **function, const char **source, int *line) {
+    const ShellCallFrame *frame = shellRuntimeCallFrameAtDepth(index);
+    if (frame) {
+        *function = frame->function;
+        *source = frame->source;
+        *line = frame->line;
+        return true;
+    }
+    if (index == shellRuntimeCallStackDepth() && gShellScriptName) {
+        *function = "main";
+        *source = gShellScriptName;
+        *line = 0;
+        return true;
+    }
+    return false;
+}
+
+/* A line and a file for no operand; a line, a name and a file for how far out to look. So at the
+ * top of a script it is `0 NULL`, and nothing at all in a -c string or at a prompt. */
 Value vmBuiltinShellCaller(VM *vm, int arg_count, Value *args) {
+    int first = shellSkipDoubleDash(arg_count, args);
+    bool has_depth = arg_count > first;
     long depth = 0;
-    if (arg_count > 1) {
-        runtimeError(vm, "caller: too many arguments");
-        shellUpdateStatus(2);
-        return makeVoid();
-    }
-    if (arg_count == 1) {
-        if (VALUE_TYPE(args[0]) != TYPE_STRING || !AS_STRING(args[0])) {
-            runtimeError(vm, "caller: expected numeric depth");
+    if (has_depth) {
+        const char *text = VALUE_TYPE(args[first]) == TYPE_STRING ? AS_STRING(args[first]) : NULL;
+        if (first == 0 && text && text[0] == '-' && text[1]) {
+            runtimeError(vm, "caller: -%c: invalid option", text[1]);
+            shellCallerUsage();
             shellUpdateStatus(2);
             return makeVoid();
         }
-        char *end = NULL;
-        depth = strtol(AS_STRING(args[0]), &end, 10);
-        if (!end || *end != '\0') {
-            runtimeError(vm, "caller: %s: numeric argument required", AS_STRING(args[0]));
-            shellUpdateStatus(2);
-            return makeVoid();
-        }
-        if (depth < 0) {
-            runtimeError(vm, "caller: negative depth not allowed");
+        if (!text || !shellParseLong(text, &depth)) {
+            runtimeError(vm, "caller: %s: invalid number", text ? text : "");
+            shellCallerUsage();
             shellUpdateStatus(2);
             return makeVoid();
         }
     }
 
-    size_t stack_depth = shellRuntimeCallStackDepth();
-    if (stack_depth == 0 || (size_t)depth >= stack_depth) {
+    const char *function = NULL;
+    const char *source = NULL;
+    int line = 0;
+    if (depth < 0 || !shellCallStackEntry((size_t)depth, &function, &source, &line)) {
         shellUpdateStatus(1);
         return makeVoid();
     }
-
-    const ShellCallFrame *frame = shellRuntimeCallFrameAtDepth((size_t)depth);
-    if (!frame) {
-        shellUpdateStatus(1);
-        return makeVoid();
-    }
-
-    int line = frame->line >= 0 ? frame->line : 0;
-    const char *function = (frame->caller_function && *frame->caller_function)
-                               ? frame->caller_function
-                               : "NULL";
-    const char *source = (frame->source && *frame->source) ? frame->source : NULL;
-
-    if (depth == 0) {
-        if (source) {
-            printf("%d %s\n", line, source);
-        } else {
-            printf("%d %s\n", line, function);
-        }
+    const char *outer_function = NULL;
+    const char *outer_source = NULL;
+    int outer_line = 0;
+    bool outer = shellCallStackEntry((size_t)depth + 1, &outer_function, &outer_source, &outer_line);
+    if (!has_depth) {
+        printf("%d %s\n", line, outer ? outer_source : "NULL");
+    } else if (outer) {
+        printf("%d %s %s\n", line, outer_function, outer_source);
     } else {
-        if (source) {
-            printf("%d %s %s\n", line, function, source);
-        } else {
-            printf("%d %s\n", line, function);
-        }
+        shellUpdateStatus(1);
+        return makeVoid();
     }
 
     shellUpdateStatus(0);
@@ -12160,9 +12435,40 @@ static int shellJobIndexCompareById(const void *left, const void *right) {
 }
 
 Value vmBuiltinShellJobs(VM *vm, int arg_count, Value *args) {
-    (void)vm;
-    (void)arg_count;
-    (void)args;
+    bool pids_only = false;
+    bool with_pid = false;
+    bool running_only = false;
+    bool stopped_only = false;
+    int first = 0;
+    for (; first < arg_count; ++first) {
+        const char *text = VALUE_TYPE(args[first]) == TYPE_STRING ? AS_STRING(args[first]) : NULL;
+        if (!text || text[0] != '-' || !text[1]) {
+            break;
+        }
+        if (strcmp(text, "--") == 0) {
+            first++;
+            break;
+        }
+        for (const char *flag = text + 1; *flag; ++flag) {
+            if (*flag == 'p') {
+                pids_only = true;
+            } else if (*flag == 'l') {
+                with_pid = true;
+            } else if (*flag == 'r') {
+                running_only = true;
+            } else if (*flag == 's') {
+                stopped_only = true;
+            } else {
+                runtimeError(vm, "jobs: -%c: invalid option", *flag);
+                fprintf(stderr, "jobs: usage: jobs [-lprs] [jobspec ...]\n");
+                shellUpdateStatus(2);
+                return makeVoid();
+            }
+        }
+    }
+    arg_count -= first;
+    args += first;
+
     shellCollectJobs();
     shellFinishedJobsReported();
     size_t current_index = SIZE_MAX;
@@ -12180,20 +12486,26 @@ Value vmBuiltinShellJobs(VM *vm, int arg_count, Value *args) {
         }
     }
 
-    size_t visible_count = 0;
-    for (size_t i = 0; i < gShellJobCount; ++i) {
-        if (!gShellJobs[i].disowned) {
-            visible_count++;
+    /* Those named, in the order named, or all of them by number. */
+    bool ok = true;
+    size_t capacity = arg_count > 0 ? (size_t)arg_count : gShellJobCount;
+    size_t *indices = capacity > 0 ? malloc(sizeof(size_t) * capacity) : NULL;
+    if (capacity > 0 && !indices) {
+        runtimeError(vm, "jobs: out of memory");
+        shellUpdateStatus(1);
+        return makeVoid();
+    }
+    size_t idx_count = 0;
+    if (arg_count > 0) {
+        for (int i = 0; i < arg_count; ++i) {
+            size_t index = 0;
+            if (shellParseJobSpecifier(vm, "jobs", args[i], &index)) {
+                indices[idx_count++] = index;
+            } else {
+                ok = false;
+            }
         }
-    }
-    bool show_markers = shellRuntimeIsInteractive();
-
-    size_t *indices = NULL;
-    if (visible_count > 0) {
-        indices = malloc(sizeof(size_t) * visible_count);
-    }
-    if (indices) {
-        size_t idx_count = 0;
+    } else {
         for (size_t i = 0; i < gShellJobCount; ++i) {
             if (!gShellJobs[i].disowned) {
                 indices[idx_count++] = i;
@@ -12202,72 +12514,105 @@ Value vmBuiltinShellJobs(VM *vm, int arg_count, Value *args) {
         if (idx_count > 1) {
             qsort(indices, idx_count, sizeof(size_t), shellJobIndexCompareById);
         }
-        for (size_t i = 0; i < idx_count; ++i) {
-            size_t job_index = indices[i];
-            ShellJob *job = &gShellJobs[job_index];
-            const char *state = job->stopped ? "Stopped" : "Running";
-            const char *command = job->command ? job->command : "";
-            if (show_markers) {
-                char marker = ' ';
-                if (job_index == current_index) {
-                    marker = '+';
-                } else if (job_index == previous_index) {
-                    marker = '-';
-                }
-                shellFdPrintf(STDOUT_FILENO, "[%zu] %c %s %s\n", job->id, marker, state, command);
-            } else {
-                shellFdPrintf(STDOUT_FILENO, "[%zu] %s %s\n", job->id, state, command);
-            }
+    }
+
+    bool show_markers = shellRuntimeIsInteractive();
+    for (size_t i = 0; i < idx_count; ++i) {
+        size_t job_index = indices[i];
+        ShellJob *job = &gShellJobs[job_index];
+        if ((running_only && job->stopped) || (stopped_only && !job->stopped)) {
+            continue;
         }
-        free(indices);
-    } else {
-        for (size_t i = 0; i < gShellJobCount; ++i) {
-            ShellJob *job = &gShellJobs[i];
-            if (job->disowned) {
-                continue;
+        /* The first command's, as $! names the last. */
+        pid_t pid = job->pid_count > 0 && job->pids && job->pids[0] > 0 ? job->pids[0] : job->last_pid;
+        if (pids_only) {
+            shellFdPrintf(STDOUT_FILENO, "%ld\n", (long)pid);
+            continue;
+        }
+        const char *state = job->stopped ? "Stopped" : "Running";
+        const char *command = job->command ? job->command : "";
+        char prefix[32] = "";
+        if (with_pid) {
+            snprintf(prefix, sizeof(prefix), "%ld ", (long)pid);
+        }
+        if (show_markers) {
+            char marker = ' ';
+            if (job_index == current_index) {
+                marker = '+';
+            } else if (job_index == previous_index) {
+                marker = '-';
             }
-            const char *state = job->stopped ? "Stopped" : "Running";
-            const char *command = job->command ? job->command : "";
-            if (show_markers) {
-                char marker = ' ';
-                if (i == current_index) {
-                    marker = '+';
-                } else if (i == previous_index) {
-                    marker = '-';
-                }
-                shellFdPrintf(STDOUT_FILENO, "[%zu] %c %s %s\n", job->id, marker, state, command);
-            } else {
-                shellFdPrintf(STDOUT_FILENO, "[%zu] %s %s\n", job->id, state, command);
-            }
+            shellFdPrintf(STDOUT_FILENO, "[%zu] %c %s%s %s\n", job->id, marker, prefix, state, command);
+        } else {
+            shellFdPrintf(STDOUT_FILENO, "[%zu] %s%s %s\n", job->id, prefix, state, command);
         }
     }
-    shellUpdateStatus(0);
+    free(indices);
+    shellUpdateStatus(ok ? 0 : 1);
     return makeVoid();
 }
 
 Value vmBuiltinShellDisown(VM *vm, int arg_count, Value *args) {
     shellCollectJobs();
+    bool all = false;
+    bool running_only = false;
+    bool keep = false;
+    int first = 0;
+    for (; first < arg_count; ++first) {
+        const char *text = VALUE_TYPE(args[first]) == TYPE_STRING ? AS_STRING(args[first]) : NULL;
+        if (!text || text[0] != '-' || !text[1]) {
+            break;
+        }
+        if (strcmp(text, "--") == 0) {
+            first++;
+            break;
+        }
+        for (const char *flag = text + 1; *flag; ++flag) {
+            if (*flag == 'a') {
+                all = true;
+            } else if (*flag == 'r') {
+                running_only = true;
+            } else if (*flag == 'h') {
+                keep = true;
+            } else {
+                runtimeError(vm, "disown: -%c: invalid option", *flag);
+                fprintf(stderr, "disown: usage: disown [-h] [-ar] [jobspec ... | pid ...]\n");
+                shellUpdateStatus(2);
+                return makeVoid();
+            }
+        }
+    }
+    args += first;
+    arg_count -= first;
+
+    /* -h leaves it in the table, marked to miss the HUP. Nothing here sends one on the way out. */
+    if (arg_count == 0 && (all || running_only)) {
+        for (size_t i = 0; !keep && i < gShellJobCount; ++i) {
+            if (all || !gShellJobs[i].stopped) {
+                gShellJobs[i].disowned = true;
+            }
+        }
+        shellUpdateStatus(0);
+        return makeVoid();
+    }
     if (arg_count == 0) {
         size_t index = 0;
         if (!shellResolveJobIndex(vm, "disown", arg_count, args, &index)) {
             shellUpdateStatus(1);
             return makeVoid();
         }
-        gShellJobs[index].disowned = true;
+        gShellJobs[index].disowned = !keep;
         shellUpdateStatus(0);
         return makeVoid();
     }
 
     bool ok = true;
     size_t resolved_count = 0;
-    size_t *indices = NULL;
-    if (arg_count > 0) {
-        indices = malloc(sizeof(size_t) * (size_t)arg_count);
-        if (!indices) {
-            runtimeError(vm, "disown: out of memory");
-            shellUpdateStatus(1);
-            return makeVoid();
-        }
+    size_t *indices = malloc(sizeof(size_t) * (size_t)arg_count);
+    if (!indices) {
+        runtimeError(vm, "disown: out of memory");
+        shellUpdateStatus(1);
+        return makeVoid();
     }
 
     for (int i = 0; i < arg_count; ++i) {
@@ -12279,7 +12624,7 @@ Value vmBuiltinShellDisown(VM *vm, int arg_count, Value *args) {
         indices[resolved_count++] = index;
     }
 
-    for (size_t i = 0; i < resolved_count; ++i) {
+    for (size_t i = 0; !keep && i < resolved_count; ++i) {
         gShellJobs[indices[i]].disowned = true;
     }
 
@@ -12686,7 +13031,7 @@ Value vmBuiltinShellKill(VM *vm, int arg_count, Value *args) {
                         overall_ok = false;
                     }
                 } else {
-                    fprintf(stderr, "kill: %s: no such job\n", AS_STRING(target));
+                    runtimeError(vm, "kill: %s: no such job", AS_STRING(target));
                     overall_ok = false;
                 }
                 continue;
@@ -13191,7 +13536,7 @@ static int shellWaitForJobAt(size_t index, int *signo_out) {
 }
 
 /* One operand, which may have ended long ago. */
-static int shellWaitForOperand(Value spec, int *signo_out, pid_t *pid_out) {
+static int shellWaitForOperand(VM *vm, Value spec, int *signo_out, pid_t *pid_out) {
     ShellWaitOperand operand;
     bool parsed = shellWaitParseOperand(spec, &operand);
     long target = operand.target;
@@ -13199,10 +13544,10 @@ static int shellWaitForOperand(Value spec, int *signo_out, pid_t *pid_out) {
     const char *text = operand.text;
     if (!parsed) {
         if (by_id) {
-            fprintf(stderr, "wait: %s: no such job\n", text);
+            runtimeError(vm, "wait: %s: no such job", text);
             return 127;
         }
-        fprintf(stderr, "wait: `%s': not a pid or valid job spec\n", text);
+        runtimeError(vm, "wait: `%s': not a pid or valid job spec", text);
         return 1;
     }
 
@@ -13239,9 +13584,9 @@ static int shellWaitForOperand(Value spec, int *signo_out, pid_t *pid_out) {
         return entry->status;
     }
     if (by_id) {
-        fprintf(stderr, "wait: %%%ld: no such job\n", target);
+        runtimeError(vm, "wait: %%%ld: no such job", target);
     } else {
-        fprintf(stderr, "wait: pid %ld is not a child of this shell\n", target);
+        runtimeError(vm, "wait: pid %ld is not a child of this shell", target);
     }
     return 127;
 }
@@ -13266,7 +13611,6 @@ static void shellWaitSetPidVar(const char *name, pid_t pid) {
 }
 
 Value vmBuiltinShellWait(VM *vm, int arg_count, Value *args) {
-    (void)vm;
     shellCollectJobs();
     bool next = false;
     const char *pid_var = NULL;
@@ -13368,7 +13712,7 @@ Value vmBuiltinShellWait(VM *vm, int arg_count, Value *args) {
     for (int i = 0; i < arg_count; ++i) {
         int signo = 0;
         pid = -1;
-        status = shellWaitForOperand(args[i], &signo, &pid);
+        status = shellWaitForOperand(vm, args[i], &signo, &pid);
         if (signo > 0) {
             shellWaitInterrupted(signo);
             shellWaitSetPidVar(pid_var, -1);

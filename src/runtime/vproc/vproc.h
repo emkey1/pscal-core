@@ -1,5 +1,6 @@
 #pragma once
 
+#include <sys/resource.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -300,7 +301,14 @@ char *vprocShellGetcwdShim(char *buffer, size_t size);
 mode_t vprocUmaskShim(mode_t mask);
 mode_t vprocShellUmaskShim(mode_t mask);
 bool vprocFileMaskIsHostMask(void);
+/* A task's resource limits, kept with its file mask and handed to what it starts. Set for the
+ * shell it is running, as a cd reaches it; `restore` is a scope ending, which may raise a hard
+ * limit back. Open files holds the task's descriptors to the limit; the rest are only kept. */
+int vprocGetrlimitShim(int resource, struct rlimit *limit);
+int vprocShellSetrlimitShim(int resource, const struct rlimit *limit, bool restore);
 int vprocHostMkdirMasked(const char *path, mode_t mode);
+int vprocHostMkfifoMasked(const char *path, mode_t mode);
+int vprocHostMknodMasked(const char *path, mode_t mode, dev_t dev);
 int vprocMkfifoShim(const char *path, mode_t mode);
 int vprocMknodShim(const char *path, mode_t mode, dev_t dev);
 /* A subshell's environment and directory. There is no fork here, so a subshell is a
@@ -766,6 +774,11 @@ static inline int vprocShellChdirShim(const char *path) { return chdir(path); }
 static inline char *vprocShellGetcwdShim(char *buffer, size_t size) { return getcwd(buffer, size); }
 static inline mode_t vprocUmaskShim(mode_t mask) { return umask(mask); }
 static inline mode_t vprocShellUmaskShim(mode_t mask) { return umask(mask); }
+static inline int vprocGetrlimitShim(int resource, struct rlimit *limit) { return getrlimit(resource, limit); }
+static inline int vprocShellSetrlimitShim(int resource, const struct rlimit *limit, bool restore) {
+    (void)restore;
+    return setrlimit(resource, limit);
+}
 static inline int vprocAccessShim(const char *path, int mode) { return access(path, mode); }
 static inline int vprocChmodShim(const char *path, mode_t mode) { return chmod(path, mode); }
 static inline int vprocChownShim(const char *path, uid_t uid, gid_t gid) { return chown(path, uid, gid); }

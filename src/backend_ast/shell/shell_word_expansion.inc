@@ -1654,6 +1654,16 @@ bool shellRuntimeHistoryGetEntry(size_t reverse_index, char **out_line) {
     return true;
 }
 
+void shellRuntimeSetScriptName(const char *path) {
+    char *copy = path ? strdup(path) : NULL;
+    free(gShellScriptName);
+    gShellScriptName = copy;
+}
+
+const char *shellRuntimeGetScriptName(void) {
+    return gShellScriptName;
+}
+
 void shellRuntimeSetArg0(const char *name) {
     char *copy = NULL;
     if (name && *name) {
@@ -2202,29 +2212,15 @@ static bool shellInvokeFunction(VM *vm, ShellCommand *cmd) {
     }
     invoke_vm->frontendContext = vm ? vm->frontendContext : NULL;
 
-    if (!shellRuntimePushCallFrame(name, cmd->line, cmd->column)) {
+    char *function_source = shellFunctionSourceCopy(name);
+    bool frame_ok = shellRuntimePushCallFrame(name, function_source, cmd->line, true);
+    free(function_source);
+    if (!frame_ok) {
         runtimeError(vm, "%s: out of memory", name);
         shellUpdateStatus(1);
         goto invoke_cleanup;
     }
     frame_pushed = true;
-
-    /* Innermost first, in the order FUNCNAME shows them. */
-    bool name_pushed = false;
-    if (gShellFunctionNameCount == gShellFunctionNameCapacity) {
-        size_t capacity = gShellFunctionNameCapacity ? gShellFunctionNameCapacity * 2 : 8;
-        char **grown = (char **)realloc(gShellFunctionNames, capacity * sizeof(char *));
-        if (grown) {
-            gShellFunctionNames = grown;
-            gShellFunctionNameCapacity = capacity;
-        }
-    }
-    if (gShellFunctionNameCount < gShellFunctionNameCapacity) {
-        memmove(gShellFunctionNames + 1, gShellFunctionNames, gShellFunctionNameCount * sizeof(char *));
-        gShellFunctionNames[0] = (char *)name;
-        gShellFunctionNameCount++;
-        name_pushed = true;
-    }
 
     gShellReturnScopeDepth++;
     result = interpretBytecode(invoke_vm, &compiled->chunk,
@@ -2248,10 +2244,6 @@ static bool shellInvokeFunction(VM *vm, ShellCommand *cmd) {
     /* The caller's ERR trap and errexit answer to the call. */
     shellUpdateStatus(call_status);
     gShellErrTrapSkipOnce = !err_trap_at_call;
-    if (name_pushed) {
-        gShellFunctionNameCount--;
-        memmove(gShellFunctionNames, gShellFunctionNames + 1, gShellFunctionNameCount * sizeof(char *));
-    }
     if ((gShellExitRequested || gShellDiscardPending) && vm) {
         /* `exit` ended this chunk. It ends the one that called the function too. */
         vm->exit_requested = true;
@@ -2357,86 +2349,72 @@ static void shellSubshellResetState(pid_t dollar_pid) {
 #endif
 }
 
-#if defined(PSCAL_TARGET_IOS)
+/* `jobs | wc -l`: the same, but it still sees the jobs, to list and not to wait for or take. */
+static void shellSubshellResetStateListingJobs(pid_t dollar_pid) {
+    ShellJob *jobs = gShellJobs;
+    size_t job_count = gShellJobCount;
+    gShellJobs = NULL;
+    gShellJobCount = 0;
+    shellSubshellResetState(dollar_pid);
+    gShellJobs = jobs;
+    gShellJobCount = job_count;
+    for (size_t i = 0; i < job_count; ++i) {
+        gShellJobs[i].inherited = true;
+    }
+}
+
 static void shellCallStackFree(ShellCallStack *stack) {
     for (size_t i = 0; i < stack->frame_count; ++i) {
         shellRuntimeFreeCallFrame(&stack->frames[i]);
     }
     free(stack->frames);
-    for (size_t i = 0; i < stack->source_count; ++i) {
-        free(stack->sources[i]);
-    }
-    free(stack->sources);
-    free(stack->function_names);
-    free(stack->source_names);
-    for (size_t i = 0; i < stack->held_count; ++i) {
-        free(stack->held[i]);
-    }
-    free(stack->held);
+    free(stack->script_name);
     memset(stack, 0, sizeof(*stack));
 }
 
-static char *shellCallStackDup(const char *text) {
-    return text ? strdup(text) : NULL;
+/* This thread takes the copy on, and what it had goes in the copy's place. A push grows it
+ * again, so a count will do as a capacity. */
+static void shellCallStackSwap(ShellCallStack *stack) {
+    ShellCallStack had = {gShellCallStack, gShellCallStackCount, gShellScriptName};
+    gShellCallStack = stack->frames;
+    gShellCallStackCount = stack->frame_count;
+    gShellCallStackCapacity = stack->frame_count;
+    gShellScriptName = stack->script_name;
+    *stack = had;
 }
 
-static char **shellCallStackHoldNames(ShellCallStack *stack, char **names, size_t count) {
-    char **copy = count > 0 ? (char **)calloc(count, sizeof(char *)) : NULL;
-    for (size_t i = 0; copy && i < count; ++i) {
-        copy[i] = strdup(names[i] ? names[i] : "");
-        stack->held[stack->held_count++] = copy[i];
+/* A shell started as a command, on this thread: none of its caller's calls are its own. */
+void *shellRuntimeCallStackPutAside(void) {
+    ShellCallStack *aside = (ShellCallStack *)calloc(1, sizeof(ShellCallStack));
+    if (aside) {
+        shellCallStackSwap(aside);
     }
-    return copy;
+    return aside;
 }
 
+void shellRuntimeCallStackBack(void *saved) {
+    ShellCallStack *aside = (ShellCallStack *)saved;
+    if (aside) {
+        shellCallStackSwap(aside);
+        shellCallStackFree(aside);
+        free(aside);
+    }
+}
+
+#if defined(PSCAL_TARGET_IOS)
 static void shellCallStackCapture(ShellCallStack *stack) {
     memset(stack, 0, sizeof(*stack));
     if (gShellCallStackCount > 0) {
         stack->frames = (ShellCallFrame *)calloc(gShellCallStackCount, sizeof(ShellCallFrame));
         for (size_t i = 0; stack->frames && i < gShellCallStackCount; ++i) {
-            stack->frames[i].function = shellCallStackDup(gShellCallStack[i].function);
-            stack->frames[i].caller_function = shellCallStackDup(gShellCallStack[i].caller_function);
-            stack->frames[i].source = shellCallStackDup(gShellCallStack[i].source);
+            stack->frames[i].function = strdup(gShellCallStack[i].function);
+            stack->frames[i].source = strdup(gShellCallStack[i].source);
             stack->frames[i].line = gShellCallStack[i].line;
-            stack->frames[i].column = gShellCallStack[i].column;
+            stack->frames[i].is_function = gShellCallStack[i].is_function;
             stack->frame_count = i + 1;
         }
     }
-    if (gShellSourceDepth > 0) {
-        stack->sources = (char **)calloc(gShellSourceDepth, sizeof(char *));
-        for (size_t i = 0; stack->sources && i < gShellSourceDepth; ++i) {
-            stack->sources[i] = strdup(gShellSourceStack[i] ? gShellSourceStack[i] : "");
-            stack->source_count = i + 1;
-        }
-    }
-    size_t names = gShellFunctionNameCount + gShellSourceNameCount;
-    stack->held = names > 0 ? (char **)calloc(names, sizeof(char *)) : NULL;
-    if (stack->held) {
-        stack->function_names = shellCallStackHoldNames(stack, gShellFunctionNames, gShellFunctionNameCount);
-        stack->function_name_count = stack->function_names ? gShellFunctionNameCount : 0;
-        stack->source_names = shellCallStackHoldNames(stack, gShellSourceNames, gShellSourceNameCount);
-        stack->source_name_count = stack->source_names ? gShellSourceNameCount : 0;
-    }
-}
-
-/* This thread takes the copy on, and what it had goes in the copy's place. A push grows any of
- * them again, so a count will do as a capacity. */
-static void shellCallStackSwap(ShellCallStack *stack) {
-    ShellCallStack had = {gShellCallStack, gShellCallStackCount, gShellSourceStack, gShellSourceDepth,
-                          gShellFunctionNames, gShellFunctionNameCount, gShellSourceNames, gShellSourceNameCount,
-                          stack->held, stack->held_count};
-    gShellCallStack = stack->frames;
-    gShellCallStackCount = stack->frame_count;
-    gShellCallStackCapacity = stack->frame_count;
-    gShellSourceStack = stack->sources;
-    gShellSourceDepth = stack->source_count;
-    gShellSourceCapacity = stack->source_count;
-    gShellFunctionNames = stack->function_names;
-    gShellFunctionNameCount = stack->function_name_count;
-    gShellFunctionNameCapacity = stack->function_name_count;
-    gShellSourceNames = stack->source_names;
-    gShellSourceNameCount = stack->source_name_count;
-    *stack = had;
+    stack->script_name = gShellScriptName ? strdup(gShellScriptName) : NULL;
 }
 
 static void shellVariableAttributesFree(ShellVariableAttribute *attributes, size_t count) {
@@ -2522,7 +2500,7 @@ static ShellBodyState *shellBodyStateCapture(void) {
         state->traps_dormant_return = gShellReturnTrap.dormant;
     }
     shellCallStackCapture(&state->calls);
-    state->in_loop = gShellLoopStackSize > 0;
+    state->in_loop = gShellLoopStackSize > 0 || gShellRuntime.loops_around > 0;
     if (gShellVariableAttributeCount > 0) {
         state->attributes = (ShellVariableAttribute *)calloc(gShellVariableAttributeCount, sizeof(ShellVariableAttribute));
         if (!state->attributes) {
@@ -2586,7 +2564,11 @@ static void shellBodyScopeEnter(ShellBodyState *state, ShellBodyScope *scope) {
         gShellReturnTrap.dormant = state->traps_dormant_return;
         state->return_trap = NULL;
     }
-    shellSubshellResetState(state->dollar_pid);
+    if (state->lists_jobs) {
+        shellSubshellResetStateListingJobs(state->dollar_pid);
+    } else {
+        shellSubshellResetState(state->dollar_pid);
+    }
     scope->previous_env = vprocEnvActivate(state->env);
     VProc *self = vprocCurrent();
     if (self) {
@@ -2737,6 +2719,25 @@ static bool shellStageLeavesJobsToShell(const ShellCommand *cmd) {
 
 static bool shellCommandIsFrontendToolName(const char *name);
 
+#endif
+
+/* `jobs` as a stage's whole command, or under `command`: bash's stage keeps the listing for that,
+ * and nothing else. `builtin jobs`, `eval jobs`, `{ jobs; }` and a function list nothing there. */
+static bool shellCommandIsJobsListing(const ShellCommand *cmd) {
+    if (!cmd || cmd->body || cmd->argc == 0 || !cmd->argv || !cmd->argv[0]) {
+        return false;
+    }
+    size_t word = 0;
+    if (strcmp(cmd->argv[0], "command") == 0) {
+        word = 1;
+        if (word < cmd->argc && strcmp(cmd->argv[word], "--") == 0) {
+            word++;
+        }
+    }
+    return word < cmd->argc && strcmp(cmd->argv[word], "jobs") == 0 && !shellFindCompiledFunction("jobs");
+}
+
+#if defined(PSCAL_TARGET_IOS)
 /* A job runs apart from the shell as a forked child does, so what any builtin in it changes stays
  * there: `cd d &`, `read v <<< x &`, `alias a=b &`. printf (-v), pwd and kill (%n) are applets too,
  * but run as builtins here. What is only a program keeps to what it was handed. */
@@ -2756,10 +2757,17 @@ static bool shellJobNeedsOwnState(const ShellCommand *cmd) {
            strcmp(name, "kill") == 0;
 }
 
-/* So does a stage: `cd d | cat`, `echo x | read v`. Only `jobs | wc -l` lists the shell's, as
- * under bash; a stage's `kill %1` finds no such job there either. */
-static bool shellStageNeedsOwnState(const ShellCommand *cmd) {
-    return shellJobNeedsOwnState(cmd) && (shellStageRunsShellCode(cmd) || strcmp(cmd->argv[0], "jobs") != 0);
+/* So does a stage: `cd d | cat`, `echo x | read v`. Only `jobs | wc -l` can look at the shell's
+ * jobs, as under bash; a stage's `kill %1` finds no such job there either. */
+static ShellBodyState *shellStageStateCapture(const ShellCommand *cmd) {
+    if (!shellJobNeedsOwnState(cmd)) {
+        return NULL;
+    }
+    ShellBodyState *state = shellBodyStateCapture();
+    if (state) {
+        state->lists_jobs = shellCommandIsJobsListing(cmd) && !gShellRuntime.pipeline.async;
+    }
+    return state;
 }
 
 static bool shellRunShellCodeStage(VM *vm, ShellCommand *cmd) {
@@ -3776,7 +3784,7 @@ static bool shellParseJobSpecifier(VM *vm, const char *name, Value spec, size_t 
         char *end = NULL;
         long index = strtol(text, &end, 10);
         if (*end != '\0' || index <= 0) {
-            runtimeError(vm, "%s: invalid job '%s'", name, AS_STRING(spec));
+            runtimeError(vm, "%s: %s: no such job", name, AS_STRING(spec));
             return false;
         }
         size_t pid_index = 0;
@@ -3785,7 +3793,7 @@ static bool shellParseJobSpecifier(VM *vm, const char *name, Value spec, size_t 
             return true;
         }
         if (!shellJobFindVisibleIndex((size_t)index, out_index)) {
-            runtimeError(vm, "%s: invalid job '%s'", name, AS_STRING(spec));
+            runtimeError(vm, "%s: %s: no such job", name, AS_STRING(spec));
             return false;
         }
         return true;
@@ -3824,7 +3832,7 @@ static bool shellResolveJobIndex(VM *vm, const char *name, int arg_count, Value 
 #endif
     if (arg_count == 0) {
         if (visible_count == 0) {
-            runtimeError(vm, "%s: no current job", name);
+            runtimeError(vm, "%s: current: no such job", name);
             return false;
         }
         for (size_t i = gShellJobCount; i > 0; --i) {
@@ -3834,7 +3842,7 @@ static bool shellResolveJobIndex(VM *vm, const char *name, int arg_count, Value 
                 return true;
             }
         }
-        runtimeError(vm, "%s: no current job", name);
+        runtimeError(vm, "%s: current: no such job", name);
         return false;
     }
     if (arg_count > 1) {

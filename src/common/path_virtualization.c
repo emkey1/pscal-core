@@ -377,6 +377,16 @@ int pscalPathVirtualized_mkdir(const char *path, mode_t mode) {
     return vprocHostMkdirMasked(target ? target : path, mode);
 }
 
+int pscalPathVirtualized_mkfifo(const char *path, mode_t mode) {
+    char expanded[PATH_MAX];
+    return vprocHostMkfifoMasked(pscalPathVirtualized_hostPath(path, expanded), mode);
+}
+
+int pscalPathVirtualized_mknod(const char *path, mode_t mode, dev_t dev) {
+    char expanded[PATH_MAX];
+    return vprocHostMknodMasked(pscalPathVirtualized_hostPath(path, expanded), mode, dev);
+}
+
 int pscalPathVirtualized_rmdir(const char *path) {
     if (pathVirtualizedIsVprocDevicePath(path)) {
         return rmdir(path);

@@ -493,6 +493,42 @@ static VProc *shellCreateVProcForStage(int stdin_host,
 }
 #endif
 
+/* A NUL on the first line, as bash looks: a program for some other system, not a script. */
+static bool shellFileLooksBinary(const char *path) {
+    char head[80];
+    int fd = open(path, O_RDONLY);
+    ssize_t length = fd >= 0 ? read(fd, head, sizeof(head)) : -1;
+    if (fd >= 0) {
+        close(fd);
+    }
+    for (ssize_t i = 0; i < length && head[i] != '\n'; ++i) {
+        if (head[i] == '\0') {
+            return true;
+        }
+    }
+    return false;
+}
+
+#if !defined(PSCAL_TARGET_IOS)
+/* execvp hands what the kernel will not run to /bin/sh, which is not this shell and takes a program
+ * for some other system for a script as well. A path goes to the kernel, and ENOEXEC comes back
+ * here: bash reads such a file itself, and so does shellTryRunScriptFallback. A name PATH has no
+ * program for goes to execvp, for what it says about that. On return *found is what was tried. */
+static bool shellLookupForExec(const char *name, char **out_found, bool always_search);
+
+static int shellExecFound(const char *name, char **found, char *const *argv) {
+    if (!*found && !strchr(name, '/')) {
+        (void)shellLookupForExec(name, found, true);
+    }
+    if (*found || strchr(name, '/')) {
+        execv(*found ? *found : name, argv);
+    } else {
+        execvp(name, argv);
+    }
+    return errno;
+}
+#endif
+
 static int shellTryRunScriptFallback(VM *vm, const ShellCommand *cmd) {
     if (!cmd || cmd->argc <= 0 || !cmd->argv || !cmd->argv[0]) {
         return -1;
@@ -547,6 +583,11 @@ static int shellTryRunScriptFallback(VM *vm, const ShellCommand *cmd) {
         return -1;
     }
 
+    if (shellFileLooksBinary(script_path)) {
+        runtimeError(vm, "%s: cannot execute binary file: Exec format error", cmd->argv[0]);
+        return 126;
+    }
+
     char *source = shellLoadFile(script_path);
     if (!source) {
         return -1;
@@ -597,7 +638,10 @@ static int shellTryRunScriptFallback(VM *vm, const ShellCommand *cmd) {
     /* A script run as a command has a directory of its own. */
     ShellCwdScope cwd_scope;
     shellCwdScopeEnter(&cwd_scope);
+    void *caller_calls = shellRuntimeCallStackPutAside();
+    shellRuntimeSetScriptName(cmd->argv[0]);
     int status = shellRunSource(source, cmd->argv[0], &opts, &exit_requested);
+    shellRuntimeCallStackBack(caller_calls);
     shellCwdScopeLeave(&cwd_scope);
     free(source);
     bool had_program_ctx = program_scope.ctx != NULL;
@@ -827,8 +871,8 @@ void shellRuntimeProgramEnvLeave(void *scope) {
 }
 
 static void shellStageCaptureState(ShellCommand *stage, const ShellCommand *cmd, size_t stage_count) {
-    if (stage_count > 1 && shellStageNeedsOwnState(stage)) {
-        stage->body_state = shellBodyStateCapture();
+    if (stage_count > 1 && !stage->body_state) {
+        stage->body_state = shellStageStateCapture(stage);
     }
     if (!stage->body && !stage->body_state) {
         /* exec -c in a substitution has chosen one. */
@@ -1821,7 +1865,12 @@ static int shellSpawnProcess(VM *vm,
              * both streams to out, and under `set -C` the second open failed. */
             shellFreeRedirections((ShellCommand *)cmd);
             /* This child may go on to run shell code: a function or a compound command. */
-            shellSubshellResetState(dollar_pid);
+            if (ctx->active && ctx->stage_count > 1 && !ctx->async && !cmd->background &&
+                shellCommandIsJobsListing(cmd)) {
+                shellSubshellResetStateListingJobs(dollar_pid);
+            } else {
+                shellSubshellResetState(dollar_pid);
+            }
             bool builtin_ran = shellInvokeBuiltin(vm ? vm : gShellCurrentVm, (ShellCommand *)cmd);
             if (builtin_ran) {
                 int status = gShellRuntime.last_status;
@@ -1871,12 +1920,12 @@ static int shellSpawnProcess(VM *vm,
                 cmd->argv[0] = cmd->exec_arg0;
             }
             if (exec_lookup_ok) {
-                execvp(exec_found ? exec_found : exec_program, cmd->argv);
-                err = errno;
+                err = shellExecFound(exec_program, &exec_found, cmd->argv);
             } else {
                 err = ENOENT;
             }
-            cmd->argv[0] = exec_program;
+            /* The name it reads, and its $0: PATH may be what found it. */
+            cmd->argv[0] = (err == ENOEXEC && exec_found) ? exec_found : exec_program;
 #endif
 #if defined(PSCAL_TARGET_IOS)
             int script_status = shellTryRunScriptFallback(vm ? vm : gShellCurrentVm, cmd);
@@ -3094,6 +3143,7 @@ static void shellResetPipeline(void) {
     ctx->stage_count = 0;
     ctx->launched = 0;
     ctx->background = false;
+    ctx->async = false;
     ctx->last_status = 0;
     ctx->pgid = -1;
 }
@@ -5216,8 +5266,8 @@ static int shellPipelineRunStage(VM *vm,
     bool pipeline_in_process = ctx && ctx->in_process;
 #if defined(PSCAL_TARGET_IOS)
     /* The last stage runs right here, on the shell's thread. */
-    if (ctx && ctx->stage_count > 1 && cmd && !cmd->body_state && shellStageNeedsOwnState(cmd)) {
-        cmd->body_state = shellBodyStateCapture();
+    if (ctx && ctx->stage_count > 1 && cmd && !cmd->body_state) {
+        cmd->body_state = shellStageStateCapture(cmd);
     }
 #endif
     if (pipe_dbg) {
@@ -6396,8 +6446,34 @@ static bool shellExecuteExecBuiltin(VM *vm, ShellCommand *cmd) {
     }
     int err = ENOENT;
     if (exec_lookup_ok) {
-        execvp(exec_found ? exec_found : original, argv);
-        err = errno;
+        err = shellExecFound(original, &exec_found, argv);
+    }
+    if (err == ENOEXEC) {
+        /* It reads the file itself, and when that is done so is this shell, as if replaced. */
+        argv[0] = exec_found ? exec_found : original;
+        ShellCommand program;
+        memset(&program, 0, sizeof(program));
+        program.argv = argv;
+        program.argc = cmd->argc - (size_t)(argv - cmd->argv);
+        program.line = cmd->line;
+        program.column = cmd->column;
+        int script_status = shellTryRunScriptFallback(vm, &program);
+        argv[0] = original;
+        free(shown);
+        free(exec_found);
+        if (script_status >= 0) {
+            shellFreeExecRedirBackups(backups, backup_count);
+            shellRuntimeSetExitTrap(SHELL_TRAP_ACTION_DEFAULT, NULL);
+            shellUpdateStatus(script_status);
+            shellRuntimeRequestExit();
+            if (vm) {
+                vm->exit_requested = true;
+                vm->current_builtin_name = "exec";
+            }
+            return true;
+        }
+        shown = NULL;
+        exec_found = NULL;
     }
     argv[0] = original;
     free(shown);

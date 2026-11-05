@@ -44,6 +44,11 @@ extern void pscalRuntimeDebugLog(const char *message);
  * what it runs, and its caller stays where it was. On iOS it shares the process with its
  * caller, so the vproc it runs under owns them while it runs, as a subshell's does, and PWD
  * and OLDPWD go back by hand. */
+/* How many of these this thread is inside, for what `ulimit` has to put back. */
+static PSCAL_THREAD_LOCAL size_t gShellCwdScopeDepth = 0;
+
+static void shellCwdScopeRestoreLimits(size_t depth);
+
 void shellCwdScopeEnter(ShellCwdScope *scope) {
     if (!scope) {
         return;
@@ -67,6 +72,7 @@ void shellCwdScopeEnter(ShellCwdScope *scope) {
     value = getenv("OLDPWD");
     scope->oldpwd = value ? strdup(value) : NULL;
     scope->active = true;
+    scope->depth = ++gShellCwdScopeDepth;
 }
 
 void shellCwdScopeLeave(ShellCwdScope *scope) {
@@ -74,6 +80,8 @@ void shellCwdScopeLeave(ShellCwdScope *scope) {
         return;
     }
     scope->active = false;
+    gShellCwdScopeDepth = scope->depth - 1;
+    shellCwdScopeRestoreLimits(scope->depth);
     if (scope->cwd) {
         (void)SHELL_CHDIR(scope->cwd);
     }
@@ -1067,7 +1075,10 @@ static char *shellRunCommandSubstitution(const char *command) {
         opts.first_line = gShellCurrentCommandLine;
         opts.inherit_locals = true;
         ShellSubstitutionSignals saved_signals = shellSubstitutionSignalsEnter();
+        size_t saved_loops_around = gShellRuntime.loops_around;
+        gShellRuntime.loops_around += gShellLoopStackSize;
         status = shellRunSource(source, "<command-substitution>", &opts, &exit_requested);
+        gShellRuntime.loops_around = saved_loops_around;
         shellSubstitutionSignalsLeave(&saved_signals);
         shellCwdScopeLeave(&cwd_scope);
     }
@@ -1296,6 +1307,18 @@ static bool shellFunctionSetTraced(const char *name, bool traced) {
     return entry != NULL;
 }
 
+/* A copy: the table can change on another thread. */
+static char *shellFunctionSourceCopy(const char *name) {
+    char *source = NULL;
+    pthread_mutex_lock(&gShellFunctionTableMutex);
+    ShellFunctionEntry *entry = shellFindFunctionEntryUnlocked(name);
+    if (entry && entry->source) {
+        source = strdup(entry->source);
+    }
+    pthread_mutex_unlock(&gShellFunctionTableMutex);
+    return source;
+}
+
 static ShellCompiledFunction *shellFindCompiledFunction(const char *name) {
     ShellCompiledFunction *compiled = NULL;
     pthread_mutex_lock(&gShellFunctionTableMutex);
@@ -1314,6 +1337,7 @@ static void shellRemoveFunction(const char *name) {
     if (entry) {
         free(entry->name);
         free(entry->parameter_metadata);
+        free(entry->source);
         size_t index = (size_t)(entry - gShellFunctions);
         memmove(entry, entry + 1, (gShellFunctionCount - index - 1) * sizeof(ShellFunctionEntry));
         gShellFunctionCount--;
@@ -1337,15 +1361,19 @@ static bool shellStoreFunction(const char *name, const char *param_meta, ShellCo
             return false;
         }
     }
+    /* Where the definition ran, not where the name is first called from. */
+    char *source_copy = strdup(shellRuntimeCurrentSourceName());
     pthread_mutex_lock(&gShellFunctionTableMutex);
     ShellFunctionEntry *existing = shellFindFunctionEntryUnlocked(name);
     if (existing) {
         /* Another shell session may still be executing the old body. */
         free(existing->name);
         free(existing->parameter_metadata);
+        free(existing->source);
         existing->name = name_copy;
         existing->parameter_metadata = meta_copy;
         existing->compiled = compiled;
+        existing->source = source_copy;
         pthread_mutex_unlock(&gShellFunctionTableMutex);
         return true;
     }
@@ -1354,6 +1382,7 @@ static bool shellStoreFunction(const char *name, const char *param_meta, ShellCo
         pthread_mutex_unlock(&gShellFunctionTableMutex);
         free(name_copy);
         free(meta_copy);
+        free(source_copy);
         return false;
     }
     gShellFunctions = entries;
@@ -1362,6 +1391,7 @@ static bool shellStoreFunction(const char *name, const char *param_meta, ShellCo
     entry->parameter_metadata = meta_copy;
     entry->compiled = compiled;
     entry->traced = false;
+    entry->source = source_copy;
     pthread_mutex_unlock(&gShellFunctionTableMutex);
     return true;
 }

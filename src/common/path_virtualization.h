@@ -28,6 +28,8 @@ int pscalPathVirtualized_stat(const char *path, struct stat *buf);
 int pscalPathVirtualized_lstat(const char *path, struct stat *buf);
 int pscalPathVirtualized_access(const char *path, int mode);
 int pscalPathVirtualized_mkdir(const char *path, mode_t mode);
+int pscalPathVirtualized_mkfifo(const char *path, mode_t mode);
+int pscalPathVirtualized_mknod(const char *path, mode_t mode, dev_t dev);
 int pscalPathVirtualized_rmdir(const char *path);
 int pscalPathVirtualized_unlink(const char *path);
 int pscalPathVirtualized_remove(const char *path);
@@ -63,6 +65,12 @@ int pscalPathVirtualized_streamSlot(FILE *stream);
 #endif
 #define access(path, mode) pscalPathVirtualized_access(path, mode)
 #define mkdir(path, mode) pscalPathVirtualized_mkdir(path, mode)
+#ifndef mkfifo
+#define mkfifo(path, mode) pscalPathVirtualized_mkfifo(path, mode)
+#endif
+#ifndef mknod
+#define mknod(path, mode, dev) pscalPathVirtualized_mknod(path, mode, dev)
+#endif
 #define rmdir(path) pscalPathVirtualized_rmdir(path)
 #define unlink(path) pscalPathVirtualized_unlink(path)
 #define remove(path) pscalPathVirtualized_remove(path)

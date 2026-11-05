@@ -75,6 +75,36 @@ static char *shellJoinWithIfs(char **items, size_t count) {
     return out;
 }
 
+typedef enum { SHELL_CALL_ARRAY_FUNCTION, SHELL_CALL_ARRAY_SOURCE, SHELL_CALL_ARRAY_LINE } ShellCallArray;
+
+/* Innermost first, and the script itself last. */
+static void shellRefreshCallArray(const char *name, ShellCallArray which) {
+    size_t frames = gShellCallStackCount;
+    size_t count = frames + (gShellScriptName ? 1 : 0);
+    if (count == 0) {
+        shellArrayRegistryRemove(name);
+        return;
+    }
+    char **items = (char **)calloc(count, sizeof(char *));
+    if (!items) {
+        return;
+    }
+    for (size_t i = 0; i < count; ++i) {
+        const ShellCallFrame *frame = i < frames ? &gShellCallStack[frames - 1 - i] : NULL;
+        if (which == SHELL_CALL_ARRAY_FUNCTION) {
+            items[i] = strdup(frame ? frame->function : "main");
+        } else if (which == SHELL_CALL_ARRAY_SOURCE) {
+            items[i] = strdup(frame ? frame->source : gShellScriptName);
+        } else {
+            char line[16];
+            snprintf(line, sizeof(line), "%d", frame ? frame->line : 0);
+            items[i] = strdup(line);
+        }
+    }
+    shellArrayRegistryStore(name, items, NULL, count, SHELL_ARRAY_KIND_INDEXED);
+    shellFreeArrayValues(items, count);
+}
+
 /* Bash's arrays that the runtime keeps elsewhere: copy them in when they are read. */
 static void shellRefreshSpecialArray(const char *name, size_t len) {
     if (len == 13 && strncmp(name, "BASH_VERSINFO", 13) == 0) {
@@ -85,16 +115,9 @@ static void shellRefreshSpecialArray(const char *name, size_t len) {
         }
         shellArrayRegistryStore("BASH_VERSINFO", items, NULL, 6, SHELL_ARRAY_KIND_INDEXED);
     } else if (len == 11 && strncmp(name, "BASH_SOURCE", 11) == 0) {
-        size_t count = gShellSourceNameCount + 1;
-        char **items = (char **)calloc(count, sizeof(char *));
-        if (items) {
-            for (size_t i = 0; i < gShellSourceNameCount; ++i) {
-                items[i] = strdup(gShellSourceNames[i]);
-            }
-            items[count - 1] = strdup(gShellArg0 ? gShellArg0 : "exsh");
-            shellArrayRegistryStore("BASH_SOURCE", items, NULL, count, SHELL_ARRAY_KIND_INDEXED);
-            shellFreeArrayValues(items, count);
-        }
+        shellRefreshCallArray("BASH_SOURCE", SHELL_CALL_ARRAY_SOURCE);
+    } else if (len == 11 && strncmp(name, "BASH_LINENO", 11) == 0) {
+        shellRefreshCallArray("BASH_LINENO", SHELL_CALL_ARRAY_LINE);
     } else if (len == 10 && strncmp(name, "PIPESTATUS", 10) == 0) {
         char **items = (char **)calloc(gShellPipeStatusCount ? gShellPipeStatusCount : 1, sizeof(char *));
         if (!items) {
@@ -108,21 +131,16 @@ static void shellRefreshSpecialArray(const char *name, size_t len) {
         shellArrayRegistryStore("PIPESTATUS", items, NULL, gShellPipeStatusCount, SHELL_ARRAY_KIND_INDEXED);
         shellFreeArrayValues(items, gShellPipeStatusCount);
     } else if (len == 8 && strncmp(name, "FUNCNAME", 8) == 0) {
-        if (gShellFunctionNameCount == 0) {
+        /* A sourced file is listed here, but alone it does not make the list appear. */
+        bool in_function = false;
+        for (size_t i = 0; i < gShellCallStackCount; ++i) {
+            in_function = in_function || gShellCallStack[i].is_function;
+        }
+        if (!in_function) {
             shellArrayRegistryRemove("FUNCNAME");
             return;
         }
-        /* Bash ends the list with the script itself. */
-        size_t count = gShellFunctionNameCount + 1;
-        char **items = (char **)calloc(count, sizeof(char *));
-        if (items) {
-            for (size_t i = 0; i < gShellFunctionNameCount; ++i) {
-                items[i] = strdup(gShellFunctionNames[i]);
-            }
-            items[count - 1] = strdup("main");
-            shellArrayRegistryStore("FUNCNAME", items, NULL, count, SHELL_ARRAY_KIND_INDEXED);
-            shellFreeArrayValues(items, count);
-        }
+        shellRefreshCallArray("FUNCNAME", SHELL_CALL_ARRAY_FUNCTION);
     }
 }
 

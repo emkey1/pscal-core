@@ -601,6 +601,8 @@ typedef struct {
     int (*pipes)[2];
     size_t launched;
     bool background;
+    /* `a | b &`, known from its start. background comes only with the last stage. */
+    bool async;
     int last_status;
     pid_t pgid;
 #if defined(PSCAL_TARGET_IOS)
@@ -719,6 +721,8 @@ typedef struct ShellRuntimeState {
     ShellLoopFrame *loop_stack;
     size_t loop_stack_size;
     size_t loop_stack_capacity;
+    /* The loops around a command substitution. They are the shell's, and it cannot leave them. */
+    size_t loops_around;
     /* A subshell's own definitions: on iOS no fork gives it a copy of these. */
     bool has_private_tables;
     struct ShellFunctionEntry *private_functions;
@@ -775,28 +779,28 @@ typedef struct {
     char *detail;
 } ShellCommandResult;
 
+/* A function being called or a file being sourced, the way bash lists them. Together they make
+ * FUNCNAME, BASH_SOURCE and BASH_LINENO, and what caller reads. */
 typedef struct {
-    char *function;
-    char *caller_function;
-    char *source;
-    int line;
-    int column;
+    char *function; /* "source" for a sourced file */
+    char *source;   /* the file its text came from */
+    int line;       /* where in its caller's text it was called */
+    bool is_function;
 } ShellCallFrame;
 
 /* On iOS a subshell or pipeline stage runs its own interpreter on a thread. */
 static PSCAL_THREAD_LOCAL ShellCallFrame *gShellCallStack = NULL;
 static PSCAL_THREAD_LOCAL size_t gShellCallStackCount = 0;
 static PSCAL_THREAD_LOCAL size_t gShellCallStackCapacity = 0;
-
-static PSCAL_THREAD_LOCAL char **gShellSourceStack = NULL;
-static PSCAL_THREAD_LOCAL size_t gShellSourceDepth = 0;
-static PSCAL_THREAD_LOCAL size_t gShellSourceCapacity = 0;
+/* The script this shell runs: under every frame, as "main". A -c string or a prompt has none. */
+static PSCAL_THREAD_LOCAL char *gShellScriptName = NULL;
 
 typedef struct ShellFunctionEntry {
     char *name;
     char *parameter_metadata;
     ShellCompiledFunction *compiled;
     bool traced; /* declare -ft: it sees the caller's RETURN trap */
+    char *source; /* the file it was defined in: its entry in BASH_SOURCE */
 } ShellFunctionEntry;
 
 static ShellFunctionEntry *gShellFunctionTable = NULL;
@@ -837,13 +841,8 @@ static void shellRuntimeFreeCallFrame(ShellCallFrame *frame) {
         return;
     }
     free(frame->function);
-    free(frame->caller_function);
     free(frame->source);
-    frame->function = NULL;
-    frame->caller_function = NULL;
-    frame->source = NULL;
-    frame->line = 0;
-    frame->column = 0;
+    memset(frame, 0, sizeof(*frame));
 }
 
 static bool shellRuntimeEnsureCallStackCapacity(size_t needed) {
@@ -859,132 +858,43 @@ static bool shellRuntimeEnsureCallStackCapacity(size_t needed) {
     if (!resized) {
         return false;
     }
-    for (size_t i = gShellCallStackCapacity; i < new_capacity; ++i) {
-        resized[i].function = NULL;
-        resized[i].caller_function = NULL;
-        resized[i].source = NULL;
-        resized[i].line = 0;
-        resized[i].column = 0;
-    }
+    memset(resized + gShellCallStackCapacity, 0, (new_capacity - gShellCallStackCapacity) * sizeof(ShellCallFrame));
     gShellCallStack = resized;
     gShellCallStackCapacity = new_capacity;
     return true;
 }
 
-static bool shellRuntimeEnsureSourceCapacity(size_t needed) {
-    if (gShellSourceCapacity >= needed) {
-        return true;
-    }
-    size_t new_capacity = gShellSourceCapacity ? (gShellSourceCapacity * 2) : 4;
-    while (new_capacity < needed) {
-        new_capacity *= 2;
-    }
-    char **resized = (char **)realloc(gShellSourceStack, new_capacity * sizeof(char *));
-    if (!resized) {
-        return false;
-    }
-    for (size_t i = gShellSourceCapacity; i < new_capacity; ++i) {
-        resized[i] = NULL;
-    }
-    gShellSourceStack = resized;
-    gShellSourceCapacity = new_capacity;
-    return true;
-}
-
-static bool shellRuntimePushSourcePath(const char *path) {
-    const char *label = (path && *path) ? path : "";
-    if (!shellRuntimeEnsureSourceCapacity(gShellSourceDepth + 1)) {
-        return false;
-    }
-    char *copy = strdup(label);
-    if (!copy) {
-        return false;
-    }
-    gShellSourceStack[gShellSourceDepth++] = copy;
-    return true;
-}
-
-static void shellRuntimePopSourcePath(void) {
-    if (gShellSourceDepth == 0) {
-        return;
-    }
-    size_t index = gShellSourceDepth - 1;
-    free(gShellSourceStack[index]);
-    gShellSourceStack[index] = NULL;
-    gShellSourceDepth--;
-    if (gShellSourceDepth == 0 && gShellSourceStack) {
-        free(gShellSourceStack);
-        gShellSourceStack = NULL;
-        gShellSourceCapacity = 0;
-    }
-}
-
-static const char *shellRuntimeCurrentSourcePath(void) {
-    if (gShellSourceDepth == 0) {
-        return NULL;
-    }
-    return gShellSourceStack[gShellSourceDepth - 1];
-}
-
-bool shellRuntimeTrackSourcePush(const char *path) {
-    return shellRuntimePushSourcePath(path);
-}
-
-void shellRuntimeTrackSourcePop(void) {
-    shellRuntimePopSourcePath();
-}
-
-static bool shellRuntimePushCallFrame(const char *function_name,
-                                      int call_line,
-                                      int call_column) {
+static bool shellRuntimePushCallFrame(const char *function_name, const char *source, int call_line, bool is_function) {
     if (!shellRuntimeEnsureCallStackCapacity(gShellCallStackCount + 1)) {
         return false;
     }
-    ShellCallFrame *frame = &gShellCallStack[gShellCallStackCount];
-    frame->function = NULL;
-    frame->caller_function = NULL;
-    frame->source = NULL;
+    char *function_copy = strdup(function_name ? function_name : "");
+    char *source_copy = strdup(source ? source : "");
+    if (!function_copy || !source_copy) {
+        free(function_copy);
+        free(source_copy);
+        return false;
+    }
+    ShellCallFrame *frame = &gShellCallStack[gShellCallStackCount++];
+    frame->function = function_copy;
+    frame->source = source_copy;
     frame->line = (call_line >= 0) ? call_line : 0;
-    frame->column = (call_column >= 0) ? call_column : 0;
-
-    if (function_name && *function_name) {
-        frame->function = strdup(function_name);
-        if (!frame->function) {
-            return false;
-        }
-    }
-
-    const ShellCallFrame *previous =
-        (gShellCallStackCount > 0) ? &gShellCallStack[gShellCallStackCount - 1] : NULL;
-    const char *caller_name = NULL;
-    if (previous && previous->function && *previous->function) {
-        caller_name = previous->function;
-    } else if (!previous) {
-        caller_name = "main";
-    }
-    if (caller_name) {
-        frame->caller_function = strdup(caller_name);
-        if (!frame->caller_function) {
-            free(frame->function);
-            frame->function = NULL;
-            return false;
-        }
-    }
-
-    const char *source = shellRuntimeCurrentSourcePath();
-    if (source && *source) {
-        frame->source = strdup(source);
-        if (!frame->source) {
-            free(frame->function);
-            free(frame->caller_function);
-            frame->function = NULL;
-            frame->caller_function = NULL;
-            return false;
-        }
-    }
-
-    gShellCallStackCount++;
+    frame->is_function = is_function;
     return true;
+}
+
+/* ${BASH_SOURCE[0]}, or what a function defined here keeps: a -c string has $0, a prompt "main". */
+static const char *shellRuntimeCurrentSourceName(void) {
+    if (gShellCallStackCount > 0) {
+        return gShellCallStack[gShellCallStackCount - 1].source;
+    }
+    if (gShellScriptName) {
+        return gShellScriptName;
+    }
+    if (shellRuntimeIsInteractive()) {
+        return "main";
+    }
+    return gShellArg0 ? gShellArg0 : "exsh";
 }
 
 static void shellRuntimePopCallFrame(void) {
@@ -1012,23 +922,14 @@ static const ShellCallFrame *shellRuntimeCallFrameAtDepth(size_t depth) {
     return &gShellCallStack[gShellCallStackCount - 1 - depth];
 }
 
-#if defined(PSCAL_TARGET_IOS)
-/* Where a job or a stage was started from. It runs on a thread of its own, and caller, FUNCNAME
- * and BASH_SOURCE show what a forked child would have. */
+/* Where a job or a stage was started from, or what a shell started as a command puts aside. On iOS
+ * a job runs on a thread of its own, and caller, FUNCNAME and BASH_SOURCE show what a forked child
+ * would have. */
 typedef struct {
     ShellCallFrame *frames;
     size_t frame_count;
-    char **sources;
-    size_t source_count;
-    /* The two name stacks point at strings someone else owns, and here that is `held`. */
-    char **function_names;
-    size_t function_name_count;
-    char **source_names;
-    size_t source_name_count;
-    char **held;
-    size_t held_count;
+    char *script_name;
 } ShellCallStack;
-#endif
 
 static const char *shellResolveBashPath(void) {
     static char resolved[PATH_MAX];
@@ -2480,6 +2381,7 @@ typedef struct {
     bool traps_dormant_return;
     ShellCallStack calls;
     bool in_loop;
+    bool lists_jobs;
 } ShellBodyState;
 
 /* What a thread started by a shell takes from it, beyond the vproc every new thread starts
@@ -5203,6 +5105,7 @@ static void shellCopyDefinitionTables(ShellRuntimeState *ctx,
         for (size_t i = 0; ctx->private_functions && i < function_count; ++i) {
             ShellFunctionEntry *dst = &ctx->private_functions[ctx->private_function_count];
             dst->name = strdup(functions[i].name);
+            dst->source = functions[i].source ? strdup(functions[i].source) : NULL;
             dst->parameter_metadata = functions[i].parameter_metadata
                                           ? strdup(functions[i].parameter_metadata)
                                           : NULL;
@@ -5447,6 +5350,7 @@ ShellRuntimeState *shellRuntimeCreateContext(void) {
     ctx->loop_stack = NULL;
     ctx->loop_stack_size = 0;
     ctx->loop_stack_capacity = 0;
+    ctx->loops_around = template_ctx->loops_around;
 
     ctx->has_private_tables = false;
     ctx->private_functions = NULL;
@@ -5527,6 +5431,7 @@ static ShellRuntimeState *shellRuntimeCreateProgramContext(void) {
     ctx->job_count = 0;
     ctx->finished_job_count = 0;
     ctx->last_bg_pid = 0;
+    ctx->loops_around = 0;
     ctx->started_as_command = true;
     for (size_t i = 0; i < ctx->dir_stack_count; ++i) {
         free(ctx->dir_stack[i]);
@@ -5539,6 +5444,7 @@ static ShellRuntimeState *shellRuntimeCreateProgramContext(void) {
     for (size_t i = 0; i < ctx->private_function_count; ++i) {
         free(ctx->private_functions[i].name);
         free(ctx->private_functions[i].parameter_metadata);
+        free(ctx->private_functions[i].source);
     }
     free(ctx->private_functions);
     ctx->private_functions = NULL;
@@ -5650,6 +5556,7 @@ void shellRuntimeDestroyContext(ShellRuntimeState *ctx) {
     for (size_t i = 0; i < ctx->private_function_count; ++i) {
         free(ctx->private_functions[i].name);
         free(ctx->private_functions[i].parameter_metadata);
+        free(ctx->private_functions[i].source);
     }
     free(ctx->private_functions);
     ctx->private_functions = NULL;

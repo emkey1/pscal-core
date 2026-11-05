@@ -2084,6 +2084,7 @@ struct VProc {
     int pid;
     char cwd[PATH_MAX];
     mode_t file_mask;
+    struct rlimit limits[RLIM_NLIMITS];
     VProcResourceEntry *resources;
     size_t resource_count;
     size_t resource_capacity;
@@ -7020,6 +7021,16 @@ static int vprocAllocSlot(VProc *vp) {
     if (capacity <= 0) {
         return -1;
     }
+    /* ulimit -n: only slots under the limit can be handed out. */
+    int all_slots = capacity;
+    rlim_t open_files = vp->limits[RLIMIT_NOFILE].rlim_cur;
+    if (open_files != RLIM_INFINITY && open_files < (rlim_t)capacity) {
+        capacity = (int)open_files;
+        if (capacity <= 0) {
+            errno = EMFILE;
+            return -1;
+        }
+    }
     int start = vp->next_fd;
     if (start < 0 || start >= capacity) {
         start %= capacity;
@@ -7040,6 +7051,10 @@ static int vprocAllocSlot(VProc *vp) {
         }
     }
     size_t old_cap = vp->capacity;
+    if (capacity < all_slots || (open_files != RLIM_INFINITY && old_cap >= open_files)) {
+        errno = EMFILE;
+        return -1;
+    }
     if (!vprocEnsureFdCapacityLocked(vp, old_cap + 1)) {
         return -1;
     }
@@ -8370,6 +8385,19 @@ static VProc *vprocCreateFrom(const VProcOptions *opts, VProc *active) {
     }
     vprocInitializeVirtualCwd(vp, active);
     vp->file_mask = active ? active->file_mask : vprocHostMaskGet();
+    for (int resource = 0; resource < RLIM_NLIMITS; ++resource) {
+        if (active) {
+            vp->limits[resource] = active->limits[resource];
+        } else if (getrlimit(resource, &vp->limits[resource]) != 0) {
+            vp->limits[resource].rlim_cur = RLIM_INFINITY;
+            vp->limits[resource].rlim_max = RLIM_INFINITY;
+        }
+    }
+    /* A task's descriptors are slots, and an in-process pipe uses no host descriptor: the host's
+     * few hundred would be too few. Linux starts a process at this. */
+    if (!active && vp->limits[RLIMIT_NOFILE].rlim_cur < 1024 && vp->limits[RLIMIT_NOFILE].rlim_max >= 1024) {
+        vp->limits[RLIMIT_NOFILE].rlim_cur = 1024;
+    }
     vp->next_fd = 3;
     vp->winsize.cols = (local.winsize_cols > 0) ? local.winsize_cols : 80;
     vp->winsize.rows = (local.winsize_rows > 0) ? local.winsize_rows : 24;
@@ -9542,7 +9570,7 @@ static void vprocMoveSavedStdinLocked(VProc *vp, int cloned) {
 #endif
 
 int vprocDup2(VProc *vp, int fd, int target) {
-    if (!vp || target < 0) {
+    if (!vp || target < 0 || (rlim_t)target >= vp->limits[RLIMIT_NOFILE].rlim_cur) {
         errno = EBADF;
         return -1;
     }
@@ -15505,6 +15533,10 @@ int vprocDup2Shim(int fd, int target) {
     if (!vp) {
         return vprocHostDup2(fd, target);
     }
+    if (target >= 0 && (rlim_t)target >= vp->limits[RLIMIT_NOFILE].rlim_cur) {
+        errno = EBADF;
+        return -1;
+    }
     int rc = vprocDup2(vp, fd, target);
     if (rc >= 0) {
         return rc;
@@ -16452,6 +16484,63 @@ mode_t vprocShellUmaskShim(mode_t mask) {
     return previous;
 }
 
+int vprocGetrlimitShim(int resource, struct rlimit *limit) {
+    if (resource < 0 || resource >= RLIM_NLIMITS || !limit) {
+        errno = EINVAL;
+        return -1;
+    }
+    VProc *vp = vprocForThread();
+    if (!vp) {
+        return getrlimit(resource, limit);
+    }
+    pthread_mutex_lock(&vp->mu);
+    *limit = vp->limits[resource];
+    pthread_mutex_unlock(&vp->mu);
+    return 0;
+}
+
+static void vprocLimitStore(VProc *vp, int resource, const struct rlimit *limit) {
+    pthread_mutex_lock(&vp->mu);
+    vp->limits[resource] = *limit;
+    pthread_mutex_unlock(&vp->mu);
+}
+
+/* A hard limit only comes down: nothing in the app runs as root. */
+int vprocShellSetrlimitShim(int resource, const struct rlimit *limit, bool restore) {
+    if (resource < 0 || resource >= RLIM_NLIMITS || !limit) {
+        errno = EINVAL;
+        return -1;
+    }
+    VProc *owner = vprocResolvePathOpsVproc(true);
+    if (!owner) {
+        return setrlimit(resource, limit);
+    }
+    if (!restore) {
+        if (limit->rlim_cur > limit->rlim_max) {
+            errno = EINVAL;
+            return -1;
+        }
+        struct rlimit current;
+        pthread_mutex_lock(&owner->mu);
+        current = owner->limits[resource];
+        pthread_mutex_unlock(&owner->mu);
+        if (limit->rlim_max > current.rlim_max) {
+            errno = EPERM;
+            return -1;
+        }
+    }
+    vprocLimitStore(owner, resource, limit);
+    VProc *vp = gVProcCurrent;
+    size_t depth = gVProcStackDepth;
+    while (vp && vp != owner) {
+        if (vprocRegistryContains(vp)) {
+            vprocLimitStore(vp, resource, limit);
+        }
+        vp = (depth > 0) ? *vprocStackSlot(--depth) : NULL;
+    }
+    return 0;
+}
+
 bool vprocFileMaskIsHostMask(void) {
     VProc *vp = vprocForThread();
     return !vp || vp->file_mask == vprocHostMaskGet();
@@ -16468,24 +16557,33 @@ int vprocHostMkdirMasked(const char *path, mode_t mode) {
     return rc;
 }
 
-int vprocMkfifoShim(const char *path, mode_t mode) {
+int vprocHostMkfifoMasked(const char *path, mode_t mode) {
     bool restore = vprocCreateModeApply(&mode);
-    int rc = mkfifo(path, mode);
+    int rc = (mkfifo)(path, mode);
     if (rc == 0 && restore) {
         (void)vprocHostChmodRaw(path, mode);
     }
     return rc;
 }
 
-int vprocMknodShim(const char *path, mode_t mode, dev_t dev) {
+int vprocHostMknodMasked(const char *path, mode_t mode, dev_t dev) {
     mode_t type = mode & S_IFMT;
     mode_t perms = mode & ~(mode_t)S_IFMT;
     bool restore = vprocCreateModeApply(&perms);
-    int rc = mknod(path, type | perms, dev);
+    int rc = (mknod)(path, type | perms, dev);
     if (rc == 0 && restore) {
         (void)vprocHostChmodRaw(path, perms);
     }
     return rc;
+}
+
+/* The app's names: relative to the task's directory, and absolute ones under its root. */
+int vprocMkfifoShim(const char *path, mode_t mode) {
+    return pscalPathVirtualized_mkfifo(path, mode);
+}
+
+int vprocMknodShim(const char *path, mode_t mode, dev_t dev) {
+    return pscalPathVirtualized_mknod(path, mode, dev);
 }
 
 char *vprocShellGetcwdShim(char *buffer, size_t size) {
