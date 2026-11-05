@@ -73,6 +73,7 @@ typedef struct {
     bool can_read;
     bool can_write;
     bool redirected_stdin;
+    bool terminal_stdin;
 } VmVprocShimCookie;
 
 typedef struct VmShimCookieNode {
@@ -213,12 +214,24 @@ static int vmVprocShimRead(void *cookie, char *buf, int len) {
         return -1;
     }
     ssize_t res;
-    if (ctx->redirected_stdin) {
+    VProcSessionStdio *session = ctx->terminal_stdin ? vprocSessionStdioCurrent() : NULL;
+    if (session && vprocSessionStdioIsDefault(session) && PSCALRuntimeGetCurrentRuntimeStdio) {
+        /* As readln: a VM thread can start on the default session, and the keys are the
+         * runtime's. Reading the default one raced the session's reader for each key. */
+        VProcSessionStdio *runtime_stdio = PSCALRuntimeGetCurrentRuntimeStdio();
+        if (runtime_stdio && !vprocSessionStdioIsDefault(runtime_stdio)) {
+            session = runtime_stdio;
+            vprocSessionStdioActivate(session);
+        }
+    }
+    bool terminal = session && (session->input || session->stdin_pscal_fd);
+    if (ctx->redirected_stdin || terminal) {
         /* Without waiting: see vmInputGetc. Not cancellable either, because Ctrl-C can
          * cancel this thread, and the FILE's lock would then stay held for good. */
         int cancel_state;
         pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
-        res = vprocReadRedirectedStdin(buf, (size_t)len);
+        res = terminal ? vprocSessionReadInputShimMode(buf, (size_t)len, true)
+                       : vprocReadRedirectedStdin(buf, (size_t)len);
         int read_errno = errno;
         pthread_setcancelstate(cancel_state, NULL);
         errno = read_errno;
@@ -287,6 +300,7 @@ static FILE *vmVprocStreamOpenShim(int std_fd,
     cookie->can_read = strchr(mode, 'r') != NULL;
     cookie->can_write = (strchr(mode, 'w') != NULL) || (strchr(mode, 'a') != NULL);
     cookie->redirected_stdin = (cache == &gVmVprocRedirectedStdin);
+    cookie->terminal_stdin = (cache == &gVmVprocStdin);
     vmShimCookieTrackAdd(cookie);
 
     FILE *fp = funopen(cookie,
@@ -476,15 +490,27 @@ void pscalRuntimeVmFlushOutput(void) {
     }
 }
 
-/* The FILE to read for `stream`. On a redirected stdin Read, Readln and Eof must all
- * use one: the stdin that CLike names is a FILE of its own over the same fd 0, and what
- * it buffers the others never see, so a loop of eof(stdin) and scanf lost lines. */
+/* The FILE to read for `stream`. On fd 0 Read, Readln and Eof must all use one: the stdin
+ * that CLike names is a FILE of its own over the same fd 0, shared by every program in the
+ * app, and what it buffers the others never see, so a loop of eof(stdin) and scanf lost
+ * lines. */
 static FILE *vmInputStream(FILE *stream) {
-    if (stream && (stream == gVmStdinSharedShim.fp || stream == gVmVprocStdin.fp) &&
-        vprocStdinIsRedirected()) {
+    if (stream && (stream == gVmStdinSharedShim.fp || stream == gVmVprocStdin.fp ||
+                   stream == gVmVprocRedirectedStdin.fp)) {
         return vmVprocStdin();
     }
     return stream;
+}
+
+/* Has this FILE read ahead? At the terminal Read and Eof go through a FILE and Readln
+ * takes the session's input directly, so Readln has to empty the FILE first. */
+static bool vmInputHasBuffered(FILE *stream) {
+#if defined(__APPLE__)
+    return stream && (stream->_r > 0 || stream->_ur > 0);
+#else
+    (void)stream;
+    return false;
+#endif
 }
 
 static bool vmFdMatchesFileIdentity(int fd, int other_fd) {
@@ -6406,6 +6432,9 @@ static VmReadSignal vmTakeReadSignal(VM *vm) {
  * done here: stdio holds the FILE's lock during a read, and only out here can Ctrl-C and
  * Ctrl-Z unwind the program. Returns EOF with the VM's flags set if the program is to end. */
 static int vmInputGetc(VM *vm, FILE *stream) {
+    if (stream == gVmVprocStdin.fp && feof(stream)) {
+        clearerr(stream);   // The end-of-file key ends one read, not the terminal.
+    }
     for (;;) {
         errno = 0;
         int ch = fgetc(stream);
@@ -6624,7 +6653,13 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, VmLineBuf *line) {
                  * the keyboard bar is a signal alone: nothing wakes that wait, and it can
                  * cancel this thread there, leaving the input's mutex held, so the next
                  * key was lost. After Ctrl-Z the stopped program took that key itself. */
-                ssize_t n = vprocSessionReadInputShimMode(&ch, 1, true);
+                FILE *read_ahead = vmInputStream(stream);
+                ssize_t n = 1;
+                if (vmInputHasBuffered(read_ahead)) {
+                    ch = (char)fgetc(read_ahead);
+                } else {
+                    n = vprocSessionReadInputShimMode(&ch, 1, true);
+                }
                 if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
                     usleep(50 * 1000);
                     continue;
@@ -9098,6 +9133,11 @@ Value vmBuiltinEof(VM* vm, int arg_count, Value* args) {
 
     stream = vmInputStream(stream);
 #if defined(PSCAL_TARGET_IOS)
+    if (stream == gVmVprocStdin.fp) {
+        /* As Read and Readln: the end-of-file key is a key only in line mode, and the
+         * terminal can be out of it, after a Readln among others. */
+        vmPrepareCanonicalInput();
+    }
     /* Eof runs under globals_mutex, which every VM in the app takes to start, and this
      * read can wait as long as its input likes. */
     int released_globals_locks = vmSuspendReleaseGlobalsMutex();
