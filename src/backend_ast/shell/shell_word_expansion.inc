@@ -282,7 +282,20 @@ static char *shellProcessSubstitution(char direction, const char *command) {
         dup2(direction == '<' ? fds[1] : fds[0], direction == '<' ? STDOUT_FILENO : STDIN_FILENO);
         close(fds[0]);
         close(fds[1]);
+        /* Copies of the shell's jobs, as in a command substitution: bash's child sees them too,
+         * and they are nobody's to wait for. */
+        ShellJob *jobs = gShellJobs;
+        size_t job_count = gShellJobCount;
+        size_t finished_count = gShellRuntime.finished_job_count;
+        gShellJobs = NULL;
+        gShellJobCount = 0;
         shellSubshellResetState(shellRuntimeDollarPid());
+        gShellJobs = jobs;
+        gShellJobCount = job_count;
+        gShellRuntime.finished_job_count = finished_count;
+        for (size_t i = 0; i < job_count; ++i) {
+            jobs[i].inherited = true;
+        }
         int status = shellProcSubRun(command, "<process-substitution>");
         fflush(stdout);
         fflush(stderr);
@@ -853,6 +866,7 @@ static void shellFreeRedirections(ShellCommand *cmd) {
         free(cmd->redirs[i].here_string_literal);
         free(cmd->redirs[i].here_string);
         free(cmd->redirs[i].fd_var);
+        free(cmd->redirs[i].takes_turn);
     }
     free(cmd->redirs);
     cmd->redirs = NULL;
@@ -877,6 +891,12 @@ static void shellFreeCommand(ShellCommand *cmd) {
     cmd->argc = 0;
     shellFreeRedirections(cmd);
 #if defined(PSCAL_TARGET_IOS)
+    for (size_t i = 0; i < cmd->stage_fd_var_count; ++i) {
+        free(cmd->stage_fd_vars[i].name);
+    }
+    free(cmd->stage_fd_vars);
+    cmd->stage_fd_vars = NULL;
+    cmd->stage_fd_var_count = 0;
     if (cmd->body_state) {
         shellBodyStateFree(cmd->body_state);
         cmd->body_state = NULL;
@@ -2739,6 +2759,9 @@ static bool shellRunShellCodeStage(VM *vm, ShellCommand *cmd) {
     if (leaves_itself) {
         shellUpdateStatus(0);
     } else {
+        for (size_t i = 0; i < cmd->stage_fd_var_count; ++i) {
+            shellFdVarAssign(cmd->stage_fd_vars[i].name, cmd->stage_fd_vars[i].fd);
+        }
         ran = shellInvokeBuiltin(stage_vm, cmd);
     }
     (void)shellRuntimeConsumeExitRequested();
@@ -3053,6 +3076,7 @@ static ShellFinishedJob *shellRememberFinishedJob(const ShellJob *job, bool repo
     entry->has_id = !job->disowned;
     entry->reported = reported || job->disowned;
     entry->killed_now = false;
+    entry->next_repeats = false;
     return entry;
 }
 
@@ -4394,6 +4418,28 @@ static bool shellRedirectTargetIsAmbiguous(const char *expanded, uint8_t flags, 
     return false;
 }
 
+/* Bash expands each redirection's word when its turn comes. Here they expand together, which only
+ * shows where the redirections before a word can change what it says: a {name} sets a variable,
+ * and a substitution can read what they opened. Those wait. A process substitution does not: on
+ * iOS what happens around the command depends on its having started by then. */
+static bool shellRedirectionWordTakesTurn(const ShellCommand *cmd, const char *word) {
+    if (cmd->redir_count == 0 || strstr(word, "<(") || strstr(word, ">(")) {
+        return false;
+    }
+    if (strstr(word, "$(") || strchr(word, '`')) {
+        return true;
+    }
+    if (!strchr(word, '$')) {
+        return false;
+    }
+    for (size_t i = 0; i < cmd->redir_count; ++i) {
+        if (cmd->redirs[i].fd_var) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool shellAddRedirection(ShellCommand *cmd, const char *spec) {
     if (!cmd || !spec) {
         return false;
@@ -4478,6 +4524,25 @@ static bool shellAddRedirection(ShellCommand *cmd, const char *spec) {
 
     char *expanded_target = NULL;
     bool ambiguous_target = false;
+    if (strcmp(type_text, "<<") != 0 && target_text && shellRedirectionWordTakesTurn(cmd, target_text)) {
+        redir.takes_turn = strdup(spec);
+        if (!redir.takes_turn) {
+            free(word_encoded);
+            free(copy);
+            return false;
+        }
+        /* What a job's stdin asks of it before it has its turn. */
+        if (strcmp(type_text, "<&") == 0 || strcmp(type_text, ">&") == 0) {
+            redir.kind = SHELL_RUNTIME_REDIR_DUP;
+            redir.dup_target_fd = -1;
+        } else if (strcmp(type_text, "<<<") == 0) {
+            redir.kind = SHELL_RUNTIME_REDIR_HERE_STRING;
+        } else {
+            redir.kind = SHELL_RUNTIME_REDIR_OPEN;
+            redir.flags = strcmp(type_text, "<") == 0 ? O_RDONLY : (strcmp(type_text, "<>") == 0 ? O_RDWR : O_WRONLY);
+        }
+        goto add_redirection;
+    }
     if (strcmp(type_text, "<<") != 0) {
         if (!target_spec || *target_spec == '\0') {
             free(word_encoded);
@@ -4654,9 +4719,11 @@ static bool shellAddRedirection(ShellCommand *cmd, const char *spec) {
         return false;
     }
 
+add_redirection:;
     ShellRedirection *new_redirs = realloc(cmd->redirs, sizeof(ShellRedirection) * (cmd->redir_count + 1));
     if (!new_redirs) {
         free(expanded_target);
+        free(redir.takes_turn);
         free(redir.path);
         free(redir.here_doc);
         free(redir.here_string_literal);

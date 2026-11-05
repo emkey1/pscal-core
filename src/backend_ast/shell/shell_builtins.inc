@@ -13028,55 +13028,173 @@ Value vmBuiltinShellBg(VM *vm, int arg_count, Value *args) {
     return makeVoid();
 }
 
-static bool shellHasOwnJob(void) {
-    for (size_t i = 0; i < gShellJobCount; ++i) {
-        if (!gShellJobs[i].disowned && !gShellJobs[i].inherited) {
-            return true;
-        }
-    }
-    return false;
-}
-
 /* wait ended early for this signal: its status is the command's, and the trap runs now. */
 static void shellWaitInterrupted(int signo) {
     shellUpdateStatus(128 + signo);
     shellRuntimeProcessPendingSignals();
 }
 
-/* wait -n: a job that already ended and nothing has reported, or else the next to end. */
-static void shellWaitForNextJob(void) {
+/* A number is a pid and %n a job. False if it is neither. */
+typedef struct {
+    long target;
+    bool by_id;
+    const char *text;
+} ShellWaitOperand;
+
+static bool shellWaitParseOperand(Value spec, ShellWaitOperand *op) {
+    op->target = -1;
+    op->by_id = false;
+    op->text = "";
+    if (VALUE_TYPE(spec) == TYPE_STRING && AS_STRING(spec)) {
+        op->text = AS_STRING(spec);
+        op->by_id = op->text[0] == '%';
+        const char *digits = op->by_id ? op->text + 1 : op->text;
+        char *end = NULL;
+        long parsed = *digits ? strtol(digits, &end, 10) : -1;
+        if (end && *end == '\0' && parsed > 0) {
+            op->target = parsed;
+        }
+    } else if (IS_INTLIKE(spec)) {
+        op->target = (long)AS_INTEGER(spec);
+    }
+    return op->target > 0;
+}
+
+static bool shellWaitOperandIsJob(const ShellWaitOperand *op, const ShellJob *job) {
+    if (op->by_id) {
+        return job->id == (size_t)op->target && !job->disowned;
+    }
+    if (job->last_pid == (pid_t)op->target) {
+        return true;
+    }
+    for (size_t i = 0; i < job->pid_count; ++i) {
+        if (job->pids[i] == (pid_t)op->target) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool shellWaitOperandIsFinished(const ShellWaitOperand *op, const ShellFinishedJob *entry) {
+    return op->by_id ? entry->has_id && entry->id == (size_t)op->target
+                     : entry->last_pid == (pid_t)op->target || entry->pgid == (pid_t)op->target;
+}
+
+/* wait -n's operands that it can do anything with, each reported if not. */
+static size_t shellWaitNextOperands(Value *args, int count, ShellWaitOperand *ops) {
+    ShellRuntimeState *ctx = shellGetContext();
+    size_t kept = 0;
+    for (int i = 0; i < count; ++i) {
+        ShellWaitOperand op;
+        bool parsed = shellWaitParseOperand(args[i], &op);
+        bool known = false;
+        for (size_t j = 0; parsed && !known && j < gShellJobCount; ++j) {
+            known = shellWaitOperandIsJob(&op, &gShellJobs[j]);
+        }
+        for (size_t j = 0; parsed && !known && ctx && j < ctx->finished_job_count; ++j) {
+            const ShellFinishedJob *entry = &ctx->finished_jobs[j];
+            known = shellWaitOperandIsFinished(&op, entry) && (!entry->reported || entry->next_repeats);
+        }
+        if (known) {
+            ops[kept++] = op;
+        } else if (op.by_id) {
+            fprintf(stderr, "wait: %s: no such job\n", op.text);
+        } else {
+            fprintf(stderr, "wait: `%s': not a pid or valid job spec\n", op.text);
+        }
+    }
+    return kept;
+}
+
+/* wait -n: a job that already ended and nothing has reported, or else the next to end. Operands
+ * narrow it to those. A pid wait -n gave stays the answer to the next wait -n naming it (5.3). */
+static void shellWaitForNextJob(Value *args, int arg_count, pid_t *pid_out) {
+    ShellWaitOperand *ops = NULL;
+    size_t op_count = 0;
+    if (arg_count > 0) {
+        ops = (ShellWaitOperand *)calloc((size_t)arg_count, sizeof(ShellWaitOperand));
+        if (!ops) {
+            shellUpdateStatus(1);
+            return;
+        }
+        op_count = shellWaitNextOperands(args, arg_count, ops);
+        if (op_count == 0) {
+            free(ops);
+            shellUpdateStatus(127);
+            return;
+        }
+    }
     for (;;) {
         int signo = shellRuntimeSignalEndingWait();
         if (signo > 0) {
             shellWaitInterrupted(signo);
-            return;
+            break;
         }
         ShellRuntimeState *ctx = shellGetContext();
-        for (size_t i = 0; ctx && i < ctx->finished_job_count; ++i) {
-            ShellFinishedJob *entry = &ctx->finished_jobs[i];
-            if (!entry->reported) {
-                entry->reported = true;
-                entry->has_id = false;
-                shellUpdateStatus(entry->status);
-                return;
+        ShellFinishedJob *found = NULL;
+        for (int pass = 0; !found && pass < 2; ++pass) {
+            for (size_t i = 0; !found && ctx && i < ctx->finished_job_count; ++i) {
+                ShellFinishedJob *entry = &ctx->finished_jobs[i];
+                if (pass == 0 ? (!entry->next_repeats || op_count == 0) : entry->reported) {
+                    continue;
+                }
+                bool wanted = op_count == 0;
+                for (size_t j = 0; !wanted && j < op_count; ++j) {
+                    wanted = shellWaitOperandIsFinished(&ops[j], entry);
+                }
+                found = wanted ? entry : NULL;
             }
         }
-        if (!shellHasOwnJob()) {
+        if (found) {
+            found->reported = true;
+            found->has_id = false;
+            found->next_repeats = op_count > 0;
+            *pid_out = found->last_pid;
+            shellUpdateStatus(found->status);
+            break;
+        }
+        bool running = false;
+        int settled = -1;
+        for (size_t i = 0; i < gShellJobCount && !running && settled < 0; ++i) {
+            ShellJob *job = &gShellJobs[i];
+            bool wanted = op_count == 0;
+            for (size_t j = 0; !wanted && j < op_count; ++j) {
+                wanted = shellWaitOperandIsJob(&ops[j], job);
+            }
+            if (!wanted) {
+                continue;
+            }
+            if (op_count > 0 && (job->disowned || job->inherited)) {
+                /* Bash calls what it has no child for ended, and gives 0. */
+                if (job->inherited) {
+                    shellRemoveJobAt(i);
+                }
+                settled = 0;
+            } else {
+                running = !job->disowned && !job->inherited;
+            }
+        }
+        if (settled >= 0) {
+            shellUpdateStatus(settled);
+            break;
+        }
+        if (!running) {
             /* A substitution's copy of a job the shell started is no child of its own. Bash finds
              * it has no child, calls them all ended, and gives 0 for each in turn. */
             int status = 127;
-            for (size_t i = 0; i < gShellJobCount && status != 0; ++i) {
+            for (size_t i = 0; op_count == 0 && i < gShellJobCount && status != 0; ++i) {
                 if (gShellJobs[i].inherited && !gShellJobs[i].disowned) {
                     shellRemoveJobAt(i);
                     status = 0;
                 }
             }
             shellUpdateStatus(status);
-            return;
+            break;
         }
         usleep(5000);
         shellCollectJobs();
     }
+    free(ops);
 }
 
 /* Waits for what is left of the job, which leaves it for the caller to take off the table.
@@ -13107,24 +13225,14 @@ static int shellWaitForJobAt(size_t index, int *signo_out) {
     return status;
 }
 
-/* One operand. As in bash a number is a pid and %n a job, and it may have ended long ago. */
-static int shellWaitForOperand(Value spec, int *signo_out) {
-    const char *text = "";
-    long target = -1;
-    bool by_id = false;
-    if (VALUE_TYPE(spec) == TYPE_STRING && AS_STRING(spec)) {
-        text = AS_STRING(spec);
-        by_id = text[0] == '%';
-        const char *digits = by_id ? text + 1 : text;
-        char *end = NULL;
-        long parsed = *digits ? strtol(digits, &end, 10) : -1;
-        if (end && *end == '\0' && parsed > 0) {
-            target = parsed;
-        }
-    } else if (IS_INTLIKE(spec)) {
-        target = (long)AS_INTEGER(spec);
-    }
-    if (target <= 0) {
+/* One operand, which may have ended long ago. */
+static int shellWaitForOperand(Value spec, int *signo_out, pid_t *pid_out) {
+    ShellWaitOperand operand;
+    bool parsed = shellWaitParseOperand(spec, &operand);
+    long target = operand.target;
+    bool by_id = operand.by_id;
+    const char *text = operand.text;
+    if (!parsed) {
         if (by_id) {
             fprintf(stderr, "wait: %s: no such job\n", text);
             return 127;
@@ -13135,17 +13243,13 @@ static int shellWaitForOperand(Value spec, int *signo_out) {
 
     for (size_t i = 0; i < gShellJobCount; ++i) {
         ShellJob *job = &gShellJobs[i];
-        bool found = by_id ? (job->id == (size_t)target && !job->disowned)
-                           : (job->last_pid == (pid_t)target);
-        for (size_t j = 0; !by_id && !found && j < job->pid_count; ++j) {
-            found = job->pids[j] == (pid_t)target;
-        }
-        if (!found || job->inherited) {
+        if (!shellWaitOperandIsJob(&operand, job) || job->inherited) {
             continue;
         }
         if (job->disowned) {
             return 0;
         }
+        *pid_out = job->last_pid;
         int status = shellWaitForJobAt(i, signo_out);
         if (*signo_out > 0) {
             return status;
@@ -13162,9 +13266,11 @@ static int shellWaitForOperand(Value spec, int *signo_out) {
                                     : shellFindFinishedJobByPid((pid_t)target);
     if (entry) {
         entry->reported = true;
+        entry->next_repeats = false;
         if (by_id) {
             entry->has_id = false;
         }
+        *pid_out = entry->last_pid;
         return entry->status;
     }
     if (by_id) {
@@ -13175,15 +13281,83 @@ static int shellWaitForOperand(Value spec, int *signo_out) {
     return 127;
 }
 
+static void shellWaitUsage(void) {
+    fprintf(stderr, "wait: usage: wait [-fn] [-p var] [id ...]\n");
+    shellUpdateStatus(2);
+}
+
+/* wait -p name: the pid that gave the status, or unset if none did. */
+static void shellWaitSetPidVar(const char *name, pid_t pid) {
+    if (!name) {
+        return;
+    }
+    if (pid > 0) {
+        char text[32];
+        snprintf(text, sizeof(text), "%ld", (long)pid);
+        shellSetTrackedVariable(name, text, false);
+    } else {
+        shellUnsetTrackedVariable(name);
+    }
+}
+
 Value vmBuiltinShellWait(VM *vm, int arg_count, Value *args) {
     (void)vm;
     shellCollectJobs();
-    if (arg_count >= 1 && VALUE_TYPE(args[0]) == TYPE_STRING && AS_STRING(args[0]) &&
-        strcmp(AS_STRING(args[0]), "-n") == 0) {
-        shellWaitForNextJob();
+    bool next = false;
+    const char *pid_var = NULL;
+    pid_t pid = -1;
+    int first = 0;
+    /* -f makes no difference: the job's end is what is waited for, and a stopped one stays. */
+    for (; first < arg_count; ++first) {
+        const char *word = VALUE_TYPE(args[first]) == TYPE_STRING ? AS_STRING(args[first]) : NULL;
+        if (!word || word[0] != '-' || !word[1]) {
+            break;
+        }
+        if (strcmp(word, "--") == 0) {
+            first++;
+            break;
+        }
+        for (const char *opt = word + 1; *opt; ++opt) {
+            if (*opt == 'n') {
+                next = true;
+            } else if (*opt == 'p') {
+                const char *value = opt[1] ? opt + 1 : NULL;
+                if (!value && first + 1 < arg_count && VALUE_TYPE(args[first + 1]) == TYPE_STRING) {
+                    value = AS_STRING(args[++first]);
+                }
+                if (!value) {
+                    fprintf(stderr, "wait: -p: option requires an argument\n");
+                    shellWaitUsage();
+                    return makeVoid();
+                }
+                pid_var = value;
+                break;
+            } else if (*opt != 'f') {
+                fprintf(stderr, "wait: -%c: invalid option\n", *opt);
+                shellWaitUsage();
+                return makeVoid();
+            }
+        }
+    }
+    if (pid_var && !shellIsValidEnvName(pid_var)) {
+        fprintf(stderr, "wait: `%s': not a valid identifier\n", pid_var);
+        shellUpdateStatus(1);
+        return makeVoid();
+    }
+    if (pid_var && shellReadonlyContains(pid_var)) {
+        fprintf(stderr, "wait: %s: readonly variable\n", pid_var);
+        shellUpdateStatus(1);
+        return makeVoid();
+    }
+    args += first;
+    arg_count -= first;
+    if (next) {
+        shellWaitForNextJob(args, arg_count, &pid);
+        shellWaitSetPidVar(pid_var, pid);
         return makeVoid();
     }
     if (arg_count == 0) {
+        shellWaitSetPidVar(pid_var, -1);
         /* Bash gives 0 here and forgets every job. A script keeps the one $! names, if that had
          * already ended. */
         ShellFinishedJob *ended = gShellRuntime.last_bg_pid > 0
@@ -13228,12 +13402,15 @@ Value vmBuiltinShellWait(VM *vm, int arg_count, Value *args) {
     int status = 0;
     for (int i = 0; i < arg_count; ++i) {
         int signo = 0;
-        status = shellWaitForOperand(args[i], &signo);
+        pid = -1;
+        status = shellWaitForOperand(args[i], &signo, &pid);
         if (signo > 0) {
             shellWaitInterrupted(signo);
+            shellWaitSetPidVar(pid_var, -1);
             return makeVoid();
         }
     }
+    shellWaitSetPidVar(pid_var, pid);
     shellUpdateStatus(status);
     return makeVoid();
 }

@@ -558,6 +558,8 @@ typedef struct {
     bool has_id;
     /* wait -n passes it by. */
     bool reported;
+    /* wait -n gave it for its pid, and gives it again if asked for that pid. */
+    bool next_repeats;
     /* `kill` ended it just now, and the next prompt is too soon to report that. */
     bool killed_now;
 } ShellFinishedJob;
@@ -1150,6 +1152,7 @@ static const ShellArrayVariable *shellArrayRegistryLookup(const char *name, size
 static void shellArrayRegistryAssignFromText(const char *name, const char *value);
 static bool shellSetTrackedVariable(const char *name, const char *value, bool is_array_literal);
 static void shellUnsetTrackedVariable(const char *name);
+static bool shellFdVarAssign(const char *name, int fd);
 static char *shellLookupRawEnvironmentValue(const char *name, size_t len);
 static char *shellLookupParameterValue(const char *name, size_t len);
 static bool shellAssignmentIsArrayLiteral(const char *raw_assignment, uint8_t word_flags);
@@ -1246,6 +1249,7 @@ static ShellOptionEntry gShellOptionTable[] = {
     {"restricted_shell", false},
     {"shift_verbose", false},
     {"sourcepath", true},
+    {"varredir_close", false},
     {"xpg_echo", false}
 };
 
@@ -2450,6 +2454,8 @@ typedef struct {
     bool ambiguous;
     /* {name}> f: the shell picks the descriptor from 10 up and name gets its number. fd is -1. */
     char *fd_var;
+    /* The whole redir: text, for a word that expands when this redirection's turn comes. */
+    char *takes_turn;
 } ShellRedirection;
 
 typedef struct {
@@ -2510,6 +2516,12 @@ typedef struct {
     ShellCompiledFunction *body;
 #if defined(PSCAL_TARGET_IOS)
     ShellBodyState *body_state;
+    /* {name}> f on a stage or job with a state of its own: name goes there, once it has one. */
+    struct {
+        char *name;
+        int fd;
+    } *stage_fd_vars;
+    size_t stage_fd_var_count;
     /* What it gets if it turns out to be a program, and the file that would be: taken while
      * the shell's thread launched it, when what the command sets for itself is in place. */
     VProcEnv *program_env;

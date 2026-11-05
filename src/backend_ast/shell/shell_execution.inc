@@ -1580,7 +1580,13 @@ static int shellSpawnProcess(VM *vm,
     int redir_error = 0;
     const char *redir_error_target = NULL;
     enum { SHELL_REDIR_ERROR_AMBIGUOUS = -1 };
+    /* A word that waits for its turn sees what the ones before it did, so the child does them all,
+     * in order. Under bash it does every one. */
+    bool redirs_in_child = false;
     for (size_t i = 0; i < cmd->redir_count; ++i) {
+        redirs_in_child = redirs_in_child || cmd->redirs[i].takes_turn;
+    }
+    for (size_t i = 0; i < cmd->redir_count && !redirs_in_child; ++i) {
         if (op_count >= op_capacity) {
             prep_error = ENOMEM;
             goto spawn_cleanup;
@@ -1778,6 +1784,10 @@ static int shellSpawnProcess(VM *vm,
                         }
                         break;
                 }
+            }
+
+            if (redirs_in_child && !shellApplyExecRedirections((ShellCommand *)cmd, NULL, NULL)) {
+                _exit(1);
             }
 
             /* After the earlier ones: `cmd 2>log >/missing` reports into log. */
@@ -2596,11 +2606,12 @@ static ShellCommand *shellCloneCommandForBackground(const ShellCommand *src) {
             dr->here_string_literal = sr->here_string_literal ? strdup(sr->here_string_literal) : NULL;
             dr->here_string = sr->here_string ? strdup(sr->here_string) : NULL;
             dr->fd_var = sr->fd_var ? strdup(sr->fd_var) : NULL;
+            dr->takes_turn = sr->takes_turn ? strdup(sr->takes_turn) : NULL;
             if ((sr->path && !dr->path) ||
                 (sr->here_doc && !dr->here_doc) ||
                 (sr->here_string_literal && !dr->here_string_literal) ||
                 (sr->here_string && !dr->here_string) ||
-                (sr->fd_var && !dr->fd_var)) {
+                (sr->fd_var && !dr->fd_var) || (sr->takes_turn && !dr->takes_turn)) {
                 shellFreeCommand(dst);
                 free(dst);
                 return NULL;
@@ -4015,6 +4026,52 @@ static int shellFdVarPick(VProc *vp) {
     return fd;
 }
 
+/* A builtin stays in the shell, whichever way it came. On iOS some of those run apart. */
+static bool shellNameRunsInShell(const char *argv0) {
+    char lookup_buf[PATH_MAX];
+    const char *name = shellCommandLookupName(argv0, lookup_buf, sizeof(lookup_buf));
+    if (!shellIsRuntimeBuiltin(name)) {
+        return false;
+    }
+#if defined(PSCAL_TARGET_IOS)
+    if (shellCommandIsFrontendToolName(name) || shellIOSFrontendHandler(name)) {
+        return false;
+    }
+    if (!smallclueFindApplet(name)) {
+        return true;
+    }
+    /* Builtins under bash too, though an applet has the name. */
+    static const char *const kBashBuiltins[] = {"echo", "false", "kill", "printf", "pwd", "test", "true", "["};
+    for (size_t i = 0; i < sizeof(kBashBuiltins) / sizeof(kBashBuiltins[0]); ++i) {
+        if (strcmp(name, kBashBuiltins[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+#else
+    return true;
+#endif
+}
+
+/* `command prog`: the builtin is what applies the redirections here, in the shell, where under bash
+ * a process does and takes the name and the descriptor with it. -v and -V run nothing. */
+static bool shellCommandBuiltinRunsProgram(const ShellCommand *cmd) {
+    size_t i = 0;
+    while (i < cmd->argc && strcmp(cmd->argv[i], "command") == 0) {
+        i++;
+        for (; i < cmd->argc && cmd->argv[i][0] == '-' && cmd->argv[i][1]; ++i) {
+            if (strcmp(cmd->argv[i], "--") == 0) {
+                i++;
+                break;
+            }
+            if (strpbrk(cmd->argv[i], "vV")) {
+                return false;
+            }
+        }
+    }
+    return i > 0 && i < cmd->argc && !shellNameRunsInShell(cmd->argv[i]);
+}
+
 /* On a host only what stays in the shell comes this way: a program, a job and a stage have forked
  * first. On iOS they come too. Under bash each of those is a process, which ends and takes the
  * descriptor and the name with it, and the vproc made for it takes the descriptor. */
@@ -4033,26 +4090,19 @@ static bool shellFdVarOutlivesCommand(const ShellCommand *cmd) {
     if (shellFindCompiledFunction(cmd->argv[0])) {
         return true;
     }
-    char lookup_buf[PATH_MAX];
-    const char *name = shellCommandLookupName(cmd->argv[0], lookup_buf, sizeof(lookup_buf));
-    if (!shellIsRuntimeBuiltin(name) || shellCommandIsFrontendToolName(name) || shellIOSFrontendHandler(name)) {
-        return false;
-    }
-    if (!smallclueFindApplet(name)) {
+    return shellNameRunsInShell(cmd->argv[0]) && !shellCommandBuiltinRunsProgram(cmd);
+#else
+    return !shellCommandBuiltinRunsProgram(cmd);
+#endif
+}
+
+/* Its descriptor goes when the command ends, so it is put back like any other. `shopt -s
+ * varredir_close` asks that of all but exec, and leaves the name set. */
+static bool shellFdVarClosesWithCommand(const ShellCommand *cmd) {
+    if (cmd->argc > 0 && cmd->argv && shellCommandBuiltinRunsProgram(cmd)) {
         return true;
     }
-    /* Builtins under bash too, though an applet has the name. */
-    static const char *const kBashBuiltins[] = {"echo", "false", "kill", "printf", "pwd", "test", "true", "["};
-    for (size_t i = 0; i < sizeof(kBashBuiltins) / sizeof(kBashBuiltins[0]); ++i) {
-        if (strcmp(name, kBashBuiltins[i]) == 0) {
-            return true;
-        }
-    }
-    return false;
-#else
-    (void)cmd;
-    return true;
-#endif
+    return shellShoptOptionEnabled("varredir_close") && !shellCommandIsExecBuiltin(cmd);
 }
 
 /* The descriptor is there. It stays for the script to use, and name says where. */
@@ -4066,17 +4116,120 @@ static bool shellFdVarFinish(const ShellCommand *cmd, const ShellRedirection *re
         return true;
     }
     if (!shellFdVarOutlivesCommand(cmd)) {
+#if defined(PSCAL_TARGET_IOS)
+        /* Its own state starts when it runs, and that is where a function looks for the name. */
+        if (cmd->body_state) {
+            ShellCommand *stage = (ShellCommand *)cmd;
+            size_t count = stage->stage_fd_var_count;
+            void *grown = realloc(stage->stage_fd_vars, (count + 1) * sizeof(stage->stage_fd_vars[0]));
+            char *name = strdup(redir->fd_var);
+            if (grown) {
+                stage->stage_fd_vars = grown;
+            }
+            if (grown && name) {
+                stage->stage_fd_vars[count].name = name;
+                stage->stage_fd_vars[count].fd = fd;
+                stage->stage_fd_var_count = count + 1;
+            } else {
+                free(name);
+            }
+        }
+#endif
         return true;
     }
     if (!shellFdVarAssign(redir->fd_var, fd)) {
         close(fd);
         return false;
     }
+    if (shellFdVarClosesWithCommand(cmd)) {
+        return true;
+    }
     shellCommandSubKeepFdVar(fd);
 #if defined(PSCAL_TARGET_IOS)
     vprocShellFdFollow(fd);
 #endif
     return true;
+}
+
+/* A word's turn has come: it expands now, with what came before it done. Runs apart if the command
+ * does, so a failure in it is that command's. */
+static bool shellRedirectionTakeTurn(ShellCommand *cmd, size_t index) {
+    ShellRedirection *slot = &cmd->redirs[index];
+    ShellCommand words;
+    memset(&words, 0, sizeof(words));
+    bool was_expanding = gShellExpandingJobWords;
+    gShellExpandingJobWords = cmd->background ||
+                              (cmd->pipeline_index >= 0 && !(cmd->is_pipeline_head && cmd->is_pipeline_tail));
+    gShellExpansionFailed = false;
+    bool added = shellAddRedirection(&words, slot->takes_turn);
+    gShellExpandingJobWords = was_expanding;
+    if (added && !gShellExpansionFailed && words.redir_count > 0) {
+        ShellRedirection *grown = cmd->redirs;
+        if (words.redir_count > 1) {
+            grown = realloc(cmd->redirs, sizeof(ShellRedirection) * (cmd->redir_count + words.redir_count - 1));
+        }
+        if (grown) {
+            cmd->redirs = grown;
+            slot = &cmd->redirs[index];
+            memmove(slot + words.redir_count, slot + 1, sizeof(ShellRedirection) * (cmd->redir_count - index - 1));
+            free(slot->takes_turn);
+            ShellRedirection placed = words.redirs[0];
+            /* These may have been settled since it was written. */
+            placed.fd = slot->fd;
+            free(placed.fd_var);
+            placed.fd_var = slot->fd_var;
+            *slot = placed;
+            for (size_t i = 1; i < words.redir_count; ++i) {
+                slot[i] = words.redirs[i];
+            }
+            cmd->redir_count += words.redir_count - 1;
+            free(words.redirs);
+            return true;
+        }
+    }
+    shellFreeRedirections(&words);
+    shellUpdateStatus(1);
+    return false;
+}
+
+/* What a later word on the command must see of a name the shell is not to keep. Only a plain name
+ * is lent: `prog {a[1]}> f >&${a[1]}` is not. */
+typedef struct {
+    char *name;
+    char *old_value;
+} ShellFdVarLoan;
+
+static bool shellFdVarLend(ShellFdVarLoan *loan, const char *name, int fd) {
+    if (strchr(name, '[')) {
+        return false;
+    }
+    ShellParamSubject subject;
+    char *old_value = NULL;
+    if (shellParamLoadSubject(name, strlen(name), NULL, 0, &subject)) {
+        if (subject.is_set && subject.value) {
+            old_value = strdup(subject.value);
+        }
+        shellParamSubjectFree(&subject);
+    }
+    loan->name = strdup(name);
+    loan->old_value = old_value;
+    if (!loan->name) {
+        free(old_value);
+        return false;
+    }
+    return shellFdVarAssign(name, fd);
+}
+
+static void shellFdVarLoansEnd(ShellFdVarLoan *loans, size_t count) {
+    for (size_t i = count; i > 0; --i) {
+        if (loans[i - 1].old_value) {
+            shellSetTrackedVariable(loans[i - 1].name, loans[i - 1].old_value, false);
+        } else {
+            shellUnsetTrackedVariable(loans[i - 1].name);
+        }
+        free(loans[i - 1].name);
+        free(loans[i - 1].old_value);
+    }
 }
 
 /* `{fd}> f` with no command makes the file and leaves nothing behind, as `> f` does. Each is then
@@ -4129,8 +4282,13 @@ static bool shellApplyExecRedirections(const ShellCommand *cmd,
     size_t backup_count = 0;
     size_t backup_capacity = 0;
     bool stdout_redirected = false;
+    ShellFdVarLoan loans[8];
+    size_t loan_count = 0;
 
     for (size_t i = 0; i < cmd->redir_count; ++i) {
+        if (cmd->redirs[i].takes_turn && !shellRedirectionTakeTurn((ShellCommand *)cmd, i)) {
+            goto redir_error;
+        }
         const ShellRedirection *redir = &cmd->redirs[i];
         int target_fd = redir->fd;
         int avoid_fd = -1;
@@ -4150,7 +4308,7 @@ static bool shellApplyExecRedirections(const ShellCommand *cmd,
             target_fd = shellFdVarPick(vp_current);
         }
         /* Closing goes back after the command unless that is exec, as any `3>&-` does. */
-        if ((!redir->fd_var || closes_fd_var) &&
+        if ((!redir->fd_var || closes_fd_var || shellFdVarClosesWithCommand(cmd)) &&
             !shellEnsureExecRedirBackup(target_fd, avoid_fd, &backups, &backup_count, &backup_capacity)) {
             int err = errno;
             if (err == 0) {
@@ -4334,7 +4492,17 @@ static bool shellApplyExecRedirections(const ShellCommand *cmd,
             shellUpdateStatus(1);
             goto redir_error;
         }
+        if (redir->fd_var && !closes_fd_var && !shellFdVarOutlivesCommand(cmd) && loan_count < 8) {
+            bool word_after = false;
+            for (size_t j = i + 1; j < cmd->redir_count; ++j) {
+                word_after = word_after || cmd->redirs[j].takes_turn;
+            }
+            if (word_after && shellFdVarLend(&loans[loan_count], redir->fd_var, target_fd)) {
+                loan_count++;
+            }
+        }
     }
+    shellFdVarLoansEnd(loans, loan_count);
 
     if (out_backups) {
         *out_backups = backups;
@@ -4347,6 +4515,7 @@ static bool shellApplyExecRedirections(const ShellCommand *cmd,
     return true;
 
 redir_error:
+    shellFdVarLoansEnd(loans, loan_count);
     shellRestoreExecRedirections(backups, backup_count);
     shellFreeExecRedirBackups(backups, backup_count);
     if (out_backups) {

@@ -888,6 +888,87 @@ static char *shellParamLength(const char *inner, size_t inner_len) {
     return strdup(buffer);
 }
 
+/* ${!@} and ${!*}: "$*" names the variable, and what follows applies to that. With no positional
+ * parameters nothing is named, so only a default gives anything. */
+static char *shellParamIndirectPositional(const char *inner, size_t inner_len, bool in_double, bool *out_array,
+                                          size_t *out_count, bool **out_map, size_t *out_map_len) {
+    const char *op = inner + 2;
+    size_t op_len = inner_len - 2;
+    if (op_len > 0 && !strchr(":-=+?#%/@", op[0])) {
+        shellParamBadSubstitution(inner, inner_len);
+        return strdup("");
+    }
+    bool colon_assign = op_len > 1 && op[0] == ':' && op[1] == '=';
+    bool assigns = colon_assign || (op_len > 0 && op[0] == '=');
+    ShellParamSubject positional;
+    if (!shellParamLoadSubject(inner + 1, 1, NULL, 0, &positional)) {
+        return strdup("");
+    }
+    char *target = positional.count > 0 ? shellJoinWithIfs(positional.items, positional.count) : NULL;
+    bool any = positional.count > 0;
+    shellParamSubjectFree(&positional);
+    if (!any) {
+        if (assigns) {
+            shellReportRecoverableError(gShellCurrentVm, true, "$!%c: cannot assign in this way", inner[1]);
+            shellExpansionFail();
+            return strdup("");
+        }
+        if (gShellRuntime.nounset_enabled && !gShellNounsetSuppressed && op_len == 0) {
+            shellReportRecoverableError(gShellCurrentVm, true, "!%c: unbound variable", inner[1]);
+            shellExpansionFail();
+            return strdup("");
+        }
+        size_t skip = op_len > 0 && op[0] == ':' ? 1 : 0;
+        if (op_len > skip && op[skip] == '-') {
+            return shellParamExpandWord(op + skip + 1, op_len - skip - 1, in_double, out_map, out_map_len);
+        }
+        return strdup("");
+    }
+    if (!target) {
+        return NULL;
+    }
+    size_t target_len = strlen(target);
+    size_t name_len = 0;
+    size_t consumed = 0;
+    const char *subscript = NULL;
+    size_t subscript_len = 0;
+    if (target_len == 0 || !shellParamParseName(target, target_len, &name_len, &subscript, &subscript_len, &consumed) ||
+        consumed != target_len) {
+        shellReportRecoverableError(gShellCurrentVm, true, "%s: invalid variable name", target);
+        shellExpansionFail();
+        free(target);
+        return strdup("");
+    }
+    if (assigns) {
+        /* The name holds a value, and that is all this gives. It takes no new one. */
+        ShellParamSubject named;
+        bool present = false;
+        if (shellParamLoadSubject(target, name_len, subscript, subscript_len, &named)) {
+            present = named.is_set && named.value && (!colon_assign || named.value[0]);
+            shellParamSubjectFree(&named);
+        }
+        if (!present) {
+            shellReportRecoverableError(gShellCurrentVm, true, "$!%c: cannot assign in this way", inner[1]);
+            shellExpansionFail();
+            free(target);
+            return strdup("");
+        }
+    }
+    char *combined = (char *)malloc(target_len + op_len + 1);
+    if (!combined) {
+        free(target);
+        return NULL;
+    }
+    memcpy(combined, target, target_len);
+    memcpy(combined + target_len, op, op_len);
+    combined[target_len + op_len] = '\0';
+    free(target);
+    char *result = shellExpandBraceParameter(combined, target_len + op_len, in_double, out_array, out_count, out_map,
+                                             out_map_len);
+    free(combined);
+    return result;
+}
+
 static char *shellExpandBraceParameter(const char *inner, size_t inner_len, bool in_double, bool *out_array,
                                        size_t *out_count, bool **out_map, size_t *out_map_len) {
     if (inner_len == 0) {
@@ -913,6 +994,9 @@ static char *shellExpandBraceParameter(const char *inner, size_t inner_len, bool
         if (rest[0] == '!' || rest[0] == '$') {
             shellParamBadSubstitution(inner, inner_len);
             return strdup("");
+        }
+        if (rest[0] == '@' || rest[0] == '*') {
+            return shellParamIndirectPositional(inner, inner_len, in_double, out_array, out_count, out_map, out_map_len);
         }
         char last = rest[rest_len - 1];
         size_t name_len = 0;
