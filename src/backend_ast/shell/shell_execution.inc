@@ -871,6 +871,9 @@ void shellRuntimeProgramEnvLeave(void *scope) {
 }
 
 static void shellStageCaptureState(ShellCommand *stage, const ShellCommand *cmd, size_t stage_count) {
+    if (stage_count > 1) {
+        shellFinishedJobsForgetWaited();
+    }
     if (stage_count > 1 && !stage->body_state) {
         stage->body_state = shellStageStateCapture(stage);
     }
@@ -1724,6 +1727,13 @@ static int shellSpawnProcess(VM *vm,
 
     {
     pid_t dollar_pid = shellRuntimeDollarPid();
+    bool lists_jobs = gShellRuntime.pipeline.active && gShellRuntime.pipeline.stage_count > 1 &&
+                      !gShellRuntime.pipeline.async && !cmd->background && shellCommandIsJobsListing(cmd);
+    if (lists_jobs) {
+        /* What has ended is listed as that, and only this shell can tell. */
+        shellCollectJobs();
+    }
+    shellFinishedJobsForgetWaited();
     /* The child reaches its own exit with a copy of whatever is still buffered. */
     shellFlushStandardStreams();
     pid_t child = fork();
@@ -1865,8 +1875,7 @@ static int shellSpawnProcess(VM *vm,
              * both streams to out, and under `set -C` the second open failed. */
             shellFreeRedirections((ShellCommand *)cmd);
             /* This child may go on to run shell code: a function or a compound command. */
-            if (ctx->active && ctx->stage_count > 1 && !ctx->async && !cmd->background &&
-                shellCommandIsJobsListing(cmd)) {
+            if (lists_jobs) {
                 shellSubshellResetStateListingJobs(dollar_pid);
             } else {
                 shellSubshellResetState(dollar_pid);
@@ -2127,6 +2136,30 @@ static int shellWaitPidForBuiltin(pid_t pid, ShellWaitResult *res, int *signo_ou
 static void shellFdPrintf(int fd, const char *fmt, ...);
 #endif
 
+static void shellPrintJobStarted(const ShellJob *job, pid_t pid) {
+    if (pid <= 0) {
+        return;
+    }
+    /* As under bash: a prompt announces its own jobs, on stderr, and a subshell, a substitution or
+     * a sourced file or startup file announces none. */
+    if (!shellRuntimeIsInteractive() || gShellRuntime.in_subshell || gShellCommandSubFrame || gShellScriptName) {
+        return;
+    }
+    for (size_t i = 0; i < gShellCallStackCount; ++i) {
+        if (!gShellCallStack[i].is_function) {
+            return;
+        }
+    }
+    size_t job_id = job ? job->id : 0;
+    if (job_id == 0) {
+        job_id = (size_t)vprocGetJobId((int)pid);
+    }
+    if (job_id == 0) {
+        return;
+    }
+    shellFdPrintf(STDERR_FILENO, "[%zu] %d\n", job_id, (int)pid);
+}
+
 #if defined(PSCAL_TARGET_IOS)
 static const char *shellFormatCommandSummary(const ShellCommand *cmd, char *buf, size_t buf_len) {
     if (!buf || buf_len == 0) {
@@ -2170,24 +2203,6 @@ static void shellPrintJobSuspended(const ShellJob *job, const ShellCommand *cmd)
     shellFdPrintf(STDERR_FILENO, "exsh: suspended  %s\n", command);
 }
 
-static void shellPrintJobStarted(const ShellJob *job, pid_t pid) {
-    if (pid <= 0) {
-        return;
-    }
-    /* As under bash: a prompt announces its own jobs, on stderr, and a subshell or a substitution
-     * announces none. */
-    if (!shellRuntimeIsInteractive() || gShellRuntime.in_subshell || gShellCommandSubFrame) {
-        return;
-    }
-    size_t job_id = job ? job->id : 0;
-    if (job_id == 0) {
-        job_id = (size_t)vprocGetJobId((int)pid);
-    }
-    if (job_id == 0) {
-        return;
-    }
-    shellFdPrintf(STDERR_FILENO, "[%zu] %d\n", job_id, (int)pid);
-}
 #endif
 
 #if defined(PSCAL_TARGET_IOS)
@@ -3460,9 +3475,7 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd) {
                         job->last_status = 0;
                     }
                     gShellRuntime.last_bg_pid = ctx->pids[ctx->launched - 1];
-#if defined(PSCAL_TARGET_IOS)
-                    shellPrintJobStarted(job, bg_pgid);
-#endif
+                    shellPrintJobStarted(job, gShellRuntime.last_bg_pid);
                 }
             ShellShebangThreadCtx *bg_ctx = NULL;
             if (tail_cmd && tail_cmd->argc > 0 && tail_cmd->argv) {
@@ -3639,6 +3652,7 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd) {
             shellJobMarkRunning(job);
             job->last_status = 0;
         }
+        shellPrintJobStarted(job, gShellRuntime.last_bg_pid);
         final_status = 0;
     }
 
@@ -6110,7 +6124,7 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
                 /* The job's own pid: in a subshell the group is the subshell's. */
                 gShellRuntime.last_bg_pid = async_stage_pid;
 #if defined(PSCAL_TARGET_IOS)
-                shellPrintJobStarted(job, bg_pgid);
+                shellPrintJobStarted(job, gShellRuntime.last_bg_pid);
 #endif
             }
 
@@ -6209,7 +6223,7 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
                 }
                 gShellRuntime.last_bg_pid = ctx->pids[stage_pos];
 #if defined(PSCAL_TARGET_IOS)
-                shellPrintJobStarted(job, bg_pgid);
+                shellPrintJobStarted(job, gShellRuntime.last_bg_pid);
 #endif
             }
             /* Background single-stage workers run detached from shared pipeline state. */
@@ -6590,6 +6604,7 @@ static Value shellExecuteCommand(VM *vm, ShellCommand *cmd) {
         shellScalarCacheInvalidate();
         return makeVoid();
     }
+    gShellRuntime.commands_run++;
     bool exit_already_requested = gShellExitRequested;
     /* What came during a substitution in its words waits for the command: `x=$(cmd)` assigns, and
      * then the trap runs. A pipeline waits as a whole: the stages before this one have started, and
@@ -7172,9 +7187,7 @@ static Value shellRunExpandedCommand(VM *vm, ShellCommand *cmd) {
             shellJobMarkRunning(job);
             job->last_status = 0;
         }
-    #if defined(PSCAL_TARGET_IOS)
         shellPrintJobStarted(job, child);
-    #endif
         status = 0;
         }
         shellUpdateStatus(status);

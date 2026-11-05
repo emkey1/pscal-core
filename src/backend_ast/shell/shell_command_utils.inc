@@ -44,6 +44,9 @@ extern void pscalRuntimeDebugLog(const char *message);
  * what it runs, and its caller stays where it was. On iOS it shares the process with its
  * caller, so the vproc it runs under owns them while it runs, as a subshell's does, and PWD
  * and OLDPWD go back by hand. */
+static int shellCollectJobs(void);
+static void shellFinishedJobsForgetWaited(void);
+
 /* How many of these this thread is inside, for what `ulimit` has to put back. */
 static PSCAL_THREAD_LOCAL size_t gShellCwdScopeDepth = 0;
 
@@ -1075,6 +1078,12 @@ static char *shellRunCommandSubstitution(const char *command) {
         opts.first_line = gShellCurrentCommandLine;
         opts.inherit_locals = true;
         ShellSubstitutionSignals saved_signals = shellSubstitutionSignalsEnter();
+        /* Its copy of a job is only to look at: what has ended is known from here. Under bash this
+         * is a fork, which is when what `wait` has used goes. */
+        if (gShellJobCount > 0) {
+            shellCollectJobs();
+        }
+        shellFinishedJobsForgetWaited();
         size_t saved_loops_around = gShellRuntime.loops_around;
         gShellRuntime.loops_around += gShellLoopStackSize;
         status = shellRunSource(source, "<command-substitution>", &opts, &exit_requested);

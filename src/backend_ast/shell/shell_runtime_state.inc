@@ -545,7 +545,15 @@ typedef struct ShellJob {
      * but it is the shell's to wait for: reaping it here left the shell's `wait` hanging. */
     bool inherited;
     int last_status;
+    /* What ended it, for `jobs`: last_status cannot tell that from `exit 143`. */
+    int term_signal;
     char *command;
+    /* As written, from a table that keeps it: a finished job is copied as bytes. NULL for a job
+     * no `&` started, which goes by command. */
+    const char *text;
+    pid_t first_pid;
+    /* `jobs` has shown it, for jobs -n. */
+    bool notified;
 } ShellJob;
 
 /* What `wait` can still find of a job that has left the table. */
@@ -562,6 +570,11 @@ typedef struct {
     bool next_repeats;
     /* `kill` ended it just now, and the next prompt is too soon to report that. */
     bool killed_now;
+    int term_signal;
+    const char *text;
+    pid_t first_pid;
+    /* `wait` calls since one first used it: the number lasts for one more. */
+    unsigned char waits_since;
 } ShellFinishedJob;
 
 #define SHELL_FINISHED_JOB_MAX 1024
@@ -637,6 +650,14 @@ typedef struct ShellRuntimeState {
     pid_t last_bg_pid;
     int tty_fd;
     bool job_control_enabled;
+    /* Commands so far, and which of them last sent a signal: the very next one is too soon to
+     * have heard what came of it. */
+    size_t commands_run;
+    size_t kill_command;
+    /* set -m: fg and bg work outside a prompt. Nothing else follows from it yet. */
+    bool monitor_enabled;
+    /* A subshell or a stage has none, whatever it inherited, until it says set -m itself. */
+    bool job_control_gone;
     bool job_control_initialized;
     ShellJobControlCaps job_control_caps;
     bool errexit_enabled;
@@ -723,6 +744,8 @@ typedef struct ShellRuntimeState {
     size_t loop_stack_capacity;
     /* The loops around a command substitution. They are the shell's, and it cannot leave them. */
     size_t loops_around;
+    /* What the next `&` was written as: __shell_job_text comes just before it. */
+    const char *pending_job_text;
     /* A subshell's own definitions: on iOS no fork gives it a copy of these. */
     bool has_private_tables;
     struct ShellFunctionEntry *private_functions;
@@ -5271,6 +5294,10 @@ ShellRuntimeState *shellRuntimeCreateContext(void) {
                 dst->disowned = src->disowned;
                 dst->inherited = src->inherited || gShellCommandSubFrame != NULL;
                 dst->last_status = src->last_status;
+                dst->term_signal = src->term_signal;
+                dst->text = src->text;
+                dst->first_pid = src->first_pid;
+                dst->notified = src->notified;
                 if (src->pid_count > 0 && src->pids) {
                     dst->pids = (pid_t *)calloc(src->pid_count, sizeof(pid_t));
                     if (dst->pids) {
@@ -6227,6 +6254,14 @@ static void shellInitJobControlState(void) {
 static void shellEnsureJobControl(void) {
     bool allow_headless_jc = getenv("RUN_VPROC_TESTS") != NULL ||
                              getenv("PSCALI_SHELL_VPROC") != NULL;
+#if !defined(PSCAL_TARGET_IOS)
+    /* A subshell has none. In one in the background, taking the terminal stopped it for good. */
+    if (gShellRuntime.in_subshell) {
+        gShellRuntime.job_control_enabled = false;
+        gShellRuntime.job_control_caps.has_job_control = false;
+        return;
+    }
+#endif
     if (!shellRuntimeIsInteractive() && !allow_headless_jc) {
         gShellRuntime.job_control_enabled = false;
         gShellRuntime.job_control_caps.has_job_control = false;

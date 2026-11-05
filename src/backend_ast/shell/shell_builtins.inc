@@ -9406,6 +9406,15 @@ static PSCAL_THREAD_LOCAL ShellTimeFrame *gShellTimeFrames = NULL;
 static PSCAL_THREAD_LOCAL size_t gShellTimeFrameCount = 0;
 static PSCAL_THREAD_LOCAL size_t gShellTimeFrameCapacity = 0;
 
+/* The `&` that comes next was written as this. It leaves $? alone. */
+Value vmBuiltinShellJobText(VM *vm, int arg_count, Value *args) {
+    (void)vm;
+    if (arg_count == 1 && VALUE_TYPE(args[0]) == TYPE_STRING && AS_STRING(args[0])) {
+        gShellRuntime.pending_job_text = shellJobTextIntern(AS_STRING(args[0]));
+    }
+    return makeVoid();
+}
+
 Value vmBuiltinShellTimeBegin(VM *vm, int arg_count, Value *args) {
     (void)arg_count;
     (void)args;
@@ -10494,7 +10503,7 @@ static size_t shellSetOptionTable(ShellSetOption *out) {
         {"ignoreeof", NULL, false},
         {"interactive-comments", NULL, false},
         {"keyword", NULL, false},
-        {"monitor", NULL, false},
+        {"monitor", &gShellRuntime.monitor_enabled, false},
         {"noclobber", &gShellRuntime.noclobber_enabled, false},
         {"noexec", NULL, false},
         {"noglob", &gShellRuntime.noglob_enabled, false},
@@ -10535,6 +10544,9 @@ static bool shellSetOptionByName(const char *name, bool enable) {
             return true;
         }
         *table[i].flag = table[i].inverted ? !enable : enable;
+        if (strcmp(table[i].name, "monitor") == 0 && enable) {
+            gShellRuntime.job_control_gone = false;
+        }
         if (strcmp(table[i].name, "errexit") == 0) {
             gShellRuntime.errexit_pending = false;
             gShellRuntime.errexit_defer_active = false;
@@ -10624,6 +10636,7 @@ Value vmBuiltinShellSet(VM *vm, int arg_count, Value *args) {
                     case 'a': name = "allexport"; break;
                     case 'e': name = "errexit"; break;
                     case 'f': name = "noglob"; break;
+                    case 'm': name = "monitor"; break;
                     case 'u': name = "nounset"; break;
                     case 'x': name = "xtrace"; break;
                     case 'v': name = "verbose"; break;
@@ -11682,9 +11695,12 @@ static const ShellHelpTopic kShellHelpTopics[] = {
     },
     {
         "jobs",
-        "List active background jobs.",
-        "jobs",
-        "Reports each tracked job with its index, status, and command line.",
+        "List background jobs.",
+        "jobs [-lnprs] [jobspec ...] or jobs -x command [args]",
+        "Reports each job with its number, state and command, and a job that has "
+        "ended once. -l adds pids, -p gives only pids, -n only what changed since "
+        "the last report, -r running, -s stopped. -x runs COMMAND with each job "
+        "specifier in its arguments replaced by that job's pid.",
         NULL,
         0
     },
@@ -11714,8 +11730,8 @@ static const ShellHelpTopic kShellHelpTopics[] = {
         "Remove jobs from the shell's job table.",
         "disown [job ...]",
         "Marks the supplied jobs as disowned so future jobs, fg, bg, and wait "
-        "commands ignore them. With no arguments the most recent job is "
-        "disowned. Job specifiers may be numeric indexes or begin with '%'.",
+        "commands ignore them. With no arguments the current job is disowned. "
+        "Job specifiers are %N, %%, %+, %-, %name and %?text.",
         NULL,
         0
     },
@@ -11901,9 +11917,10 @@ static const ShellHelpTopic kShellHelpTopics[] = {
     {
         "wait",
         "Wait for a job to change state.",
-        "wait [job]",
-        "Waits for the specified job (or the most recent one) to finish. Job"
-        " specifiers may be numeric indexes or begin with '%'.",
+        "wait [-fn] [-p var] [id ...]",
+        "Waits for the specified jobs (or every job) to finish. -n waits for the next"
+        " one to end, -p puts its pid in VAR. Job specifiers are %N, %%, %+, %-,"
+        " %name and %?text.",
         NULL,
         0
     },
@@ -12420,18 +12437,55 @@ static void shellPsPrintLineTree(const VProcSnapshot *snap,
 }
 #endif
 
-static int shellJobIndexCompareById(const void *left, const void *right) {
-    size_t lhs = *(const size_t *)left;
-    size_t rhs = *(const size_t *)right;
-    size_t lhs_id = gShellJobs[lhs].id;
-    size_t rhs_id = gShellJobs[rhs].id;
-    if (lhs_id < rhs_id) {
-        return -1;
+/* Bash's `jobs -x`: the command with each job spec that names a job swapped for its pid. */
+static void shellJobsRunWithPids(VM *vm, int arg_count, Value *args) {
+    if (arg_count == 0) {
+        shellUpdateStatus(0);
+        return;
     }
-    if (lhs_id > rhs_id) {
-        return 1;
+    shellCollectJobs();
+    size_t capacity = 1;
+    for (int i = 0; i < arg_count; ++i) {
+        const char *text = VALUE_TYPE(args[i]) == TYPE_STRING ? AS_STRING(args[i]) : NULL;
+        capacity += (text ? strlen(text) * 4 : 0) + 32;
     }
-    return 0;
+    char *script = (char *)malloc(capacity);
+    if (!script) {
+        runtimeError(vm, "jobs: out of memory");
+        shellUpdateStatus(1);
+        return;
+    }
+    size_t length = 0;
+    for (int i = 0; i < arg_count; ++i) {
+        const char *text = VALUE_TYPE(args[i]) == TYPE_STRING && AS_STRING(args[i]) ? AS_STRING(args[i]) : "";
+        char pid_text[32];
+        ShellJobRow row;
+        if (text[0] == '%' && shellJobSpecFind(text + 1, &row) == SHELL_JOB_SPEC_FOUND) {
+            snprintf(pid_text, sizeof(pid_text), "%ld", (long)shellJobRowPid(&row));
+            text = pid_text;
+        }
+        if (i > 0) {
+            script[length++] = ' ';
+        }
+        script[length++] = '\'';
+        for (; *text; ++text) {
+            if (*text == '\'') {
+                memcpy(script + length, "'\\''", 4);
+                length += 4;
+            } else {
+                script[length++] = *text;
+            }
+        }
+        script[length++] = '\'';
+    }
+    script[length] = '\0';
+    Value eval_arg;
+    memset(&eval_arg, 0, sizeof(eval_arg));
+    SET_VALUE_TYPE(&eval_arg, TYPE_STRING);
+    pscalStringEnsureObj(&eval_arg);
+    AS_STRING(eval_arg) = script;
+    (void)vmBuiltinShellEval(vm, 1, &eval_arg);
+    freeValue(&eval_arg);
 }
 
 Value vmBuiltinShellJobs(VM *vm, int arg_count, Value *args) {
@@ -12439,6 +12493,8 @@ Value vmBuiltinShellJobs(VM *vm, int arg_count, Value *args) {
     bool with_pid = false;
     bool running_only = false;
     bool stopped_only = false;
+    bool changed_only = false;
+    bool with_pids_in_command = false;
     int first = 0;
     for (; first < arg_count; ++first) {
         const char *text = VALUE_TYPE(args[first]) == TYPE_STRING ? AS_STRING(args[first]) : NULL;
@@ -12450,7 +12506,14 @@ Value vmBuiltinShellJobs(VM *vm, int arg_count, Value *args) {
             break;
         }
         for (const char *flag = text + 1; *flag; ++flag) {
-            if (*flag == 'p') {
+            if (*flag == 'x') {
+                if (pids_only || with_pid || running_only || stopped_only || changed_only) {
+                    runtimeError(vm, "jobs: no other options allowed with `-x'");
+                    shellUpdateStatus(1);
+                    return makeVoid();
+                }
+                with_pids_in_command = true;
+            } else if (*flag == 'p') {
                 pids_only = true;
             } else if (*flag == 'l') {
                 with_pid = true;
@@ -12458,9 +12521,11 @@ Value vmBuiltinShellJobs(VM *vm, int arg_count, Value *args) {
                 running_only = true;
             } else if (*flag == 's') {
                 stopped_only = true;
+            } else if (*flag == 'n') {
+                changed_only = true;
             } else {
                 runtimeError(vm, "jobs: -%c: invalid option", *flag);
-                fprintf(stderr, "jobs: usage: jobs [-lprs] [jobspec ...]\n");
+                fprintf(stderr, "jobs: usage: jobs [-lnprs] [jobspec ...] or jobs -x command [args]\n");
                 shellUpdateStatus(2);
                 return makeVoid();
             }
@@ -12468,86 +12533,70 @@ Value vmBuiltinShellJobs(VM *vm, int arg_count, Value *args) {
     }
     arg_count -= first;
     args += first;
+    if (with_pids_in_command) {
+        shellJobsRunWithPids(vm, arg_count, args);
+        return makeVoid();
+    }
 
     shellCollectJobs();
-    shellFinishedJobsReported();
-    size_t current_index = SIZE_MAX;
-    size_t previous_index = SIZE_MAX;
-    for (size_t i = gShellJobCount; i > 0; --i) {
-        ShellJob *job = &gShellJobs[i - 1];
-        if (job->disowned) {
-            continue;
-        }
-        if (current_index == SIZE_MAX) {
-            current_index = i - 1;
-        } else {
-            previous_index = i - 1;
-            break;
-        }
-    }
+    shellFinishedJobsForgetWaited();
+    ShellJobRow *rows = NULL;
+    size_t count = shellJobRows(&rows, false);
+    size_t current = SIZE_MAX;
+    size_t previous = SIZE_MAX;
+    shellJobRowMarks(rows, count, &current, &previous);
 
     /* Those named, in the order named, or all of them by number. */
     bool ok = true;
-    size_t capacity = arg_count > 0 ? (size_t)arg_count : gShellJobCount;
-    size_t *indices = capacity > 0 ? malloc(sizeof(size_t) * capacity) : NULL;
-    if (capacity > 0 && !indices) {
-        runtimeError(vm, "jobs: out of memory");
-        shellUpdateStatus(1);
-        return makeVoid();
-    }
-    size_t idx_count = 0;
-    if (arg_count > 0) {
+    size_t capacity = arg_count > 0 ? (size_t)arg_count : count;
+    size_t *chosen = capacity > 0 ? (size_t *)malloc(sizeof(size_t) * capacity) : NULL;
+    size_t chosen_count = 0;
+    if (arg_count > 0 && chosen) {
         for (int i = 0; i < arg_count; ++i) {
+            const char *text = VALUE_TYPE(args[i]) == TYPE_STRING && AS_STRING(args[i]) ? AS_STRING(args[i]) : "";
+            if (text[0] != '%') {
+                runtimeError(vm, "jobs: warning: %s: job specification requires leading `%%'", text);
+            }
             size_t index = 0;
-            if (shellParseJobSpecifier(vm, "jobs", args[i], &index)) {
-                indices[idx_count++] = index;
-            } else {
-                ok = false;
+            ShellJobSpecResult result = shellJobSpecFindIn(rows, count, text[0] == '%' ? text + 1 : text, &index);
+            if (result == SHELL_JOB_SPEC_FOUND) {
+                chosen[chosen_count++] = index;
+                continue;
             }
-        }
-    } else {
-        for (size_t i = 0; i < gShellJobCount; ++i) {
-            if (!gShellJobs[i].disowned) {
-                indices[idx_count++] = i;
+            if (result == SHELL_JOB_SPEC_AMBIGUOUS) {
+                const char *what = text[0] == '%' ? text + 1 : text;
+                runtimeError(vm, "jobs: %s: ambiguous job spec", what[0] == '?' ? what + 1 : what);
             }
+            runtimeError(vm, "jobs: %s: no such job", text);
+            ok = false;
         }
-        if (idx_count > 1) {
-            qsort(indices, idx_count, sizeof(size_t), shellJobIndexCompareById);
+    } else if (chosen) {
+        for (size_t i = 0; i < count; ++i) {
+            chosen[chosen_count++] = i;
         }
     }
 
-    bool show_markers = shellRuntimeIsInteractive();
-    for (size_t i = 0; i < idx_count; ++i) {
-        size_t job_index = indices[i];
-        ShellJob *job = &gShellJobs[job_index];
-        if ((running_only && job->stopped) || (stopped_only && !job->stopped)) {
+    for (size_t i = 0; i < chosen_count; ++i) {
+        ShellJobRow *row = &rows[chosen[i]];
+        bool stopped = row->job && row->job->stopped;
+        if ((running_only && (!row->job || stopped)) || (stopped_only && !stopped) ||
+            (changed_only && row->job && row->job->notified)) {
             continue;
         }
-        /* The first command's, as $! names the last. */
-        pid_t pid = job->pid_count > 0 && job->pids && job->pids[0] > 0 ? job->pids[0] : job->last_pid;
         if (pids_only) {
-            shellFdPrintf(STDOUT_FILENO, "%ld\n", (long)pid);
+            shellFdPrintf(STDOUT_FILENO, "%ld\n", (long)shellJobRowPid(row));
             continue;
         }
-        const char *state = job->stopped ? "Stopped" : "Running";
-        const char *command = job->command ? job->command : "";
-        char prefix[32] = "";
-        if (with_pid) {
-            snprintf(prefix, sizeof(prefix), "%ld ", (long)pid);
-        }
-        if (show_markers) {
-            char marker = ' ';
-            if (job_index == current_index) {
-                marker = '+';
-            } else if (job_index == previous_index) {
-                marker = '-';
-            }
-            shellFdPrintf(STDOUT_FILENO, "[%zu] %c %s%s %s\n", job->id, marker, prefix, state, command);
+        char marker = chosen[i] == current ? '+' : (chosen[i] == previous ? '-' : ' ');
+        shellJobRowPrint(STDOUT_FILENO, row, marker, with_pid);
+        if (row->ended) {
+            shellFinishedJobReported(row->ended);
         } else {
-            shellFdPrintf(STDOUT_FILENO, "[%zu] %s%s %s\n", job->id, prefix, state, command);
+            row->job->notified = true;
         }
     }
-    free(indices);
+    free(chosen);
+    free(rows);
     shellUpdateStatus(ok ? 0 : 1);
     return makeVoid();
 }
@@ -12592,16 +12641,25 @@ Value vmBuiltinShellDisown(VM *vm, int arg_count, Value *args) {
                 gShellJobs[i].disowned = true;
             }
         }
+        ShellRuntimeState *ctx = shellGetContext();
+        for (size_t i = 0; !keep && all && ctx && i < ctx->finished_job_count; ++i) {
+            shellFinishedJobReported(&ctx->finished_jobs[i]);
+        }
         shellUpdateStatus(0);
         return makeVoid();
     }
     if (arg_count == 0) {
-        size_t index = 0;
-        if (!shellResolveJobIndex(vm, "disown", arg_count, args, &index)) {
+        ShellJobRow row;
+        if (shellJobSpecFind("", &row) != SHELL_JOB_SPEC_FOUND) {
+            runtimeError(vm, "disown: current: no such job");
             shellUpdateStatus(1);
             return makeVoid();
         }
-        gShellJobs[index].disowned = !keep;
+        if (row.ended && !keep) {
+            shellFinishedJobReported(row.ended);
+        } else if (row.job) {
+            row.job->disowned = !keep;
+        }
         shellUpdateStatus(0);
         return makeVoid();
     }
@@ -12617,6 +12675,19 @@ Value vmBuiltinShellDisown(VM *vm, int arg_count, Value *args) {
 
     for (int i = 0; i < arg_count; ++i) {
         size_t index = 0;
+        if (VALUE_TYPE(args[i]) == TYPE_STRING && AS_STRING(args[i]) && AS_STRING(args[i])[0] == '%') {
+            ShellJobRow row;
+            if (!shellJobSpecResolve(vm, "disown", AS_STRING(args[i]), &row)) {
+                ok = false;
+            } else if (row.ended) {
+                if (!keep) {
+                    shellFinishedJobReported(row.ended);
+                }
+            } else {
+                indices[resolved_count++] = (size_t)(row.job - gShellJobs);
+            }
+            continue;
+        }
         if (!shellParseJobSpecifier(vm, "disown", args[i], &index)) {
             ok = false;
             continue;
@@ -12683,34 +12754,6 @@ static bool shellKillParseSignal(Value value, bool numeric_only, int *out_signo)
     }
     if (VALUE_TYPE(value) == TYPE_STRING && AS_STRING(value)) {
         return shellRuntimeParseSignal(AS_STRING(value), out_signo);
-    }
-    return false;
-}
-
-static bool shellKillTryJobSpec(const char *text, size_t *out_index) {
-    if (!text || !*text || !out_index) {
-        return false;
-    }
-    while (isspace((unsigned char)*text)) {
-        ++text;
-    }
-    if (*text != '%') {
-        return false;
-    }
-    ++text;
-    while (isspace((unsigned char)*text)) {
-        ++text;
-    }
-    if (!*text) {
-        return false;
-    }
-    char *endptr = NULL;
-    long vis = strtol(text, &endptr, 10);
-    while (endptr && *endptr && isspace((unsigned char)*endptr)) {
-        ++endptr;
-    }
-    if (endptr && *endptr == '\0' && vis > 0) {
-        return shellJobFindVisibleIndex((size_t)vis, out_index);
     }
     return false;
 }
@@ -12868,6 +12911,7 @@ static bool shellKillSignalJob(VM *vm, const char *spec_text, size_t index, int 
         job->stopped = false;
     }
     if (terminate) {
+        job->term_signal = signo;
         ShellFinishedJob *entry = shellRememberFinishedJob(job, false);
         if (entry) {
             entry->killed_now = true;
@@ -13017,6 +13061,7 @@ Value vmBuiltinShellKill(VM *vm, int arg_count, Value *args) {
     }
 
     bool overall_ok = true;
+    bool signalled = false;
     for (int i = operand_start; i < arg_count; ++i) {
         Value target = args[i];
         if (VALUE_TYPE(target) == TYPE_STRING && AS_STRING(target)) {
@@ -13025,11 +13070,21 @@ Value vmBuiltinShellKill(VM *vm, int arg_count, Value *args) {
                 ++text;
             }
             if (*text == '%') {
-                size_t index = 0;
-                if (shellKillTryJobSpec(text, &index) && index < gShellJobCount) {
-                    if (!shellKillSignalJob(vm, AS_STRING(target), index, signal_number)) {
-                        overall_ok = false;
+                ShellJobRow row;
+                ShellJobSpecResult found = shellJobSpecFind(text + 1, &row);
+                if (found == SHELL_JOB_SPEC_FOUND) {
+                    /* One that has ended is still there to be named, and takes no signal. */
+                    if (row.job) {
+                        if (shellKillSignalJob(vm, AS_STRING(target), (size_t)(row.job - gShellJobs),
+                                               signal_number)) {
+                            signalled = true;
+                        } else {
+                            overall_ok = false;
+                        }
                     }
+                } else if (found == SHELL_JOB_SPEC_AMBIGUOUS) {
+                    runtimeError(vm, "kill: %s: ambiguous job spec", text[1] == '?' ? text + 2 : text + 1);
+                    overall_ok = false;
                 } else {
                     runtimeError(vm, "kill: %s: no such job", AS_STRING(target));
                     overall_ok = false;
@@ -13093,7 +13148,12 @@ Value vmBuiltinShellKill(VM *vm, int arg_count, Value *args) {
         if (rc != 0) {
             fprintf(stderr, "kill: (%ld) %s\n", pid_value, strerror(errno));
             overall_ok = false;
+        } else {
+            signalled = true;
         }
+    }
+    if (signalled && signal_number != 0) {
+        gShellRuntime.kill_command = gShellRuntime.commands_run;
     }
 
     /* Pull in any state changes caused by the signals (stops, exits) so jobs/
@@ -13211,7 +13271,20 @@ static bool shellJobIsVirtualStoppedWithoutThread(const ShellJob *job) {
     return has_nonresumable;
 }
 
+/* Bash has them at a prompt and under set -m, and says so anywhere else. */
+static bool shellJobControlBuiltinAllowed(VM *vm, const char *name) {
+    if (!gShellRuntime.job_control_gone && (gShellRuntime.monitor_enabled || shellRuntimeIsInteractive())) {
+        return true;
+    }
+    runtimeError(vm, "%s: no job control", name);
+    shellUpdateStatus(1);
+    return false;
+}
+
 Value vmBuiltinShellFg(VM *vm, int arg_count, Value *args) {
+    if (!shellJobControlBuiltinAllowed(vm, "fg")) {
+        return makeVoid();
+    }
     shellCollectJobs();
     shellEnsureJobControl();
     size_t index = 0;
@@ -13265,13 +13338,15 @@ Value vmBuiltinShellFg(VM *vm, int arg_count, Value *args) {
         shellUpdateStatus(1);
         return makeVoid();
     }
-    if (job_control) {
+    if (job_control && shellRuntimeIsInteractive()) {
         shellFdPrintf(STDOUT_FILENO, "\033[2J\033[H");
         if (job->command && job->command[0]) {
             shellFdPrintf(STDOUT_FILENO, "[%zu]  + continued  %s\n", job->id, job->command);
         } else {
             shellFdPrintf(STDOUT_FILENO, "[%zu]  + continued\n", job->id);
         }
+    } else {
+        shellFdPrintf(STDOUT_FILENO, "%s\n", job->text ? job->text : (job->command ? job->command : ""));
     }
     shellJobMarkRunning(job);
     int final_status = job->last_status;
@@ -13316,6 +13391,9 @@ Value vmBuiltinShellFg(VM *vm, int arg_count, Value *args) {
 }
 
 Value vmBuiltinShellBg(VM *vm, int arg_count, Value *args) {
+    if (!shellJobControlBuiltinAllowed(vm, "bg")) {
+        return makeVoid();
+    }
     shellCollectJobs();
     shellEnsureJobControl();
     size_t index = 0;
@@ -13333,6 +13411,12 @@ Value vmBuiltinShellBg(VM *vm, int arg_count, Value *args) {
         shellUpdateStatus(1);
         return makeVoid();
     }
+    if (!job->stopped) {
+        runtimeError(vm, "bg: job %zu already in background", job->id);
+        shellUpdateStatus(0);
+        return makeVoid();
+    }
+    shellFdPrintf(STDOUT_FILENO, "[%zu]+ %s &\n", job->id, job->text ? job->text : (job->command ? job->command : ""));
     shellJobContinue(job, true);
     shellUpdateStatus(0);
     return makeVoid();
@@ -13344,20 +13428,36 @@ static void shellWaitInterrupted(int signo) {
     shellRuntimeProcessPendingSignals();
 }
 
-/* A number is a pid and %n a job. False if it is neither. */
+/* A number is a pid and a % spec a job. False if it is neither. */
 typedef struct {
     long target;
     bool by_id;
+    /* More than one job goes by that name. */
+    bool ambiguous;
     const char *text;
 } ShellWaitOperand;
 
 static bool shellWaitParseOperand(Value spec, ShellWaitOperand *op) {
     op->target = -1;
     op->by_id = false;
+    op->ambiguous = false;
     op->text = "";
     if (VALUE_TYPE(spec) == TYPE_STRING && AS_STRING(spec)) {
         op->text = AS_STRING(spec);
         op->by_id = op->text[0] == '%';
+        if (op->by_id) {
+            ShellJobRow row;
+            ShellJobSpecResult found = shellJobSpecFind(op->text + 1, &row);
+            if (found == SHELL_JOB_SPEC_FOUND) {
+                op->target = (long)row.id;
+                return true;
+            }
+            if (found == SHELL_JOB_SPEC_AMBIGUOUS) {
+                op->ambiguous = true;
+                return false;
+            }
+            /* A number is looked for among the finished too: `wait %1` twice. */
+        }
         const char *digits = op->by_id ? op->text + 1 : op->text;
         char *end = NULL;
         long parsed = *digits ? strtol(digits, &end, 10) : -1;
@@ -13542,6 +13642,10 @@ static int shellWaitForOperand(VM *vm, Value spec, int *signo_out, pid_t *pid_ou
     long target = operand.target;
     bool by_id = operand.by_id;
     const char *text = operand.text;
+    if (operand.ambiguous) {
+        runtimeError(vm, "wait: %s: ambiguous job spec", text[1] == '?' ? text + 2 : text + 1);
+        return 127;
+    }
     if (!parsed) {
         if (by_id) {
             runtimeError(vm, "wait: %s: no such job", text);
@@ -13564,10 +13668,7 @@ static int shellWaitForOperand(VM *vm, Value spec, int *signo_out, pid_t *pid_ou
         if (*signo_out > 0) {
             return status;
         }
-        ShellFinishedJob *entry = shellRememberFinishedJob(job, true);
-        if (entry && by_id) {
-            entry->has_id = false;
-        }
+        (void)shellRememberFinishedJob(job, true);
         shellRemoveJobAt(i);
         return status;
     }
@@ -13575,16 +13676,16 @@ static int shellWaitForOperand(VM *vm, Value spec, int *signo_out, pid_t *pid_ou
     ShellFinishedJob *entry = by_id ? shellFindFinishedJobById((size_t)target)
                                     : shellFindFinishedJobByPid((pid_t)target);
     if (entry) {
-        entry->reported = true;
-        entry->next_repeats = false;
-        if (by_id) {
-            entry->has_id = false;
+        if (!entry->reported) {
+            entry->reported = true;
+            entry->waits_since = 0;
         }
+        entry->next_repeats = false;
         *pid_out = entry->last_pid;
         return entry->status;
     }
     if (by_id) {
-        runtimeError(vm, "wait: %%%ld: no such job", target);
+        runtimeError(vm, "wait: %s: no such job", text);
     } else {
         runtimeError(vm, "wait: pid %ld is not a child of this shell", target);
     }
@@ -13660,6 +13761,14 @@ Value vmBuiltinShellWait(VM *vm, int arg_count, Value *args) {
     }
     args += first;
     arg_count -= first;
+    /* A number wait has used lasts for one more wait. */
+    ShellRuntimeState *wait_ctx = shellGetContext();
+    for (size_t i = 0; wait_ctx && i < wait_ctx->finished_job_count; ++i) {
+        ShellFinishedJob *entry = &wait_ctx->finished_jobs[i];
+        if (entry->reported && entry->has_id && ++entry->waits_since >= 2) {
+            entry->has_id = false;
+        }
+    }
     if (next) {
         shellWaitForNextJob(args, arg_count, &pid);
         shellWaitSetPidVar(pid_var, pid);
@@ -13668,11 +13777,12 @@ Value vmBuiltinShellWait(VM *vm, int arg_count, Value *args) {
     if (arg_count == 0) {
         shellWaitSetPidVar(pid_var, -1);
         /* Bash gives 0 here and forgets every job. A script keeps the one $! names, if that had
-         * already ended. */
+         * already ended, and kill as the command before this is too soon for bash to have heard. */
         ShellFinishedJob *ended = gShellRuntime.last_bg_pid > 0
                                       ? shellFindFinishedJobByPid(gShellRuntime.last_bg_pid)
                                       : NULL;
-        bool keep_last = ended && (!shellRuntimeIsInteractive() || shellNumbersItsOwnJobs());
+        bool keep_last = ended && gShellRuntime.kill_command + 1 != gShellRuntime.commands_run &&
+                         (!shellRuntimeIsInteractive() || shellNumbersItsOwnJobs());
         ShellFinishedJob last;
         if (keep_last) {
             last = *ended;
