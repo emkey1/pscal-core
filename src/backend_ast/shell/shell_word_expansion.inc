@@ -2241,7 +2241,9 @@ invoke_cleanup:
     shellRuntimeUnwindRedirectScopes(redirect_scope_depth);
     shellUnwindChunk(loop_depth, case_depth);
     if (pipeline_saved) {
-        shellResetPipeline();
+        if (!shellRuntimeChunkLeftStages()) {
+            shellResetPipeline();
+        }
         *caller_pipeline = saved_pipeline;
     }
     if (using_cached_vm) {
@@ -2648,9 +2650,15 @@ static bool shellRunBody(VM *vm, ShellCommand *cmd) {
     if (shellRuntimeConsumeExitRequested()) {
         status = shellRuntimeLastStatus();
     }
-    freeVM(body_vm);
-    free(body_vm);
+    bool left_stages = shellRuntimeChunkLeftStages();
+    if (!left_stages) {
+        freeVM(body_vm);
+        free(body_vm);
+    }
 #if defined(PSCAL_TARGET_IOS)
+    if (left_stages && state) {
+        state->ctx = NULL;
+    }
     shellBodyScopeLeave(state, &scope);
 #endif
     shellUpdateStatus(status);

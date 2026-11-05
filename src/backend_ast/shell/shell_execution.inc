@@ -6025,6 +6025,27 @@ static bool shellPipelineExecuteStageInProcess(VM *vm,
 }
 #endif /* PSCAL_TARGET_IOS */
 
+/* A trap's `exit` or `return` can end a chunk between its pipeline's stages. Those already running
+ * use this state and pick up their pipe ends with no lock, and one may never end, so nothing they
+ * can reach is closed, freed or waited for. A context this happened in is left to them for good. */
+bool shellRuntimeChunkLeftStages(void) {
+#if defined(PSCAL_TARGET_IOS)
+    if (gShellRuntime.left_stages_running) {
+        return true;
+    }
+    ShellPipelineContext *ctx = &gShellRuntime.pipeline;
+    if (ctx->active && ctx->thread_started) {
+        for (size_t i = 0; i < ctx->stage_count; ++i) {
+            if (ctx->thread_started[i]) {
+                gShellRuntime.left_stages_running = true;
+                return true;
+            }
+        }
+    }
+#endif
+    return false;
+}
+
 static void shellExitUnlessInteractive(VM *vm, const char *reason) {
     if (shellRuntimeIsInteractive()) {
         return;

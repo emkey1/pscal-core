@@ -654,6 +654,7 @@ typedef struct ShellRuntimeState {
     bool break_requested;
     bool continue_requested;
     bool pipeline_subshell_active;
+    bool left_stages_running;
     bool in_subshell;
     bool started_as_command; /* a shell inside its caller: the session's jobs are not its own */
     pid_t subshell_parent_pid; /* $$ in a subshell is its shell's */
@@ -3921,7 +3922,9 @@ static void shellRuntimeExecuteTrap(const char *command, const char *label) {
         status = shellRunSource(command, label ? label : "<trap>", &opts, &exit_requested);
         gShellTextDepth--;
     }
-    shellResetPipeline();
+    if (!shellRuntimeChunkLeftStages()) {
+        shellResetPipeline();
+    }
     *caller_pipeline = saved_pipeline;
 
 #if defined(PSCAL_TARGET_IOS)
@@ -4224,6 +4227,7 @@ static void shellRuntimeRunReturnTrap(bool returned, int status) {
 typedef struct {
     ShellTrapEntry err;
     ShellTrapEntry ret;
+    ShellTrapEntry debug; /* A substitution's only: a function keeps the DEBUG trap it was called with. */
 } ShellCallerTraps;
 
 static void shellCallerTrapsPutAside(ShellCallerTraps *saved, bool traced) {
@@ -5223,6 +5227,7 @@ ShellRuntimeState *shellRuntimeCreateContext(void) {
     }
     *ctx = *template_ctx;
     ctx->pipeline = (ShellPipelineContext){0};
+    ctx->left_stages_running = false;
     /* Deep-copy owned runtime state so contexts do not share pointers. */
     ctx->dir_stack = NULL;
     ctx->dir_stack_count = 0;
@@ -7051,7 +7056,8 @@ void shellRuntimeAbandonCommand(void) {
 }
 
 /* A substitution sees the caller's ERR and RETURN traps only under set -E and set -T, and what
- * it sets stays in there. These are per thread rather than per context. */
+ * it sets stays in there, as a DEBUG trap it sets does. These are per thread rather than per
+ * context. */
 void *shellRuntimeSubstitutionTrapsPutAside(void) {
     ShellCallerTraps *saved = (ShellCallerTraps *)malloc(sizeof(ShellCallerTraps));
     if (!saved) {
@@ -7059,8 +7065,13 @@ void *shellRuntimeSubstitutionTrapsPutAside(void) {
     }
     saved->err = gShellErrTrap;
     saved->ret = gShellReturnTrap;
+    saved->debug = gShellDebugTrap;
     memset(&gShellErrTrap, 0, sizeof(gShellErrTrap));
     memset(&gShellReturnTrap, 0, sizeof(gShellReturnTrap));
+    memset(&gShellDebugTrap, 0, sizeof(gShellDebugTrap));
+    if (saved->debug.command) {
+        (void)shellTrapSetCommand(&gShellDebugTrap, saved->debug.command);
+    }
     if (saved->err.command) {
         (void)shellTrapSetCommand(&gShellErrTrap, saved->err.command);
         gShellErrTrap.dormant = saved->err.dormant || !gShellRuntime.errtrace_enabled;
@@ -7078,8 +7089,10 @@ void shellRuntimeSubstitutionTrapsBack(void *saved) {
     }
     shellTrapClearEntry(&gShellErrTrap);
     shellTrapClearEntry(&gShellReturnTrap);
+    shellTrapClearEntry(&gShellDebugTrap);
     gShellErrTrap = ((ShellCallerTraps *)saved)->err;
     gShellReturnTrap = ((ShellCallerTraps *)saved)->ret;
+    gShellDebugTrap = ((ShellCallerTraps *)saved)->debug;
     free(saved);
 }
 

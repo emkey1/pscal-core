@@ -423,6 +423,7 @@ void shellRuntimeSetLastStatus(int status);
 void shellRuntimeSetLastStatusSticky(int status);
 void shellRuntimeSetPromptStatus(int status);
 void shellRuntimeIdsMayHaveChanged(void);
+bool shellRuntimeChunkLeftStages(void);
 void shellRuntimeKeepLineState(ShellRuntimeState *line_ctx);
 bool shellRuntimeHistoryGetEntry(size_t reverse_index, char **out_line);
 bool shellRuntimeExpandHistoryReference(const char *input,

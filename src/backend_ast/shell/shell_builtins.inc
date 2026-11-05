@@ -325,7 +325,12 @@ Value vmBuiltinShellExec(VM *vm, int arg_count, Value *args) {
         goto cleanup;
     }
     shellCollectJobs();
+    bool exit_before_trap = gShellExitRequested;
     shellRuntimeRunDebugTrap();
+    /* Its `exit` comes before the command, which doesn't run. */
+    if (gShellExitRequested && !exit_before_trap) {
+        goto cleanup;
+    }
     ShellCommand cmd;
     /* A job's or stage's words failing is its own failure: under bash it has forked by then, so it
      * reports, ends with status 1 and the shell goes on. The rest of the pipeline runs, and the
@@ -5057,7 +5062,9 @@ Value vmBuiltinShellSource(VM *vm, int arg_count, Value *args) {
     gShellReturnScopeDepth--;
     gShellTrapStatusValid = saved_trap_status_valid;
     if (pipeline_saved) {
-        shellResetPipeline();
+        if (!shellRuntimeChunkLeftStages()) {
+            shellResetPipeline();
+        }
         *caller_pipeline = saved_pipeline;
     }
     if (source_name_pushed) {
@@ -5177,7 +5184,9 @@ Value vmBuiltinShellEval(VM *vm, int arg_count, Value *args) {
         shellUnwindChunk(loop_depth, case_depth);
     }
     if (pipeline_saved) {
-        shellResetPipeline();
+        if (!shellRuntimeChunkLeftStages()) {
+            shellResetPipeline();
+        }
         *caller_pipeline = saved_pipeline;
     }
 
