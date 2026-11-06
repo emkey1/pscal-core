@@ -1,4 +1,5 @@
 #include "backend_ast/builtin.h"
+#include "ext_builtins/registry.h"
 #include "core/utils.h"
 #include "vm/vm.h"
 #include "vm/string_sentinels.h"
@@ -1713,6 +1714,12 @@ void registerLandscapeBuiltins(void) {
     registerVmBuiltin("landscapesetlightingpreset", vmBuiltinLandscapeSetLightingPreset,
                       BUILTIN_TYPE_PROCEDURE, "LandscapeSetLightingPreset", FX_PURE);
 #ifdef SDL
+    /* The two that draw through SDL's OpenGL are filed with the other SDL
+     * drawing builtins, as the listings expect of an SDL build: Aether's
+     * guide leaves the graphics category out of its inventory. */
+    extBuiltinRegisterGroup("graphics", "drawing");
+    extBuiltinRegisterFunction("graphics", "drawing", "LandscapeDrawSkyDome");
+    extBuiltinRegisterFunction("graphics", "drawing", "LandscapeDrawCloudLayer");
     registerVmBuiltin("landscapedrawskydome", vmBuiltinLandscapeDrawSkyDome,
                       BUILTIN_TYPE_PROCEDURE, "LandscapeDrawSkyDome", FX_IO);
     registerVmBuiltin("landscapedrawcloudlayer", vmBuiltinLandscapeDrawCloudLayer,

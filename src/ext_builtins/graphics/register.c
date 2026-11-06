@@ -126,12 +126,21 @@ void registerGraphicsBuiltins(void) {
 
     for (size_t i = 0; i < sizeof(graphics_builtins) / sizeof(graphics_builtins[0]); ++i) {
         const GraphicsBuiltin *entry = &graphics_builtins[i];
-        extBuiltinRegisterFunction(category, entry->group, entry->display_name);
         /* Whole category (window/drawing/textures/text/input/audio/opengl)
          * touches the screen or audio device; blanket FX_IO rather than
          * itemizing ~70 SDL entries individually (Docs/pscal_vm2_plan.md
          * §6.3's conservative default for ext_builtins categories). */
-        registerVmBuiltin(entry->vm_name, entry->handler, entry->type, entry->display_name, FX_IO);
+        EffectMask mask = FX_IO;
+        if (getVmBuiltinHandler(entry->vm_name) == entry->handler) {
+            /* Already a core builtin of every build (PollKeyAny, whose
+             * handler reads SDL's keys too when there are any): registered
+             * again for its routine type, but it keeps its category and
+             * effect rather than turning into graphics. */
+            mask = getVmBuiltinEffectMaskById(getVmBuiltinID(entry->vm_name));
+        } else {
+            extBuiltinRegisterFunction(category, entry->group, entry->display_name);
+        }
+        registerVmBuiltin(entry->vm_name, entry->handler, entry->type, entry->display_name, mask);
     }
 #endif
 }

@@ -2553,6 +2553,46 @@ static atomic_size_t g_extra_builtins_published_count = 0;
 static pthread_mutex_t builtin_registry_mutex;
 static pthread_once_t builtin_registry_once = PTHREAD_ONCE_INIT;
 
+/* Aether's view of what the shell registered (registerShellVmBuiltin). In the
+ * iOS app the shell's builtins and smallclue's tools go into this one table
+ * for every front end of the process, so Aether found `cat`, `[` and
+ * `__shell_exec` as builtins, its pure `sum` took the effect of smallclue's
+ * `sum` tool, and its `exit`, `exec` and `printf` ran the shell's. Per id:
+ * SHELL_VIEW_ONLY for a name only the shell registered, SHELL_VIEW_REPLACED
+ * for a builtin it replaced, whose own handler and effect g_shell_replaced
+ * keeps. Ids past SHELL_VIEW_MAX_IDS are seen as registered. Nothing is set
+ * outside the app, where g_shell_view_used stays false and the lookups below
+ * cost one load. */
+enum { SHELL_VIEW_NONE = 0, SHELL_VIEW_ONLY = 1, SHELL_VIEW_REPLACED = 2 };
+#define SHELL_VIEW_MAX_IDS 4096
+#define SHELL_REPLACED_MAX 32
+static _Atomic bool g_shell_view_used = false;
+static _Atomic unsigned char g_shell_view[SHELL_VIEW_MAX_IDS];
+static struct {
+    int id;
+    VmBuiltinFn handler;
+    EffectMask mask;
+} g_shell_replaced[SHELL_REPLACED_MAX];
+static _Atomic size_t g_shell_replaced_count = 0;
+
+static unsigned char shellViewOfId(int id) {
+    if (!atomic_load_explicit(&g_shell_view_used, memory_order_acquire) ||
+        id < 0 || id >= SHELL_VIEW_MAX_IDS || frontendGetKind() != FRONTEND_KIND_AETHER) {
+        return SHELL_VIEW_NONE;
+    }
+    return atomic_load_explicit(&g_shell_view[id], memory_order_acquire);
+}
+
+static size_t shellReplacedIndex(int id) {
+    size_t count = atomic_load_explicit(&g_shell_replaced_count, memory_order_acquire);
+    for (size_t i = 0; i < count; ++i) {
+        if (g_shell_replaced[i].id == id) {
+            return i;
+        }
+    }
+    return SIZE_MAX;
+}
+
 /* VM 2.0 Phase 6 (Docs/pscal_vm2_plan.md §6.3): per-id effect-mask overrides.
  * Sparse, indexed by builtin id (core ids included, since registerVmBuiltin
  * can replace a core dispatch-table placeholder, e.g. SDL graphics). Grown
@@ -2898,7 +2938,7 @@ EffectMask pscalBuiltinNameEffectMaskLive(const char *name) {
     return pscalBuiltinNameEffectMask(name);
 }
 
-EffectMask getVmBuiltinEffectMaskById(int id) {
+static EffectMask effectMaskByIdAsRegistered(int id) {
     if (id < 0) return FX_PURE;
     pthread_once(&builtin_registry_once, initBuiltinRegistryMutex);
     pthread_mutex_lock(&builtin_registry_mutex);
@@ -2926,8 +2966,19 @@ EffectMask getVmBuiltinEffectMaskById(int id) {
     return result;
 }
 
-void registerVmBuiltin(const char *name, VmBuiltinFn handler,
-        BuiltinRoutineType type, const char *display_name, EffectMask effect_mask) {
+EffectMask getVmBuiltinEffectMaskById(int id) {
+    if (shellViewOfId(id) == SHELL_VIEW_REPLACED) {
+        size_t index = shellReplacedIndex(id);
+        if (index != SIZE_MAX) {
+            return g_shell_replaced[index].mask;
+        }
+    }
+    return effectMaskByIdAsRegistered(id);
+}
+
+static void registerVmBuiltinFrom(const char *name, VmBuiltinFn handler,
+        BuiltinRoutineType type, const char *display_name, EffectMask effect_mask,
+        bool from_shell) {
     if (!name || !handler) return;
     pthread_once(&builtin_registry_once, initBuiltinRegistryMutex);
 
@@ -2951,6 +3002,11 @@ void registerVmBuiltin(const char *name, VmBuiltinFn handler,
         __atomic_store_n(&mapping->handler, handler, __ATOMIC_RELEASE);
         if (existing_id != SIZE_MAX) {
             setEffectOverrideUnlocked(existing_id, effect_mask);
+            if (!from_shell && existing_id < SHELL_VIEW_MAX_IDS) {
+                /* A front end's own registration: its name, whatever the
+                 * shell made of it. */
+                atomic_store_explicit(&g_shell_view[existing_id], SHELL_VIEW_NONE, memory_order_release);
+            }
         }
         pthread_mutex_unlock(&builtin_registry_mutex);
         return;
@@ -2983,6 +3039,11 @@ void registerVmBuiltin(const char *name, VmBuiltinFn handler,
     pthread_mutex_unlock(&builtin_registry_mutex);
 }
 
+void registerVmBuiltin(const char *name, VmBuiltinFn handler,
+        BuiltinRoutineType type, const char *display_name, EffectMask effect_mask) {
+    registerVmBuiltinFrom(name, handler, type, display_name, effect_mask, false);
+}
+
 // This function now comes AFTER the table and comparison function it uses.
 VmBuiltinFn getVmBuiltinHandler(const char *name) {
     if (!name) return NULL;
@@ -3013,13 +3074,28 @@ static const VmBuiltinMapping *publishedExtraBuiltin(size_t extra_index) {
     return table ? &table[extra_index] : NULL;
 }
 
-VmBuiltinFn getVmBuiltinHandlerById(int id) {
+static VmBuiltinFn handlerByIdAsRegistered(int id) {
     if (id < 0) return NULL;
     if ((size_t)id < num_vm_builtins) {
         return __atomic_load_n(&vmBuiltinDispatchTable[id].handler, __ATOMIC_ACQUIRE);
     }
     const VmBuiltinMapping *extra = publishedExtraBuiltin((size_t)id - num_vm_builtins);
     return extra ? __atomic_load_n(&extra->handler, __ATOMIC_ACQUIRE) : NULL;
+}
+
+VmBuiltinFn getVmBuiltinHandlerById(int id) {
+    if (id < 0) return NULL;
+    unsigned char view = shellViewOfId(id);
+    if (view == SHELL_VIEW_ONLY) {
+        return NULL;
+    }
+    if (view == SHELL_VIEW_REPLACED) {
+        size_t index = shellReplacedIndex(id);
+        if (index != SIZE_MAX) {
+            return g_shell_replaced[index].handler;
+        }
+    }
+    return handlerByIdAsRegistered(id);
 }
 
 const char* getVmBuiltinNameById(int id) {
@@ -3193,7 +3269,7 @@ bool builtinNameRejectedByFrontend(const char* name) {
     return false;
 }
 
-int getVmBuiltinID(const char *name) {
+static int builtinIdAsRegistered(const char *name) {
     if (!name) {
         return -1;
     }
@@ -3219,6 +3295,47 @@ int getVmBuiltinID(const char *name) {
     pthread_mutex_unlock(&builtin_registry_mutex);
 
     return result;
+}
+
+int getVmBuiltinID(const char *name) {
+    int id = builtinIdAsRegistered(name);
+    return shellViewOfId(id) == SHELL_VIEW_ONLY ? -1 : id;
+}
+
+void registerShellVmBuiltin(const char *name, VmBuiltinFn handler,
+        BuiltinRoutineType type, const char *display_name, EffectMask effect_mask) {
+    if (!name || !handler) return;
+    pthread_once(&builtin_registry_once, initBuiltinRegistryMutex);
+    /* What the name was before, as registered: the registering thread may
+     * itself be running Aether. A language builtin keeps its handler and
+     * effect for Aether, recorded before the shell's replace them. */
+    int prior = builtinIdAsRegistered(name);
+    if (prior >= 0 && prior < SHELL_VIEW_MAX_IDS) {
+        VmBuiltinFn prior_handler = handlerByIdAsRegistered(prior);
+        EffectMask prior_mask = effectMaskByIdAsRegistered(prior);
+        pthread_mutex_lock(&builtin_registry_mutex);
+        size_t count = atomic_load_explicit(&g_shell_replaced_count, memory_order_relaxed);
+        if (atomic_load_explicit(&g_shell_view[prior], memory_order_relaxed) == SHELL_VIEW_NONE &&
+            prior_handler && count < SHELL_REPLACED_MAX) {
+            g_shell_replaced[count].id = prior;
+            g_shell_replaced[count].handler = prior_handler;
+            g_shell_replaced[count].mask = prior_mask;
+            atomic_store_explicit(&g_shell_replaced_count, count + 1, memory_order_release);
+            atomic_store_explicit(&g_shell_view[prior], SHELL_VIEW_REPLACED, memory_order_release);
+            atomic_store_explicit(&g_shell_view_used, true, memory_order_release);
+        }
+        pthread_mutex_unlock(&builtin_registry_mutex);
+    }
+
+    registerVmBuiltinFrom(name, handler, type, display_name, effect_mask, true);
+
+    if (prior < 0) {
+        int id = builtinIdAsRegistered(name);
+        if (id >= 0 && id < SHELL_VIEW_MAX_IDS) {
+            atomic_store_explicit(&g_shell_view[id], SHELL_VIEW_ONLY, memory_order_release);
+            atomic_store_explicit(&g_shell_view_used, true, memory_order_release);
+        }
+    }
 }
 
 Value vmBuiltinSqr(VM* vm, int arg_count, Value* args) {
@@ -13060,6 +13177,9 @@ int isBuiltin(const char *name) {
 
     if (!result) {
         result = getVmBuiltinID(name) != -1;
+    } else if (shellViewOfId(builtinIdAsRegistered(name)) == SHELL_VIEW_ONLY) {
+        /* A shell command (cat, sum, [) is no builtin of Aether's. */
+        result = 0;
     }
 
     return result;

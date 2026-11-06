@@ -15,7 +15,7 @@ static void registerShellBuiltin(const char *category, const char *group,
      * "true", "false") exist, but classifying this whole surface as
      * FX_PROC|FX_IO is the conservative call Docs/pscal_vm2_plan.md §6.3 asks
      * for rather than auditing each of the ~80 shell commands individually. */
-    registerVmBuiltin(name, handler, BUILTIN_TYPE_PROCEDURE, NULL, FX_PROC | FX_IO);
+    registerShellVmBuiltin(name, handler, BUILTIN_TYPE_PROCEDURE, NULL, FX_PROC | FX_IO);
     extBuiltinRegisterFunction(category, group, name);
 }
 

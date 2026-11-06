@@ -68,6 +68,17 @@ bool builtinNameRejectedByFrontend(const char* name);
 void registerVmBuiltin(const char *vm_name, VmBuiltinFn handler,
                        BuiltinRoutineType type, const char *display_name,
                        EffectMask effect_mask);
+/* registerVmBuiltin for the shell's builtins and its tools (exsh, smallclue).
+ * In the iOS app they share the one table with every front end, and Aether
+ * must see only its language there: under Aether a name only the shell
+ * registered does not exist (getVmBuiltinID, getVmBuiltinHandlerById and the
+ * listings), and a builtin the shell replaced (exit, exec, printf, the thread
+ * builtins) keeps its own handler and effect. Other front ends, and
+ * getVmBuiltinHandler by name, which only the shell and its tools use, see
+ * the table as registered. */
+void registerShellVmBuiltin(const char *vm_name, VmBuiltinFn handler,
+                            BuiltinRoutineType type, const char *display_name,
+                            EffectMask effect_mask);
 
 /* Authoritative predicate: is this builtin effectful (touches the outside world,
  * is nondeterministic, or observes concurrent state)? Single source of truth for

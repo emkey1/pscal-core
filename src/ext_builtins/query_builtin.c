@@ -746,6 +746,11 @@ static bool findExtBuiltinCategoryForFunction(const char *func,
     if (!category || !extBuiltinHasFunction(category, func)) {
       continue;
     }
+    /* The app's shell lists exit, exec and printf among its commands; to
+     * Aether they are its own builtins (registerShellVmBuiltin). */
+    if (frontendIsAether() && strcasecmp(category, "shell") == 0) {
+      continue;
+    }
     if (out_category) {
       *out_category = category;
     }
