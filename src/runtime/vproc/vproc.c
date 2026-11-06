@@ -15054,6 +15054,11 @@ char *vprocTtynameShim(int fd) {
     int host = -1;
     if (vp) {
         host = vprocResolveFdForShim(vp, fd, 0, &pscal_fd);
+        if (!pscal_fd && host < 0) {
+            /* Closed, as for isatty: not the session's terminal. */
+            host = vprocResolveFdForShim(vp, fd, 1, NULL);
+            return host >= 0 ? ttyname(host) : NULL;
+        }
     }
 #if defined(PSCAL_TARGET_IOS)
     if (!pscal_fd && host < 0 &&
@@ -15103,6 +15108,10 @@ int vprocIsattyShim(int fd) {
         if (host_fd >= 0) {
             return vprocHostIsatty(host_fd);
         }
+        /* A closed slot is no terminal, not the session's: `exec <&-; [ -t 0 ]` is false.
+         * Only a host number this vproc owns is still asked about. */
+        host_fd = vprocResolveFdForShim(vp, fd, 1, NULL);
+        return host_fd >= 0 ? vprocHostIsatty(host_fd) : 0;
     }
 #if defined(PSCAL_TARGET_IOS)
     if (fd == STDIN_FILENO || fd == STDOUT_FILENO || fd == STDERR_FILENO) {
