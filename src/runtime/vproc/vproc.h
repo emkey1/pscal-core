@@ -144,6 +144,9 @@ int vprocTagHostFd(int fd);
 ssize_t vprocHostRead(int fd, void *buf, size_t count);
 /* Write to a host descriptor without routing through the shim table. */
 ssize_t vprocHostWrite(int fd, const void *buf, size_t count);
+/* vprocHostWrite for task PID's output on a pipe, FIFO or socket: it waits where a kill can
+ * act, and gives up with EINTR once PID is killed or gone, whichever vproc the thread is in. */
+ssize_t vprocHostWriteForTask(int pid, int fd, const void *buf, size_t count);
 /* Poll host descriptors without routing through the shim table. */
 int vprocHostPoll(struct pollfd *fds, nfds_t nfds, int timeout);
 /* The host's signal disposition, not the one the current vproc has recorded. */
@@ -724,6 +727,10 @@ static inline int vprocHostClose(int fd) { return close(fd); }
 static inline int vprocTagHostFd(int fd) { return fd; }
 static inline ssize_t vprocHostRead(int fd, void *buf, size_t count) { return read(fd, buf, count); }
 static inline ssize_t vprocHostWrite(int fd, const void *buf, size_t count) { return write(fd, buf, count); }
+static inline ssize_t vprocHostWriteForTask(int pid, int fd, const void *buf, size_t count) {
+    (void)pid;
+    return write(fd, buf, count);
+}
 static inline int vprocHostPoll(struct pollfd *fds, nfds_t nfds, int timeout) { return poll(fds, nfds, timeout); }
 static inline int vprocHostSigaction(int sig, const struct sigaction *act, struct sigaction *oldact) {
     return sigaction(sig, act, oldact);

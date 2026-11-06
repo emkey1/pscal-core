@@ -4939,7 +4939,22 @@ static void vprocHostWaitCancelled(void *unused) {
  * inside them: it stayed there after its job was reported gone, with what the job held still
  * open. So wait first where a cancel can act, looking for signals now and then. In select, not
  * poll: on Darwin poll reports neither the end of a FIFO nor that a FIFO is full. */
-static int vprocWaitHostFd(int host, bool for_write) {
+/* For a wait on behalf of task PID, when the thread's current vproc may no longer be it: a
+ * killed job's cleanup flushes its frontend's stream after the job's vproc is gone, and a wait
+ * that asked the current vproc, by then the caller's, would wait for good on a stalled reader. */
+static bool vprocHostWaitEndedFor(int pid) {
+    VProc *vp = vprocCurrent();
+    if (pid <= 0 || (vp && vprocPid(vp) == pid)) {
+        return vprocHostWaitInterrupted();
+    }
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    bool ended = !entry || entry->exited || entry->zombie || entry->dying_since_ns != 0;
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    return ended;
+}
+
+static int vprocWaitHostFdFor(int host, bool for_write, int pid) {
     if (host < 0 || host >= FD_SETSIZE) {
         return 0;
     }
@@ -4956,12 +4971,16 @@ static int vprocWaitHostFd(int host, bool for_write) {
             /* Ready, or nothing select can say about: the call itself decides. */
             return 0;
         }
-        if (vprocHostWaitInterrupted()) {
+        if (vprocHostWaitEndedFor(pid)) {
             pthread_testcancel();
             errno = EINTR;
             return -1;
         }
     }
+}
+
+static int vprocWaitHostFd(int host, bool for_write) {
+    return vprocWaitHostFdFor(host, for_write, 0);
 }
 
 static bool vprocHostFdBlocks(int host) {
@@ -4971,7 +4990,7 @@ static bool vprocHostFdBlocks(int host) {
 
 /* A pipe or socket says it is writable with room for PIPE_BUF bytes, and a write of more could
  * then block where no cancel reaches it. A longer write was never one unit anyway. */
-static ssize_t vprocHostWriteKillable(int host, const void *buf, size_t count) {
+static ssize_t vprocHostWriteKillableFor(int host, const void *buf, size_t count, int pid) {
     struct stat st;
     if (count == 0 || !vprocHostFdBlocks(host) || vprocHostFstatRaw(host, &st) != 0 ||
         !(S_ISFIFO(st.st_mode) || S_ISSOCK(st.st_mode))) {
@@ -4981,13 +5000,21 @@ static ssize_t vprocHostWriteKillable(int host, const void *buf, size_t count) {
     size_t done = 0;
     while (done < count) {
         size_t chunk = count - done < PIPE_BUF ? count - done : PIPE_BUF;
-        ssize_t wrote = vprocWaitHostFd(host, true) < 0 ? -1 : vprocHostWrite(host, bytes + done, chunk);
+        ssize_t wrote = vprocWaitHostFdFor(host, true, pid) < 0 ? -1 : vprocHostWrite(host, bytes + done, chunk);
         if (wrote < 0) {
             return done > 0 ? (ssize_t)done : -1;
         }
         done += (size_t)wrote;
     }
     return (ssize_t)done;
+}
+
+static ssize_t vprocHostWriteKillable(int host, const void *buf, size_t count) {
+    return vprocHostWriteKillableFor(host, buf, count, 0);
+}
+
+ssize_t vprocHostWriteForTask(int pid, int fd, const void *buf, size_t count) {
+    return vprocHostWriteKillableFor(fd, buf, count, pid);
 }
 
 typedef struct {
@@ -5113,6 +5140,11 @@ static int vprocHostOpenFifoKillable(const char *path, int flags, mode_t mode, b
 }
 #else
 #define vprocHostWriteKillable(host, buf, count) vprocHostWrite((host), (buf), (count))
+
+ssize_t vprocHostWriteForTask(int pid, int fd, const void *buf, size_t count) {
+    (void)pid;
+    return vprocHostWrite(fd, buf, count);
+}
 #endif
 
 typedef struct {

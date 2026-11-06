@@ -309,6 +309,46 @@ static FILE *vmVprocStreamOpenShim(int std_fd,
     return fp;
 }
 
+#if defined(PSCAL_TARGET_IOS)
+/* A thread's stdout or stderr on a pipe, FIFO or socket: a FILE over its own dup, as on a file,
+ * but whose writes wait where a kill can act. libc's write under fdopen is the nocancel one, so
+ * a killed frontend whose reader had stalled stayed in it for good, holding the descriptor. */
+typedef struct {
+    int fd;
+    int pid;
+} VmVprocPipeCookie;
+
+static int vmVprocPipeWrite(void *cookie, const char *buf, int len) {
+    VmVprocPipeCookie *ctx = (VmVprocPipeCookie *)cookie;
+    ssize_t res = vprocHostWriteForTask(ctx->pid, ctx->fd, buf, (size_t)len);
+    if (res < 0) {
+        return -1;
+    }
+    return res > INT_MAX ? INT_MAX : (int)res;
+}
+
+static int vmVprocPipeClose(void *cookie) {
+    VmVprocPipeCookie *ctx = (VmVprocPipeCookie *)cookie;
+    int rc = vprocHostClose(ctx->fd);
+    free(ctx);
+    return rc;
+}
+
+static FILE *vmVprocPipeOpen(int dup_fd, int pid) {
+    VmVprocPipeCookie *ctx = (VmVprocPipeCookie *)malloc(sizeof(VmVprocPipeCookie));
+    if (!ctx) {
+        return NULL;
+    }
+    ctx->fd = dup_fd;
+    ctx->pid = pid;
+    FILE *fp = funopen(ctx, NULL, vmVprocPipeWrite, NULL, vmVprocPipeClose);
+    if (!fp) {
+        free(ctx);
+    }
+    return fp;
+}
+#endif
+
 static FILE *vmVprocStreamOpen(int std_fd,
                                VmVprocStream *cache,
                                const char *mode,
@@ -379,7 +419,18 @@ static FILE *vmVprocStreamOpen(int std_fd,
         return vmVprocStreamFallback(std_fd);
     }
 
-    FILE *fp = fdopen(dup_fd, mode);
+    struct stat host_st;
+    bool have_host_st = fstat(std_fd, &host_st) == 0;
+    FILE *fp = NULL;
+#if defined(PSCAL_TARGET_IOS)
+    if (vp && have_host_st && strchr(mode, 'r') == NULL &&
+        (S_ISFIFO(host_st.st_mode) || S_ISSOCK(host_st.st_mode))) {
+        fp = vmVprocPipeOpen(dup_fd, vprocPid(vp));
+    } else
+#endif
+    {
+        fp = fdopen(dup_fd, mode);
+    }
     if (!fp) {
         vprocHostClose(dup_fd);
         return vmVprocStreamFallback(std_fd);
@@ -390,8 +441,7 @@ static FILE *vmVprocStreamOpen(int std_fd,
     vprocStreamSkipFlushAll(fp);
     cache->fp = fp;
     cache->host_fd = host_fd;
-    struct stat host_st;
-    if (fstat(std_fd, &host_st) == 0) {
+    if (have_host_st) {
         cache->host_dev = host_st.st_dev;
         cache->host_ino = host_st.st_ino;
         cache->host_identity_valid = true;
