@@ -5310,14 +5310,21 @@ static void vmRestoreTerminal(void) {
     }
 
     if (vm_termios_saved) {
+        /* A thread that made the terminal raw puts back what it found; another
+         * one goes back to the base of the last terminal made raw. */
+        const struct termios *target = &vm_orig_termios;
+        VmThreadTerm *mine = vm_raw_mode ? (VmThreadTerm *)pthread_getspecific(vm_thread_cleanup_key) : NULL;
+        if (mine && mine->raw) {
+            target = &mine->restore;
+        }
         if (vmTermiosDebugEnabled()) {
-            vmLogTermios("restore target", &vm_orig_termios);
+            vmLogTermios("restore target", target);
         }
         bool should_restore = vm_raw_mode;
         struct termios current;
         if (vmTcgetattr(STDIN_FILENO, &current) == 0) {
             vmLogTermios("restore current", &current);
-            if ((current.c_lflag & (ICANON | ECHO)) != (vm_orig_termios.c_lflag & (ICANON | ECHO))) {
+            if ((current.c_lflag & (ICANON | ECHO)) != (target->c_lflag & (ICANON | ECHO))) {
                 should_restore = true;
             }
         } else if (vmTermiosDebugEnabled()) {
@@ -5327,9 +5334,9 @@ static void vmRestoreTerminal(void) {
             if (vmTermiosDebugEnabled()) {
                 fprintf(stderr, "[termios] restore apply raw_mode=%d\n", vm_raw_mode);
             }
-            if (vmTcsetattr(STDIN_FILENO, TCSANOW, &vm_orig_termios) == 0) {
+            if (vmTcsetattr(STDIN_FILENO, TCSANOW, target) == 0) {
                 vmNoteRawMode(false);
-                vmLogTermios("restore applied", &vm_orig_termios);
+                vmLogTermios("restore applied", target);
             } else if (vmTermiosDebugEnabled()) {
                 fprintf(stderr, "[termios] restore set failed errno=%d\n", errno);
             }
@@ -5922,14 +5929,20 @@ static void vmEnableRawMode(void) {
         }
     }
 
-    if (!vm_termios_saved) {
-        if (vmTcgetattr(STDIN_FILENO, &vm_orig_termios) != 0) {
-            if (vmTermiosDebugEnabled()) {
-                fprintf(stderr, "[termios] raw get failed errno=%d\n", errno);
-            }
-            pthread_mutex_unlock(&vm_term_mutex);
-            return;
+    /* The base is the terminal as it is now, not as it was when a program
+     * first took it: in the app every command shares this process, and an
+     * stty, or another tab's settings, came after that. A terminal another
+     * thread has made raw keeps the base it has. */
+    struct termios current;
+    if (vmTcgetattr(STDIN_FILENO, &current) != 0) {
+        if (vmTermiosDebugEnabled()) {
+            fprintf(stderr, "[termios] raw get failed errno=%d\n", errno);
         }
+        pthread_mutex_unlock(&vm_term_mutex);
+        return;
+    }
+    if (!vm_termios_saved || !vmTermiosIsRaw(&current)) {
+        vm_orig_termios = current;
         vm_termios_saved = 1;
         vmNoteSignalTermios();
     }
