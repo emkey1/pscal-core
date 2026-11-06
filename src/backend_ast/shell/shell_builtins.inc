@@ -3675,6 +3675,9 @@ static void *shellToolThreadMain(void *arg) {
 }
 
 static void *shellToolWaiterMain(void *arg) {
+    /* In the app this thread counts as the tool's, and a kill of the tool would cancel it in the
+     * join below, so finished would never be set. */
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
     ShellToolThreadContext *ctx = (ShellToolThreadContext *)arg;
     void *exit_value = NULL;
     pthread_join(ctx->worker_thread, &exit_value);
@@ -3973,7 +3976,8 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
     sigaddset(&wait_mask, SIGINT);
     sigaddset(&wait_mask, SIGURG);
 
-    while (!context->finished) {
+    /* The worker's own flag too: the waiter may have been cancelled before it turned that off. */
+    while (!context->finished && !context->worker_exited) {
         sigset_t pending;
         sigemptyset(&pending);
 #if defined(PSCAL_TARGET_IOS)
