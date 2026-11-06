@@ -2557,10 +2557,53 @@ static void shellFinalizeStageVproc(VProc *vp, int status) {
     shellFinalizeStageVprocEx(vp, status, false);
 }
 
+/* A stage's ends of the pipes between it and its neighbours, let go of when it ends. */
+typedef struct {
+    bool head;
+    bool tail;
+    int *stdin_fd;
+    int *stdout_fd;
+    struct pscal_fd **stdin_pscal;
+    struct pscal_fd **stdout_pscal;
+    struct pscal_fd **stderr_pscal;
+} ShellStageEnds;
+
+static void shellStageReleaseEnds(ShellPipelineContext *ctx, size_t stage_pos, const ShellStageEnds *ends) {
+    bool stderr_shared_with_stdout = *ends->stderr_pscal && *ends->stdout_pscal &&
+                                     *ends->stderr_pscal == *ends->stdout_pscal;
+    if (!ends->tail && *ends->stdout_fd >= 0) {
+        vprocHostClose(*ends->stdout_fd);
+        *ends->stdout_fd = -1;
+    }
+    if (!ends->head && *ends->stdin_fd >= 0) {
+        vprocHostClose(*ends->stdin_fd);
+        *ends->stdin_fd = -1;
+    }
+    if (!ends->tail && *ends->stdout_pscal) {
+        pscal_fd_close(*ends->stdout_pscal);
+        if (ctx->pscal_pipe_write) {
+            ctx->pscal_pipe_write[stage_pos] = NULL;
+        }
+        *ends->stdout_pscal = NULL;
+    }
+    if (!ends->head && *ends->stdin_pscal) {
+        pscal_fd_close(*ends->stdin_pscal);
+        if (ctx->pscal_pipe_read) {
+            ctx->pscal_pipe_read[stage_pos - 1] = NULL;
+        }
+        *ends->stdin_pscal = NULL;
+    }
+    if (*ends->stderr_pscal && !stderr_shared_with_stdout) {
+        pscal_fd_close(*ends->stderr_pscal);
+    }
+    *ends->stderr_pscal = NULL;
+}
+
 typedef struct {
     VProc *vp;
     ShellPipelineContext *ctx;
     size_t stage_pos;
+    const ShellStageEnds *ends;
 } ShellStageCancelArg;
 
 /* The thread running this stage was cancelled with the stage's job. Nothing else would end the
@@ -2571,6 +2614,10 @@ static void shellInlineStageCancelled(void *arg) {
     int status = 128 + (sig > 0 ? sig : SIGKILL);
     if (stage->ctx && stage->ctx->stage_status && stage->stage_pos < stage->ctx->stage_count) {
         stage->ctx->stage_status[stage->stage_pos] = status;
+    }
+    /* The pipeline holds its ends too: kept, the stage after it would read for good. */
+    if (stage->ctx && stage->ends) {
+        shellStageReleaseEnds(stage->ctx, stage->stage_pos, stage->ends);
     }
     vprocEndAbandoned(stage->vp);
     vprocDeactivate();
@@ -5639,7 +5686,9 @@ static int shellPipelineRunStage(VM *vm,
         status = 1;
     } else {
 #if defined(PSCAL_TARGET_IOS)
-        ShellStageCancelArg cancel_arg = { vp, ctx, stage_pos };
+        ShellStageEnds ends = { pipeline_head, pipeline_tail, &stdin_fd, &stdout_fd,
+                                &stdin_pscal, &stdout_pscal, &stderr_pscal };
+        ShellStageCancelArg cancel_arg = { vp, ctx, stage_pos, &ends };
         pthread_cleanup_push(shellInlineStageCancelled, &cancel_arg);
 #endif
         status = shellRunBuiltinInProcess(vm, cmd, stdin_fd, stdout_fd, stderr_fd, apply_exec_redirs);
@@ -5660,36 +5709,16 @@ static int shellPipelineRunStage(VM *vm,
     }
 #endif
 
-    bool stderr_shared_with_stdout =
-        (stderr_pscal && stdout_pscal && stderr_pscal == stdout_pscal);
-
+#if defined(PSCAL_TARGET_IOS)
+    ShellStageEnds ends = { pipeline_head, pipeline_tail, &stdin_fd, &stdout_fd,
+                            &stdin_pscal, &stdout_pscal, &stderr_pscal };
+    shellStageReleaseEnds(ctx, stage_pos, &ends);
+#else
     if (!pipeline_tail && stdout_fd >= 0) {
         vprocHostClose(stdout_fd);
     }
     if (!pipeline_head && stdin_fd >= 0) {
         vprocHostClose(stdin_fd);
-    }
-#if defined(PSCAL_TARGET_IOS)
-    if (!pipeline_tail && stdout_pscal) {
-        pscal_fd_close(stdout_pscal);
-        if (ctx->pscal_pipe_write) {
-            ctx->pscal_pipe_write[stage_pos] = NULL;
-        }
-        stdout_pscal = NULL;
-    }
-    if (!pipeline_head && stdin_pscal) {
-        pscal_fd_close(stdin_pscal);
-        if (ctx->pscal_pipe_read) {
-            ctx->pscal_pipe_read[stage_pos - 1] = NULL;
-        }
-        stdin_pscal = NULL;
-    }
-    if (stderr_pscal && !stderr_shared_with_stdout) {
-        pscal_fd_close(stderr_pscal);
-        stderr_pscal = NULL;
-    }
-    if (stderr_shared_with_stdout) {
-        stderr_pscal = NULL;
     }
 #endif
 #if defined(PSCAL_TARGET_IOS)
