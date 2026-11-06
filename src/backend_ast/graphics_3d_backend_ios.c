@@ -370,8 +370,10 @@ static bool queueMetalDraw(const PscalMetalVertex* vertices,
         return false;
     }
 
-    memmove(&gMetalVertexBuffer[gMetalQueuedVertexCount], vertices,
-            vertexCount * sizeof(PscalMetalVertex));
+    if (vertices != &gMetalVertexBuffer[gMetalQueuedVertexCount]) {
+        memmove(&gMetalVertexBuffer[gMetalQueuedVertexCount], vertices,
+                vertexCount * sizeof(PscalMetalVertex));
+    }
 
     if (gMetalDrawCommandCount > 0) {
         MetalDrawCommand* prev = &gMetalDrawCommands[gMetalDrawCommandCount - 1];
@@ -1123,22 +1125,25 @@ static void renderLines(void) {
         if (vertexCount == 0) {
             return;
         }
-        if (ensureMetalVertexCapacity(vertexCount)) {
+        /* Build in place at the end of this frame's queue: the start of
+           the buffer holds earlier draws, and a grow may move it. */
+        if (ensureMetalVertexCapacity(gMetalQueuedVertexCount + vertexCount)) {
+            PscalMetalVertex* dst = gMetalVertexBuffer + gMetalQueuedVertexCount;
             size_t out = 0;
             if (gImmediatePrimitive == GL_LINE_LOOP || gImmediatePrimitive == GL_LINE_STRIP) {
                 for (size_t i = 1; i < gImmediateCount; ++i) {
                     const ImmediateVertex* prev = &gImmediateVertices[i - 1];
                     const ImmediateVertex* cur = &gImmediateVertices[i];
                     if (!prev->valid || !cur->valid) continue;
-                    buildMetalVertex(&gMetalVertexBuffer[out++], prev);
-                    buildMetalVertex(&gMetalVertexBuffer[out++], cur);
+                    buildMetalVertex(&dst[out++], prev);
+                    buildMetalVertex(&dst[out++], cur);
                 }
                 if (gImmediatePrimitive == GL_LINE_LOOP && gImmediateCount >= 2) {
                     const ImmediateVertex* first = &gImmediateVertices[0];
                     const ImmediateVertex* last = &gImmediateVertices[gImmediateCount - 1];
                     if (first->valid && last->valid) {
-                        buildMetalVertex(&gMetalVertexBuffer[out++], last);
-                        buildMetalVertex(&gMetalVertexBuffer[out++], first);
+                        buildMetalVertex(&dst[out++], last);
+                        buildMetalVertex(&dst[out++], first);
                     }
                 }
             } else {
@@ -1146,8 +1151,8 @@ static void renderLines(void) {
                     const ImmediateVertex* v0 = &gImmediateVertices[i];
                     const ImmediateVertex* v1 = &gImmediateVertices[i + 1];
                     if (!v0->valid || !v1->valid) continue;
-                    buildMetalVertex(&gMetalVertexBuffer[out++], v0);
-                    buildMetalVertex(&gMetalVertexBuffer[out++], v1);
+                    buildMetalVertex(&dst[out++], v0);
+                    buildMetalVertex(&dst[out++], v1);
                 }
             }
             if (out == 0) {
@@ -1157,7 +1162,7 @@ static void renderLines(void) {
                 return;
             }
             if (out > 0) {
-                if (queueMetalDraw(gMetalVertexBuffer, out, true,
+                if (queueMetalDraw(dst, out, true,
                                    gDepthTestEnabled, gDepthWriteEnabled, gDepthFunc,
                                    gBlendEnabled, gBlendSrc, gBlendDst)) {
                     return;
@@ -1316,7 +1321,10 @@ static void renderTriangles(void) {
         if (maxVertexCount == 0) {
             return;
         }
-        if (ensureMetalVertexCapacity(maxVertexCount)) {
+        /* Build in place at the end of this frame's queue: the start of
+           the buffer holds earlier draws, and a grow may move it. */
+        if (ensureMetalVertexCapacity(gMetalQueuedVertexCount + maxVertexCount)) {
+            PscalMetalVertex* dst = gMetalVertexBuffer + gMetalQueuedVertexCount;
             size_t out = 0;
             if (gImmediatePrimitive == GL_TRIANGLES) {
                 for (size_t i = 0; i + 2 < gImmediateCount; i += 3) {
@@ -1324,9 +1332,9 @@ static void renderTriangles(void) {
                     const ImmediateVertex* b = &gImmediateVertices[i + 1];
                     const ImmediateVertex* c = &gImmediateVertices[i + 2];
                     if (!a->valid || !b->valid || !c->valid) continue;
-                    buildMetalVertex(&gMetalVertexBuffer[out++], a);
-                    buildMetalVertex(&gMetalVertexBuffer[out++], b);
-                    buildMetalVertex(&gMetalVertexBuffer[out++], c);
+                    buildMetalVertex(&dst[out++], a);
+                    buildMetalVertex(&dst[out++], b);
+                    buildMetalVertex(&dst[out++], c);
                 }
             } else if (gImmediatePrimitive == GL_TRIANGLE_STRIP) {
                 for (size_t i = 0; i + 2 < gImmediateCount; ++i) {
@@ -1336,9 +1344,9 @@ static void renderTriangles(void) {
                     const ImmediateVertex* b = &gImmediateVertices[bIndex];
                     const ImmediateVertex* c = &gImmediateVertices[i + 2];
                     if (!a->valid || !b->valid || !c->valid) continue;
-                    buildMetalVertex(&gMetalVertexBuffer[out++], a);
-                    buildMetalVertex(&gMetalVertexBuffer[out++], b);
-                    buildMetalVertex(&gMetalVertexBuffer[out++], c);
+                    buildMetalVertex(&dst[out++], a);
+                    buildMetalVertex(&dst[out++], b);
+                    buildMetalVertex(&dst[out++], c);
                 }
             } else if (gImmediatePrimitive == GL_TRIANGLE_FAN) {
                 const ImmediateVertex* center = &gImmediateVertices[0];
@@ -1347,9 +1355,9 @@ static void renderTriangles(void) {
                         const ImmediateVertex* b = &gImmediateVertices[i];
                         const ImmediateVertex* c = &gImmediateVertices[i + 1];
                         if (!b->valid || !c->valid) continue;
-                        buildMetalVertex(&gMetalVertexBuffer[out++], center);
-                        buildMetalVertex(&gMetalVertexBuffer[out++], b);
-                        buildMetalVertex(&gMetalVertexBuffer[out++], c);
+                        buildMetalVertex(&dst[out++], center);
+                        buildMetalVertex(&dst[out++], b);
+                        buildMetalVertex(&dst[out++], c);
                     }
                 }
             } else if (gImmediatePrimitive == GL_QUADS) {
@@ -1359,14 +1367,14 @@ static void renderTriangles(void) {
                     const ImmediateVertex* c = &gImmediateVertices[i + 2];
                     const ImmediateVertex* d = &gImmediateVertices[i + 3];
                     if (a->valid && b->valid && c->valid) {
-                        buildMetalVertex(&gMetalVertexBuffer[out++], a);
-                        buildMetalVertex(&gMetalVertexBuffer[out++], b);
-                        buildMetalVertex(&gMetalVertexBuffer[out++], c);
+                        buildMetalVertex(&dst[out++], a);
+                        buildMetalVertex(&dst[out++], b);
+                        buildMetalVertex(&dst[out++], c);
                     }
                     if (a->valid && c->valid && d->valid) {
-                        buildMetalVertex(&gMetalVertexBuffer[out++], a);
-                        buildMetalVertex(&gMetalVertexBuffer[out++], c);
-                        buildMetalVertex(&gMetalVertexBuffer[out++], d);
+                        buildMetalVertex(&dst[out++], a);
+                        buildMetalVertex(&dst[out++], c);
+                        buildMetalVertex(&dst[out++], d);
                     }
                 }
             }
@@ -1377,7 +1385,7 @@ static void renderTriangles(void) {
                 return;
             }
             if (out > 0) {
-                if (queueMetalDraw(gMetalVertexBuffer, out, false,
+                if (queueMetalDraw(dst, out, false,
                                    gDepthTestEnabled, gDepthWriteEnabled, gDepthFunc,
                                    gBlendEnabled, gBlendSrc, gBlendDst)) {
                     return;
