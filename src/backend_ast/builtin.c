@@ -11489,29 +11489,13 @@ Value vmBuiltinDelay(VM* vm, int arg_count, Value* args) {
         const long long slice_ms = 200;
         long long remaining = ms;
         while (remaining > 0) {
-            if (pscalRuntimeConsumeSigint()) {
-                if (vm) {
-                    vm->abort_requested = true;
-                    vm->exit_requested = true;
-                }
-                break;
+            /* A blocked read's checks: on iOS the key's SIGINT waits on the vproc, and the
+             * runtime's own flag alone never saw it, so delay ran to its end. */
+            VmReadSignal read_signal = vmTakeReadSignal(vm);
+            if (read_signal == VM_READ_RESUMED) {
+                continue;
             }
-            if (pscalRuntimeConsumeSigtstp()) {
-#if defined(PSCAL_TARGET_IOS)
-                if (!vmShouldUseCooperativeSuspend() && vmRequestHardSuspendCurrentVproc()) {
-                    vmWaitIfStoppedWithCheckpoint();
-                    continue;
-                }
-#endif
-                if (vm) {
-                    vm->abort_requested = false;
-                    vm->exit_requested = true;
-                    vm->suspend_unwind_requested = true;
-                }
-                shellRuntimeSetLastStatus(128 + SIGTSTP);
-                break;
-            }
-            if (vm && (vm->abort_requested || vm->exit_requested)) {
+            if (read_signal == VM_READ_UNWIND) {
                 break;
             }
             long long step = remaining > slice_ms ? slice_ms : remaining;

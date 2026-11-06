@@ -463,7 +463,10 @@ typedef struct VM_s {
 
 // --- Public VM Interface ---
 void initVM(VM* vm);    // Initialize a new VM instance
-void freeVM(VM* vm);    // Free resources associated with a VM instance
+void freeVM(VM* vm);
+/* After interpretBytecode: true when the run was stopped (Ctrl-C, a kill) rather than ended
+ * by a runtime error. A frontend then reports nothing and ends with 128 + SIGINT. */
+bool vmRunWasInterrupted(const VM* vm);    // Free resources associated with a VM instance
 void vmResetExecutionState(VM* vm); // Reset stack/frames so a VM can be reused
 
 // Main function to interpret a chunk of bytecode

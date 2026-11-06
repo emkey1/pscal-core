@@ -6205,6 +6205,10 @@ static void aetherCodeTaskError(char *message, size_t size) {
     }
 }
 
+bool vmRunWasInterrupted(const VM* vm) {
+    return vm && vm->abort_requested && !vm->runtime_error_raised;
+}
+
 void runtimeError(VM* vm, const char* format, ...) {
     if (vm) {
         vm->abort_requested = true;

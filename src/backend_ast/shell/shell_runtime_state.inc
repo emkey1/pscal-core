@@ -720,6 +720,9 @@ typedef struct {
     pthread_t *threads;
     bool *thread_started;
     int *stage_status;
+    /* The interrupt key ended a stage's input: the whole job ends as if the key's SIGINT
+     * had reached every stage, as it does on Linux. */
+    bool key_interrupted;
     struct pscal_fd **pscal_pipe_read;
     struct pscal_fd **pscal_pipe_write;
     struct pscal_fd **pscal_pipe_write_hold;

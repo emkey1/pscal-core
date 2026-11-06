@@ -15519,6 +15519,11 @@ int vprocStdioWriteError(int fd) {
 }
 
 ssize_t vprocWriteShim(int fd, const void *buf, size_t count) {
+    /* The interrupt key ended this command's input. On Linux its SIGINT ends the command
+     * there, so what it would write after, such as wc's counts, never appears. */
+    if (gVprocTerminalInterrupted) {
+        return (ssize_t)count;
+    }
     vprocDeliverPendingSignalsForCurrent();
     VProc *vp = vprocForThread();
     struct pscal_fd *pscal_fd = NULL;

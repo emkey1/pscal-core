@@ -3191,6 +3191,7 @@ static void shellResetPipeline(void) {
 #if defined(PSCAL_TARGET_IOS)
     shellPipelineSessionRestoreStdStreams(ctx);
     shellPipelineSessionCloseSpool(ctx);
+    ctx->key_interrupted = false;
     ctx->in_process = false;
     ctx->in_process_worker = false;
     ctx->session_stdio = NULL;
@@ -3543,6 +3544,9 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd) {
                 return final_status;
             }
 
+            if (ctx->key_interrupted && final_status < 128) {
+                final_status = 128 + SIGINT;   // `cat | tr`: tr saw only the end of cat's output
+            }
             if (!ctx->background && final_status >= 128 && final_status < 128 + NSIG) {
                 shellHandleStatusSignal(final_status - 128);
             }
@@ -3626,6 +3630,9 @@ static int shellFinishPipeline(const ShellCommand *tail_cmd) {
             if (gShellRuntime.pipefail_enabled) {
                 final_status = combined;
             }
+        }
+        if (ctx->key_interrupted && final_status < 128) {
+            final_status = 128 + SIGINT;   // `cat | tr`: tr saw only the end of cat's output
         }
         bool job_control = false;
         if (!ctx->background) {
@@ -5624,6 +5631,7 @@ static int shellPipelineRunStage(VM *vm,
     /* The interrupt key ended its input, so it ended as if that were all it had. */
     if (vprocTakeTerminalInterrupted() && status < 128) {
         status = 128 + SIGINT;
+        ctx->key_interrupted = true;
     }
 #endif
 
