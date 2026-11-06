@@ -55,6 +55,7 @@ int pscalPathVirtualized_streamSlot(FILE *stream);
 #ifndef open
 #define open(...) pscalPathVirtualized_open(__VA_ARGS__)
 #endif
+#undef fopen
 #define fopen(path, mode) pscalPathVirtualized_fopen(path, mode)
 #define freopen(path, mode, stream) pscalPathVirtualized_freopen(path, mode, stream)
 #ifndef stat
@@ -64,6 +65,7 @@ int pscalPathVirtualized_streamSlot(FILE *stream);
 #define lstat(path, buf) pscalPathVirtualized_lstat(path, buf)
 #endif
 #define access(path, mode) pscalPathVirtualized_access(path, mode)
+#undef mkdir
 #define mkdir(path, mode) pscalPathVirtualized_mkdir(path, mode)
 #ifndef mkfifo
 #define mkfifo(path, mode) pscalPathVirtualized_mkfifo(path, mode)

@@ -328,6 +328,12 @@ int vprocShellSetrlimitShim(int resource, const struct rlimit *limit, bool resto
 int vprocHostMkdirMasked(const char *path, mode_t mode);
 int vprocHostMkfifoMasked(const char *path, mode_t mode);
 int vprocHostMknodMasked(const char *path, mode_t mode, dev_t dev);
+/* Host descriptors and host paths, as libc's would be, for code past the shims: what they make
+ * obeys the calling task's mask, not the host's. */
+int vprocHostOpenMasked(const char *path, int flags, ...);
+int vprocHostOpenatMasked(int dirfd, const char *path, int flags, ...);
+int vprocHostMkdiratMasked(int dirfd, const char *path, mode_t mode);
+FILE *vprocHostFopenMasked(const char *path, const char *mode);
 int vprocMkfifoShim(const char *path, mode_t mode);
 int vprocMknodShim(const char *path, mode_t mode, dev_t dev);
 /* A subshell's environment and directory. There is no fork here, so a subshell is a

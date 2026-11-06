@@ -31,6 +31,9 @@
 #undef lstat
 #undef umask
 #undef mkfifo
+#undef mkdir
+#undef creat
+#undef fopen
 #undef mknod
 #undef chmod
 #undef chown
@@ -96,6 +99,11 @@
 #define lstat(path, buf) vprocLstatShim((path), (buf))
 #define umask(mask) vprocUmaskShim((mask))
 #define mkfifo(path, mode) vprocMkfifoShim((path), (mode))
+/* What makes a file obeys the task's mask, never the host's, which is the session shell's. These
+ * keep libc's names: a path is the host's, as it was. */
+#define mkdir(path, mode) vprocHostMkdirMasked((path), (mode))
+#define creat(path, mode) vprocOpenShim((path), O_CREAT | O_WRONLY | O_TRUNC, (mode))
+#define fopen(path, mode) vprocHostFopenMasked((path), (mode))
 #define mknod(path, mode, dev) vprocMknodShim((path), (mode), (dev))
 #define chmod(path, mode) vprocChmodShim((path), (mode))
 #define chown(path, uid, gid) vprocChownShim((path), (uid), (gid))

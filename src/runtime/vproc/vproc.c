@@ -16629,6 +16629,87 @@ int vprocHostMknodMasked(const char *path, mode_t mode, dev_t dev) {
     return rc;
 }
 
+int vprocHostOpenMasked(const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    return vprocHostOpenRawInternal(path, flags, mode, (flags & O_CREAT) != 0);
+}
+
+int vprocHostOpenatMasked(int dirfd, const char *path, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    if (dirfd == AT_FDCWD || (path && path[0] == '/')) {
+        return vprocHostOpenRawInternal(path, flags, mode, (flags & O_CREAT) != 0);
+    }
+    if ((flags & O_CREAT) && vprocCreateModeApply(&mode)) {
+        /* As vprocHostOpenRawInternal: only O_EXCL says the file is new. */
+        for (int tries = 0; tries < 4; ++tries) {
+            int fd = (openat)(dirfd, path, flags | O_EXCL, mode);
+            if (fd >= 0) {
+                (void)vprocHostFchmodRaw(fd, mode);
+                return fd;
+            }
+            if (errno != EEXIST || (flags & O_EXCL)) {
+                return -1;
+            }
+            fd = (openat)(dirfd, path, flags & ~O_CREAT);
+            if (fd >= 0 || errno != ENOENT) {
+                return fd;
+            }
+        }
+    }
+    return (flags & O_CREAT) ? (openat)(dirfd, path, flags, mode) : (openat)(dirfd, path, flags);
+}
+
+int vprocHostMkdiratMasked(int dirfd, const char *path, mode_t mode) {
+    if (dirfd == AT_FDCWD || (path && path[0] == '/')) {
+        return vprocHostMkdirMasked(path, mode);
+    }
+    bool restore = vprocCreateModeApply(&mode);
+    int rc = (mkdirat)(dirfd, path, mode);
+    if (rc == 0 && restore) {
+        (void)fchmodat(dirfd, path, mode, 0);
+    }
+    return rc;
+}
+
+/* libc's fopen makes a file with the host's mask. When the task's differs, the stream is opened
+ * on a descriptor that obeys the task's, as fopen's own would be: a host one. */
+FILE *vprocHostFopenMasked(const char *path, const char *mode) {
+    if (!mode || (mode[0] != 'w' && mode[0] != 'a') || vprocFileMaskIsHostMask()) {
+        return (fopen)(path, mode);
+    }
+    int flags = O_CREAT | (mode[0] == 'w' ? O_TRUNC : O_APPEND);
+    flags |= strchr(mode, '+') ? O_RDWR : O_WRONLY;
+    if (strchr(mode, 'x')) {
+        flags |= O_EXCL;
+    }
+    if (strchr(mode, 'e')) {
+        flags |= O_CLOEXEC;
+    }
+    int fd = vprocHostOpenRawInternal(path, flags, 0666, true);
+    if (fd < 0) {
+        return NULL;
+    }
+    FILE *stream = fdopen(fd, mode);
+    if (!stream) {
+        int saved_errno = errno;
+        (void)vprocHostCloseRaw(fd);
+        errno = saved_errno;
+    }
+    return stream;
+}
+
 /* The app's names: relative to the task's directory, and absolute ones under its root. */
 int vprocMkfifoShim(const char *path, mode_t mode) {
     return pscalPathVirtualized_mkfifo(path, mode);
