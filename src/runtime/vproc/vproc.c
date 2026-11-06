@@ -2508,7 +2508,12 @@ static bool vprocInprocPipeShouldDestroy(VprocInprocPipe *pipe) {
 
 /* `kill` cancels a job's threads, and a condition wait is a cancellation point that takes the
  * mutex back before the thread's cleanup handlers run. Without a handler to let go of it, the
- * thread dies holding the mutex, or deadlocks on it in its own cleanup. */
+ * thread dies holding the mutex, or deadlocks on it in its own cleanup.
+ * Darwin also acts on a cancel that is already pending as the wait starts, after it has let go of
+ * the mutex and without taking it back, and this unlock then took another thread's hold on it: a
+ * wait elsewhere ended the app as a corrupt mutex. So a pending cancel is acted on here first,
+ * with the mutex held, and the task table's mutex checks its owner, so the rare cancel that comes
+ * in between finds nothing to unlock. */
 static void vprocCondWaitCancelled(void *mu) {
     pthread_mutex_unlock((pthread_mutex_t *)mu);
 }
@@ -2516,6 +2521,7 @@ static void vprocCondWaitCancelled(void *mu) {
 static int vprocCondWait(pthread_cond_t *cv, pthread_mutex_t *mu) {
     int rc;
     pthread_cleanup_push(vprocCondWaitCancelled, mu);
+    pthread_testcancel();
     rc = pthread_cond_wait(cv, mu);
     pthread_cleanup_pop(0);
     return rc;
@@ -2524,6 +2530,7 @@ static int vprocCondWait(pthread_cond_t *cv, pthread_mutex_t *mu) {
 static int vprocCondTimedWait(pthread_cond_t *cv, pthread_mutex_t *mu, const struct timespec *deadline) {
     int rc;
     pthread_cleanup_push(vprocCondWaitCancelled, mu);
+    pthread_testcancel();
     rc = pthread_cond_timedwait(cv, mu, deadline);
     pthread_cleanup_pop(0);
     return rc;
@@ -3469,11 +3476,20 @@ void vprocSetStopWaitHooks(void (*before_hook)(void), void (*after_hook)(void)) 
 
 __attribute__((weak)) void PSCALRuntimeOnProcessGroupEmpty(int pgid);
 
+#if defined(PTHREAD_ERRORCHECK_MUTEX_INITIALIZER)
+#define VPROC_TASKS_MUTEX_INITIALIZER PTHREAD_ERRORCHECK_MUTEX_INITIALIZER
+#elif defined(PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP)
+#define VPROC_TASKS_MUTEX_INITIALIZER PTHREAD_ERRORCHECK_MUTEX_INITIALIZER_NP
+#else
+#define VPROC_TASKS_MUTEX_INITIALIZER PTHREAD_MUTEX_INITIALIZER
+#endif
+/* An unlock by a thread that doesn't hold the mutex fails rather than freeing it: see
+ * vprocCondWaitCancelled. */
 static VProcTaskTable gVProcTasks = {
     .items = NULL,
     .count = 0,
     .capacity = 0,
-    .mu = PTHREAD_MUTEX_INITIALIZER,
+    .mu = VPROC_TASKS_MUTEX_INITIALIZER,
     .cv = PTHREAD_COND_INITIALIZER,
 };
 static VProcTaskEntry *gVProcTasksItemsStable = NULL;
