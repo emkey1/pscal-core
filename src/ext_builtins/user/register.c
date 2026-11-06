@@ -18,6 +18,8 @@ void registerUserBuiltins(void) {
                                "LandscapeDrawTerrain");
     extBuiltinRegisterFunction(category, "landscape/rendering",
                                "LandscapeDrawWater");
+    extBuiltinRegisterFunction(category, "landscape/rendering",
+                               "LandscapeShadersAvailable");
     extBuiltinRegisterFunction(category, "landscape/precompute",
                                "LandscapePrecomputeWorldCoords");
     extBuiltinRegisterFunction(category, "landscape/precompute",

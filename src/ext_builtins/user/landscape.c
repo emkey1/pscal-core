@@ -344,6 +344,28 @@ static bool ensureGlContext(VM* vm, const char* name) {
     return true;
 }
 
+/* LandscapeDrawSkyDome, LandscapeDrawCloudLayer and the procedural terrain's
+ * buffers call OpenGL directly rather than through gfx3d. On Apple platforms
+ * InitGraph3D draws with the SDL renderer and makes no GL context, and a GL
+ * call with no current context crashes inside the driver. */
+static bool landscapeGlContextCurrent(void) {
+    return gSdlGLContext != NULL && SDL_GL_GetCurrentContext() != NULL;
+}
+
+static bool ensureShaderContext(VM* vm, const char* name) {
+    if (!ensureGlContext(vm, name)) {
+        return false;
+    }
+    if (!landscapeGlContextCurrent()) {
+        runtimeError(vm,
+                     "%s needs an OpenGL context, and this 3D window draws with the SDL renderer. "
+                     "Check LandscapeShadersAvailable first, or set PSCAL_APPLE_3D_OPENGL=1 before InitGraph3D.",
+                     name);
+        return false;
+    }
+    return true;
+}
+
 static void computeTerrainNormal(const ArrayArg* vertexHeights,
                                  const ArrayArg* worldXCoords,
                                  const ArrayArg* worldZCoords,
@@ -1339,7 +1361,8 @@ static Value vmBuiltinLandscapeDrawTerrain(VM* vm, int arg_count, Value* args) {
     }
 
 #if !defined(PSCAL_TARGET_IOS)
-    if (gProceduralTerrain.enabled && gProceduralTerrain.initialised &&
+    if (landscapeGlContextCurrent() &&
+        gProceduralTerrain.enabled && gProceduralTerrain.initialised &&
         gProceduralTerrain.lastResolution == terrainSize &&
         terrainGeneratorVertexCount(&gProceduralTerrain.generator) == (size_t)vertexCount) {
         if (terrainGeneratorEnsureUploaded(&gProceduralTerrain.generator)) {
@@ -1602,7 +1625,7 @@ static Value vmBuiltinLandscapeDrawCloudLayer(VM* vm, int arg_count, Value* args
         }
     }
 
-    if (!ensureGlContext(vm, name)) return makeVoid();
+    if (!ensureShaderContext(vm, name)) return makeVoid();
 
     CloudLayerParams params;
     memset(&params, 0, sizeof(params));
@@ -1630,7 +1653,7 @@ static Value vmBuiltinLandscapeDrawSkyDome(VM* vm, int arg_count, Value* args) {
         return makeVoid();
     }
 
-    if (!ensureGlContext(vm, name)) return makeVoid();
+    if (!ensureShaderContext(vm, name)) return makeVoid();
 
     ensureSkyDomeState();
 
@@ -1652,9 +1675,25 @@ static Value vmBuiltinLandscapeDrawSkyDome(VM* vm, int arg_count, Value* args) {
     skyDomeDraw(&gSkyDome.dome, radius, horizon, zenith);
     return makeVoid();
 }
+
 #endif
 
+static Value vmBuiltinLandscapeShadersAvailable(VM* vm, int arg_count, Value* args) {
+    (void)args;
+    if (arg_count != 0) {
+        runtimeError(vm, "LandscapeShadersAvailable expects no arguments.");
+        return makeBoolean(false);
+    }
+#ifdef SDL
+    return makeBoolean(gSdlInitialized && gSdlWindow && landscapeGlContextCurrent());
+#else
+    return makeBoolean(false);
+#endif
+}
+
 void registerLandscapeBuiltins(void) {
+    registerVmBuiltin("landscapeshadersavailable", vmBuiltinLandscapeShadersAvailable,
+                      BUILTIN_TYPE_FUNCTION, "LandscapeShadersAvailable", FX_IO);
     registerVmBuiltin("landscapeconfigureprocedural", vmBuiltinLandscapeConfigureProcedural,
                       BUILTIN_TYPE_PROCEDURE, "LandscapeConfigureProcedural", FX_PURE);
     registerVmBuiltin("landscapedrawterrain", vmBuiltinLandscapeDrawTerrain,
