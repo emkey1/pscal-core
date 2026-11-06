@@ -2,8 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // An open file that lives inside the process: a terminal, an in-process pipe, the
-// location device. It has no host descriptor, so a poller cannot wait on it directly,
-// and every event a poller might want goes through one process-wide wake pipe.
+// location device. It has no host descriptor, so a poller cannot wait on it directly.
+// Each polling thread waits on a host wake pipe of its own instead, and every event a
+// poller might want makes all of them readable.
 #pragma once
 
 #include <sys/types.h>
@@ -43,7 +44,10 @@ struct pscal_fd *pscal_fd_retain(struct pscal_fd *fd);
  * caller may hold a vproc's table lock or the session registry's lock. */
 int pscal_fd_close(struct pscal_fd *fd);
 
-/* The host descriptor a poller adds to its host poll, or -1 if there is no pipe. */
+/* The calling thread's wake descriptor, which a poller adds to its host poll, or -1
+ * if no pipe could be made. It is made on first use, already readable, and closed
+ * when the thread ends. When it is readable the poller calls pscalPollDrain, which
+ * empties only this thread's pipe, and then asks every one of its files again. */
 int pscalPollWakeFd(void);
 void pscalPollDrain(void);
 

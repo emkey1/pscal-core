@@ -51,10 +51,22 @@ int pscal_fd_close(struct pscal_fd *fd) {
     return result;
 }
 
-/* The ends are written once, before gWakeReady goes true, and never change. */
-static int gWakeEnds[2] = {-1, -1};
-static bool gWakeReady = false;
+/* Each thread that polls has a wake pipe of its own. With one shared pipe, whichever
+ * thread polled next emptied it, and the poller the byte was meant for slept on. */
+struct wakeChannel {
+    int ends[2];
+    bool pending; /* a byte is in the pipe or about to be, so wakers pass it by */
+    struct wakeChannel *prev;
+    struct wakeChannel *next;
+};
+
+/* Wakers write under the lock, so a channel's pipe is closed only once it is off the
+ * list. Wakers arrive holding other locks, so this one takes nothing else. */
+static struct wakeChannel *gWakeChannels = NULL;
 static pthread_mutex_t gWakeLock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_key_t gWakeKey;
+static bool gWakeKeyReady = false;
+static pthread_once_t gWakeKeyOnce = PTHREAD_ONCE_INIT;
 
 static bool wakePipeConfigure(int ends[2]) {
     for (int i = 0; i < 2; i++) {
@@ -74,50 +86,25 @@ static bool wakePipeConfigure(int ends[2]) {
     return true;
 }
 
-/* Whichever thread needs the pipe first makes it, poller or waker: a waker that
- * skipped an absent pipe could lose its event to a poller that is about to make it.
- * A failure is not final, as running out of descriptors can pass. */
-static bool wakePipeEnsure(void) {
-    if (__atomic_load_n(&gWakeReady, __ATOMIC_ACQUIRE)) {
-        return true;
-    }
-    /* fcntl is a cancellation point on Darwin, and this lock is everybody's. */
-    int cancel_state = 0;
-    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
-    pthread_mutex_lock(&gWakeLock);
-    if (!gWakeReady) {
-        /* Unowned: a vproc that owned these would close them as it ended, and the
-         * numbers kept here would then name somebody else's file. */
-        int ends[2] = {-1, -1};
-        if (vprocHostPipeUnowned(ends) == 0) {
-            if (wakePipeConfigure(ends)) {
-                gWakeEnds[0] = ends[0];
-                gWakeEnds[1] = ends[1];
-                __atomic_store_n(&gWakeReady, true, __ATOMIC_RELEASE);
-            } else {
-                vprocHostClose(ends[0]);
-                vprocHostClose(ends[1]);
-            }
-        }
-    }
-    bool ready = gWakeReady;
-    pthread_mutex_unlock(&gWakeLock);
-    pthread_setcancelstate(cancel_state, NULL);
-    return ready;
-}
+/* A byte lost to a signal would leave the flag set on an empty pipe, so EINTR tries
+ * again. A full pipe is not a failure that matters: its reader is due to wake. */
 
 #if defined(F_SETNOSIGPIPE)
 
-static void wakePipeWrite(void) {
+static bool wakePipeWrite(int fd) {
     const unsigned char byte = 0;
-    (void)vprocHostWrite(gWakeEnds[1], &byte, 1);
+    ssize_t written = 0;
+    do {
+        written = vprocHostWrite(fd, &byte, 1);
+    } while (written < 0 && errno == EINTR);
+    return written == 1;
 }
 
 #else
 
 /* A signal handler belongs to the whole app, so a stray SIGPIPE must not reach one.
  * With no per-descriptor setting, keep it pending on this thread and take it back. */
-static void wakePipeWrite(void) {
+static bool wakePipeWrite(int fd) {
     const unsigned char byte = 0;
     int cancel_state = 0;
     pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
@@ -129,7 +116,10 @@ static void wakePipeWrite(void) {
     pthread_sigmask(SIG_BLOCK, &pipe_only, &previous);
     sigpending(&pending);
     const bool was_pending = sigismember(&pending, SIGPIPE) == 1;
-    (void)vprocHostWrite(gWakeEnds[1], &byte, 1);
+    ssize_t written = 0;
+    do {
+        written = vprocHostWrite(fd, &byte, 1);
+    } while (written < 0 && errno == EINTR);
     if (!was_pending) {
         sigpending(&pending);
         if (sigismember(&pending, SIGPIPE) == 1) {
@@ -139,23 +129,109 @@ static void wakePipeWrite(void) {
     }
     pthread_sigmask(SIG_SETMASK, &previous, NULL);
     pthread_setcancelstate(cancel_state, NULL);
+    return written == 1;
 }
 
 #endif
 
+/* Runs as the thread ends, cancelled or not. */
+static void wakeChannelEnd(void *value) {
+    struct wakeChannel *ch = (struct wakeChannel *)value;
+    int cancel_state = 0;
+    pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+    pthread_mutex_lock(&gWakeLock);
+    if (ch->prev) {
+        ch->prev->next = ch->next;
+    } else {
+        gWakeChannels = ch->next;
+    }
+    if (ch->next) {
+        ch->next->prev = ch->prev;
+    }
+    pthread_mutex_unlock(&gWakeLock);
+    vprocHostClose(ch->ends[0]);
+    vprocHostClose(ch->ends[1]);
+    free(ch);
+    pthread_setcancelstate(cancel_state, NULL);
+}
+
+static void wakeKeyCreate(void) {
+    gWakeKeyReady = pthread_key_create(&gWakeKey, wakeChannelEnd) == 0;
+}
+
+static struct wakeChannel *wakeChannelCurrent(void) {
+    pthread_once(&gWakeKeyOnce, wakeKeyCreate);
+    return gWakeKeyReady ? (struct wakeChannel *)pthread_getspecific(gWakeKey) : NULL;
+}
+
+/* The poll loop asks its files before it asks for this pipe, so a new pipe starts with
+ * a byte in it: the first poll wakes at once and asks them again, which covers any wake
+ * sent before the channel was on the list. That first write is also made off the lock,
+ * as the host write sets itself up on its first use. */
+static struct wakeChannel *wakeChannelCreate(void) {
+    struct wakeChannel *ch = (struct wakeChannel *)calloc(1, sizeof(*ch));
+    if (!ch) {
+        return NULL;
+    }
+    /* Unowned: a vproc that owned these would close them as it ended, and the numbers
+     * kept here would then name somebody else's file. */
+    if (vprocHostPipeUnowned(ch->ends) != 0) {
+        free(ch);
+        return NULL;
+    }
+    ch->pending = true;
+    if (!wakePipeConfigure(ch->ends) || !wakePipeWrite(ch->ends[1]) ||
+        pthread_setspecific(gWakeKey, ch) != 0) {
+        vprocHostClose(ch->ends[0]);
+        vprocHostClose(ch->ends[1]);
+        free(ch);
+        return NULL;
+    }
+    pthread_mutex_lock(&gWakeLock);
+    ch->next = gWakeChannels;
+    if (gWakeChannels) {
+        gWakeChannels->prev = ch;
+    }
+    gWakeChannels = ch;
+    pthread_mutex_unlock(&gWakeLock);
+    return ch;
+}
+
 int pscalPollWakeFd(void) {
     int saved_errno = errno;
-    int fd = wakePipeEnsure() ? gWakeEnds[0] : -1;
+    int fd = -1;
+    struct wakeChannel *ch = wakeChannelCurrent();
+    if (!ch && gWakeKeyReady) {
+        /* fcntl is a cancellation point on Darwin, and a pipe made but not yet kept
+         * would leak. A failure is not final, as running out of descriptors can pass. */
+        int cancel_state = 0;
+        pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+        ch = wakeChannelCreate();
+        pthread_setcancelstate(cancel_state, NULL);
+    }
+    if (ch) {
+        fd = ch->ends[0];
+    }
     errno = saved_errno;
     return fd;
 }
 
 void pscalPollDrain(void) {
     int saved_errno = errno;
-    if (wakePipeEnsure()) {
+    struct wakeChannel *ch = wakeChannelCurrent();
+    if (ch) {
+        /* A short read means the pipe was empty, and the flag keeps it to a byte or two. */
         unsigned char sink[64];
-        while (vprocHostRead(gWakeEnds[0], sink, sizeof(sink)) > 0) {
+        while (vprocHostRead(ch->ends[0], sink, sizeof(sink)) == (ssize_t)sizeof(sink)) {
         }
+        /* The flag is cleared after the read, never before. Cleared first, a waker could
+         * set it and write a byte this read then took, and the flag would stay set on an
+         * empty pipe with every later waker passing it by. A waker that finds it still
+         * set here is not lost either: the caller asks its files again after this, and
+         * the fence pairs with the one in pscal_fd_poll_wakeup, so either that waker
+         * sees the flag clear and writes, or the files show what it changed. */
+        __atomic_store_n(&ch->pending, false, __ATOMIC_RELAXED);
+        __atomic_thread_fence(__ATOMIC_SEQ_CST);
     }
     errno = saved_errno;
 }
@@ -163,11 +239,29 @@ void pscalPollDrain(void) {
 void pscal_fd_poll_wakeup(struct pscal_fd *fd, int events) {
     (void)fd;
     (void)events;
-    /* Wakes happen in the middle of other work, whose errno is not ours to change.
-     * A full pipe drops the byte, and that is fine: pollers ask every file anyway. */
+    /* Wakes happen in the middle of other work, whose errno is not ours to change. */
     int saved_errno = errno;
-    if (wakePipeEnsure()) {
-        wakePipeWrite();
+    /* Orders the caller's change to a file before the flags. Pairs with pscalPollDrain. */
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    int cancel_state = 0;
+    bool cancel_off = false;
+    pthread_mutex_lock(&gWakeLock);
+    for (struct wakeChannel *ch = gWakeChannels; ch; ch = ch->next) {
+        if (__atomic_load_n(&ch->pending, __ATOMIC_RELAXED) ||
+            __atomic_exchange_n(&ch->pending, true, __ATOMIC_RELAXED)) {
+            continue;
+        }
+        /* A write can be a cancellation point, and a waker ended between setting the
+         * flag and writing would leave that poller asleep for good. */
+        if (!cancel_off) {
+            pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &cancel_state);
+            cancel_off = true;
+        }
+        (void)wakePipeWrite(ch->ends[1]);
+    }
+    pthread_mutex_unlock(&gWakeLock);
+    if (cancel_off) {
+        pthread_setcancelstate(cancel_state, NULL);
     }
     errno = saved_errno;
 }
