@@ -16150,6 +16150,17 @@ char *vprocSetlocaleShim(int category, const char *name) {
 #endif
 }
 
+void *vprocLocaleLoad(int mask, const char *name) {
+#if defined(__APPLE__)
+    pthread_mutex_lock(&gVprocLocaleMu);
+    locale_t made = newlocale(mask, name, (locale_t)0);
+    pthread_mutex_unlock(&gVprocLocaleMu);
+    return made;
+#else
+    return newlocale(mask, name, (locale_t)0);
+#endif
+}
+
 void *vprocLocaleSave(void) {
 #if defined(__APPLE__)
     locale_t current = uselocale((locale_t)0);

@@ -1319,9 +1319,9 @@ static int shellExpandExtglob(const char *pattern, char ***out_matches, size_t *
     return 0;
 }
 
-/* shellExpandGlobPattern and what shopt adds to it. A hidden name only matches a pattern
- * that starts with a dot, so dotglob asks again with one and merges the two. */
-static int shellExpandGlobWithOptions(const char *pattern, char ***out_matches, size_t *out_count) {
+/* shellExpandGlobPattern and what shopt adds to it, in byte order. A hidden name only matches a
+ * pattern that starts with a dot, so dotglob asks again with one and merges the two. */
+static int shellExpandGlobInByteOrder(const char *pattern, char ***out_matches, size_t *out_count) {
     *out_matches = NULL;
     *out_count = 0;
     if (shellExtglobFind(pattern)) {
@@ -1376,6 +1376,81 @@ static int shellExpandGlobWithOptions(const char *pattern, char ***out_matches, 
     *out_matches = merged;
     *out_count = count;
     return 0;
+}
+
+/* Loaded collations, kept for the life of the process: another thread may be sorting with one.
+ * Past the last slot a new name sorts by bytes. A name that won't load is kept too, as no locale. */
+static pthread_mutex_t gShellCollateMu = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+    char *name;
+    locale_t locale;
+} gShellCollateCache[16];
+static size_t gShellCollateCount = 0;
+
+/* What the shell's variables choose, exported or not, as they stand now: bash follows an
+ * assignment at once. No locale means C. The process's own locale and environment don't say,
+ * since nothing sets the one and on iOS the other doesn't hold a tab's LANG. */
+static locale_t shellCollateLocale(void) {
+    static const char *const kNames[] = {"LC_ALL", "LC_COLLATE", "LANG"};
+    char *name = NULL;
+    for (size_t i = 0; i < sizeof(kNames) / sizeof(kNames[0]) && !name; ++i) {
+        char *value = shellLookupParameterValue(kNames[i], strlen(kNames[i]));
+        if (value && *value) {
+            name = value;
+        } else {
+            free(value);
+        }
+    }
+    if (!name || strcmp(name, "C") == 0 || strcmp(name, "POSIX") == 0 || strchr(name, '/')) {
+        free(name);
+        return (locale_t)0;
+    }
+    locale_t found = (locale_t)0;
+    bool known = false;
+    pthread_mutex_lock(&gShellCollateMu);
+    for (size_t i = 0; i < gShellCollateCount && !known; ++i) {
+        if (strcmp(gShellCollateCache[i].name, name) == 0) {
+            found = gShellCollateCache[i].locale;
+            known = true;
+        }
+    }
+    if (!known && gShellCollateCount < sizeof(gShellCollateCache) / sizeof(gShellCollateCache[0])) {
+#if defined(PSCAL_TARGET_IOS)
+        found = (locale_t)vprocLocaleLoad(LC_COLLATE_MASK, name);
+#else
+        found = newlocale(LC_COLLATE_MASK, name, (locale_t)0);
+#endif
+        gShellCollateCache[gShellCollateCount].name = name;
+        gShellCollateCache[gShellCollateCount].locale = found;
+        gShellCollateCount++;
+        name = NULL;
+    }
+    pthread_mutex_unlock(&gShellCollateMu);
+    free(name);
+    return found;
+}
+
+static int shellCompareGlobCollated(const void *a, const void *b) {
+    const char *left = *(char *const *)a;
+    const char *right = *(char *const *)b;
+    int order = strcoll(left, right);
+    return order != 0 ? order : strcmp(left, right);
+}
+
+/* A glob's matches, sorted as the locale collates them, as bash does. */
+static int shellExpandGlobWithOptions(const char *pattern, char ***out_matches, size_t *out_count) {
+    int status = shellExpandGlobInByteOrder(pattern, out_matches, out_count);
+    if (status != 0 || *out_count < 2) {
+        return status;
+    }
+    locale_t collate = shellCollateLocale();
+    if (collate) {
+        /* For this thread alone, and qsort has no portable way to pass the locale along. */
+        locale_t previous = uselocale(collate);
+        qsort(*out_matches, *out_count, sizeof(char *), shellCompareGlobCollated);
+        uselocale(previous);
+    }
+    return status;
 }
 
 static bool shellIsCharBoundary(const char *text, size_t index) {

@@ -334,6 +334,8 @@ char *vprocDirnameShim(char *path);
 /* As setlocale, for the calling thread alone. libc's is the whole app's, and it crashes if two
  * threads load a locale at once. */
 char *vprocSetlocaleShim(int category, const char *name);
+/* As newlocale with no base, under the lock vprocSetlocaleShim loads with. Returns a locale_t. */
+void *vprocLocaleLoad(int mask, const char *name);
 /* A program on the shell's thread has its locale end with it. */
 void *vprocLocaleSave(void);
 void vprocLocaleRestore(void *saved);
