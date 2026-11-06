@@ -299,6 +299,12 @@ Value vmBuiltinShellExec(VM *vm, int arg_count, Value *args) {
     /* What runs apart has its arguments to itself, and `$_` stays as it was. */
     bool runs_apart = cmd.background || (gShellRuntime.pipeline.active && gShellRuntime.pipeline.stage_count > 1);
     char *last_word = (!runs_apart && cmd.argc > 0 && cmd.argv && cmd.argv[cmd.argc - 1]) ? strdup(cmd.argv[cmd.argc - 1]) : NULL;
+#if defined(PSCAL_TARGET_IOS)
+    /* A builtin is the subshell itself. A program is a child of it under bash, even when it runs on
+     * this thread, as an applet or frontend does: only that program dies of SIGPIPE. */
+    bool runs_as_program = !shellStageRunsShellCode(&cmd) && cmd.argc > 0 && cmd.argv && cmd.argv[0] &&
+                           (!shellNameRunsInShell(cmd.argv[0]) || shellCommandBuiltinRunsProgram(&cmd));
+#endif
     result = shellExecuteCommand(vm, &cmd);
     if (last_word) {
         free(gShellLastWord);
@@ -316,9 +322,14 @@ Value vmBuiltinShellExec(VM *vm, int arg_count, Value *args) {
     /* SIGPIPE cannot end one thread, and a builtin writing here is the subshell itself. */
     if (gShellRuntime.in_subshell && vprocConsumeClosedPipe()) {
         shellUpdateStatus(128 + SIGPIPE);
-        shellRuntimeRequestExit();
-        if (vm) {
-            vm->exit_requested = true;
+        if (gShellPipeStatusCount > 0) {
+            gShellPipeStatus[gShellPipeStatusCount - 1] = 128 + SIGPIPE;
+        }
+        if (!runs_as_program) {
+            shellRuntimeRequestExit();
+            if (vm) {
+                vm->exit_requested = true;
+            }
         }
     }
 #endif
