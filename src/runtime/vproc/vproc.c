@@ -4914,6 +4914,28 @@ static bool vprocCurrentHasInterruptingSignal(void) {
     return interrupt;
 }
 
+/* The shell at its prompt: is a signal that ends it waiting? One stays queued with a task that
+ * unwinds itself until the task looks, and a prompt read never looks on its own. */
+static bool vprocPromptKillPending(int shell_pid) {
+    if (shell_pid <= 0) {
+        return false;
+    }
+    bool pending = false;
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(shell_pid);
+    if (entry && entry->unwinds_itself && entry->pending_signals) {
+        for (int sig = 1; sig < 32 && !pending; ++sig) {
+            if (!(entry->pending_signals & vprocSigMask(sig)) || vprocSignalBlockedLocked(entry, sig) ||
+                vprocSignalIgnoredLocked(entry, sig)) {
+                continue;
+            }
+            pending = vprocEffectiveSignalActionLocked(entry, sig) == VPROC_SIG_KILL;
+        }
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    return pending;
+}
+
 /* For a wait in place of a host call: does a signal end it? A handler runs here, and one that
  * asked for SA_RESTART leaves the wait going, as the host call would have. A task being killed
  * stops waiting even where its thread cannot be cancelled yet, such as during setup. */
@@ -6165,6 +6187,13 @@ static void *vprocSessionInputThread(void *arg) {
         }
         ssize_t r = 0;
         if (fd >= 0) {
+            /* Look again now and then for a stop: on Darwin a close of the terminal waits for
+             * a read of it to end, and the shell closes its copy as it ends. */
+            struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+            int ready = vprocHostPollRaw(&pfd, 1, 100);
+            if (ready == 0 || (ready < 0 && errno == EINTR)) {
+                continue;
+            }
             r = vprocHostRead(fd, &ch, 1);
             if (r <= 0) {
                 if (r < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
@@ -6678,6 +6707,10 @@ static ssize_t vprocSessionReadInput(VProcSessionStdio *session, void *buf, size
     VProcSessionInput *input = session->input;
     const bool tool_dbg = vprocToolDebugEnabled();
     const bool prompt_reader = vprocShellPromptReadActive(session->shell_pid);
+    /* The shell itself, reading at its prompt, whichever session it has. */
+    VProc *self_vp = vprocCurrent();
+    const int self_pid = self_vp ? vprocPid(self_vp) : 0;
+    const bool prompt_self = self_pid > 0 && vprocShellPromptReadActive(self_pid);
     const bool line_mode = vprocTtyInLineMode(session->pty_slave);
     if (tool_dbg) {
         if (!vprocSessionInputLockWithTimeout(input, 200, "read.debug")) {
@@ -6720,7 +6753,25 @@ static ssize_t vprocSessionReadInput(VProcSessionStdio *session, void *buf, size
         }
         while (input->len == 0 && !input->eof && !input->interrupt_pending &&
                input->eof_mark_count == 0) {
-            vprocCondWait(&input->cv, &input->mu);
+            if (!prompt_self) {
+                vprocCondWait(&input->cv, &input->mu);
+                continue;
+            }
+            /* halt from a job, or kill -HUP from another tab, ends the shell now, not at the
+             * next line typed. The prompt takes EINTR and acts on what came. */
+            struct timespec deadline;
+            vprocInprocPipeWaitDeadline(&deadline);
+            if (vprocCondTimedWait(&input->cv, &input->mu, &deadline) != ETIMEDOUT) {
+                continue;
+            }
+            pthread_mutex_unlock(&input->mu);
+            bool killed = vprocPromptKillPending(self_pid);
+            pthread_mutex_lock(&input->mu);
+            if (killed) {
+                pthread_mutex_unlock(&input->mu);
+                errno = EINTR;
+                return -1;
+            }
         }
         if (input->interrupt_pending) {
             input->interrupt_pending = false;
@@ -6806,6 +6857,25 @@ ssize_t vprocSessionReadInputShimMode(void *buf, size_t count, bool nonblocking)
                        (int)nonblocking);
     }
     return vprocSessionReadInput(session, buf, count, nonblocking);
+}
+
+void vprocSessionInputStop(VProcSessionStdio *session) {
+    VProcSessionInput *input = session ? session->input : NULL;
+    if (!input) {
+        return;
+    }
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 1;
+    pthread_mutex_lock(&input->mu);
+    input->stop_requested = true;
+    pthread_cond_broadcast(&input->cv);
+    while (input->reader_active) {
+        if (vprocCondTimedWait(&input->cv, &input->mu, &deadline) == ETIMEDOUT) {
+            break;
+        }
+    }
+    pthread_mutex_unlock(&input->mu);
 }
 
 VProcSessionInput *vprocSessionInputEnsureShim(void) {
@@ -7627,6 +7697,14 @@ static int vprocPathNamedFdOf(const char *path, int *out_pid) {
 
 int vprocPathNamedFd(const char *path) {
     return vprocPathNamedFdOf(path, NULL);
+}
+
+static bool vprocPathParseConsoleTty(const char *path, int *out_num);
+
+bool vprocPathIsTerminal(const char *path) {
+    int num = -1;
+    return vprocPathIsDevTty(path) || vprocPathIsDevConsole(path) || vprocPathIsPtyMaster(path) ||
+           vprocPathIsDevPtsNode(path) || vprocPathParseConsoleTty(path, &num);
 }
 
 static void vprocInitializeVirtualCwd(VProc *vp, VProc *active) {
@@ -18528,8 +18606,25 @@ int vprocOpenShim(const char *path, int flags, ...) {
     }
     if (vprocPathIsDevTty(path)) {
         struct pscal_fd *tty_fd = NULL;
-        int err = pscalTtyOpenControlling(flags, &tty_fd);
         VProcSessionStdio *session = vprocSessionStdioCurrent();
+        /* A tab's commands carry its session, so its terminal is theirs. The controlling
+         * terminal table goes by session id, and a tab whose thread took its terminal before
+         * its shell had a task holds another tab's shell's id there: that table sent one tab's
+         * /dev/tty to another, and to a closed one's after it closed. */
+        if (session && !vprocSessionStdioIsDefault(session) && session->pty_active &&
+            session->pty_slave && session->pty_slave->tty &&
+            session->pty_slave->tty->driver == &pty_slave) {
+            int err = pscalPtyOpenSlave(session->pty_slave->tty->num, flags | O_NOCTTY, &tty_fd);
+            if (err < 0) {
+                return vprocSetCompatErrno(err);
+            }
+            tty_fd->flags = (unsigned)flags;
+            int slot = vprocInsertPscalFd(vp, tty_fd);
+            /* fd table retains; drop caller ref regardless of outcome. */
+            pscal_fd_close(tty_fd);
+            return slot;
+        }
+        int err = pscalTtyOpenControlling(flags, &tty_fd);
         if (err == _ENXIO || err == _ENOTTY) {
             /* If this vproc never claimed a controlling TTY, bind the session
              * PTY as the controlling terminal for the current sid and retry. */
@@ -18564,6 +18659,19 @@ int vprocOpenShim(const char *path, int flags, ...) {
                         return slot;
                     }
                 }
+            }
+            /* A session on the host's own descriptors, as the iOS-flavoured shell has in a
+             * host terminal, has the host's controlling terminal. */
+            if (session && vprocSessionStdioIsDefault(session) && !session->pty_slave) {
+                int host_fd = vprocHostOpenRawInternal(path, flags, (mode_t)mode, (flags & O_CREAT) != 0);
+                if (host_fd < 0) {
+                    return -1;
+                }
+                int slot = vprocInsert(vp, host_fd);
+                if (slot < 0) {
+                    vprocHostClose(host_fd);
+                }
+                return slot;
             }
             return vprocSetCompatErrno(err);
         }

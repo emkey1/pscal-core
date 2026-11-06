@@ -4517,8 +4517,8 @@ static bool shellApplyExecRedirections(const ShellCommand *cmd,
                 int vfd = -1;
 #if defined(PSCAL_TARGET_IOS)
                 /* /dev/stdout and the like are descriptors the command already has, which may
-                 * have no host side at all. */
-                if (vp_current && vprocPathNamedFd(redir->path) >= 0) {
+                 * have no host side at all, and /dev/tty and the like are vproc's terminals. */
+                if (vp_current && (vprocPathNamedFd(redir->path) >= 0 || vprocPathIsTerminal(redir->path))) {
                     /* set -C stops only at a regular file. */
                     int named_flags = redir->flags;
                     struct stat named_st;

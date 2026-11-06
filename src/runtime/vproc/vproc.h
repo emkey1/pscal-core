@@ -399,6 +399,9 @@ int vprocOpenShim(const char *path, int flags, ...);
  * no vproc. Only tells that it is one, and which: the slot is this vproc's unless the path has
  * another's pid. Opening one acts as Linux's /proc links do: see vprocOpenNamedFd. */
 int vprocPathNamedFd(const char *path);
+/* A terminal vproc answers itself: /dev/tty, /dev/console, /dev/ttyN, /dev/ptmx, /dev/pts/N.
+ * The host's own device of that name is never the one meant. */
+bool vprocPathIsTerminal(const char *path);
 /* What /proc/<pid>/fd/<fd> reads as on Linux: a path (the host's, for a file), pipe:[N] or
  * socket:[N]. False if that vproc has no such descriptor. */
 bool vprocFdLinkTarget(int pid, int fd, char *out, size_t size);
@@ -541,6 +544,9 @@ ssize_t vprocSessionWriteToMaster(uint64_t session_id, const void *buf, size_t l
 ssize_t vprocSessionWriteToMasterMode(uint64_t session_id, const void *buf, size_t len, bool blocking);
 /* Ensure session input is initialized for the current session. */
 VProcSessionInput *vprocSessionInputEnsureShim(void);
+/* The session's reader stops, waiting up to a second for it: a shell ending does this before it
+ * closes its copies of the terminal. */
+void vprocSessionInputStop(VProcSessionStdio *session);
 /* Inject input into the current session input queue. */
 bool vprocSessionInjectInputShim(const void *data, size_t len);
 
