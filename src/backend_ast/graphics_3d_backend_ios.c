@@ -1120,7 +1120,10 @@ static void renderLines(void) {
             segmentCount = gImmediateCount / 2;
         }
         size_t vertexCount = segmentCount * 2;
-        if (vertexCount > 0 && ensureMetalVertexCapacity(vertexCount)) {
+        if (vertexCount == 0) {
+            return;
+        }
+        if (ensureMetalVertexCapacity(vertexCount)) {
             size_t out = 0;
             if (gImmediatePrimitive == GL_LINE_LOOP || gImmediatePrimitive == GL_LINE_STRIP) {
                 for (size_t i = 1; i < gImmediateCount; ++i) {
@@ -1146,6 +1149,12 @@ static void renderLines(void) {
                     buildMetalVertex(&gMetalVertexBuffer[out++], v0);
                     buildMetalVertex(&gMetalVertexBuffer[out++], v1);
                 }
+            }
+            if (out == 0) {
+                /* Every vertex was rejected (behind the eye). Falling through
+                   would draw into the software buffer, and a frame that has
+                   touched it presents that buffer instead of the Metal draws. */
+                return;
             }
             if (out > 0) {
                 if (queueMetalDraw(gMetalVertexBuffer, out, true,
@@ -1304,7 +1313,10 @@ static void renderTriangles(void) {
             maxTriCount = (gImmediateCount / 4) * 2;
         }
         size_t maxVertexCount = maxTriCount * 3;
-        if (maxVertexCount > 0 && ensureMetalVertexCapacity(maxVertexCount)) {
+        if (maxVertexCount == 0) {
+            return;
+        }
+        if (ensureMetalVertexCapacity(maxVertexCount)) {
             size_t out = 0;
             if (gImmediatePrimitive == GL_TRIANGLES) {
                 for (size_t i = 0; i + 2 < gImmediateCount; i += 3) {
@@ -1357,6 +1369,12 @@ static void renderTriangles(void) {
                         buildMetalVertex(&gMetalVertexBuffer[out++], d);
                     }
                 }
+            }
+            if (out == 0) {
+                /* Every vertex was rejected (behind the eye). Falling through
+                   would draw into the software buffer, and a frame that has
+                   touched it presents that buffer instead of the Metal draws. */
+                return;
             }
             if (out > 0) {
                 if (queueMetalDraw(gMetalVertexBuffer, out, false,
