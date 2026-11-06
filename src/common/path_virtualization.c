@@ -186,6 +186,15 @@ static const char *pathVirtualizedExpand(const char *input, char *buffer, size_t
     return buffer;
 }
 
+/* A program's PWD is in its own environment: libc's is the whole app's, where a tab's cd never goes. */
+static const char *pathVirtualizedPwd(void) {
+#if defined(PSCAL_TARGET_IOS)
+    return vprocGetenvShim("PWD");
+#else
+    return getenv("PWD");
+#endif
+}
+
 static bool pathVirtualizedGetCwd(char *buffer, size_t size) {
     if (!buffer || size == 0) {
         return false;
@@ -205,7 +214,7 @@ static bool pathVirtualizedGetCwd(char *buffer, size_t size) {
         }
     }
 #endif
-    const char *pwd = getenv("PWD");
+    const char *pwd = pathVirtualizedPwd();
     if (pwd && pwd[0] == '/') {
         int written = snprintf(buffer, size, "%s", pwd);
         if (written > 0 && (size_t)written < size) {
@@ -487,7 +496,7 @@ int pscalPathVirtualized_glob(const char *pattern,
     target = pathVirtualizedKeepSlash(target ? target : pattern, wants_dirs, dir_pattern, sizeof(dir_pattern));
     int result = glob(target, flags, errfunc, pglob);
     if (result == GLOB_NOMATCH && relative_pattern && pattern && pattern[0] != '~') {
-        const char *pwd = getenv("PWD");
+        const char *pwd = pathVirtualizedPwd();
         if (pwd && pwd[0] == '/') {
             char resolved_from_pwd[PATH_MAX];
             int written = snprintf(resolved_from_pwd,
