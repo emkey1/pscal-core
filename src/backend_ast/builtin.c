@@ -5056,22 +5056,83 @@ static pthread_once_t vm_thread_cleanup_key_once = PTHREAD_ONCE_INIT;
 static pthread_once_t vm_restore_once = PTHREAD_ONCE_INIT;
 
 static void vmRestoreTerminal(void);
+static int vmTcgetattr(int fd, struct termios *term);
+static int vmTcsetattr(int fd, int optional_actions, const struct termios *term);
+static bool vmTermiosIsRaw(const struct termios *term);
 
-/* A thread that set up the terminal handlers is exiting. It undoes raw mode
- * it set itself (vm_raw_mode is per thread) and nothing else: this used to
- * run the whole exit cleanup, so any worker thread finishing ended the
- * process-wide fx record/replay session and took the terminal out of raw
- * mode under the main thread. The process-level cleanup belongs to
- * vmExitWithCleanup and the atexit handler. */
-static void vmThreadCleanup(void *unused) {
-    (void)unused;
-    if (vm_raw_mode) {
-        vmRestoreTerminal();
+/* What vm_thread_cleanup_key holds, for its destructor: on Darwin the thread's
+ * _Thread_local values already read as zero there, and in the app its vproc
+ * is gone too, so stdin no longer names its terminal. */
+typedef struct {
+    bool raw;
+    struct termios restore;
+#if defined(PSCAL_TARGET_IOS)
+    VProcTerminalHold *tty;
+#endif
+} VmThreadTerm;
+
+/* A thread that set up the terminal handlers is exiting (killed, or a worker
+ * as its pool shuts down). It undoes raw mode it set itself, if the terminal
+ * is still raw, and nothing else: this used to run the whole exit cleanup, so
+ * any worker thread finishing ended the process-wide fx record/replay session
+ * and took the terminal out of raw mode under the main thread. The
+ * process-level cleanup belongs to vmExitWithCleanup and the atexit handler. */
+static void vmThreadCleanup(void *arg) {
+    VmThreadTerm *term = (VmThreadTerm *)arg;
+    /* No vm_term_mutex: this uses only its own record, and a thread cancelled
+     * while it held the mutex would never end. */
+    if (term->raw) {
+        struct termios current;
+#if defined(PSCAL_TARGET_IOS)
+        if (vprocTerminalHoldFetchTermios(term->tty, &current) && vmTermiosIsRaw(&current)) {
+            (void)vprocTerminalHoldApplyTermios(term->tty, &term->restore);
+        }
+#else
+        if (vmTcgetattr(STDIN_FILENO, &current) == 0 && vmTermiosIsRaw(&current)) {
+            (void)vmTcsetattr(STDIN_FILENO, TCSANOW, &term->restore);
+        }
+#endif
     }
+#if defined(PSCAL_TARGET_IOS)
+    vprocTerminalHoldRelease(term->tty);
+#endif
+    free(term);
 }
 
 static void vmCreateThreadKey(void) {
     pthread_key_create(&vm_thread_cleanup_key, vmThreadCleanup);
+}
+
+/* This thread's record, made on first use; NULL when out of memory. */
+static VmThreadTerm *vmThreadTerm(void) {
+    pthread_once(&vm_thread_cleanup_key_once, vmCreateThreadKey);
+    VmThreadTerm *term = (VmThreadTerm *)pthread_getspecific(vm_thread_cleanup_key);
+    if (!term) {
+        term = (VmThreadTerm *)calloc(1, sizeof(*term));
+        if (term && pthread_setspecific(vm_thread_cleanup_key, term) != 0) {
+            free(term);
+            term = NULL;
+        }
+    }
+    return term;
+}
+
+/* Called with vm_term_mutex held wherever vm_raw_mode changes, so the
+ * destructor knows too, and where the terminal goes back to. */
+static void vmNoteRawMode(bool raw) {
+    vm_raw_mode = raw ? 1 : 0;
+    VmThreadTerm *term = vmThreadTerm();
+    if (!term) {
+        return;
+    }
+    term->raw = raw;
+#if defined(PSCAL_TARGET_IOS)
+    vprocTerminalHoldRelease(term->tty);
+    term->tty = raw ? vprocTerminalHold(STDIN_FILENO) : NULL;
+#endif
+    if (raw) {
+        term->restore = vm_orig_termios;
+    }
 }
 
 static int vmTcgetattr(int fd, struct termios *term) {
@@ -5217,7 +5278,7 @@ static void vmRestoreTerminal(void) {
                 fprintf(stderr, "[termios] restore apply raw_mode=%d\n", vm_raw_mode);
             }
             if (vmTcsetattr(STDIN_FILENO, TCSANOW, &vm_orig_termios) == 0) {
-                vm_raw_mode = 0;
+                vmNoteRawMode(false);
                 vmLogTermios("restore applied", &vm_orig_termios);
             } else if (vmTermiosDebugEnabled()) {
                 fprintf(stderr, "[termios] restore set failed errno=%d\n", errno);
@@ -5468,8 +5529,7 @@ static void vmRegisterRestoreHandlers(void) {
 }
 
 static void vmSetupTermHandlers(void) {
-    pthread_once(&vm_thread_cleanup_key_once, vmCreateThreadKey);
-    pthread_setspecific(vm_thread_cleanup_key, (void *)1);
+    (void)vmThreadTerm();
 
     pthread_mutex_lock(&vm_term_mutex);
     if (!vm_termios_saved) {
@@ -5831,7 +5891,7 @@ static void vmEnableRawMode(void) {
     raw.c_cc[VTIME] = 0;
 
     if (vmTcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
-        vm_raw_mode = 1;
+        vmNoteRawMode(true);
         vmLogTermios("raw applied", &raw);
     } else if (vmTermiosDebugEnabled()) {
         fprintf(stderr, "[termios] raw set failed errno=%d\n", errno);
@@ -5895,7 +5955,7 @@ static void vmPrepareCanonicalInput(void) {
         }
         if (changed) {
             if (vmTcsetattr(STDIN_FILENO, TCSANOW, &term) == 0) {
-                vm_raw_mode = 0;
+                vmNoteRawMode(false);
                 vmLogTermios("canon after", &term);
             } else if (vmTermiosDebugEnabled()) {
                 fprintf(stderr, "[termios] canon set failed errno=%d\n", errno);

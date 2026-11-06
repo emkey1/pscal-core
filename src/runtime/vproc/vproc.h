@@ -505,6 +505,13 @@ void vprocSessionStdioActivate(VProcSessionStdio *stdio_ctx);
 /* Termios helpers that always target the active session PTY (if present). */
 bool vprocSessionStdioFetchTermios(int fd, struct termios *termios);
 bool vprocSessionStdioApplyTermios(int fd, int action, const struct termios *termios);
+/* The terminal fd names now, held for use where this thread's vproc and session are gone, such
+ * as a pthread key destructor. NULL when fd is no terminal. */
+typedef struct VProcTerminalHold VProcTerminalHold;
+VProcTerminalHold *vprocTerminalHold(int fd);
+bool vprocTerminalHoldFetchTermios(VProcTerminalHold *hold, struct termios *termios);
+bool vprocTerminalHoldApplyTermios(VProcTerminalHold *hold, const struct termios *termios);
+void vprocTerminalHoldRelease(VProcTerminalHold *hold);
 /* Create/destroy a heap-backed session stdio for custom sessions. */
 VProcSessionStdio *vprocSessionStdioCreate(void);
 void vprocSessionStdioDestroy(VProcSessionStdio *stdio_ctx);
@@ -884,6 +891,22 @@ static inline bool vprocSessionStdioApplyTermios(int fd, int action, const struc
     (void)termios;
     return false;
 }
+typedef struct VProcTerminalHold VProcTerminalHold;
+static inline VProcTerminalHold *vprocTerminalHold(int fd) {
+    (void)fd;
+    return NULL;
+}
+static inline bool vprocTerminalHoldFetchTermios(VProcTerminalHold *hold, struct termios *termios) {
+    (void)hold;
+    (void)termios;
+    return false;
+}
+static inline bool vprocTerminalHoldApplyTermios(VProcTerminalHold *hold, const struct termios *termios) {
+    (void)hold;
+    (void)termios;
+    return false;
+}
+static inline void vprocTerminalHoldRelease(VProcTerminalHold *hold) { (void)hold; }
 static inline int vprocSessionStdioInitWithPty(VProcSessionStdio *stdio_ctx,
                                                struct pscal_fd *pty_slave,
                                                struct pscal_fd *pty_master,

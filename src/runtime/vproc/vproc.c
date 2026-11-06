@@ -17357,6 +17357,100 @@ bool vprocSessionStdioApplyTermios(int fd, int action, const struct termios *ter
     return res == 0;
 }
 
+struct VProcTerminalHold {
+    struct pscal_fd *tty;
+    int host_fd;
+};
+
+VProcTerminalHold *vprocTerminalHold(int fd) {
+    VProc *vp = vprocForThread();
+    struct pscal_fd *pscal_fd = vp ? vprocGetPscalFd(vp, fd) : NULL;
+    if (!pscal_fd) {
+        pscal_fd = vprocSessionPscalFdForStd(fd);
+    }
+    int host_fd = -1;
+    if (pscal_fd) {
+        if (!pscal_fd->tty) {
+            pscal_fd_close(pscal_fd);
+            return NULL;
+        }
+    } else {
+        /* In the order a termios call tries them: the descriptor's own file, then the
+         * process's descriptor of that number. */
+        int host = shimTranslate(fd, 1);
+        if (host < 0 || !vprocHostIsatty(host)) {
+            host = fd;
+            if (!vprocHostIsatty(host)) {
+                return NULL;
+            }
+        }
+        /* Unowned: the vproc that named it may be gone by the time this is used. */
+        host_fd = vprocHostDupRaw(host);
+        if (host_fd < 0) {
+            return NULL;
+        }
+    }
+    VProcTerminalHold *hold = (VProcTerminalHold *)malloc(sizeof(*hold));
+    if (!hold) {
+        if (pscal_fd) {
+            pscal_fd_close(pscal_fd);
+        } else {
+            vprocHostCloseRaw(host_fd);
+        }
+        return NULL;
+    }
+    hold->tty = pscal_fd;
+    hold->host_fd = host_fd;
+    return hold;
+}
+
+bool vprocTerminalHoldFetchTermios(VProcTerminalHold *hold, struct termios *termios) {
+    if (!hold || !termios) {
+        return false;
+    }
+    if (!hold->tty) {
+#if defined(TIOCGETA)
+        return vprocHostIoctlRaw(hold->host_fd, TIOCGETA, termios) == 0;
+#else
+        return vprocHostIoctlRaw(hold->host_fd, TCGETS, termios) == 0;
+#endif
+    }
+    struct termios_ termios_val;
+    if (!hold->tty->ops || !hold->tty->ops->ioctl || hold->tty->ops->ioctl(hold->tty, TCGETS_, &termios_val) != 0) {
+        return false;
+    }
+    vprocTermiosToHost(&termios_val, termios);
+    return true;
+}
+
+bool vprocTerminalHoldApplyTermios(VProcTerminalHold *hold, const struct termios *termios) {
+    if (!hold || !termios) {
+        return false;
+    }
+    if (!hold->tty) {
+#if defined(TIOCSETA)
+        return vprocHostIoctlRaw(hold->host_fd, TIOCSETA, (void *)termios) == 0;
+#else
+        return vprocHostIoctlRaw(hold->host_fd, TCSETS, (void *)termios) == 0;
+#endif
+    }
+    struct termios_ termios_val;
+    vprocTermiosFromHost(termios, &termios_val);
+    return hold->tty->ops && hold->tty->ops->ioctl && hold->tty->ops->ioctl(hold->tty, TCSETS_, &termios_val) == 0;
+}
+
+void vprocTerminalHoldRelease(VProcTerminalHold *hold) {
+    if (!hold) {
+        return;
+    }
+    if (hold->tty) {
+        pscal_fd_close(hold->tty);
+    } else {
+        vprocHostCloseRaw(hold->host_fd);
+    }
+    free(hold);
+}
+
 int vprocIoctlShim(int fd, unsigned long request, ...) {
     vprocDeliverPendingSignalsForCurrent();
     uintptr_t arg_val = 0;
@@ -17511,34 +17605,47 @@ typedef struct {
     size_t capacity;
 } VProcSelectScratch;
 
-static __thread VProcPollScratch gVProcPollScratch = {0};
-static __thread VProcSelectScratch gVProcSelectScratch = {0};
+typedef struct {
+    VProcPollScratch poll;
+    VProcSelectScratch select;
+} VProcScratchTls;
+
+/* On the heap behind a key: on Darwin a thread's __thread values already read
+ * as zero in a key destructor, so one there could never free them. */
+static __thread VProcScratchTls *gVProcScratchTls = NULL;
 static pthread_key_t gVProcScratchTlsKey;
 static pthread_once_t gVProcScratchTlsKeyOnce = PTHREAD_ONCE_INIT;
 static bool gVProcScratchTlsKeyReady = false;
 
-static void vprocScratchTlsCleanupCurrentThread(void) {
-    free(gVProcPollScratch.pscal_fds);
-    free(gVProcPollScratch.host_index);
-    free(gVProcPollScratch.host_fds);
-    gVProcPollScratch.pscal_fds = NULL;
-    gVProcPollScratch.host_index = NULL;
-    gVProcPollScratch.host_fds = NULL;
-    gVProcPollScratch.capacity = 0;
+/* Only after vprocScratchTlsForThread has given this thread its set. */
+#define gVProcPollScratch (gVProcScratchTls->poll)
+#define gVProcSelectScratch (gVProcScratchTls->select)
 
-    free(gVProcSelectScratch.pfds);
-    free(gVProcSelectScratch.fd_map);
-    gVProcSelectScratch.pfds = NULL;
-    gVProcSelectScratch.fd_map = NULL;
-    gVProcSelectScratch.capacity = 0;
+static void vprocScratchTlsFree(VProcScratchTls *scratch) {
+    free(scratch->poll.pscal_fds);
+    free(scratch->poll.host_index);
+    free(scratch->poll.host_fds);
+    free(scratch->select.pfds);
+    free(scratch->select.fd_map);
+    free(scratch);
 }
 
-static void vprocScratchTlsDestructor(void *value) {
-    (void)value;
+static void vprocScratchTlsCleanupCurrentThread(void) {
+    VProcScratchTls *scratch = gVProcScratchTls;
+    if (!scratch) {
+        return;
+    }
+    gVProcScratchTls = NULL;
     if (gVProcScratchTlsKeyReady) {
         (void)pthread_setspecific(gVProcScratchTlsKey, NULL);
     }
-    vprocScratchTlsCleanupCurrentThread();
+    vprocScratchTlsFree(scratch);
+}
+
+static void vprocScratchTlsDestructor(void *value) {
+    vprocScratchTlsFree((VProcScratchTls *)value);
+    /* A destructor after this one that polls gets a new set, and the key runs again. */
+    gVProcScratchTls = NULL;
 }
 
 static void vprocScratchTlsKeyInit(void) {
@@ -17547,15 +17654,31 @@ static void vprocScratchTlsKeyInit(void) {
     }
 }
 
-static inline void vprocScratchTlsMarkThread(void) {
-    pthread_once(&gVProcScratchTlsKeyOnce, vprocScratchTlsKeyInit);
-    if (gVProcScratchTlsKeyReady) {
-        (void)pthread_setspecific(gVProcScratchTlsKey, (void *)1);
+static VProcScratchTls *vprocScratchTlsForThread(void) {
+    if (gVProcScratchTls) {
+        return gVProcScratchTls;
     }
+    pthread_once(&gVProcScratchTlsKeyOnce, vprocScratchTlsKeyInit);
+    if (!gVProcScratchTlsKeyReady) {
+        return NULL;
+    }
+    VProcScratchTls *scratch = (VProcScratchTls *)calloc(1, sizeof(*scratch));
+    if (!scratch) {
+        return NULL;
+    }
+    if (pthread_setspecific(gVProcScratchTlsKey, scratch) != 0) {
+        free(scratch);
+        return NULL;
+    }
+    gVProcScratchTls = scratch;
+    return scratch;
 }
 
 static bool vprocPollScratchEnsure(size_t needed) {
-    vprocScratchTlsMarkThread();
+    if (!vprocScratchTlsForThread()) {
+        errno = ENOMEM;
+        return false;
+    }
     if (needed <= gVProcPollScratch.capacity) {
         return true;
     }
@@ -17596,7 +17719,10 @@ static bool vprocPollScratchEnsure(size_t needed) {
 }
 
 static bool vprocSelectScratchEnsure(size_t needed) {
-    vprocScratchTlsMarkThread();
+    if (!vprocScratchTlsForThread()) {
+        errno = ENOMEM;
+        return false;
+    }
     if (needed <= gVProcSelectScratch.capacity) {
         return true;
     }
