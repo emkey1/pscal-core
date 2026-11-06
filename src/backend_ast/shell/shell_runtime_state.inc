@@ -3022,6 +3022,8 @@ typedef struct ShellCommandSubFrame {
 #if defined(PSCAL_TARGET_IOS)
     VProc *vp;
 #endif
+    /* Its context has dropped what bash's fork would. */
+    bool jobs_trimmed;
 } ShellCommandSubFrame;
 
 static PSCAL_THREAD_LOCAL ShellCommandSubFrame *gShellCommandSubFrame = NULL;
@@ -5445,6 +5447,20 @@ ShellRuntimeState *shellRuntimeCreateContext(void) {
                 dst->command = src->command ? strdup(src->command) : NULL;
             }
         }
+    }
+    /* Under bash a substitution is a fork, whose child drops every job that has ended but the one
+     * $! names. Only the substitution's own context: a stage in there sees what it has. */
+    if (gShellCommandSubFrame && !gShellCommandSubFrame->jobs_trimmed) {
+        gShellCommandSubFrame->jobs_trimmed = true;
+        pid_t last = template_ctx->last_bg_pid;
+        size_t kept = 0;
+        for (size_t i = 0; i < ctx->finished_job_count; ++i) {
+            const ShellFinishedJob *entry = &ctx->finished_jobs[i];
+            if (last > 0 && (entry->last_pid == last || entry->pgid == last)) {
+                ctx->finished_jobs[kept++] = *entry;
+            }
+        }
+        ctx->finished_job_count = kept;
     }
 
     ctx->array_vars = NULL;
