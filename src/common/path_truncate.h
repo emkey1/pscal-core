@@ -63,6 +63,22 @@ bool pathTruncateMountRemove(const char *target_path);
  */
 size_t pathTruncateMountSnapshot(PathTruncateMountEntry *out, size_t out_capacity);
 
+/*
+ * The mount table the app's processes see, in /proc/mounts order: the root
+ * filesystem, /proc, then each virtual mount, with sources and types in the
+ * app's own terms (no host path, volume or filesystem name). /proc/mounts,
+ * mount and the statfs in path_virtualization.h all read it. Copies up to
+ * `out_capacity` entries and returns how many there are.
+ */
+size_t pathTruncateMountTable(PathTruncateMountEntry *out, size_t out_capacity);
+
+/*
+ * The entry of that table whose filesystem holds `host_path` (an expanded
+ * path): the longest mount point over the path's virtual form. Every path is
+ * on some entry, the root at least.
+ */
+bool pathTruncateMountForHostPath(const char *host_path, PathTruncateMountEntry *out);
+
 /* Clears all virtual mount mappings. */
 void pathTruncateMountClearAll(void);
 

@@ -45,6 +45,8 @@ static size_t g_pathTruncatePrimaryLen = 0;
 static char g_pathTruncateAlias[PATH_MAX];
 static size_t g_pathTruncateAliasLen = 0;
 enum { PATH_TRUNCATE_MAX_MOUNTS = 64 };
+/* The root filesystem and /proc, ahead of the virtual mounts in the app's table. */
+enum { PATH_TRUNCATE_FIXED_MOUNTS = 2 };
 static PathTruncateMountEntry g_pathTruncateMounts[PATH_TRUNCATE_MAX_MOUNTS];
 static size_t g_pathTruncateMountCount = 0;
 static _Thread_local int g_pathTruncateResolving = 0;
@@ -76,6 +78,11 @@ static bool pathTruncateResolveMountedPathLocked(const char *virtual_path,
 static bool pathTruncateStripMountedPathLocked(const char *host_path,
                                                char *out,
                                                size_t out_size);
+static size_t pathTruncateMountTableLocked(PathTruncateMountEntry *out, size_t out_capacity);
+static bool pathTruncateMatchesStoredPrefix(const char *path,
+                                            size_t path_len,
+                                            const char **matched_prefix,
+                                            size_t *matched_len);
 
 typedef struct PathTruncateSmallclueApplet {
     const char *name;
@@ -3172,32 +3179,19 @@ static void pathTruncateRefreshProc(const char *prefix, const char *request_path
 
     char mounts_path[PATH_MAX];
     char mountinfo_path[PATH_MAX];
-    const char *mnt_from = "rootfs";
-    const char *fs_type = "ext4";
-#if defined(__APPLE__)
-    struct statfs sfs;
-    if (statfs("/", &sfs) == 0) {
-        if (sfs.f_mntfromname[0]) {
-            mnt_from = sfs.f_mntfromname;
-        }
-        if (sfs.f_fstypename[0]) {
-            fs_type = sfs.f_fstypename;
-        }
+    /* Each entry is two PATH_MAX buffers: too many for a thread's stack. */
+    const size_t table_capacity = PATH_TRUNCATE_MAX_MOUNTS + PATH_TRUNCATE_FIXED_MOUNTS;
+    PathTruncateMountEntry *table = calloc(table_capacity, sizeof(*table));
+    size_t table_count = table ? pathTruncateMountTableLocked(table, table_capacity) : 0;
+    if (table_count > table_capacity) {
+        table_count = table_capacity;
     }
-#endif
     if (snprintf(mounts_path, sizeof(mounts_path), "%s/mounts", procdir) > 0) {
         FILE *f = fopen(mounts_path, "w");
         if (f) {
-            fprintf(f, "%s / %s rw 0 0\n", mnt_from, fs_type);
-            for (size_t i = 0; i < g_pathTruncateMountCount; ++i) {
-                const PathTruncateMountEntry *entry = &g_pathTruncateMounts[i];
-                const char *entry_type = entry->type[0] ? entry->type : "auto";
-                const char *entry_opts = entry->options[0] ? entry->options : "rw";
+            for (size_t i = 0; i < table_count; ++i) {
                 fprintf(f, "%s %s %s %s 0 0\n",
-                        entry->source,
-                        entry->target,
-                        entry_type,
-                        entry_opts);
+                        table[i].source, table[i].target, table[i].type, table[i].options);
             }
             fclose(f);
         }
@@ -3205,25 +3199,24 @@ static void pathTruncateRefreshProc(const char *prefix, const char *request_path
     if (snprintf(mountinfo_path, sizeof(mountinfo_path), "%s/mountinfo", procdir) > 0) {
         FILE *f = fopen(mountinfo_path, "w");
         if (f) {
-            fprintf(f, "1 0 0:1 / / rw - %s %s rw\n", fs_type, mnt_from);
-            for (size_t i = 0; i < g_pathTruncateMountCount; ++i) {
-                const PathTruncateMountEntry *entry = &g_pathTruncateMounts[i];
-                const char *entry_type = entry->type[0] ? entry->type : "auto";
-                const char *entry_opts = entry->options[0] ? entry->options : "rw";
-                unsigned long mount_id = (unsigned long)(i + 2);
+            /* Mount 1 is the root, every other one is mounted on it. */
+            for (size_t i = 0; i < table_count; ++i) {
+                unsigned long mount_id = (unsigned long)(i + 1);
                 fprintf(f,
-                        "%lu 1 0:%lu / %s %s - %s %s %s\n",
+                        "%lu %lu 0:%lu / %s %s - %s %s %s\n",
                         mount_id,
+                        i == 0 ? 0ul : 1ul,
                         mount_id,
-                        entry->target,
-                        entry_opts,
-                        entry_type,
-                        entry->source,
-                        entry_opts);
+                        table[i].target,
+                        table[i].options,
+                        table[i].type,
+                        table[i].source,
+                        table[i].options);
             }
             fclose(f);
         }
     }
+    free(table);
 
     char sys_kernel_dir[PATH_MAX];
     if (snprintf(sys_kernel_dir, sizeof(sys_kernel_dir), "%s/sys/kernel", procdir) > 0) {
@@ -4206,6 +4199,108 @@ size_t pathTruncateMountSnapshot(PathTruncateMountEntry *out, size_t out_capacit
     }
     pathTruncateUnlock();
     return count;
+}
+
+/* One row of the app's table. Fails, leaving the row unset, when a field does not fit. */
+static bool pathTruncateMountTableRow(PathTruncateMountEntry *row,
+                                      const char *source,
+                                      const char *target,
+                                      const char *type,
+                                      const char *options,
+                                      unsigned long flags) {
+    memset(row, 0, sizeof(*row));
+    if (snprintf(row->source, sizeof(row->source), "%s", source) >= (int)sizeof(row->source) ||
+        snprintf(row->target, sizeof(row->target), "%s", target) >= (int)sizeof(row->target) ||
+        snprintf(row->type, sizeof(row->type), "%s", type) >= (int)sizeof(row->type) ||
+        snprintf(row->options, sizeof(row->options), "%s", options) >= (int)sizeof(row->options)) {
+        memset(row, 0, sizeof(*row));
+        return false;
+    }
+    row->flags = flags;
+    return true;
+}
+
+/* The app's filesystems as its processes see them. The container is one ext4
+ * root, which is what /proc/filesystems offers; /proc is generated, so it is a
+ * proc mount. A virtual mount names its source the way Linux names a bind's:
+ * by the filesystem it lives on, so a directory in the container is rootfs and
+ * one outside it (a folder the picker gave) is "external", never a host path. */
+static size_t pathTruncateMountTableLocked(PathTruncateMountEntry *out, size_t out_capacity) {
+    size_t total = PATH_TRUNCATE_FIXED_MOUNTS + g_pathTruncateMountCount;
+    if (!out || out_capacity == 0) {
+        return total;
+    }
+    size_t n = 0;
+    if (n < out_capacity) {
+        pathTruncateMountTableRow(&out[n++], "rootfs", "/", "ext4", "rw,relatime", 0);
+    }
+    if (n < out_capacity) {
+        pathTruncateMountTableRow(&out[n++], "proc", "/proc", "proc",
+                                  "rw,nosuid,nodev,noexec,relatime", 0);
+    }
+    /* g_pathTruncateMounts is longest target first, for lookups; list in mount order instead,
+     * shortest first, so a mount on top of another follows it as it would in /proc/mounts. */
+    for (size_t k = g_pathTruncateMountCount; k > 0 && n < out_capacity; --k) {
+        const PathTruncateMountEntry *entry = &g_pathTruncateMounts[k - 1];
+        const char *source_path = entry->source;
+        bool inside = pathTruncateMatchesStoredPrefix(source_path, strlen(source_path), NULL, NULL);
+        const char *type = entry->type[0] ? entry->type : "auto";
+        if (strcmp(type, "bind") == 0 || strcmp(type, "auto") == 0) {
+            type = inside ? "ext4" : "fuse";
+        }
+        const char *options = entry->options[0] ? entry->options : "rw";
+        if (pathTruncateMountTableRow(&out[n], inside ? "rootfs" : "external", entry->target,
+                                      type, options, entry->flags)) {
+            n++;
+        }
+    }
+    return total;
+}
+
+size_t pathTruncateMountTable(PathTruncateMountEntry *out, size_t out_capacity) {
+    pathTruncateLock();
+    size_t total = pathTruncateMountTableLocked(out, out_capacity);
+    pathTruncateUnlock();
+    return total;
+}
+
+bool pathTruncateMountForHostPath(const char *host_path, PathTruncateMountEntry *out) {
+    if (!host_path || !out) {
+        errno = EINVAL;
+        return false;
+    }
+    char virtual_path[PATH_MAX];
+    if (!pathTruncateStrip(host_path, virtual_path, sizeof(virtual_path))) {
+        return false;
+    }
+    pathTruncateLock();
+    const size_t capacity = PATH_TRUNCATE_MAX_MOUNTS + PATH_TRUNCATE_FIXED_MOUNTS;
+    PathTruncateMountEntry *table = calloc(capacity, sizeof(*table));
+    if (!table) {
+        pathTruncateUnlock();
+        errno = ENOMEM;
+        return false;
+    }
+    size_t count = pathTruncateMountTableLocked(table, capacity);
+    pathTruncateUnlock();
+    if (count > capacity) {
+        count = capacity;
+    }
+    /* A path outside the container and every mount still lies on /, as everything does. */
+    size_t best = 0;
+    size_t best_len = 0;
+    for (size_t i = 0; i < count; ++i) {
+        size_t len = strlen(table[i].target);
+        bool holds = (len == 1 && table[i].target[0] == '/') ||
+                     pathTruncatePrefixMatch(virtual_path, table[i].target, len);
+        if (holds && len >= best_len) {
+            best = i;
+            best_len = len;
+        }
+    }
+    *out = table[best];
+    free(table);
+    return true;
 }
 
 void pathTruncateMountClearAll(void) {

@@ -31,6 +31,8 @@ extern void pscalRuntimeDebugLog(const char *message);
 #include <string.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/mount.h>
+#include <sys/statvfs.h>
 #include "common/path_truncate.h"
 #include "runtime/vproc/vproc.h"
 #include "runtime/vproc/tty/pscal_fd.h"
@@ -364,6 +366,63 @@ int pscalPathVirtualized_lstat(const char *path, struct stat *buf) {
     int rc = lstat(target ? target : path, buf);
     if (rc == 0) {
         vprocHostPathOwner(target ? target : path, buf);
+    }
+    return rc;
+}
+
+/* Linux's f_type for the filesystem types the app's mount table uses. */
+static uint32_t pathVirtualizedFsMagic(const char *type) {
+    if (strcmp(type, "proc") == 0) return 0x9FA0;
+    if (strcmp(type, "fuse") == 0) return 0x65735546;
+    if (strcmp(type, "tmpfs") == 0) return 0x01021994;
+    return 0xEF53; /* ext2, ext3 and ext4 share one */
+}
+
+/* Sizes are the host's for the filesystem under the path; names come from the
+ * app's mount table, which is what a process here mounted. /proc holds no
+ * blocks, as on Linux. */
+int pscalPathVirtualized_statfs(const char *path, struct statfs *buf) {
+    char expanded[PATH_MAX];
+    const char *target = pscalPathVirtualized_hostPath(path, expanded);
+    if (!target) {
+        target = path;
+    }
+    LOG_EXPANSION("statfs", path, target);
+    int rc = statfs(target, buf);
+    if (rc != 0 || !pathVirtualizationActive()) {
+        return rc;
+    }
+    PathTruncateMountEntry entry;
+    if (!pathTruncateMountForHostPath(target, &entry)) {
+        return rc;
+    }
+    snprintf(buf->f_mntonname, sizeof(buf->f_mntonname), "%s", entry.target);
+    snprintf(buf->f_mntfromname, sizeof(buf->f_mntfromname), "%s", entry.source);
+    snprintf(buf->f_fstypename, sizeof(buf->f_fstypename), "%s", entry.type);
+    buf->f_type = pathVirtualizedFsMagic(entry.type);
+    buf->f_fssubtype = 0;
+    if (strcmp(entry.type, "proc") == 0) {
+        buf->f_blocks = buf->f_bfree = buf->f_bavail = 0;
+        buf->f_files = buf->f_ffree = 0;
+    }
+    return rc;
+}
+
+int pscalPathVirtualized_statvfs(const char *path, struct statvfs *buf) {
+    char expanded[PATH_MAX];
+    const char *target = pscalPathVirtualized_hostPath(path, expanded);
+    if (!target) {
+        target = path;
+    }
+    LOG_EXPANSION("statvfs", path, target);
+    int rc = statvfs(target, buf);
+    if (rc != 0 || !pathVirtualizationActive()) {
+        return rc;
+    }
+    PathTruncateMountEntry entry;
+    if (pathTruncateMountForHostPath(target, &entry) && strcmp(entry.type, "proc") == 0) {
+        buf->f_blocks = buf->f_bfree = buf->f_bavail = 0;
+        buf->f_files = buf->f_ffree = buf->f_favail = 0;
     }
     return rc;
 }

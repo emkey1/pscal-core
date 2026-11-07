@@ -16,7 +16,9 @@ static inline const char *pscalPathVirtualized_hostPath(const char *path, char e
 #include <dirent.h>
 #include <glob.h>
 #include <stdio.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 
 int pscalPathVirtualized_chdir(const char *path);
@@ -26,6 +28,9 @@ FILE *pscalPathVirtualized_fopen(const char *path, const char *mode);
 FILE *pscalPathVirtualized_freopen(const char *path, const char *mode, FILE *stream);
 int pscalPathVirtualized_stat(const char *path, struct stat *buf);
 int pscalPathVirtualized_lstat(const char *path, struct stat *buf);
+/* The app's own view: the mount point, source and type from its mount table. */
+int pscalPathVirtualized_statfs(const char *path, struct statfs *buf);
+int pscalPathVirtualized_statvfs(const char *path, struct statvfs *buf);
 int pscalPathVirtualized_access(const char *path, int mode);
 int pscalPathVirtualized_mkdir(const char *path, mode_t mode);
 int pscalPathVirtualized_mkfifo(const char *path, mode_t mode);
@@ -64,6 +69,12 @@ int pscalPathVirtualized_streamSlot(FILE *stream);
 #endif
 #ifndef lstat
 #define lstat(path, buf) pscalPathVirtualized_lstat(path, buf)
+#endif
+#ifndef statfs
+#define statfs(path, buf) pscalPathVirtualized_statfs(path, buf)
+#endif
+#ifndef statvfs
+#define statvfs(path, buf) pscalPathVirtualized_statvfs(path, buf)
 #endif
 #define access(path, mode) pscalPathVirtualized_access(path, mode)
 #undef mkdir
