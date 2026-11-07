@@ -3941,16 +3941,6 @@ int vprocNextJobIdSeed(void) {
     return __sync_fetch_and_add(&next_job_id, 1);
 }
 
-static int vprocRuntimeCenti(const VProcTaskEntry *entry, uint64_t now_ns) {
-    if (!entry || entry->start_mono_ns == 0) {
-        return 0;
-    }
-    uint64_t start = entry->start_mono_ns;
-    uint64_t delta_ns = (now_ns > start) ? (now_ns - start) : 0;
-    int centi = (int)(delta_ns / 10000000ull); /* centiseconds */
-    return centi < 0 ? 0 : centi;
-}
-
 static int vprocCentiFromMicros(int64_t micros) {
     if (micros <= 0) {
         return 0;
@@ -4443,14 +4433,8 @@ static void vprocMaybeStampRusageLocked(VProcTaskEntry *entry) {
         }
         return;
     }
-    if (entry->rusage_utime == 0 && entry->rusage_stime == 0) {
-        uint64_t now = vprocNowMonoNs();
-        int centi = vprocRuntimeCenti(entry, now);
-        if (centi > 0) {
-            entry->rusage_utime = centi;
-            entry->rusage_stime = centi / 10; /* crude split fallback */
-        }
-    }
+    /* Nothing measured is no CPU time. Time alive stood in here, a tenth of it as system time,
+     * so a row with no thread to measure looked like it was spinning for as long as it lived. */
 }
 
 /* What delivering a signal to a virtual process does, once blocking has been
@@ -7111,8 +7095,41 @@ static void vprocOrphanChildrenLocked(int parent_pid, int new_parent_pid) {
     }
 }
 
+/* The kernel's task is init: it waits for nothing, so it reaps a child of its own the moment that
+ * child ends. A child of the kernel in another task's session stays for that session's leader to
+ * wait for (vprocWaitParentMatchesLocked), until the leader ends too. A tab's shell and an ssh
+ * session are the kernel's children, each its own session's leader, and stayed as zombies. */
+static bool vprocKernelReapsLocked(const VProcTaskEntry *entry) {
+    int kernel_pid = vprocGetKernelPid();
+    if (!entry || kernel_pid <= 0 || entry->pid == kernel_pid || entry->parent_pid != kernel_pid) {
+        return false;
+    }
+    if (entry->sid <= 0 || entry->sid == entry->pid || entry->sid == kernel_pid) {
+        return true;
+    }
+    const VProcTaskEntry *leader = vprocTaskFindLocked(entry->sid);
+    return !leader || leader->exited;
+}
+
+/* A session leader that ends leaves the kernel's ended children in its session to the kernel. */
+static void vprocKernelReapSessionLocked(int sid) {
+    int kernel_pid = vprocGetKernelPid();
+    if (sid <= 0 || kernel_pid <= 0) {
+        return;
+    }
+    for (size_t i = 0; i < gVProcTasks.count; ++i) {
+        VProcTaskEntry *entry = &gVProcTasks.items[i];
+        if (entry->pid <= 0 || entry->pid == sid || entry->sid != sid) continue;
+        if (entry->parent_pid != kernel_pid || !entry->exited) continue;
+        entry->zombie = false;
+        vprocClearEntryLocked(entry);
+    }
+}
+
 static void vprocNotifyPidSigchldLocked(int target_pid, VProcSigchldEvent evt) {
-    if (target_pid <= 0) {
+    /* The kernel reaps its children as they end and has no handler: a SIGCHLD only stayed
+     * pending on it for good. */
+    if (target_pid <= 0 || target_pid == vprocGetKernelPid()) {
         return;
     }
     VProcTaskEntry *target_entry = vprocTaskFindLocked(target_pid);
@@ -10326,7 +10343,10 @@ void vprocMarkExit(VProc *vp, int status) {
         int adopt_parent = vprocAdoptiveParentPidLocked(entry);
         vprocOrphanChildrenLocked(vp->pid, adopt_parent);
 
-        bool discard_zombie = entry->orphaned;
+        bool discard_zombie = entry->orphaned || vprocKernelReapsLocked(entry);
+        if (entry->sid == entry->pid) {
+            vprocKernelReapSessionLocked(entry->pid);
+        }
         VProcTaskEntry *parent_entry = vprocTaskFindLocked(entry->parent_pid);
         if (parent_entry) {
             struct sigaction sa = vprocGetSigactionLocked(parent_entry, SIGCHLD);
@@ -10859,7 +10879,6 @@ size_t vprocSnapshot(VProcSnapshot *out, size_t capacity) {
         if (entry->pid <= 0) {
             continue;
         }
-        uint64_t now = vprocNowMonoNs();
         if (out && count < capacity) {
             int fg_for_session = (entry->sid > 0) ? vprocForegroundPgidLocked(entry->sid) : -1;
             int tty_pty_num = -1;
@@ -10878,14 +10897,6 @@ size_t vprocSnapshot(VProcSnapshot *out, size_t capacity) {
                 }
                 if (cpu_stime > stime) {
                     stime = cpu_stime;
-                }
-            } else if (!entry->exited && utime == 0 && stime == 0) {
-                int live = vprocRuntimeCenti(entry, now);
-                if (live > utime) {
-                    utime = live;
-                }
-                if (live / 10 > stime) {
-                    stime = live / 10;
                 }
             }
             out[count].pid = entry->pid;
@@ -11431,7 +11442,7 @@ static bool vprocKillDeliverEntryLocked(VProcTaskEntry *entry,
         }
     }
     /* With no thread to report its end through vprocMarkExit, this was it. */
-    if (entry->orphaned && entry->exited) {
+    if (entry->exited && (entry->orphaned || vprocKernelReapsLocked(entry))) {
         vprocClearEntryLocked(entry);
     }
     return true;
@@ -14126,7 +14137,9 @@ void vprocSetCommandLabel(int pid, const char *label) {
     char thread_name[16];
     bool rename_thread = false;
     pthread_mutex_lock(&gVProcTasks.mu);
-    VProcTaskEntry *entry = label ? vprocTaskEnsureSlotLocked(pid) : vprocTaskFindLocked(pid);
+    /* A name is no process: a pid the kernel never gave out (the app's own, from getpid with
+     * no task) became a row of its own, an `exsh` with no terminal that never ended. */
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
     if (entry) {
         free(entry->label);
         entry->label = NULL;
