@@ -113,7 +113,7 @@ set(PSCAL_CORE_SOURCES
     ${SRC}/compiler/bytecode.c ${SRC}/compiler/bytecode_verify.c ${SRC}/compiler/bytecode_link.c ${SRC}/compiler/compiler.c
     ${SRC}/core/cache.c
     ${SRC}/common/runtime_params.c ${SRC}/common/runtime_tty.c ${SRC}/common/runtime_clipboard.c
-    ${SRC}/common/env_snapshot.c ${SRC}/common/pscal_hosts.c ${SRC}/common/path_truncate.c
+    ${SRC}/common/env_snapshot.c ${SRC}/common/pscal_hosts.c ${SRC}/common/path_truncate.c ${SRC}/common/net_snapshot.c
     ${SRC}/common/path_virtualization.c ${SRC}/common/pscal_terminal_host.c
     ${SRC}/common/frontend_kind.c ${SRC}/common/runtime_paths.c ${SRC}/common/pascal_state.c
     ${SRC}/core/diagmap.c

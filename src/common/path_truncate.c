@@ -1,5 +1,6 @@
 #include "common/path_truncate.h"
 #include "common/env_snapshot.h"
+#include "common/net_snapshot.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -730,19 +731,6 @@ static void pathTruncateWriteProcLimits(const char *path) {
 }
 
 typedef struct {
-    char name[IFNAMSIZ];
-    uint64_t rx_bytes;
-    uint64_t rx_packets;
-    uint64_t rx_errors;
-    uint64_t rx_drop;
-    uint64_t tx_bytes;
-    uint64_t tx_packets;
-    uint64_t tx_errors;
-    uint64_t tx_drop;
-    bool used;
-} ProcNetDevRow;
-
-typedef struct {
     unsigned total;
     unsigned unix_stream;
     unsigned unix_dgram;
@@ -753,43 +741,6 @@ typedef struct {
     unsigned raw4;
     unsigned raw6;
 } ProcSocketStats;
-
-static unsigned pathTruncateCountPrefixBits(const unsigned char *bytes, size_t len) {
-    if (!bytes || len == 0) {
-        return 0;
-    }
-    unsigned count = 0;
-    for (size_t i = 0; i < len; ++i) {
-        unsigned char value = bytes[i];
-        if (value == 0xffu) {
-            count += 8;
-            continue;
-        }
-        for (int bit = 7; bit >= 0; --bit) {
-            if ((value & (unsigned char)(1u << bit)) != 0) {
-                count++;
-            } else {
-                return count;
-            }
-        }
-    }
-    return count;
-}
-
-static unsigned pathTruncateNetmaskPrefixLength(const struct sockaddr *netmask) {
-    if (!netmask) {
-        return 0;
-    }
-    if (netmask->sa_family == AF_INET) {
-        const struct sockaddr_in *sin = (const struct sockaddr_in *)netmask;
-        return pathTruncateCountPrefixBits((const unsigned char *)&sin->sin_addr, sizeof(sin->sin_addr));
-    }
-    if (netmask->sa_family == AF_INET6) {
-        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)netmask;
-        return pathTruncateCountPrefixBits((const unsigned char *)&sin6->sin6_addr, sizeof(sin6->sin6_addr));
-    }
-    return 0;
-}
 
 static void pathTruncateCollectSocketStats(ProcSocketStats *stats) {
     if (!stats) {
@@ -842,26 +793,10 @@ static void pathTruncateCollectSocketStats(ProcSocketStats *stats) {
     }
 }
 
-static int pathTruncateFindOrAddDevRow(ProcNetDevRow *rows, size_t max_rows, const char *name) {
-    if (!rows || !name || name[0] == '\0') {
-        return -1;
-    }
-    for (size_t i = 0; i < max_rows; ++i) {
-        if (rows[i].used && strcmp(rows[i].name, name) == 0) {
-            return (int)i;
-        }
-    }
-    for (size_t i = 0; i < max_rows; ++i) {
-        if (!rows[i].used) {
-            rows[i].used = true;
-            snprintf(rows[i].name, sizeof(rows[i].name), "%s", name);
-            return (int)i;
-        }
-    }
-    return -1;
-}
-
-static void pathTruncateWriteProcNetDev(const char *path) {
+/* /proc/net/dev, route, if_inet6 and ipv6_route come from one net snapshot, the one
+ * the app's ip prints, so the two agree. */
+static void pathTruncateWriteProcNetFromSnapshot(const char *path, const PscalNetSnapshot *snap,
+                                                 void (*write)(const PscalNetSnapshot *, FILE *)) {
     if (!path) {
         return;
     }
@@ -869,117 +804,10 @@ static void pathTruncateWriteProcNetDev(const char *path) {
     if (!f) {
         return;
     }
-    fprintf(f,
-            "Inter-|   Receive                                                |  Transmit\n"
-            " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n");
-
-    ProcNetDevRow rows[128];
-    memset(rows, 0, sizeof(rows));
-
-    struct ifaddrs *ifaddr = NULL;
-    if (getifaddrs(&ifaddr) == 0 && ifaddr) {
-        for (struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
-            if (!ifa->ifa_name || ifa->ifa_name[0] == '\0') {
-                continue;
-            }
-            int idx = pathTruncateFindOrAddDevRow(rows, sizeof(rows) / sizeof(rows[0]), ifa->ifa_name);
-            if (idx < 0) {
-                continue;
-            }
-#if defined(__APPLE__)
-            if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_LINK && ifa->ifa_data) {
-                const struct if_data *d = (const struct if_data *)ifa->ifa_data;
-                rows[idx].rx_bytes = (uint64_t)d->ifi_ibytes;
-                rows[idx].rx_packets = (uint64_t)d->ifi_ipackets;
-                rows[idx].rx_errors = (uint64_t)d->ifi_ierrors;
-                rows[idx].rx_drop = 0;
-                rows[idx].tx_bytes = (uint64_t)d->ifi_obytes;
-                rows[idx].tx_packets = (uint64_t)d->ifi_opackets;
-                rows[idx].tx_errors = (uint64_t)d->ifi_oerrors;
-                rows[idx].tx_drop = 0;
-            }
-#else
-            (void)ifa;
-#endif
-        }
-        freeifaddrs(ifaddr);
-    } else {
-        int idx = pathTruncateFindOrAddDevRow(rows, sizeof(rows) / sizeof(rows[0]), "lo");
-        if (idx >= 0) {
-            rows[idx].used = true;
-        }
-    }
-
-    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i) {
-        if (!rows[i].used) {
-            continue;
-        }
-        const char *name = rows[i].name;
-        if (strcmp(name, "lo0") == 0) {
-            name = "lo";
-        }
-        fprintf(f,
-                "%6s: %-8llu %-7llu %-4llu %-4llu 0    0     0          0 "
-                "%-8llu %-7llu %-4llu %-4llu 0    0     0       0\n",
-                name,
-                (unsigned long long)rows[i].rx_bytes,
-                (unsigned long long)rows[i].rx_packets,
-                (unsigned long long)rows[i].rx_errors,
-                (unsigned long long)rows[i].rx_drop,
-                (unsigned long long)rows[i].tx_bytes,
-                (unsigned long long)rows[i].tx_packets,
-                (unsigned long long)rows[i].tx_errors,
-                (unsigned long long)rows[i].tx_drop);
-    }
+    write(snap, f);
     fclose(f);
 }
 
-static void pathTruncateWriteProcNetRoute(const char *path) {
-    if (!path) {
-        return;
-    }
-    FILE *f = fopen(path, "w");
-    if (!f) {
-        return;
-    }
-    fprintf(f, "Iface\tDestination\tGateway\tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n");
-
-    struct ifaddrs *ifaddr = NULL;
-    bool wrote_any = false;
-    if (getifaddrs(&ifaddr) == 0 && ifaddr) {
-        for (struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
-            if (!ifa->ifa_name || !ifa->ifa_addr || !ifa->ifa_netmask) {
-                continue;
-            }
-            if (ifa->ifa_addr->sa_family != AF_INET || ifa->ifa_netmask->sa_family != AF_INET) {
-                continue;
-            }
-            const struct sockaddr_in *sin_addr = (const struct sockaddr_in *)ifa->ifa_addr;
-            const struct sockaddr_in *sin_mask = (const struct sockaddr_in *)ifa->ifa_netmask;
-            uint32_t addr = ntohl(sin_addr->sin_addr.s_addr);
-            uint32_t mask = ntohl(sin_mask->sin_addr.s_addr);
-            uint32_t dest = addr & mask;
-            unsigned flags = 0x0001;
-            if (ifa->ifa_flags & IFF_LOOPBACK) {
-                flags |= 0x0004;
-            }
-            const char *ifname = strcmp(ifa->ifa_name, "lo0") == 0 ? "lo" : ifa->ifa_name;
-            fprintf(f,
-                    "%s\t%08X\t%08X\t%04X\t0\t0\t0\t%08X\t0\t0\t0\n",
-                    ifname,
-                    dest,
-                    0u,
-                    flags,
-                    mask);
-            wrote_any = true;
-        }
-        freeifaddrs(ifaddr);
-    }
-    if (!wrote_any) {
-        fprintf(f, "lo\t0000007F\t00000000\t0001\t0\t0\t0\t000000FF\t0\t0\t0\n");
-    }
-    fclose(f);
-}
 
 static void pathTruncateWriteProcNetArp(const char *path) {
     if (!path) {
@@ -988,52 +816,6 @@ static void pathTruncateWriteProcNetArp(const char *path) {
     write_text_file(path, "IP address       HW type     Flags       HW address            Mask     Device\n");
 }
 
-static void pathTruncateWriteProcNetIfInet6(const char *path) {
-    if (!path) {
-        return;
-    }
-    FILE *f = fopen(path, "w");
-    if (!f) {
-        return;
-    }
-    struct ifaddrs *ifaddr = NULL;
-    if (getifaddrs(&ifaddr) == 0 && ifaddr) {
-        for (struct ifaddrs *ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
-            if (!ifa->ifa_name || !ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET6) {
-                continue;
-            }
-            const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)ifa->ifa_addr;
-            char addr_hex[33];
-            for (int i = 0; i < 16; ++i) {
-                snprintf(addr_hex + (i * 2), 3, "%02x", sin6->sin6_addr.s6_addr[i]);
-            }
-            addr_hex[32] = '\0';
-
-            unsigned ifindex = if_nametoindex(ifa->ifa_name);
-            unsigned prefix_len = pathTruncateNetmaskPrefixLength(ifa->ifa_netmask);
-            unsigned scope = 0x00;
-            if (IN6_IS_ADDR_LOOPBACK(&sin6->sin6_addr)) {
-                scope = 0x80;
-            } else if (IN6_IS_ADDR_LINKLOCAL(&sin6->sin6_addr)) {
-                scope = 0x20;
-            } else if (IN6_IS_ADDR_SITELOCAL(&sin6->sin6_addr)) {
-                scope = 0x40;
-            }
-            const unsigned flags = 0x80;
-            const char *ifname = strcmp(ifa->ifa_name, "lo0") == 0 ? "lo" : ifa->ifa_name;
-            fprintf(f,
-                    "%s %02x %02x %02x %02x %s\n",
-                    addr_hex,
-                    (unsigned)(ifindex & 0xffu),
-                    (unsigned)(prefix_len & 0xffu),
-                    scope,
-                    flags,
-                    ifname);
-        }
-        freeifaddrs(ifaddr);
-    }
-    fclose(f);
-}
 
 static void pathTruncateWriteProcNetInet(const char *path, int sock_type, bool ipv6) {
     if (!path) {
@@ -1426,21 +1208,6 @@ static void pathTruncateWriteProcNetIgmp6(const char *path) {
     fclose(f);
 }
 
-static void pathTruncateWriteProcNetIpv6Route(const char *path) {
-    if (!path) {
-        return;
-    }
-    /* Minimal synthetic default/loopback-like route rows. */
-    write_text_file(path,
-                    "00000000000000000000000000000000 00 "
-                    "00000000000000000000000000000000 00 "
-                    "00000000000000000000000000000000 "
-                    "00000000 00000000 00000000 00000001 lo\n"
-                    "00000000000000000000000000000001 80 "
-                    "00000000000000000000000000000000 00 "
-                    "00000000000000000000000000000000 "
-                    "00000000 00000000 00000000 00000001 lo\n");
-}
 
 static void pathTruncateWriteProcNetRt6Stats(const char *path) {
     if (!path) {
@@ -3415,17 +3182,19 @@ static void pathTruncateRefreshProc(const char *prefix, const char *request_path
         pathTruncateEnsureDir(net_dir);
         if (request_net) {
             char pathbuf[PATH_MAX];
+            PscalNetSnapshot net_snap;
+            pscalNetSnapshotTake(&net_snap);
             if (snprintf(pathbuf, sizeof(pathbuf), "%s/dev", net_dir) > 0) {
-                pathTruncateWriteProcNetDev(pathbuf);
+                pathTruncateWriteProcNetFromSnapshot(pathbuf, &net_snap, pscalNetWriteProcDev);
             }
             if (snprintf(pathbuf, sizeof(pathbuf), "%s/arp", net_dir) > 0) {
                 pathTruncateWriteProcNetArp(pathbuf);
             }
             if (snprintf(pathbuf, sizeof(pathbuf), "%s/if_inet6", net_dir) > 0) {
-                pathTruncateWriteProcNetIfInet6(pathbuf);
+                pathTruncateWriteProcNetFromSnapshot(pathbuf, &net_snap, pscalNetWriteProcIfInet6);
             }
             if (snprintf(pathbuf, sizeof(pathbuf), "%s/route", net_dir) > 0) {
-                pathTruncateWriteProcNetRoute(pathbuf);
+                pathTruncateWriteProcNetFromSnapshot(pathbuf, &net_snap, pscalNetWriteProcRoute);
             }
             if (snprintf(pathbuf, sizeof(pathbuf), "%s/raw", net_dir) > 0) {
                 pathTruncateWriteProcNetInet(pathbuf, SOCK_RAW, false);
@@ -3485,7 +3254,7 @@ static void pathTruncateRefreshProc(const char *prefix, const char *request_path
                 pathTruncateWriteProcNetIgmp6(pathbuf);
             }
             if (snprintf(pathbuf, sizeof(pathbuf), "%s/ipv6_route", net_dir) > 0) {
-                pathTruncateWriteProcNetIpv6Route(pathbuf);
+                pathTruncateWriteProcNetFromSnapshot(pathbuf, &net_snap, pscalNetWriteProcIpv6Route);
             }
             if (snprintf(pathbuf, sizeof(pathbuf), "%s/rt6_stats", net_dir) > 0) {
                 pathTruncateWriteProcNetRt6Stats(pathbuf);
@@ -3508,6 +3277,7 @@ static void pathTruncateRefreshProc(const char *prefix, const char *request_path
             if (snprintf(pathbuf, sizeof(pathbuf), "%s/xfrm_stat", net_dir) > 0) {
                 pathTruncateWriteProcNetXfrmStat(pathbuf);
             }
+            pscalNetSnapshotFree(&net_snap);
             char stat_dir[PATH_MAX];
             if (snprintf(stat_dir, sizeof(stat_dir), "%s/stat", net_dir) > 0) {
                 pathTruncateEnsureDir(stat_dir);
