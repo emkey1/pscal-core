@@ -3228,7 +3228,13 @@ static void pathTruncateRefreshProc(const char *prefix, const char *request_path
     char sys_kernel_dir[PATH_MAX];
     if (snprintf(sys_kernel_dir, sizeof(sys_kernel_dir), "%s/sys/kernel", procdir) > 0) {
         pathTruncateEnsureDir(sys_kernel_dir);
-        const char *hostbuf = "pscal";
+        char hostbuf[260] = "pscal";
+#if defined(PSCAL_TARGET_IOS)
+        /* The kernel's name, as gethostname gives it. */
+        if (vprocGethostnameShim(hostbuf, sizeof(hostbuf) - 1) == 0) {
+            strlcat(hostbuf, "\n", sizeof(hostbuf));
+        }
+#endif
         char pathbuf[PATH_MAX];
         if (snprintf(pathbuf, sizeof(pathbuf), "%s/hostname", sys_kernel_dir) > 0) {
             write_text_file(pathbuf, hostbuf);

@@ -338,6 +338,60 @@ int vprocHostMkdiratMasked(int dirfd, const char *path, mode_t mode);
 FILE *vprocHostFopenMasked(const char *path, const char *mode);
 int vprocMkfifoShim(const char *path, mode_t mode);
 int vprocMknodShim(const char *path, mode_t mode, dev_t dev);
+/* A task's user and group ids, kept with its file mask and handed to what it starts, by POSIX's
+ * rules. A session starts as the login account: the host's uid, with its group and groups from
+ * /etc/passwd and /etc/group. Root is uid 0, which only exec of a set-user-id program gives. */
+uid_t vprocGetuidShim(void);
+uid_t vprocGeteuidShim(void);
+gid_t vprocGetgidShim(void);
+gid_t vprocGetegidShim(void);
+int vprocGetgroupsShim(int size, gid_t list[]);
+int vprocSetuidShim(uid_t uid);
+int vprocSeteuidShim(uid_t uid);
+int vprocSetreuidShim(uid_t ruid, uid_t euid);
+int vprocSetgidShim(gid_t gid);
+int vprocSetegidShim(gid_t gid);
+int vprocSetregidShim(gid_t rgid, gid_t egid);
+int vprocSetgroupsShim(int size, const gid_t list[]);
+int vprocInitgroupsShim(const char *user, gid_t gid);
+/* What a normal user may not touch. host_path is the host's, after expansion; op is
+ * VPROC_PERM_READ, VPROC_PERM_WRITE (a file's contents or attributes) or VPROC_PERM_ENTRY (making,
+ * removing or renaming the name itself, which doesn't follow a final symlink). 0, or -1 with EACCES.
+ * Only a task is checked: the app's own threads have none. */
+#define VPROC_PERM_READ 1
+#define VPROC_PERM_WRITE 2
+#define VPROC_PERM_ENTRY 4
+int vprocHostPathPermit(const char *host_path, int op);
+/* The same for open's flags: what they read and write. */
+int vprocHostPathPermitOpen(const char *host_path, int flags);
+/* open's flags for an fopen mode. */
+int vprocFopenModeFlags(const char *mode);
+/* The owner a file shows: what the installer put in /etc belongs to root. */
+void vprocHostPathOwner(const char *host_path, struct stat *st);
+/* exec, which never returns once the program can run: the program runs as a call on this task, which
+ * then ends with its status. -1 with errno, as exec sets it, if it can't run. The app says how a
+ * program runs; nothing can replace the app. */
+typedef bool (*VProcExecCanRunFn)(const char *path);
+typedef int (*VProcExecRunFn)(int argc, char **argv);
+void vprocSetExecHooks(VProcExecCanRunFn can_run, VProcExecRunFn run);
+/* As exec does for a program the app starts some other way: a set-user-id one gets root. */
+void vprocExecApplyCredentials(const char *program);
+int vprocExecveShim(const char *path, char *const argv[], char *const envp[]);
+int vprocExecvShim(const char *path, char *const argv[]);
+int vprocExecvpShim(const char *file, char *const argv[]);
+int vprocExeclShim(const char *path, const char *arg0, ...);
+int vprocExeclpShim(const char *file, const char *arg0, ...);
+struct VProcProgramFrame;
+/* What a program frame's setjmp returned, made a status: an exec's own status, or 128 + a signal. */
+int vprocProgramFrameStatus(const struct VProcProgramFrame *frame, int jumped);
+/* The host name, the kernel's: /etc/hostname at launch, otherwise iDevice. Only root may set it,
+ * and a set lasts until the app ends. */
+int vprocGethostnameShim(char *name, size_t len);
+int vprocSethostnameShim(const char *name, size_t len);
+struct utsname;
+int vprocUnameShim(struct utsname *buf);
+/* A number for this launch of the app, which a file left by an earlier one can't have. */
+uint64_t vprocBootId(void);
 /* A subshell's environment and directory. There is no fork here, so a subshell is a
  * thread and a vproc, and these keep what a process would keep for itself. A thread with
  * no environment of its own sees the process's, and one with no subshell pid the
@@ -614,6 +668,8 @@ typedef struct VProcProgramFrame {
     int handler_task;
     bool pushed;
     void *cleanup_stack;
+    bool exec_ended;  /* the program exec'd another, which ended with exec_status */
+    int exec_status;
     struct VProcProgramFrame *prev;
 } VProcProgramFrame;
 void vprocProgramFramePush(VProcProgramFrame *frame);
@@ -649,6 +705,9 @@ bool vprocCommandScopeBegin(VProcCommandScope *scope,
                             const char *label,
                             bool force_new_vproc,
                             bool inherit_parent_pgid);
+/* A new scope's vproc takes the descriptors of the one it began under, pipes included, as a forked
+ * process has its parent's: a program that is a process of its own, run in a pipeline's stage. */
+bool vprocCommandScopeTakeDescriptors(VProcCommandScope *scope);
 void vprocCommandScopeEnd(VProcCommandScope *scope, int exit_code);
 /* Simulated fork/exec helper for single-process iOS runtime. */
 pid_t vprocSimulatedFork(const char *label, bool inherit_parent_pgid);

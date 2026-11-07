@@ -40,6 +40,7 @@ int pscalPathVirtualized_glob(const char *pattern,
                               int (*errfunc)(const char *, int),
                               glob_t *pglob);
 int pscalPathVirtualized_symlink(const char *target, const char *linkpath);
+int pscalPathVirtualized_link(const char *oldpath, const char *newpath);
 ssize_t pscalPathVirtualized_readlink(const char *path, char *buf, size_t size);
 char *pscalPathVirtualized_realpath(const char *path, char *resolved_path);
 /* For a library that opens the file itself, which the macros below cannot reach: the host
@@ -79,6 +80,7 @@ int pscalPathVirtualized_streamSlot(FILE *stream);
 #define rename(oldpath, newpath) pscalPathVirtualized_rename(oldpath, newpath)
 #define opendir(name) pscalPathVirtualized_opendir(name)
 #define symlink(target, linkpath) pscalPathVirtualized_symlink(target, linkpath)
+#define link(oldpath, newpath) pscalPathVirtualized_link(oldpath, newpath)
 #define readlink(path, buf, size) pscalPathVirtualized_readlink(path, buf, size)
 #define realpath(path, resolved_path) pscalPathVirtualized_realpath(path, resolved_path)
 #endif /* PATH_VIRTUALIZATION_NO_MACROS */

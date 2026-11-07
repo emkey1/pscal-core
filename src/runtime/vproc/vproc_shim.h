@@ -9,6 +9,9 @@
 #include <locale.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
+#include <grp.h>
+#include <unistd.h>
 #define VPROC_SHIM_PRESENT 1
 #include "runtime/vproc/vproc.h"
 
@@ -138,6 +141,49 @@
 #define signal(sig, handler) vprocSignalShim((sig), (handler))
 #define raise(sig) vprocRaiseShim((sig))
 #define pthread_sigmask(how, set, oldset) vprocPthreadSigmaskShim((how), (set), (oldset))
+/* Who a task is, and exec, are the kernel's: see vproc.h. */
+#undef getuid
+#undef geteuid
+#undef getgid
+#undef getegid
+#undef getgroups
+#undef setuid
+#undef seteuid
+#undef setreuid
+#undef setgid
+#undef setegid
+#undef setregid
+#undef setgroups
+#undef initgroups
+#undef execve
+#undef execv
+#undef execvp
+#undef execl
+#undef execlp
+#undef gethostname
+#undef sethostname
+#undef uname
+#define getuid() vprocGetuidShim()
+#define geteuid() vprocGeteuidShim()
+#define getgid() vprocGetgidShim()
+#define getegid() vprocGetegidShim()
+#define getgroups(...) vprocGetgroupsShim(__VA_ARGS__)
+#define setuid(...) vprocSetuidShim(__VA_ARGS__)
+#define seteuid(...) vprocSeteuidShim(__VA_ARGS__)
+#define setreuid(...) vprocSetreuidShim(__VA_ARGS__)
+#define setgid(...) vprocSetgidShim(__VA_ARGS__)
+#define setegid(...) vprocSetegidShim(__VA_ARGS__)
+#define setregid(...) vprocSetregidShim(__VA_ARGS__)
+#define setgroups(...) vprocSetgroupsShim(__VA_ARGS__)
+#define initgroups(...) vprocInitgroupsShim(__VA_ARGS__)
+#define execve(...) vprocExecveShim(__VA_ARGS__)
+#define execv(...) vprocExecvShim(__VA_ARGS__)
+#define execvp(...) vprocExecvpShim(__VA_ARGS__)
+#define execl(...) vprocExeclShim(__VA_ARGS__)
+#define execlp(...) vprocExeclpShim(__VA_ARGS__)
+#define gethostname(...) vprocGethostnameShim(__VA_ARGS__)
+#define sethostname(...) vprocSethostnameShim(__VA_ARGS__)
+#define uname(...) vprocUnameShim(__VA_ARGS__)
 #define alarm(seconds) vprocAlarmShim((seconds))
 #define ualarm(useconds, interval_useconds) vprocUalarmShim((useconds), (interval_useconds))
 #define setitimer(which, new_value, old_value) vprocSetitimerShim((which), (new_value), (old_value))

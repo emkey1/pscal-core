@@ -344,7 +344,11 @@ int pscalPathVirtualized_stat(const char *path, struct stat *buf) {
     char expanded[PATH_MAX];
     const char *target = pathVirtualizedPrepare(path, expanded);
     LOG_EXPANSION("stat", path, target);
-    return stat(target ? target : path, buf);
+    int rc = stat(target ? target : path, buf);
+    if (rc == 0) {
+        vprocHostPathOwner(target ? target : path, buf);
+    }
+    return rc;
 }
 
 int pscalPathVirtualized_lstat(const char *path, struct stat *buf) {
@@ -357,7 +361,11 @@ int pscalPathVirtualized_lstat(const char *path, struct stat *buf) {
     char expanded[PATH_MAX];
     const char *target = pathVirtualizedPrepare(path, expanded);
     LOG_EXPANSION("lstat", path, target);
-    return lstat(target ? target : path, buf);
+    int rc = lstat(target ? target : path, buf);
+    if (rc == 0) {
+        vprocHostPathOwner(target ? target : path, buf);
+    }
+    return rc;
 }
 
 int pscalPathVirtualized_access(const char *path, int mode) {
@@ -406,6 +414,9 @@ int pscalPathVirtualized_rmdir(const char *path) {
     }
     char expanded[PATH_MAX];
     const char *target = pathVirtualizedPrepare(path, expanded);
+    if (vprocHostPathPermit(target ? target : path, VPROC_PERM_ENTRY) != 0) {
+        return -1;
+    }
     return rmdir(target ? target : path);
 }
 
@@ -418,6 +429,9 @@ int pscalPathVirtualized_unlink(const char *path) {
     }
     char expanded[PATH_MAX];
     const char *target = pathVirtualizedPrepare(path, expanded);
+    if (vprocHostPathPermit(target ? target : path, VPROC_PERM_ENTRY) != 0) {
+        return -1;
+    }
     return unlink(target ? target : path);
 }
 
@@ -430,6 +444,9 @@ int pscalPathVirtualized_remove(const char *path) {
     }
     char expanded[PATH_MAX];
     const char *target = pathVirtualizedPrepare(path, expanded);
+    if (vprocHostPathPermit(target ? target : path, VPROC_PERM_ENTRY) != 0) {
+        return -1;
+    }
     return remove(target ? target : path);
 }
 
@@ -445,6 +462,10 @@ int pscalPathVirtualized_rename(const char *oldpath, const char *newpath) {
     char expanded_new[PATH_MAX];
     const char *old_target = pathVirtualizedPrepare(oldpath, expanded_old);
     const char *new_target = pathVirtualizedPrepare(newpath, expanded_new);
+    if (vprocHostPathPermit(old_target ? old_target : oldpath, VPROC_PERM_ENTRY) != 0 ||
+        vprocHostPathPermit(new_target ? new_target : newpath, VPROC_PERM_ENTRY) != 0) {
+        return -1;
+    }
     return rename(old_target ? old_target : oldpath,
                   new_target ? new_target : newpath);
 }
@@ -582,7 +603,23 @@ int pscalPathVirtualized_symlink(const char *target, const char *linkpath) {
     }
     char expanded_link[PATH_MAX];
     const char *link_target = pathVirtualizedPrepare(linkpath, expanded_link);
+    if (vprocHostPathPermit(link_target ? link_target : linkpath, VPROC_PERM_ENTRY) != 0) {
+        return -1;
+    }
     return symlink(target, link_target ? link_target : linkpath);
+}
+
+/* A hard link to a file a normal user can't write would let them write it by another name. */
+int pscalPathVirtualized_link(const char *oldpath, const char *newpath) {
+    char expanded_old[PATH_MAX];
+    char expanded_new[PATH_MAX];
+    const char *old_target = pscalPathVirtualized_hostPath(oldpath, expanded_old);
+    const char *new_target = pscalPathVirtualized_hostPath(newpath, expanded_new);
+    if (vprocHostPathPermit(old_target, VPROC_PERM_WRITE | VPROC_PERM_READ) != 0 ||
+        vprocHostPathPermit(new_target, VPROC_PERM_ENTRY) != 0) {
+        return -1;
+    }
+    return link(old_target, new_target);
 }
 
 ssize_t pscalPathVirtualized_readlink(const char *path, char *buf, size_t size) {
@@ -755,10 +792,16 @@ FILE *pscalPathVirtualized_fopen(const char *path, const char *mode) {
         return stream;
     }
     if (!pathVirtualizationActive()) {
+        if (vprocHostPathPermitOpen(path, flags) != 0) {
+            return NULL;
+        }
         return fopen(path, mode);
     }
     char expanded[PATH_MAX];
     const char *target = pathVirtualizedPrepare(path, expanded);
+    if (vprocHostPathPermitOpen(target, flags) != 0) {
+        return NULL;
+    }
     return fopen(target, mode);
 }
 
@@ -774,6 +817,9 @@ FILE *pscalPathVirtualized_freopen(const char *path, const char *mode, FILE *str
     }
     char expanded[PATH_MAX];
     const char *target = pathVirtualizedPrepare(path, expanded);
+    if (vprocHostPathPermitOpen(target, vprocFopenModeFlags(mode)) != 0) {
+        return NULL;
+    }
     return freopen(target, mode, stream);
 }
 

@@ -36,6 +36,8 @@
 #include <libgen.h>
 #include <locale.h>
 #include <sys/param.h>
+#include <sys/utsname.h>
+#include <sys/xattr.h>
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
 #include <xlocale.h>
@@ -1259,6 +1261,9 @@ static int vprocHostAccessRaw(const char *path, int mode) {
 }
 
 static int vprocHostChmodRaw(const char *path, mode_t mode) {
+    if (vprocHostPathPermit(path, VPROC_PERM_WRITE) != 0) {
+        return -1;
+    }
     static int (*fn)(const char *, mode_t) = NULL;
     if (!fn) {
         fn = (int (*)(const char *, mode_t))vprocResolveSymbol("chmod");
@@ -1319,6 +1324,9 @@ static int vprocHostFchownRaw(int fd, uid_t uid, gid_t gid) {
 }
 
 static int vprocHostUtimesRaw(const char *path, const struct timeval times[2]) {
+    if (vprocHostPathPermit(path, VPROC_PERM_WRITE) != 0) {
+        return -1;
+    }
     static int (*fn)(const char *, const struct timeval *) = NULL;
     if (!fn) {
         fn = (int (*)(const char *, const struct timeval *))vprocResolveSymbol("utimes");
@@ -1379,6 +1387,9 @@ static int vprocHostFutimesRaw(int fd, const struct timeval times[2]) {
 }
 
 static int vprocHostMkdirRaw(const char *path, mode_t mode) {
+    if (vprocHostPathPermit(path, VPROC_PERM_ENTRY) != 0) {
+        return -1;
+    }
     static int (*fn)(const char *, mode_t) = NULL;
     if (!fn) {
         fn = (int (*)(const char *, mode_t))vprocResolveSymbol("mkdir");
@@ -1394,6 +1405,9 @@ static int vprocHostMkdirRaw(const char *path, mode_t mode) {
 }
 
 static int vprocHostRmdirRaw(const char *path) {
+    if (vprocHostPathPermit(path, VPROC_PERM_ENTRY) != 0) {
+        return -1;
+    }
     static int (*fn)(const char *) = NULL;
     if (!fn) {
         fn = (int (*)(const char *))vprocResolveSymbol("rmdir");
@@ -1409,6 +1423,9 @@ static int vprocHostRmdirRaw(const char *path) {
 }
 
 static int vprocHostUnlinkRaw(const char *path) {
+    if (vprocHostPathPermit(path, VPROC_PERM_ENTRY) != 0) {
+        return -1;
+    }
     static int (*fn)(const char *) = NULL;
     if (!fn) {
         fn = (int (*)(const char *))vprocResolveSymbol("unlink");
@@ -1424,6 +1441,9 @@ static int vprocHostUnlinkRaw(const char *path) {
 }
 
 static int vprocHostRemoveRaw(const char *path) {
+    if (vprocHostPathPermit(path, VPROC_PERM_ENTRY) != 0) {
+        return -1;
+    }
     static int (*fn)(const char *) = NULL;
     if (!fn) {
         fn = (int (*)(const char *))vprocResolveSymbol("remove");
@@ -1439,6 +1459,10 @@ static int vprocHostRemoveRaw(const char *path) {
 }
 
 static int vprocHostRenameRaw(const char *oldpath, const char *newpath) {
+    if (vprocHostPathPermit(oldpath, VPROC_PERM_ENTRY) != 0 ||
+        vprocHostPathPermit(newpath, VPROC_PERM_ENTRY) != 0) {
+        return -1;
+    }
     static int (*fn)(const char *, const char *) = NULL;
     if (!fn) {
         fn = (int (*)(const char *, const char *))vprocResolveSymbol("rename");
@@ -1469,6 +1493,9 @@ static DIR *vprocHostOpendirRaw(const char *name) {
 }
 
 static int vprocHostSymlinkRaw(const char *target, const char *linkpath) {
+    if (vprocHostPathPermit(linkpath, VPROC_PERM_ENTRY) != 0) {
+        return -1;
+    }
     static int (*fn)(const char *, const char *) = NULL;
     if (!fn) {
         fn = (int (*)(const char *, const char *))vprocResolveSymbol("symlink");
@@ -1624,6 +1651,9 @@ static bool vprocCreateModeApply(mode_t *mode);
 static int vprocHostOpenCall(const char *path, int flags, mode_t mode, bool has_mode);
 
 static int vprocHostOpenRawInternal(const char *path, int flags, mode_t mode, bool has_mode) {
+    if (vprocHostPathPermitOpen(path, flags) != 0) {
+        return -1;
+    }
 #if defined(PSCAL_TARGET_IOS)
     if (!gVprocFifoOpenDirect && !(flags & O_NONBLOCK) && (flags & O_ACCMODE) != O_RDWR) {
         struct stat fifo_st;
@@ -2067,6 +2097,10 @@ typedef struct {
     VProcResourceKind kind;
 } VProcResourceEntry;
 
+#define VPROC_NGROUPS_MAX 32
+static void vprocCredInherit(VProc *vp, const VProc *parent);
+static int vprocChownRecord(const char *host_path, uid_t uid, gid_t gid, bool follow);
+
 struct VProc {
     pthread_mutex_t mu;     // ADDED: Protects the FD table shared by threads
     VProcFdEntry *entries;
@@ -2084,6 +2118,12 @@ struct VProc {
     int pid;
     char cwd[PATH_MAX];
     mode_t file_mask;
+    /* Who the task is, as a process's credentials: real, effective and saved. */
+    uid_t ruid, euid, suid;
+    gid_t rgid, egid, sgid;
+    int ngroups;
+    gid_t groups[VPROC_NGROUPS_MAX];
+    bool cred_provisional;  /* taken before /etc/passwd could be read, as at a first launch */
     struct rlimit limits[RLIM_NLIMITS];
     VProcResourceEntry *resources;
     size_t resource_count;
@@ -3417,6 +3457,9 @@ typedef struct {
     uint64_t real_timer_interval_ns;
     uint64_t start_mono_ns;
     uint64_t dying_since_ns; /* killed, with a thread still to unwind; vprocMarkExit ends it */
+    uid_t cred_ruid;         /* its vproc's, for kill's check from another task */
+    uid_t cred_euid;
+    uid_t cred_suid;
 } VProcTaskEntry;
 
 typedef enum {
@@ -4257,6 +4300,11 @@ static inline bool vprocSignalIgnorable(int sig) {
 }
 
 static void vprocInitEntryDefaultsLocked(VProcTaskEntry *entry, int pid, const VProcTaskEntry *parent) {
+    /* Whose it is, for kill's check, until a vproc says: the caller's, or the one real user's. */
+    VProc *cred_source = vprocCurrent();
+    uid_t cred_ruid = cred_source ? cred_source->ruid : getuid();
+    uid_t cred_euid = cred_source ? cred_source->euid : getuid();
+    uid_t cred_suid = cred_source ? cred_source->suid : getuid();
     const VProcTaskEntry *inherit_parent = NULL;
     VProc *active = vprocCurrent();
     int shell_pid = vprocGetShellSelfPid();
@@ -4325,6 +4373,9 @@ static void vprocInitEntryDefaultsLocked(VProcTaskEntry *entry, int pid, const V
         }
     }
     entry->start_mono_ns = vprocNowMonoNs();
+    entry->cred_ruid = cred_ruid;
+    entry->cred_euid = cred_euid;
+    entry->cred_suid = cred_suid;
 }
 
 static bool vprocAddChildLocked(VProcTaskEntry *parent, int child_pid) {
@@ -8540,6 +8591,7 @@ static VProc *vprocCreateFrom(const VProcOptions *opts, VProc *active) {
     }
     vprocInitializeVirtualCwd(vp, active);
     vp->file_mask = active ? active->file_mask : vprocHostMaskGet();
+    vprocCredInherit(vp, active);
     for (int resource = 0; resource < RLIM_NLIMITS; ++resource) {
         if (active) {
             vp->limits[resource] = active->limits[resource];
@@ -8593,6 +8645,11 @@ static VProc *vprocCreateFrom(const VProcOptions *opts, VProc *active) {
         }
     }
     VProcTaskEntry *slot = vprocTaskEnsureSlotLocked(vp->pid);
+    if (slot) {
+        slot->cred_ruid = vp->ruid;
+        slot->cred_euid = vp->euid;
+        slot->cred_suid = vp->suid;
+    }
     if (!slot) {
         pthread_mutex_unlock(&gVProcTasks.mu);
         if (errno == 0) {
@@ -11548,7 +11605,13 @@ static int vprocKillTasks(pid_t pid, int sig, bool live_only) {
     return -1;
 }
 
+static bool vprocKillPermitted(pid_t pid);
+
 int vprocKillShim(pid_t pid, int sig) {
+    if (!vprocKillPermitted(pid)) {
+        errno = EPERM;
+        return -1;
+    }
     return vprocKillTasks(pid, sig, false);
 }
 
@@ -12116,6 +12179,8 @@ void vprocProgramFramePush(VProcProgramFrame *frame) {
 #if defined(__APPLE__)
     frame->cleanup_stack = pthread_self()->__cleanup_stack;
 #endif
+    frame->exec_ended = false;
+    frame->exec_status = 0;
     frame->prev = gVprocProgramFrame;
     frame->pushed = true;
     gVprocProgramFrame = frame;
@@ -12297,6 +12362,13 @@ bool vprocCommandScopeBegin(VProcCommandScope *scope,
 
     vprocActivate(vp);
     return true;
+}
+
+bool vprocCommandScopeTakeDescriptors(VProcCommandScope *scope) {
+    if (!scope || !scope->vp || !scope->prev) {
+        return false;
+    }
+    return vprocSimForkCloneFdTable(scope->vp, scope->prev);
 }
 
 void vprocCommandScopeEnd(VProcCommandScope *scope, int exit_code) {
@@ -13608,6 +13680,12 @@ int vprocEnsureKernelPid(void) {
     vprocEnsureKernelThread(pid);
     if (created && pid > 0) {
         pthread_mutex_lock(&gVProcTasks.mu);
+        /* The kernel is root's, as init is, to kill's check. Its vproc keeps the login account's
+         * ids, so nothing made under it starts as root. */
+        VProcTaskEntry *kernel_entry = vprocTaskFindLocked(pid);
+        if (kernel_entry) {
+            kernel_entry->cred_ruid = kernel_entry->cred_euid = kernel_entry->cred_suid = 0;
+        }
         for (size_t i = 0; i < gVProcTasks.count; ++i) {
             VProcTaskEntry *entry = &gVProcTasks.items[i];
             if (entry->pid <= 0) {
@@ -16351,8 +16429,16 @@ static int vprocStatShimInternal(const char *path, struct stat *st, bool follow)
         errno = ENOENT;
         return -1;
     }
-    return follow ? vprocHostStatVirtualized(virtual_path, st)
-                  : vprocHostLstatVirtualized(virtual_path, st);
+    int rc = follow ? vprocHostStatVirtualized(virtual_path, st)
+                    : vprocHostLstatVirtualized(virtual_path, st);
+#if defined(PSCAL_TARGET_IOS)
+    if (rc == 0) {
+        char owner_expanded[PATH_MAX];
+        const char *host = vprocPathExpandForShim(virtual_path, owner_expanded, sizeof(owner_expanded));
+        vprocHostPathOwner(host ? host : virtual_path, st);
+    }
+#endif
+    return rc;
 }
 
 int vprocStatShim(const char *path, struct stat *st) {
@@ -17078,6 +17164,9 @@ int vprocHostMkdirMasked(const char *path, mode_t mode) {
 }
 
 int vprocHostMkfifoMasked(const char *path, mode_t mode) {
+    if (vprocHostPathPermit(path, VPROC_PERM_ENTRY) != 0) {
+        return -1;
+    }
     bool restore = vprocCreateModeApply(&mode);
     int rc = (mkfifo)(path, mode);
     if (rc == 0 && restore) {
@@ -17087,6 +17176,14 @@ int vprocHostMkfifoMasked(const char *path, mode_t mode) {
 }
 
 int vprocHostMknodMasked(const char *path, mode_t mode, dev_t dev) {
+    /* A device node is root's to make. */
+    if ((S_ISCHR(mode) || S_ISBLK(mode)) && vprocGeteuidShim() != 0) {
+        errno = EPERM;
+        return -1;
+    }
+    if (vprocHostPathPermit(path, VPROC_PERM_ENTRY) != 0) {
+        return -1;
+    }
     mode_t type = mode & S_IFMT;
     mode_t perms = mode & ~(mode_t)S_IFMT;
     bool restore = vprocCreateModeApply(&perms);
@@ -17151,10 +17248,27 @@ int vprocHostMkdiratMasked(int dirfd, const char *path, mode_t mode) {
     return rc;
 }
 
+int vprocFopenModeFlags(const char *mode) {
+    if (!mode) {
+        return O_RDONLY;
+    }
+    int flags = O_RDONLY;
+    if (mode[0] == 'w' || mode[0] == 'a') {
+        flags = O_WRONLY | O_CREAT | (mode[0] == 'w' ? O_TRUNC : O_APPEND);
+    }
+    if (strchr(mode, '+')) {
+        flags = (flags & ~O_ACCMODE) | O_RDWR;
+    }
+    return flags;
+}
+
 /* libc's fopen makes a file with the host's mask. When the task's differs, the stream is opened
  * on a descriptor that obeys the task's, as fopen's own would be: a host one. */
 FILE *vprocHostFopenMasked(const char *path, const char *mode) {
     if (!mode || (mode[0] != 'w' && mode[0] != 'a') || vprocFileMaskIsHostMask()) {
+        if (vprocHostPathPermitOpen(path, vprocFopenModeFlags(mode)) != 0) {
+            return NULL;
+        }
         return (fopen)(path, mode);
     }
     int flags = O_CREAT | (mode[0] == 'w' ? O_TRUNC : O_APPEND);
@@ -17253,7 +17367,7 @@ int vprocChownShim(const char *path, uid_t uid, gid_t gid) {
     }
     char expanded[PATH_MAX];
     const char *target = vprocPathExpandForShim(path, expanded, sizeof(expanded));
-    return vprocHostChownRaw(target ? target : path, uid, gid);
+    return vprocChownRecord(target ? target : path, uid, gid, true);
 }
 
 int vprocFchmodShim(int fd, mode_t mode) {
@@ -19521,5 +19635,1059 @@ VProcSigHandler vprocSignalShim(int sig, VProcSigHandler handler) {
     }
     return old.sa_handler;
 }
+
+
+#if defined(PSCAL_TARGET_IOS)
+/* --- Credentials -----------------------------------------------------------------------------
+ *
+ * A task's uids and gids, the way a process has them. They live in its vproc beside its file mask,
+ * and a new vproc copies its creator's, so what a command starts runs as the command does. A
+ * session starts as the login account: the host's uid, which is the one real user underneath
+ * (mobile, 501, on a device), with that account's group and groups from the app's /etc/passwd and
+ * /etc/group rather than the host's. Only exec of a set-user-id program makes a task root. */
+
+typedef struct {
+    uid_t uid;
+    gid_t gid;
+    int ngroups;
+    gid_t groups[VPROC_NGROUPS_MAX];
+    bool found;  /* the account was in /etc/passwd */
+} VProcLoginCred;
+
+static VProcLoginCred gVprocLoginCred;
+static pthread_mutex_t gVprocLoginCredMu = PTHREAD_MUTEX_INITIALIZER;
+static bool gVprocLoginCredReady;
+
+/* Every group in /etc/group that lists `user`, after `gid`. Read here rather than through
+ * getgrent, whose loader keeps no member lists. */
+static int vprocGroupsForUser(const char *user, gid_t gid, gid_t *out, int max) {
+    int count = 0;
+    if (max <= 0) {
+        return 0;
+    }
+    out[count++] = gid;
+    char path[PATH_MAX];
+    const char *group_path = user ? pscalEtcPath("group", path, sizeof(path)) : NULL;
+    FILE *fp = group_path ? fopen(group_path, "r") : NULL;
+    if (!fp) {
+        return count;
+    }
+    char line[2048];
+    while (count < max && fgets(line, sizeof(line), fp)) {
+        if (line[0] == '#') {
+            continue;
+        }
+        char *save = NULL;
+        char *name = strtok_r(line, ":\n", &save);
+        char *pass = name ? strtok_r(NULL, ":\n", &save) : NULL;
+        char *gid_text = pass ? strtok_r(NULL, ":\n", &save) : NULL;
+        char *members = gid_text ? strtok_r(NULL, "\n", &save) : NULL;
+        if (!gid_text || !members) {
+            continue;
+        }
+        gid_t group_gid = (gid_t)strtoul(gid_text, NULL, 10);
+        char *msave = NULL;
+        for (char *m = strtok_r(members, ",", &msave); m; m = strtok_r(NULL, ",", &msave)) {
+            if (strcmp(m, user) != 0) {
+                continue;
+            }
+            bool seen = false;
+            for (int i = 0; i < count; ++i) {
+                if (out[i] == group_gid) {
+                    seen = true;
+                }
+            }
+            if (!seen) {
+                out[count++] = group_gid;
+            }
+            break;
+        }
+    }
+    fclose(fp);
+    return count;
+}
+
+static void vprocLoginCredInit(void) {
+    uid_t uid = getuid();
+    gid_t gid = getgid();
+    char name[256] = { 0 };
+    struct passwd *pw = pscalGetpwuid(uid);
+    if (pw) {
+        gid = pw->pw_gid;
+        if (pw->pw_name) {
+            strlcpy(name, pw->pw_name, sizeof(name));
+        }
+    }
+    gVprocLoginCred.uid = uid;
+    gVprocLoginCred.gid = gid;
+    gVprocLoginCred.ngroups = vprocGroupsForUser(name[0] ? name : NULL, gid,
+                                                 gVprocLoginCred.groups, VPROC_NGROUPS_MAX);
+    gVprocLoginCred.found = pw != NULL;
+}
+
+/* The login account. At a first launch the installer may not have written /etc/passwd yet, so an
+ * answer without it is asked again next time. */
+static const VProcLoginCred *vprocLoginCred(void) {
+    static time_t last_try;
+    pthread_mutex_lock(&gVprocLoginCredMu);
+    time_t now = time(NULL);
+    if (!gVprocLoginCredReady || (!gVprocLoginCred.found && now != last_try)) {
+        vprocLoginCredInit();
+        gVprocLoginCredReady = true;
+        last_try = now;
+    }
+    pthread_mutex_unlock(&gVprocLoginCredMu);
+    return &gVprocLoginCred;
+}
+
+static void vprocCredSetLogin(VProc *vp, const VProcLoginCred *login) {
+    vp->ruid = vp->euid = vp->suid = login->uid;
+    vp->rgid = vp->egid = vp->sgid = login->gid;
+    vp->ngroups = login->ngroups;
+    memcpy(vp->groups, login->groups, sizeof(vp->groups));
+    vp->cred_provisional = !login->found;
+}
+
+/* A task that started as the login account before its entry could be read takes it now. */
+static VProc *vprocCredCurrent(void) {
+    VProc *vp = vprocForThread();
+    if (vp && vp->cred_provisional && vp->ruid == vp->euid) {
+        const VProcLoginCred *login = vprocLoginCred();
+        if (login->found && login->uid == vp->ruid) {
+            vprocCredSetLogin(vp, login);
+        }
+    }
+    return vp;
+}
+#endif
+
+static void vprocCredInherit(VProc *vp, const VProc *parent) {
+#if defined(PSCAL_TARGET_IOS)
+    if (parent) {
+        vp->ruid = parent->ruid;
+        vp->euid = parent->euid;
+        vp->suid = parent->suid;
+        vp->rgid = parent->rgid;
+        vp->egid = parent->egid;
+        vp->sgid = parent->sgid;
+        vp->ngroups = parent->ngroups;
+        memcpy(vp->groups, parent->groups, sizeof(vp->groups));
+        vp->cred_provisional = parent->cred_provisional;
+        if (!vp->cred_provisional) {
+            return;
+        }
+        const VProcLoginCred *login = vprocLoginCred();
+        if (login->found && login->uid == vp->ruid && vp->ruid == vp->euid) {
+            vprocCredSetLogin(vp, login);
+        }
+        return;
+    }
+    vprocCredSetLogin(vp, vprocLoginCred());
+#else
+    if (parent) {
+        vp->ruid = parent->ruid;
+        vp->euid = parent->euid;
+        vp->suid = parent->suid;
+        vp->rgid = parent->rgid;
+        vp->egid = parent->egid;
+        vp->sgid = parent->sgid;
+        vp->ngroups = parent->ngroups;
+        memcpy(vp->groups, parent->groups, sizeof(vp->groups));
+        return;
+    }
+    vp->ruid = vp->euid = vp->suid = getuid();
+    vp->rgid = vp->egid = vp->sgid = getgid();
+    vp->ngroups = 1;
+    vp->groups[0] = vp->rgid;
+#endif
+}
+
+#if defined(PSCAL_TARGET_IOS)
+/* kill's check reads the target's ids from the task table, which other threads hold. */
+static void vprocCredPublish(VProc *vp) {
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(vp->pid);
+    if (entry) {
+        entry->cred_ruid = vp->ruid;
+        entry->cred_euid = vp->euid;
+        entry->cred_suid = vp->suid;
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+}
+
+uid_t vprocGetuidShim(void) {
+    VProc *vp = vprocCredCurrent();
+    return vp ? vp->ruid : vprocLoginCred()->uid;
+}
+
+uid_t vprocGeteuidShim(void) {
+    VProc *vp = vprocCredCurrent();
+    return vp ? vp->euid : vprocLoginCred()->uid;
+}
+
+gid_t vprocGetgidShim(void) {
+    VProc *vp = vprocCredCurrent();
+    return vp ? vp->rgid : vprocLoginCred()->gid;
+}
+
+gid_t vprocGetegidShim(void) {
+    VProc *vp = vprocCredCurrent();
+    return vp ? vp->egid : vprocLoginCred()->gid;
+}
+
+int vprocGetgroupsShim(int size, gid_t list[]) {
+    VProc *vp = vprocCredCurrent();
+    const VProcLoginCred *login = vprocLoginCred();
+    int count = vp ? vp->ngroups : login->ngroups;
+    const gid_t *groups = vp ? vp->groups : login->groups;
+    if (size < 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (size == 0) {
+        return count;
+    }
+    if (size < count) {
+        errno = EINVAL;
+        return -1;
+    }
+    memcpy(list, groups, (size_t)count * sizeof(gid_t));
+    return count;
+}
+
+/* The app's own threads have no task, and nothing changes who they are. */
+static VProc *vprocCredTarget(void) {
+    VProc *vp = vprocForThread();
+    if (!vp) {
+        errno = EPERM;
+    }
+    return vp;
+}
+
+int vprocSetuidShim(uid_t uid) {
+    VProc *vp = vprocCredTarget();
+    if (!vp) {
+        return -1;
+    }
+    if (vp->euid == 0) {
+        vp->ruid = vp->euid = vp->suid = uid;
+    } else if (uid == vp->ruid || uid == vp->suid) {
+        vp->euid = uid;
+    } else {
+        errno = EPERM;
+        return -1;
+    }
+    vprocCredPublish(vp);
+    return 0;
+}
+
+int vprocSeteuidShim(uid_t uid) {
+    VProc *vp = vprocCredTarget();
+    if (!vp) {
+        return -1;
+    }
+    if (vp->euid != 0 && uid != vp->ruid && uid != vp->suid) {
+        errno = EPERM;
+        return -1;
+    }
+    vp->euid = uid;
+    vprocCredPublish(vp);
+    return 0;
+}
+
+/* Linux's rules: an unprivileged task may swap its real and effective ids, or set either to its
+ * saved one; setting the real id, or an effective one other than the old real, saves the new one. */
+int vprocSetreuidShim(uid_t ruid, uid_t euid) {
+    VProc *vp = vprocCredTarget();
+    if (!vp) {
+        return -1;
+    }
+    bool root = vp->euid == 0;
+    uid_t new_ruid = (ruid == (uid_t)-1) ? vp->ruid : ruid;
+    uid_t new_euid = (euid == (uid_t)-1) ? vp->euid : euid;
+    if (!root) {
+        if (ruid != (uid_t)-1 && ruid != vp->ruid && ruid != vp->euid) {
+            errno = EPERM;
+            return -1;
+        }
+        if (euid != (uid_t)-1 && euid != vp->ruid && euid != vp->euid && euid != vp->suid) {
+            errno = EPERM;
+            return -1;
+        }
+    }
+    if (ruid != (uid_t)-1 || (euid != (uid_t)-1 && new_euid != vp->ruid)) {
+        vp->suid = new_euid;
+    }
+    vp->ruid = new_ruid;
+    vp->euid = new_euid;
+    vprocCredPublish(vp);
+    return 0;
+}
+
+int vprocSetgidShim(gid_t gid) {
+    VProc *vp = vprocCredTarget();
+    if (!vp) {
+        return -1;
+    }
+    if (vp->euid == 0) {
+        vp->rgid = vp->egid = vp->sgid = gid;
+    } else if (gid == vp->rgid || gid == vp->sgid) {
+        vp->egid = gid;
+    } else {
+        errno = EPERM;
+        return -1;
+    }
+    return 0;
+}
+
+int vprocSetegidShim(gid_t gid) {
+    VProc *vp = vprocCredTarget();
+    if (!vp) {
+        return -1;
+    }
+    if (vp->euid != 0 && gid != vp->rgid && gid != vp->sgid) {
+        errno = EPERM;
+        return -1;
+    }
+    vp->egid = gid;
+    return 0;
+}
+
+int vprocSetregidShim(gid_t rgid, gid_t egid) {
+    VProc *vp = vprocCredTarget();
+    if (!vp) {
+        return -1;
+    }
+    bool root = vp->euid == 0;
+    gid_t new_rgid = (rgid == (gid_t)-1) ? vp->rgid : rgid;
+    gid_t new_egid = (egid == (gid_t)-1) ? vp->egid : egid;
+    if (!root) {
+        if (rgid != (gid_t)-1 && rgid != vp->rgid && rgid != vp->egid) {
+            errno = EPERM;
+            return -1;
+        }
+        if (egid != (gid_t)-1 && egid != vp->rgid && egid != vp->egid && egid != vp->sgid) {
+            errno = EPERM;
+            return -1;
+        }
+    }
+    if (rgid != (gid_t)-1 || (egid != (gid_t)-1 && new_egid != vp->rgid)) {
+        vp->sgid = new_egid;
+    }
+    vp->rgid = new_rgid;
+    vp->egid = new_egid;
+    return 0;
+}
+
+int vprocSetgroupsShim(int size, const gid_t list[]) {
+    VProc *vp = vprocCredTarget();
+    if (!vp) {
+        return -1;
+    }
+    if (vp->euid != 0) {
+        errno = EPERM;
+        return -1;
+    }
+    if (size < 0 || size > VPROC_NGROUPS_MAX || (size > 0 && !list)) {
+        errno = EINVAL;
+        return -1;
+    }
+    vp->ngroups = size;
+    if (size > 0) {
+        memcpy(vp->groups, list, (size_t)size * sizeof(gid_t));
+    }
+    return 0;
+}
+
+int vprocInitgroupsShim(const char *user, gid_t gid) {
+    gid_t groups[VPROC_NGROUPS_MAX];
+    int count = vprocGroupsForUser(user, gid, groups, VPROC_NGROUPS_MAX);
+    return vprocSetgroupsShim(count, groups);
+}
+
+/* POSIX's rule: the sender's real or effective uid must be the target's real or saved one. Within
+ * a session the terminal's owner keeps control of its jobs, as sudo's relay gives a Linux user over
+ * the command sudo runs, so only another session's tasks are checked. Groups and broadcasts are
+ * not checked yet. */
+static bool vprocKillPermitted(pid_t pid) {
+    VProc *caller = vprocForThread();
+    if (!caller || caller->euid == 0 || pid <= 0) {
+        return true;
+    }
+    int caller_sid = vprocGetSid(caller->pid);
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked((int)pid);
+    bool permitted = true;
+    if (entry && !entry->exited && !(caller_sid > 0 && entry->sid == caller_sid)) {
+        permitted = caller->ruid == entry->cred_ruid || caller->ruid == entry->cred_suid ||
+                    caller->euid == entry->cred_ruid || caller->euid == entry->cred_suid;
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    return permitted;
+}
+
+/* --- What root gates ------------------------------------------------------------------------
+ *
+ * A normal user can't make, change or remove anything under /etc, or read /etc/shadow, or touch
+ * sudo's records under /var/run/sudo. The check is on the host path after expansion, resolved
+ * with realpath, so `cd /etc; rm x`, `..` and a symlink pointing in are all the same file. It adds
+ * to the host's permissions and replaces none. */
+
+typedef struct {
+    char etc[PATH_MAX];
+    char sudo_run[PATH_MAX];
+    char source_etc[PATH_MAX];
+} VProcGuardRoots;
+
+typedef struct {
+    dev_t dev;
+    ino_t ino;
+    bool present;
+} VProcGuardSecret;
+
+#define VPROC_GUARD_SECRETS 4
+static const char *const kVprocGuardSecretNames[VPROC_GUARD_SECRETS] = { "shadow", "gshadow", "shadow-", "shadow.tmp" };
+
+/* The roots and the secret files' identities, kept for a moment: every open and stat by a task
+ * asks, and the answers change only when the app's root does or passwd replaces a file. */
+static pthread_mutex_t gVprocGuardMu = PTHREAD_MUTEX_INITIALIZER;
+static VProcGuardRoots gVprocGuardRootsCache;
+static VProcGuardSecret gVprocGuardSecrets[VPROC_GUARD_SECRETS];
+static uint64_t gVprocGuardStamp;
+
+static uint64_t vprocGuardNowNs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static void vprocGuardRootsCompute(VProcGuardRoots *roots) {
+    char expanded[PATH_MAX];
+    roots->etc[0] = roots->sudo_run[0] = '\0';
+    if (!pathTruncateExpand("/etc", expanded, sizeof(expanded))) {
+        strlcpy(expanded, "/etc", sizeof(expanded));
+    }
+    strlcpy(roots->source_etc, expanded, sizeof(roots->source_etc));
+    if (!realpath(expanded, roots->etc)) {
+        strlcpy(roots->etc, expanded, sizeof(roots->etc));
+    }
+    char run[PATH_MAX];
+    if (!pathTruncateExpand("/var/run", run, sizeof(run))) {
+        strlcpy(run, "/var/run", sizeof(run));
+    }
+    char run_real[PATH_MAX];
+    if (!realpath(run, run_real)) {
+        strlcpy(run_real, run, sizeof(run_real));
+    }
+    snprintf(roots->sudo_run, sizeof(roots->sudo_run), "%s/sudo", run_real);
+}
+
+/* The host directories behind /etc and /var/run/sudo, which follow the container root. With
+ * secrets, the identities of /etc/shadow and its kind too. */
+static bool vprocGuardRootsWith(VProcGuardRoots *roots, VProcGuardSecret secrets[VPROC_GUARD_SECRETS]) {
+    char expanded[PATH_MAX];
+    if (!pathTruncateExpand("/etc", expanded, sizeof(expanded))) {
+        strlcpy(expanded, "/etc", sizeof(expanded));
+    }
+    uint64_t now = vprocGuardNowNs();
+    pthread_mutex_lock(&gVprocGuardMu);
+    if (gVprocGuardStamp == 0 || now - gVprocGuardStamp > 500000000ull ||
+        strcmp(expanded, gVprocGuardRootsCache.source_etc) != 0) {
+        vprocGuardRootsCompute(&gVprocGuardRootsCache);
+        for (int i = 0; i < VPROC_GUARD_SECRETS; ++i) {
+            char secret[PATH_MAX];
+            struct stat st;
+            gVprocGuardSecrets[i].present =
+                snprintf(secret, sizeof(secret), "%s/%s", gVprocGuardRootsCache.source_etc,
+                         kVprocGuardSecretNames[i]) < (int)sizeof(secret) &&
+                vprocHostStatRaw(secret, &st) == 0;
+            if (gVprocGuardSecrets[i].present) {
+                gVprocGuardSecrets[i].dev = st.st_dev;
+                gVprocGuardSecrets[i].ino = st.st_ino;
+            }
+        }
+        gVprocGuardStamp = now;
+    }
+    *roots = gVprocGuardRootsCache;
+    if (secrets) {
+        memcpy(secrets, gVprocGuardSecrets, sizeof(gVprocGuardSecrets));
+    }
+    pthread_mutex_unlock(&gVprocGuardMu);
+    return true;
+}
+
+static bool vprocGuardRoots(VProcGuardRoots *roots) {
+    return vprocGuardRootsWith(roots, NULL);
+}
+
+/* passwd has just replaced a file the cache knows. */
+static void vprocGuardForget(void) {
+    pthread_mutex_lock(&gVprocGuardMu);
+    gVprocGuardStamp = 0;
+    pthread_mutex_unlock(&gVprocGuardMu);
+}
+
+static bool vprocPathWithin(const char *path, const char *root) {
+    size_t len = strlen(root);
+    if (len == 0 || strncmp(path, root, len) != 0) {
+        return false;
+    }
+    return path[len] == '\0' || path[len] == '/';
+}
+
+/* The file a host path names, canonical. With follow, a final symlink is followed when its target
+ * exists; a name that doesn't exist yet is its directory's real path plus the name. */
+static bool vprocCanonicalHostPath(const char *path, bool follow, char out[PATH_MAX]) {
+    if (follow && realpath(path, out)) {
+        return true;
+    }
+    char copy[PATH_MAX];
+    if (strlcpy(copy, path, sizeof(copy)) >= sizeof(copy)) {
+        return false;
+    }
+    size_t len = strlen(copy);
+    while (len > 1 && copy[len - 1] == '/') {
+        copy[--len] = '\0';
+    }
+    char *slash = strrchr(copy, '/');
+    const char *base = slash ? slash + 1 : copy;
+    char dir[PATH_MAX];
+    if (!slash) {
+        strlcpy(dir, ".", sizeof(dir));
+    } else if (slash == copy) {
+        strlcpy(dir, "/", sizeof(dir));
+    } else {
+        *slash = '\0';
+        strlcpy(dir, copy, sizeof(dir));
+    }
+    if (strcmp(base, ".") == 0 || strcmp(base, "..") == 0 || base[0] == '\0') {
+        return realpath(path, out) != NULL;
+    }
+    char dir_real[PATH_MAX];
+    if (!realpath(dir, dir_real)) {
+        return false;
+    }
+    int written = snprintf(out, PATH_MAX, "%s%s%s", dir_real,
+                           (dir_real[strlen(dir_real) - 1] == '/') ? "" : "/", base);
+    return written > 0 && written < PATH_MAX;
+}
+
+/* /etc/shadow and its kind, by the file itself: a symlink or a hard link to one is the same file.
+ * A file replaced since the cache was filled is checked again by name. */
+static bool vprocGuardIsSecretFile(const char *host_path, const VProcGuardRoots *roots,
+                                   const VProcGuardSecret secrets[VPROC_GUARD_SECRETS]) {
+    struct stat st;
+    if (vprocHostStatRaw(host_path, &st) != 0 || !S_ISREG(st.st_mode)) {
+        return false;
+    }
+    for (int i = 0; i < VPROC_GUARD_SECRETS; ++i) {
+        if (secrets[i].present && secrets[i].dev == st.st_dev && secrets[i].ino == st.st_ino) {
+            return true;
+        }
+    }
+    char canonical[PATH_MAX];
+    if (!realpath(host_path, canonical)) {
+        return false;
+    }
+    size_t len = strlen(roots->etc);
+    if (strncmp(canonical, roots->etc, len) != 0 || canonical[len] != '/') {
+        return false;
+    }
+    for (int i = 0; i < VPROC_GUARD_SECRETS; ++i) {
+        if (strcmp(canonical + len + 1, kVprocGuardSecretNames[i]) == 0) {
+            vprocGuardForget();
+            return true;
+        }
+    }
+    return false;
+}
+
+int vprocHostPathPermit(const char *host_path, int op) {
+    VProc *vp = vprocForThread();
+    if (!vp || vp->euid == 0 || !host_path || host_path[0] == '\0') {
+        return 0;
+    }
+    VProcGuardRoots roots;
+    VProcGuardSecret secrets[VPROC_GUARD_SECRETS];
+    vprocGuardRootsWith(&roots, secrets);
+    bool denied = false;
+    if (op & (VPROC_PERM_WRITE | VPROC_PERM_ENTRY)) {
+        char canonical[PATH_MAX];
+        bool follow = (op & VPROC_PERM_ENTRY) == 0;
+        /* Nothing to resolve: the call itself fails, as it would have. */
+        if (vprocCanonicalHostPath(host_path, follow, canonical)) {
+            denied = vprocPathWithin(canonical, roots.etc) || vprocPathWithin(canonical, roots.sudo_run);
+        }
+    }
+    if (!denied && (op & VPROC_PERM_READ)) {
+        denied = vprocGuardIsSecretFile(host_path, &roots, secrets);
+    }
+    if (denied) {
+        errno = EACCES;
+        return -1;
+    }
+    return 0;
+}
+
+int vprocHostPathPermitOpen(const char *host_path, int flags) {
+    int op = 0;
+    int access_mode = flags & O_ACCMODE;
+    if (access_mode == O_RDONLY || access_mode == O_RDWR) {
+        op |= VPROC_PERM_READ;
+    }
+    if (access_mode == O_WRONLY || access_mode == O_RDWR || (flags & (O_TRUNC | O_APPEND))) {
+        op |= VPROC_PERM_WRITE;
+    }
+    if (flags & O_CREAT) {
+        struct stat st;
+        if (stat(host_path, &st) != 0) {
+            op |= VPROC_PERM_WRITE;
+        }
+    }
+    return vprocHostPathPermit(host_path, op);
+}
+
+#define VPROC_OWNER_XATTR "user.pscal.owner"
+
+/* A recorded owner, which chown as root writes; otherwise what the installer put in /etc is root's,
+ * and anything else stays the one real user's. */
+void vprocHostPathOwner(const char *host_path, struct stat *st) {
+    if (!host_path || !st) {
+        return;
+    }
+    char value[64];
+#if defined(__APPLE__)
+    ssize_t len = getxattr(host_path, VPROC_OWNER_XATTR, value, sizeof(value) - 1, 0, 0);
+#else
+    ssize_t len = getxattr(host_path, VPROC_OWNER_XATTR, value, sizeof(value) - 1);
+#endif
+    if (len > 0) {
+        value[len] = '\0';
+        unsigned long uid = 0;
+        unsigned long gid = 0;
+        if (sscanf(value, "%lu:%lu", &uid, &gid) == 2) {
+            st->st_uid = (uid_t)uid;
+            st->st_gid = (gid_t)gid;
+            return;
+        }
+    }
+    if (st->st_uid != vprocLoginCred()->uid) {
+        return;
+    }
+    VProcGuardRoots roots;
+    vprocGuardRoots(&roots);
+    /* Only a path that names /etc as written: a symlink elsewhere shows its own owner. */
+    if (!vprocPathWithin(host_path, roots.source_etc) && !vprocPathWithin(host_path, roots.etc) &&
+        strstr(host_path, "/var/run/sudo") == NULL) {
+        return;
+    }
+    char canonical[PATH_MAX];
+    if (!vprocCanonicalHostPath(host_path, false, canonical)) {
+        return;
+    }
+    if (vprocPathWithin(canonical, roots.etc) || vprocPathWithin(canonical, roots.sudo_run)) {
+        st->st_uid = 0;
+        st->st_gid = 0;
+    }
+}
+
+/* chown: the one real user underneath owns every file, so the owner is recorded, for stat to show.
+ * Only root gives a file away; a normal user may only change its group to one of their own. */
+static int vprocChownRecord(const char *host_path, uid_t uid, gid_t gid, bool follow) {
+    VProc *vp = vprocForThread();
+    if (!vp) {
+        return vprocHostChownRaw(host_path, uid, gid);
+    }
+    struct stat st;
+    int rc = follow ? stat(host_path, &st) : lstat(host_path, &st);
+    if (rc != 0) {
+        return -1;
+    }
+    vprocHostPathOwner(host_path, &st);
+    uid_t new_uid = (uid == (uid_t)-1) ? st.st_uid : uid;
+    gid_t new_gid = (gid == (gid_t)-1) ? st.st_gid : gid;
+    if (vp->euid != 0) {
+        bool own_group = new_gid == vp->egid;
+        for (int i = 0; i < vp->ngroups && !own_group; ++i) {
+            own_group = vp->groups[i] == new_gid;
+        }
+        if (st.st_uid != vp->euid || new_uid != st.st_uid || (new_gid != st.st_gid && !own_group)) {
+            errno = EPERM;
+            return -1;
+        }
+    }
+    if (vprocHostPathPermit(host_path, VPROC_PERM_WRITE) != 0) {
+        return -1;
+    }
+    char value[64];
+    snprintf(value, sizeof(value), "%lu:%lu", (unsigned long)new_uid, (unsigned long)new_gid);
+    int options = 0;
+#if defined(__APPLE__)
+    if (!follow) {
+        options |= XATTR_NOFOLLOW;
+    }
+    rc = setxattr(host_path, VPROC_OWNER_XATTR, value, strlen(value), 0, options);
+#else
+    (void)options;
+    rc = follow ? setxattr(host_path, VPROC_OWNER_XATTR, value, strlen(value), 0)
+                : lsetxattr(host_path, VPROC_OWNER_XATTR, value, strlen(value), 0);
+#endif
+    /* A filesystem without attributes still lets root chown; there is nothing to show. */
+    (void)rc;
+    return 0;
+}
+
+/* --- exec --------------------------------------------------------------------------------------
+ *
+ * There is one process, so a program can't replace it: exec runs the new program as a call on
+ * this task, then ends the task with its status, which is all a program can see of exec. The app
+ * says what can run and how. A set-user-id program gets effective uid 0 here, from a short table,
+ * because applets have no files to carry the bit. */
+
+static VProcExecCanRunFn gVprocExecCanRun;
+static VProcExecRunFn gVprocExecRun;
+static pid_t gVprocHostPid;
+
+void vprocSetExecHooks(VProcExecCanRunFn can_run, VProcExecRunFn run) {
+    if (gVprocHostPid == 0) {
+        gVprocHostPid = getpid();
+    }
+    gVprocExecCanRun = can_run;
+    gVprocExecRun = run;
+}
+
+static bool vprocExecIsSetuidProgram(const char *path) {
+    static const char *const kSetuidPrograms[] = { "su", "sudo", "passwd", "login" };
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    for (size_t i = 0; i < sizeof(kSetuidPrograms) / sizeof(kSetuidPrograms[0]); ++i) {
+        if (strcmp(base, kSetuidPrograms[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Called by the app as each program starts, as exec would: the set-user-id ones get root. */
+void vprocExecApplyCredentials(const char *program) {
+    VProc *vp = vprocForThread();
+    if (!vp || !program || !vprocExecIsSetuidProgram(program)) {
+        return;
+    }
+    vp->euid = 0;
+    vp->suid = 0;
+    vprocCredPublish(vp);
+}
+
+/* What the program sees as its environment: envp, in place of the task's own. */
+static void vprocExecReplaceEnvironment(char *const envp[]) {
+    char **current = *vprocEnvironShim();
+    size_t count = 0;
+    while (current && current[count]) {
+        count++;
+    }
+    char **names = calloc(count + 1, sizeof(char *));
+    for (size_t i = 0; names && i < count; ++i) {
+        const char *eq = strchr(current[i], '=');
+        names[i] = eq ? strndup(current[i], (size_t)(eq - current[i])) : strdup(current[i]);
+    }
+    for (size_t i = 0; names && i < count; ++i) {
+        if (names[i]) {
+            vprocUnsetenvShim(names[i]);
+            free(names[i]);
+        }
+    }
+    free(names);
+    for (size_t i = 0; envp && envp[i]; ++i) {
+        const char *eq = strchr(envp[i], '=');
+        if (!eq || eq == envp[i]) {
+            continue;
+        }
+        char *name = strndup(envp[i], (size_t)(eq - envp[i]));
+        if (name) {
+            vprocSetenvShim(name, eq + 1, 1);
+            free(name);
+        }
+    }
+}
+
+int vprocProgramFrameStatus(const VProcProgramFrame *frame, int jumped) {
+    if (frame && frame->exec_ended) {
+        return frame->exec_status;
+    }
+    return jumped;
+}
+
+/* The program has ended, so the task does: back to where the app started it. */
+static void vprocExecEnd(VProc *vp, int status) {
+    VProcProgramFrame *frame = gVprocProgramFrame;
+    if (vp && frame && frame->pid == vp->pid) {
+        gVprocProgramFrame = frame->prev;
+        frame->pushed = false;
+        frame->exec_ended = true;
+        frame->exec_status = status & 0xff;
+        gVprocHandlerTask = frame->handler_task;
+#if defined(__APPLE__)
+        pthread_self()->__cleanup_stack = frame->cleanup_stack;
+#endif
+        longjmp(frame->env, 1);
+    }
+    exit(status & 0xff);
+}
+
+int vprocExecveShim(const char *path, char *const argv[], char *const envp[]) {
+    if (!path || path[0] == '\0') {
+        errno = ENOENT;
+        return -1;
+    }
+    /* A real child of a real fork, on a host build, is a process of its own. */
+    if (gVprocHostPid != 0 && getpid() != gVprocHostPid) {
+        return execve(path, argv, envp ? envp : *vprocEnvironShim());
+    }
+    /* Nothing says how a program runs here, as in a host build with no applets: the host's exec. */
+    if (!gVprocExecCanRun || !gVprocExecRun) {
+        return execve(path, argv, envp ? envp : *vprocEnvironShim());
+    }
+    if (!gVprocExecCanRun(path)) {
+        char expanded[PATH_MAX];
+        const char *host = pscalPathVirtualized_hostPath(path, expanded);
+        errno = (strchr(path, '/') && access(host, F_OK) == 0) ? EACCES : ENOENT;
+        return -1;
+    }
+    int argc = 0;
+    while (argv && argv[argc]) {
+        argc++;
+    }
+    char **args = calloc((size_t)(argc > 0 ? argc : 1) + 1, sizeof(char *));
+    if (!args) {
+        errno = ENOMEM;
+        return -1;
+    }
+    /* The app finds the program by its first word. */
+    args[0] = strdup(path);
+    for (int i = 1; i < argc; ++i) {
+        args[i] = strdup(argv[i]);
+    }
+    int count = argc > 0 ? argc : 1;
+    VProc *vp = vprocForThread();
+    if (envp && envp != *vprocEnvironShim()) {
+        vprocExecReplaceEnvironment(envp);
+    }
+    vprocExecApplyCredentials(path);
+    if (vp) {
+        vprocSimExecResetCaughtSignals(vp->pid);
+    }
+    int status = gVprocExecRun(count, args);
+    for (int i = 0; i < count; ++i) {
+        free(args[i]);
+    }
+    free(args);
+    vprocExecEnd(vp, status);
+    return -1;
+}
+
+int vprocExecvShim(const char *path, char *const argv[]) {
+    return vprocExecveShim(path, argv, NULL);
+}
+
+int vprocExecvpShim(const char *file, char *const argv[]) {
+    if ((gVprocHostPid != 0 && getpid() != gVprocHostPid) || !gVprocExecRun) {
+        return execvp(file, argv);
+    }
+    return vprocExecveShim(file, argv, NULL);
+}
+
+static char **vprocExecCollectArgs(const char *arg0, va_list ap) {
+    size_t cap = 8;
+    size_t count = 0;
+    char **args = calloc(cap, sizeof(char *));
+    if (!args) {
+        return NULL;
+    }
+    const char *arg = arg0;
+    while (arg) {
+        if (count + 1 >= cap) {
+            cap *= 2;
+            char **grown = realloc(args, cap * sizeof(char *));
+            if (!grown) {
+                free(args);
+                return NULL;
+            }
+            args = grown;
+        }
+        args[count++] = (char *)arg;
+        arg = va_arg(ap, const char *);
+    }
+    args[count] = NULL;
+    return args;
+}
+
+int vprocExeclShim(const char *path, const char *arg0, ...) {
+    va_list ap;
+    va_start(ap, arg0);
+    char **args = vprocExecCollectArgs(arg0, ap);
+    va_end(ap);
+    if (!args) {
+        errno = ENOMEM;
+        return -1;
+    }
+    int rc = vprocExecveShim(path, args, NULL);
+    int saved = errno;
+    free(args);
+    errno = saved;
+    return rc;
+}
+
+int vprocExeclpShim(const char *file, const char *arg0, ...) {
+    va_list ap;
+    va_start(ap, arg0);
+    char **args = vprocExecCollectArgs(arg0, ap);
+    va_end(ap);
+    if (!args) {
+        errno = ENOMEM;
+        return -1;
+    }
+    int rc = vprocExecvpShim(file, args);
+    int saved = errno;
+    free(args);
+    errno = saved;
+    return rc;
+}
+
+/* --- The host name -----------------------------------------------------------------------------
+ *
+ * The kernel's, as on Linux: /etc/hostname when the app starts, otherwise iDevice, and a set lasts
+ * until the app ends. Only root may set it. */
+
+static pthread_mutex_t gVprocHostnameMu = PTHREAD_MUTEX_INITIALIZER;
+static char gVprocHostname[256];
+static bool gVprocHostnameLoaded;
+
+static void vprocHostnameLoadLocked(void) {
+    if (gVprocHostnameLoaded) {
+        return;
+    }
+    gVprocHostnameLoaded = true;
+    strlcpy(gVprocHostname, "iDevice", sizeof(gVprocHostname));
+    char path[PATH_MAX];
+    const char *file = pscalEtcPath("hostname", path, sizeof(path));
+    FILE *fp = file ? fopen(file, "r") : NULL;
+    if (!fp) {
+        return;
+    }
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        char *p = line;
+        while (*p == ' ' || *p == '\t') {
+            p++;
+        }
+        size_t len = strcspn(p, " \t\r\n#");
+        if (len > 0 && p[0] != '#') {
+            p[len] = '\0';
+            strlcpy(gVprocHostname, p, sizeof(gVprocHostname));
+            break;
+        }
+    }
+    fclose(fp);
+}
+
+int vprocGethostnameShim(char *name, size_t len) {
+    if (!name) {
+        errno = EFAULT;
+        return -1;
+    }
+    pthread_mutex_lock(&gVprocHostnameMu);
+    vprocHostnameLoadLocked();
+    size_t need = strlen(gVprocHostname);
+    if (len == 0) {
+        pthread_mutex_unlock(&gVprocHostnameMu);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(name, gVprocHostname, need < len ? need + 1 : len);
+    pthread_mutex_unlock(&gVprocHostnameMu);
+    if (need >= len) {
+        name[len - 1] = '\0';
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    return 0;
+}
+
+int vprocSethostnameShim(const char *name, size_t len) {
+    if (vprocGeteuidShim() != 0) {
+        errno = EPERM;
+        return -1;
+    }
+    if (!name || len >= sizeof(gVprocHostname)) {
+        errno = EINVAL;
+        return -1;
+    }
+    pthread_mutex_lock(&gVprocHostnameMu);
+    gVprocHostnameLoaded = true;
+    memcpy(gVprocHostname, name, len);
+    gVprocHostname[len] = '\0';
+    pthread_mutex_unlock(&gVprocHostnameMu);
+    return 0;
+}
+
+int vprocUnameShim(struct utsname *buf) {
+    if (uname(buf) != 0) {
+        return -1;
+    }
+    char host[sizeof(buf->nodename)];
+    if (vprocGethostnameShim(host, sizeof(host)) == 0) {
+        strlcpy(buf->nodename, host, sizeof(buf->nodename));
+    }
+    return 0;
+}
+
+static uint64_t gVprocBootIdValue;
+static pthread_once_t gVprocBootIdOnce = PTHREAD_ONCE_INIT;
+
+static void vprocBootIdInit(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t value = ((uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec) ^
+                     ((uint64_t)getpid() << 40);
+    gVprocBootIdValue = value ? value : 1;
+}
+
+uint64_t vprocBootId(void) {
+    pthread_once(&gVprocBootIdOnce, vprocBootIdInit);
+    return gVprocBootIdValue;
+}
+#else
+static bool vprocKillPermitted(pid_t pid) {
+    (void)pid;
+    return true;
+}
+
+int vprocHostPathPermit(const char *host_path, int op) {
+    (void)host_path;
+    (void)op;
+    return 0;
+}
+
+int vprocHostPathPermitOpen(const char *host_path, int flags) {
+    (void)host_path;
+    (void)flags;
+    return 0;
+}
+
+void vprocHostPathOwner(const char *host_path, struct stat *st) {
+    (void)host_path;
+    (void)st;
+}
+
+static int vprocChownRecord(const char *host_path, uid_t uid, gid_t gid, bool follow) {
+    (void)follow;
+    return vprocHostChownRaw(host_path, uid, gid);
+}
+
+uid_t vprocGeteuidShim(void) {
+    return geteuid();
+}
+#endif /* PSCAL_TARGET_IOS */
 
 #endif /* PSCAL_TARGET_IOS || VPROC_ENABLE_STUBS_FOR_TESTS */
