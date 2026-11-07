@@ -31,6 +31,11 @@ int pscalPathVirtualized_lstat(const char *path, struct stat *buf);
 /* The app's own view: the mount point, source and type from its mount table. */
 int pscalPathVirtualized_statfs(const char *path, struct statfs *buf);
 int pscalPathVirtualized_statvfs(const char *path, struct statvfs *buf);
+/* Names `buf`, a host statfs result for the file at `host_path`, from the app's mount table. */
+void pscalPathVirtualized_nameStatfs(const char *host_path, struct statfs *buf);
+/* The descriptor forms, in vproc.c: a task's descriptor, and the same names. */
+int vprocFstatfsShim(int fd, struct statfs *buf);
+int vprocFstatvfsShim(int fd, struct statvfs *buf);
 int pscalPathVirtualized_access(const char *path, int mode);
 int pscalPathVirtualized_mkdir(const char *path, mode_t mode);
 int pscalPathVirtualized_mkfifo(const char *path, mode_t mode);
@@ -75,6 +80,12 @@ int pscalPathVirtualized_streamSlot(FILE *stream);
 #endif
 #ifndef statvfs
 #define statvfs(path, buf) pscalPathVirtualized_statvfs(path, buf)
+#endif
+#ifndef fstatfs
+#define fstatfs(fd, buf) vprocFstatfsShim(fd, buf)
+#endif
+#ifndef fstatvfs
+#define fstatvfs(fd, buf) vprocFstatvfsShim(fd, buf)
 #endif
 #define access(path, mode) pscalPathVirtualized_access(path, mode)
 #undef mkdir

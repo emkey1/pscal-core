@@ -12972,15 +12972,48 @@ static int vprocEnsureMountSourceAccessFromRuntime(const char *path) {
 }
 #endif
 
+/* The folder an fstab label (UUID=...) names, from the runtime that made it. */
+static bool vprocResolveFstabSourceLabel(const char *label, char *out, size_t out_size) {
+    typedef char *(*VprocMountSourceForLabelFn)(const char *label);
+    static VprocMountSourceForLabelFn fn = NULL;
+    static bool looked_up = false;
+    if (!looked_up) {
+        looked_up = true;
+        fn = (VprocMountSourceForLabelFn)dlsym(RTLD_DEFAULT, "pscalRuntimeMountSourceForLabel");
+    }
+    char *path = fn ? fn(label) : NULL;
+    if (!path) {
+        errno = fn ? ENOENT : ENOSYS;
+        return false;
+    }
+    bool ok = strlen(path) < out_size;
+    if (ok) {
+        memcpy(out, path, strlen(path) + 1);
+    } else {
+        errno = ENAMETOOLONG;
+    }
+    free(path);
+    return ok;
+}
+
 static bool vprocResolveFstabSourceDir(const char *source, char *source_real, size_t source_real_size) {
+    char labelled[PATH_MAX];
+    if (source && strncmp(source, "UUID=", 5) == 0) {
+        if (!vprocResolveFstabSourceLabel(source, labelled, sizeof(labelled))) {
+            return false;
+        }
+        source = labelled;
+    }
     if (!source || source[0] != '/' || !source_real || source_real_size == 0) {
         errno = EINVAL;
         return false;
     }
+    /* The app's own path first: mount -p writes a source in the app's storage that way, and the
+     * same name can exist on the host. A host path (an fstab from before) is the fallback. */
     char expanded[PATH_MAX];
-    const char *candidates[2] = { source, NULL };
+    const char *candidates[2] = { NULL, source };
     if (pathTruncateExpand(source, expanded, sizeof(expanded))) {
-        candidates[1] = expanded;
+        candidates[0] = expanded;
     }
 
     for (size_t i = 0; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
@@ -16300,6 +16333,79 @@ int vprocFstatShim(int fd, struct stat *st) {
     }
     return vprocHostFstatRaw(host, st);
 }
+
+#if defined(PSCAL_TARGET_IOS)
+/* A terminal is on devpts and an in-process pipe on pipefs, as Linux reports them; neither has a
+ * host descriptor to ask. */
+static void vprocFstatfsPscal(struct pscal_fd *pscal_fd, struct statfs *buf) {
+    memset(buf, 0, sizeof(*buf));
+    bool tty = pscal_fd->tty != NULL;
+    buf->f_bsize = 4096;
+    buf->f_iosize = 4096;
+    buf->f_type = tty ? 0x1CD1 : 0x50495045;
+    snprintf(buf->f_fstypename, sizeof(buf->f_fstypename), "%s", tty ? "devpts" : "pipefs");
+    snprintf(buf->f_mntfromname, sizeof(buf->f_mntfromname), "%s", tty ? "devpts" : "pipefs");
+    snprintf(buf->f_mntonname, sizeof(buf->f_mntonname), "%s", tty ? "/dev/pts" : "/");
+}
+
+/* The host's figures for the file under the descriptor, named from the app's mount table. */
+int vprocFstatfsShim(int fd, struct statfs *buf) {
+    if (!buf) {
+        errno = EFAULT;
+        return -1;
+    }
+    VProc *vp = vprocForThread();
+    struct pscal_fd *pscal_fd = vp ? vprocGetPscalFd(vp, fd) : NULL;
+    if (pscal_fd) {
+        vprocFstatfsPscal(pscal_fd, buf);
+        pscal_fd_close(pscal_fd);
+        return 0;
+    }
+    int host = shimTranslate(fd, 1);
+    if (host < 0) {
+        return -1;
+    }
+    if (fstatfs(host, buf) != 0) {
+        return -1;
+    }
+    char path[PATH_MAX];
+    bool named = false;
+#if defined(F_GETPATH)
+    named = fcntl(host, F_GETPATH, path) == 0;
+#endif
+    pscalPathVirtualized_nameStatfs(named ? path : NULL, buf);
+    return 0;
+}
+
+int vprocFstatvfsShim(int fd, struct statvfs *buf) {
+    if (!buf) {
+        errno = EFAULT;
+        return -1;
+    }
+    struct statfs sfs;
+    if (vprocFstatfsShim(fd, &sfs) != 0) {
+        return -1;
+    }
+    VProc *vp = vprocForThread();
+    struct pscal_fd *pscal_fd = vp ? vprocGetPscalFd(vp, fd) : NULL;
+    if (pscal_fd) {
+        pscal_fd_close(pscal_fd);
+        memset(buf, 0, sizeof(*buf));
+        buf->f_bsize = buf->f_frsize = sfs.f_bsize;
+        buf->f_namemax = 255;
+        return 0;
+    }
+    int host = shimTranslate(fd, 1);
+    if (host < 0 || fstatvfs(host, buf) != 0) {
+        return -1;
+    }
+    if (sfs.f_blocks == 0 && strcmp(sfs.f_fstypename, "proc") == 0) {
+        buf->f_blocks = buf->f_bfree = buf->f_bavail = 0;
+        buf->f_files = buf->f_ffree = buf->f_favail = 0;
+    }
+    return 0;
+}
+#endif
 
 static int vprocStatFillChar(struct stat *st,
                              mode_t mode,

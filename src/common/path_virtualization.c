@@ -392,9 +392,20 @@ int pscalPathVirtualized_statfs(const char *path, struct statfs *buf) {
     if (rc != 0 || !pathVirtualizationActive()) {
         return rc;
     }
+    pscalPathVirtualized_nameStatfs(target, buf);
+    return rc;
+}
+
+void pscalPathVirtualized_nameStatfs(const char *host_path, struct statfs *buf) {
     PathTruncateMountEntry entry;
-    if (!pathTruncateMountForHostPath(target, &entry)) {
-        return rc;
+    if (!buf) {
+        return;
+    }
+    /* A file with no path (a socket, an unlinked file) is still on the root. */
+    if (!host_path || !pathTruncateMountForHostPath(host_path, &entry)) {
+        if (!pathTruncateMountForHostPath("/", &entry)) {
+            return;
+        }
     }
     snprintf(buf->f_mntonname, sizeof(buf->f_mntonname), "%s", entry.target);
     snprintf(buf->f_mntfromname, sizeof(buf->f_mntfromname), "%s", entry.source);
@@ -405,7 +416,6 @@ int pscalPathVirtualized_statfs(const char *path, struct statfs *buf) {
         buf->f_blocks = buf->f_bfree = buf->f_bavail = 0;
         buf->f_files = buf->f_ffree = 0;
     }
-    return rc;
 }
 
 int pscalPathVirtualized_statvfs(const char *path, struct statvfs *buf) {
