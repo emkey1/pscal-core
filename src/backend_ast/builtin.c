@@ -7374,6 +7374,15 @@ Value vmBuiltinReadkey(VM* vm, int arg_count, Value* args) {
     fflush(stdout);
     int c = 0;
     for (;;) {
+#if !defined(PSCAL_TARGET_IOS)
+        /* Ctrl-C is left for the VM's own interrupt check, which ends the program as it does
+         * anywhere else. Taken here as an Exit, it left only the procedure ReadKey was
+         * called from, and a game in a loop carried on. */
+        if (pscalRuntimeSigintPending()) {
+            c = 0;
+            break;
+        }
+#else
         if (pscalRuntimeConsumeSigint()) {
             if (vm) {
                 vm->abort_requested = false;
@@ -7384,6 +7393,7 @@ Value vmBuiltinReadkey(VM* vm, int arg_count, Value* args) {
             c = 0;
             break;
         }
+#endif
 #if defined(PSCAL_TARGET_IOS)
         if (pscalRuntimeConsumeSigtstp()) {
             char scratch[1] = {'\0'};
@@ -7445,12 +7455,17 @@ Value vmBuiltinReadkey(VM* vm, int arg_count, Value* args) {
         }
 #endif
         if (c == 0x03) { // Ctrl-C
+#if !defined(PSCAL_TARGET_IOS)
+            /* The key as a byte (isig off) is the same interrupt. */
+            atomic_store(&g_vm_sigint_seen, 1);
+#else
             if (vm) {
                 vm->abort_requested = false;
                 vm->exit_requested = true;
                 vm->suspend_unwind_requested = false;
             }
             shellRuntimeSetLastStatus(130);
+#endif
             c = 0;
             break;
         }
