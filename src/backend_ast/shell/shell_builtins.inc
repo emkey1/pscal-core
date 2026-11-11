@@ -2389,6 +2389,18 @@ static bool shellCondRegexMatch(const char *left, const char *pattern, bool *out
     return matched;
 }
 
+/* [[ < ]] and [[ > ]] sort as the locale collates, as bash 5 does; test and [ compare bytes. */
+static int shellCondCollatedCompare(const char *left, const char *right) {
+    locale_t collate = shellCollateLocale();
+    if (!collate) {
+        return strcmp(left, right);
+    }
+    locale_t previous = uselocale(collate);
+    int order = strcoll(left, right);
+    uselocale(previous);
+    return order;
+}
+
 static bool shellCondEvaluateBinary(ShellCondParser *parser, char *left, const char *op, char *right) {
     bool result = false;
     bool nocasematch = shellShoptOptionEnabled("nocasematch");
@@ -2416,9 +2428,9 @@ static bool shellCondEvaluateBinary(ShellCondParser *parser, char *left, const c
         shellStripGlobMarks(left);
         shellStripGlobMarks(right);
         if (strcmp(op, "<") == 0) {
-            result = strcmp(left, right) < 0;
+            result = shellCondCollatedCompare(left, right) < 0;
         } else if (strcmp(op, ">") == 0) {
-            result = strcmp(left, right) > 0;
+            result = shellCondCollatedCompare(left, right) > 0;
         } else if (!shellEvaluateFileBinary(left, op, right, &result)) {
             /* [[ -eq ]] takes arithmetic: [[ x -eq 3 ]]. */
             long long lhs = 0;
@@ -11748,9 +11760,14 @@ static const ShellHelpTopic kShellHelpTopics[] = {
     },
     {
         "history",
-        "Print the interactive history list.",
-        "history",
-        "Writes each recorded interactive command with its history index.",
+        "Display or change the history list.",
+        "history [-c] [-d offset] [n] or history -anrw [filename] or history -ps arg [arg ...]",
+        "With no option, lists the history with each entry's number, or the last N. -c clears "
+        "it, -d deletes the entry at OFFSET (negative counts from the end) or a START-END range. "
+        "-a appends this session's new entries to FILENAME, -n reads the lines added to it "
+        "since, -r reads it all into the list and -w writes the list over it; with no "
+        "FILENAME they use $HISTFILE. -s adds ARGs as one entry, -p prints them with history "
+        "expansion applied and stores nothing.",
         NULL,
         0
     },
@@ -12375,14 +12392,360 @@ Value vmBuiltinShellCaller(VM *vm, int arg_count, Value *args) {
     return makeVoid();
 }
 
-Value vmBuiltinShellHistory(VM *vm, int arg_count, Value *args) {
-    (void)vm;
-    (void)arg_count;
-    (void)args;
-    for (size_t i = 0; i < gShellHistory.count; ++i) {
-        printf("%zu  %s\n", i + 1, gShellHistory.entries[i]);
+static const char *const kShellHistoryUsage =
+    "history: usage: history [-c] [-d offset] [n] or history -anrw [filename] or history -ps arg [arg...]\n";
+
+/* A -d position: 1 is the oldest entry as `history` numbers them, -1 the newest. */
+static bool shellHistoryParsePosition(const char *text, size_t *out_index) {
+    if (!text || !*text) {
+        return false;
     }
-    shellUpdateStatus(0);
+    char *end = NULL;
+    errno = 0;
+    long long value = strtoll(text, &end, 10);
+    if (errno != 0 || !end || *end != '\0' || end == text) {
+        return false;
+    }
+    long long count = (long long)gShellHistory.count;
+    long long index;
+    if (value < 0) {
+        index = count + value;
+    } else {
+        index = value - 1 - (long long)gShellHistory.dropped;
+    }
+    if (index < 0 || index >= count) {
+        return false;
+    }
+    *out_index = (size_t)index;
+    return true;
+}
+
+static bool shellHistoryIsNumber(const char *text) {
+    if (!text || !*text) {
+        return false;
+    }
+    const char *p = text;
+    if (*p == '-' || *p == '+') {
+        ++p;
+    }
+    if (!*p) {
+        return false;
+    }
+    for (; *p; ++p) {
+        if (!isdigit((unsigned char)*p)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static int shellHistoryDelete(VM *vm, const char *arg) {
+    /* start-end, either of which may count from the end: 2-4, -3--1. */
+    const char *dash = strchr(arg[0] == '-' ? arg + 1 : arg, '-');
+    if (dash) {
+        size_t start_len = (size_t)(dash - arg);
+        char *start_text = strndup(arg, start_len);
+        size_t start = 0;
+        size_t stop = 0;
+        bool ok_start = start_text && shellHistoryParsePosition(start_text, &start);
+        bool ok_stop = ok_start && shellHistoryParsePosition(dash + 1, &stop);
+        if (!ok_start) {
+            bool numeric = start_text && shellHistoryIsNumber(start_text);
+            shellReportRecoverableError(vm, true, "history: %s: history position out of range",
+                                        numeric ? start_text : arg);
+            free(start_text);
+            return 1;
+        }
+        free(start_text);
+        if (!ok_stop || stop < start) {
+            shellReportRecoverableError(vm, true, "history: %s: history position out of range",
+                                        shellHistoryIsNumber(dash + 1) ? dash + 1 : arg);
+            return 1;
+        }
+        for (size_t i = stop + 1; i > start; --i) {
+            shellHistoryDeleteAt(i - 1);
+        }
+        return 0;
+    }
+    if (!shellHistoryIsNumber(arg)) {
+        shellReportRecoverableError(vm, true, "history: %s: invalid number", arg);
+        return 1;
+    }
+    size_t index = 0;
+    if (!shellHistoryParsePosition(arg, &index)) {
+        shellReportRecoverableError(vm, true, "history: %s: history position out of range", arg);
+        return 1;
+    }
+    shellHistoryDeleteAt(index);
+    return 0;
+}
+
+static char *shellHistoryFileFor(VM *vm, const char *arg) {
+    if (arg) {
+        char *resolved = shellHistoryResolvePath(arg);
+        return resolved ? resolved : strdup(arg);
+    }
+    char *value = shellLookupParameterValue("HISTFILE", strlen("HISTFILE"));
+    if (!value || !*value) {
+        free(value);
+        shellReportRecoverableError(vm, true, "history: HISTFILE: parameter null or not set");
+        return NULL;
+    }
+    char *resolved = shellHistoryResolvePath(value);
+    free(value);
+    return resolved;
+}
+
+/* The file's lines from `skip` on, as history entries. Returns how many lines it has. */
+static bool shellHistoryReadFile(const char *path, size_t skip, size_t *out_total) {
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        return false;
+    }
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t nread = 0;
+    size_t total = 0;
+    while ((nread = getline(&line, &cap, fp)) != -1) {
+        while (nread > 0 && (line[nread - 1] == '\n' || line[nread - 1] == '\r')) {
+            line[--nread] = '\0';
+        }
+        if (total++ < skip || nread == 0) {
+            continue;
+        }
+        if (shellHistoryEnsureCapacity(gShellHistory.count + 1)) {
+            char *copy = strdup(line);
+            if (copy) {
+                gShellHistory.entries[gShellHistory.count++] = copy;
+                gShellHistory.newest_is_prompt_line = false;
+                shellHistoryTrimMemoryLimit();
+            }
+        }
+    }
+    free(line);
+    fclose(fp);
+    *out_total = total;
+    return true;
+}
+
+static bool shellHistoryWriteFile(const char *path, size_t from, bool append) {
+    FILE *fp = fopen(path, append ? "a" : "w");
+    if (!fp) {
+        return false;
+    }
+    for (size_t i = from; i < gShellHistory.count; ++i) {
+        if (gShellHistory.entries[i]) {
+            fputs(gShellHistory.entries[i], fp);
+            fputc('\n', fp);
+        }
+    }
+    bool ok = fflush(fp) == 0;
+    ok = fclose(fp) == 0 && ok;
+    return ok;
+}
+
+/* bash's history builtin: list (all or the last n), -c, -d, -anrw [file], -s and -p. */
+Value vmBuiltinShellHistory(VM *vm, int arg_count, Value *args) {
+    bool opt_c = false, opt_a = false, opt_n = false, opt_r = false, opt_w = false;
+    bool opt_s = false, opt_p = false;
+    const char *delete_arg = NULL;
+    int index = 0;
+    for (; index < arg_count; ++index) {
+        Value v = args[index];
+        const char *text = (VALUE_TYPE(v) == TYPE_STRING && AS_STRING(v)) ? AS_STRING(v) : "";
+        if (text[0] != '-' || text[1] == '\0') {
+            break;
+        }
+        if (strcmp(text, "--") == 0) {
+            ++index;
+            break;
+        }
+        bool word_done = false;
+        for (const char *opt = text + 1; *opt && !word_done; ++opt) {
+            switch (*opt) {
+                case 'c': opt_c = true; break;
+                case 'a': opt_a = true; break;
+                case 'n': opt_n = true; break;
+                case 'r': opt_r = true; break;
+                case 'w': opt_w = true; break;
+                case 's': opt_s = true; break;
+                case 'p': opt_p = true; break;
+                case 'd':
+                    if (opt[1]) {
+                        delete_arg = opt + 1;
+                    } else if (index + 1 < arg_count && VALUE_TYPE(args[index + 1]) == TYPE_STRING &&
+                               AS_STRING(args[index + 1])) {
+                        delete_arg = AS_STRING(args[++index]);
+                    } else {
+                        shellReportRecoverableError(vm, true, "history: -d: option requires an argument");
+                        fputs(kShellHistoryUsage, stderr);
+                        shellUpdateStatus(2);
+                        return makeVoid();
+                    }
+                    word_done = true; /* the rest of the word, or the next one, was its argument */
+                    break;
+                default:
+                    shellReportRecoverableError(vm, true, "history: -%c: invalid option", *opt);
+                    fputs(kShellHistoryUsage, stderr);
+                    shellUpdateStatus(2);
+                    return makeVoid();
+            }
+        }
+    }
+    const char *rest[2] = {NULL, NULL};
+    int rest_count = arg_count - index;
+    for (int i = 0; i < rest_count && i < 2; ++i) {
+        Value v = args[index + i];
+        rest[i] = (VALUE_TYPE(v) == TYPE_STRING && AS_STRING(v)) ? AS_STRING(v) : "";
+    }
+    if ((opt_a ? 1 : 0) + (opt_n ? 1 : 0) + (opt_r ? 1 : 0) + (opt_w ? 1 : 0) > 1) {
+        shellReportRecoverableError(vm, true, "history: cannot use more than one of -anrw");
+        shellUpdateStatus(1);
+        return makeVoid();
+    }
+    /* At a prompt the line that ran -s or -p is the newest entry, and bash drops it. */
+    bool drop_own_line = shellRuntimeIsInteractive() && gShellHistory.newest_is_prompt_line &&
+                         gShellHistory.count > 0;
+
+    if (opt_c) {
+        shellHistoryClear();
+        if (rest_count == 0) {
+            shellUpdateStatus(0);
+            return makeVoid();
+        }
+    }
+    if (delete_arg) {
+        shellUpdateStatus(shellHistoryDelete(vm, delete_arg));
+        return makeVoid();
+    }
+    if (opt_s) {
+        if (rest_count > 0) {
+            if (drop_own_line) {
+                shellHistoryDeleteAt(gShellHistory.count - 1);
+            }
+            size_t len = 0;
+            for (int i = index; i < arg_count; ++i) {
+                len += strlen(AS_STRING(args[i]) ? AS_STRING(args[i]) : "") + 1;
+            }
+            char *joined = (char *)malloc(len + 1);
+            if (joined) {
+                joined[0] = '\0';
+                for (int i = index; i < arg_count; ++i) {
+                    if (i > index) {
+                        strcat(joined, " ");
+                    }
+                    strcat(joined, AS_STRING(args[i]) ? AS_STRING(args[i]) : "");
+                }
+                shellHistoryAddEntry(joined);
+                free(joined);
+            }
+        }
+        shellUpdateStatus(0);
+        return makeVoid();
+    }
+    if (opt_p) {
+        if (rest_count == 0) {
+            shellUpdateStatus(0);
+            return makeVoid();
+        }
+        if (drop_own_line) {
+            shellHistoryDeleteAt(gShellHistory.count - 1);
+        }
+        int status = 0;
+        for (int i = index; i < arg_count; ++i) {
+            const char *word = AS_STRING(args[i]) ? AS_STRING(args[i]) : "";
+            char *expanded = NULL;
+            char *bad = NULL;
+            if (!shellRuntimeExpandHistoryReference(word, &expanded, NULL, &bad)) {
+                shellReportRecoverableError(vm, true, "history: %s: history expansion failed", bad ? bad : word);
+                free(bad);
+                free(expanded);
+                status = 1;
+                break;
+            }
+            printf("%s\n", expanded ? expanded : word);
+            free(expanded);
+        }
+        fflush(stdout);
+        shellUpdateStatus(status);
+        return makeVoid();
+    }
+    if (!opt_a && !opt_n && !opt_r && !opt_w) {
+        size_t start = 0;
+        if (rest_count > 1) {
+            shellReportRecoverableError(vm, true, "history: too many arguments");
+            shellUpdateStatus(1);
+            return makeVoid();
+        }
+        if (rest_count == 1) {
+            char *end = NULL;
+            errno = 0;
+            long long limit = strtoll(rest[0], &end, 10);
+            if (!shellHistoryIsNumber(rest[0]) || errno != 0 || !end || *end != '\0') {
+                shellReportRecoverableError(vm, true, "history: %s: numeric argument required", rest[0]);
+                shellUpdateStatus(2);
+                return makeVoid();
+            }
+            if (limit < 0) {
+                limit = -limit;
+            }
+            if ((unsigned long long)limit < gShellHistory.count) {
+                start = gShellHistory.count - (size_t)limit;
+            }
+        }
+        for (size_t i = start; i < gShellHistory.count; ++i) {
+            printf("%5zu  %s\n", i + 1 + gShellHistory.dropped,
+                   gShellHistory.entries[i] ? gShellHistory.entries[i] : "");
+        }
+        fflush(stdout);
+        shellUpdateStatus(0);
+        return makeVoid();
+    }
+
+    char *path = shellHistoryFileFor(vm, rest_count > 0 ? rest[0] : NULL);
+    if (!path) {
+        shellUpdateStatus(1);
+        return makeVoid();
+    }
+    int status = 0;
+    if (opt_a) {
+        size_t new_lines = gShellHistory.session_lines;
+        if (new_lines > gShellHistory.count) {
+            new_lines = gShellHistory.count;
+        }
+        if (new_lines > 0) {
+            if (!shellHistoryWriteFile(path, gShellHistory.count - new_lines, true)) {
+                status = 1;
+            } else {
+                gShellHistory.lines_in_file += new_lines;
+            }
+        }
+        gShellHistory.session_lines = 0;
+    } else if (opt_w) {
+        /* bash's counts stay as they are: a later -a still appends this session's lines. */
+        if (!shellHistoryWriteFile(path, 0, false)) {
+            status = 1;
+        }
+    } else {
+        /* The file's line count is what a read reached; -n counts what it read as this
+         * session's, so -a writes it back, as bash does. */
+        size_t total = 0;
+        size_t before = gShellHistory.lines_in_file;
+        if (!shellHistoryReadFile(path, opt_n ? before : 0, &total)) {
+            status = 1;
+            gShellHistory.lines_in_file = 0;
+        } else {
+            gShellHistory.lines_in_file = total;
+            if (opt_n && total > before) {
+                gShellHistory.session_lines += total - before;
+            }
+        }
+    }
+    if (status != 0) {
+        shellReportRecoverableError(vm, true, "history: %s: %s", path, strerror(errno ? errno : EIO));
+    }
+    free(path);
+    shellUpdateStatus(status);
     return makeVoid();
 }
 

@@ -611,6 +611,10 @@ typedef struct {
     char **entries;
     size_t count;
     size_t capacity;
+    size_t dropped;       /* entries HISTSIZE took off the front: `history` numbers from dropped + 1 */
+    size_t session_lines; /* added since the last `history -a` or -w, which -a appends (bash's count) */
+    size_t lines_in_file; /* lines of the history file this shell has read or written: -n reads past them */
+    bool newest_is_prompt_line; /* the newest entry is the line being run, which -s and -p drop */
 } ShellHistory;
 
 typedef struct ShellTrapEntry {
@@ -815,6 +819,7 @@ typedef struct ShellRuntimeState {
     bool history_loading;
     char *arg0;
     ShellTrapEntry signal_traps[NSIG];
+    bool signal_ignored_on_entry[NSIG]; /* ignored when this shell started: no trap can change it */
     ShellTrapEntry exit_trap;
     bool trap_executing;
     int script_depth;
@@ -877,6 +882,7 @@ static void shellSetContext(ShellRuntimeState *ctx);
 #define gShellHistory (SC()->history)
 #define gShellArg0 (SC()->arg0)
 #define gShellSignalTraps (SC()->signal_traps)
+#define gShellSignalIgnoredOnEntry (SC()->signal_ignored_on_entry)
 #define gShellExitTrap (SC()->exit_trap)
 #define gShellTrapExecuting (SC()->trap_executing)
 #define gShellScriptDepth (SC()->script_depth)
@@ -4721,24 +4727,35 @@ bool shellRuntimeSignalName(int signo, bool include_prefix, char *buffer, size_t
     return false;
 }
 
-/* A signal ignored when a script starts cannot be trapped or reset, and trap lists it.
- * Hosts only: in the app the disposition belongs to the app, not to this shell. */
-#if !defined(PSCAL_TARGET_IOS)
-static bool gShellSignalIgnoredOnEntry[NSIG];
-#endif
-
+/* A signal ignored when a script starts cannot be trapped or reset, and trap lists it. On a
+ * host that is the process's disposition. In the app it is the task's: the vproc this shell
+ * starts in, which took what was ignored from whatever started it (nohup, `trap '' HUP`). */
 void shellRuntimeNoteIgnoredSignals(void) {
-#if !defined(PSCAL_TARGET_IOS)
+#if defined(PSCAL_TARGET_IOS)
+    VProc *vp = vprocCurrent();
+    int task = vp ? vprocPid(vp) : shellRuntimeOwnPid();
+#endif
     for (size_t i = 0; i < sizeof(kShellSignalNames) / sizeof(kShellSignalNames[0]); ++i) {
         int signo = kShellSignalNames[i].signo;
         struct sigaction current;
-        if (signo > 0 && signo < NSIG && sigaction(signo, NULL, &current) == 0 &&
-            current.sa_handler == SIG_IGN) {
+        memset(&current, 0, sizeof(current));
+#if defined(PSCAL_TARGET_IOS)
+        /* The keys the shell itself handles are not a disposition anything handed it, and
+         * neither is SIGPIPE, which the app ignores in every tab's task so a write gets EPIPE. */
+        if (signo == SIGTSTP || signo == SIGTTIN || signo == SIGTTOU || signo == SIGPIPE) {
+            continue;
+        }
+        bool ignored = signo > 0 && signo < NSIG && vprocSigaction(task, signo, NULL, &current) == 0 &&
+                       current.sa_handler == SIG_IGN;
+#else
+        bool ignored = signo > 0 && signo < NSIG && sigaction(signo, NULL, &current) == 0 &&
+                       current.sa_handler == SIG_IGN;
+#endif
+        if (ignored) {
             gShellSignalIgnoredOnEntry[signo] = true;
             gShellSignalTraps[signo].action = SHELL_TRAP_ACTION_IGNORE;
         }
     }
-#endif
 }
 
 static int shellRuntimeInstallSignalAction(int signo, ShellTrapAction action) {
@@ -4819,11 +4836,9 @@ bool shellRuntimeSetSignalTrap(int signo, ShellTrapAction action, const char *co
     if (signo <= 0 || signo >= NSIG) {
         return false;
     }
-#if !defined(PSCAL_TARGET_IOS)
     if (gShellSignalIgnoredOnEntry[signo] && !shellRuntimeIsInteractive()) {
         return true;
     }
-#endif
 
     char *command_copy = NULL;
     if (action == SHELL_TRAP_ACTION_COMMAND) {
@@ -4931,6 +4946,15 @@ void shellRuntimeSetInteractive(bool interactive) {
         action.sa_handler = shellSignalHandler;
         action.sa_flags |= SA_RESTART;
         sigaction(SIGTSTP, &action, NULL);
+        /* A prompt takes these keys whatever its task started with. */
+        const int keys[] = {SIGINT, SIGQUIT};
+        for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); ++i) {
+            if (gShellSignalIgnoredOnEntry[keys[i]]) {
+                gShellSignalIgnoredOnEntry[keys[i]] = false;
+                gShellSignalTraps[keys[i]].action = SHELL_TRAP_ACTION_DEFAULT;
+                (void)shellRuntimeInstallSignalAction(keys[i], SHELL_TRAP_ACTION_DEFAULT);
+            }
+        }
     }
 #else
     /* At a prompt the shell keeps SIGTSTP to itself. Anywhere else it is in the group Ctrl-Z
@@ -5570,6 +5594,9 @@ ShellRuntimeState *shellRuntimeCreateContext(void) {
     ctx->history.entries = NULL;
     ctx->history.count = 0;
     ctx->history.capacity = 0;
+    ctx->history.dropped = template_ctx->history.dropped;
+    ctx->history.session_lines = template_ctx->history.session_lines;
+    ctx->history.lines_in_file = template_ctx->history.lines_in_file;
     ctx->history_path = template_ctx->history_path ? strdup(template_ctx->history_path) : NULL;
     ctx->history_size_limit = template_ctx->history_size_limit;
     ctx->history_file_size_limit = template_ctx->history_file_size_limit;
@@ -5596,6 +5623,7 @@ ShellRuntimeState *shellRuntimeCreateContext(void) {
     ctx->arg0 = template_ctx->arg0 ? strdup(template_ctx->arg0) : NULL;
 
     for (int i = 0; i < NSIG; ++i) {
+        ctx->signal_ignored_on_entry[i] = template_ctx->signal_ignored_on_entry[i];
         ctx->signal_traps[i].action = template_ctx->signal_traps[i].action;
         ctx->signal_traps[i].command = template_ctx->signal_traps[i].command ?
                                            strdup(template_ctx->signal_traps[i].command) :
@@ -5756,6 +5784,16 @@ static ShellRuntimeState *shellRuntimeCreateProgramContext(void) {
     }
     /* Its script is the outermost one in this shell, and its EXIT trap runs when that ends. */
     ctx->script_depth = 0;
+    /* A new shell has no history until it records some: the prompt's list is not its own. */
+    for (size_t i = 0; i < ctx->history.count; ++i) {
+        free(ctx->history.entries[i]);
+        ctx->history.entries[i] = NULL;
+    }
+    ctx->history.count = 0;
+    ctx->history.dropped = 0;
+    ctx->history.session_lines = 0;
+    ctx->history.lines_in_file = 0;
+    ctx->history.newest_is_prompt_line = false;
     for (size_t i = 0; i < ctx->array_var_count; ++i) {
         shellArrayVariableClear(&ctx->array_vars[i]);
     }
@@ -5853,6 +5891,12 @@ static void shellProgramScopeEnter(ShellProgramScope *scope) {
     shellRuntimeSetInteractive(false);
     scope->ctx = shellRuntimeCreateProgramContext();
     scope->previous = scope->ctx ? shellRuntimeActivateContext(scope->ctx) : NULL;
+#if defined(PSCAL_TARGET_IOS)
+    /* As a new process would: what its task has ignored, from nohup or a `trap ''`, stays so. */
+    if (scope->ctx) {
+        shellRuntimeNoteIgnoredSignals();
+    }
+#endif
     scope->attributes = gShellVariableAttributes;
     scope->attribute_count = gShellVariableAttributeCount;
     gShellVariableAttributes = NULL;

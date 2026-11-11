@@ -1583,6 +1583,10 @@ static void shellHistoryTrimMemoryLimit(void) {
             gShellHistory.entries + excess,
             (gShellHistory.count - excess) * sizeof(char *));
     gShellHistory.count -= excess;
+    gShellHistory.dropped += excess;
+    if (gShellHistory.session_lines > gShellHistory.count) {
+        gShellHistory.session_lines = gShellHistory.count;
+    }
 }
 
 static void shellHistoryRewriteFileTail(size_t keep) {
@@ -1722,6 +1726,7 @@ void shellHistoryLoadFromFile(void) {
         }
         shellRuntimeRecordHistory(line);
         shellHistoryTrimMemoryLimit();
+        gShellHistory.lines_in_file++;
     }
     free(line);
     fclose(fp);
@@ -1781,10 +1786,59 @@ void shellRuntimeRecordHistory(const char *line) {
     memcpy(copy, line, len);
     copy[len] = '\0';
     gShellHistory.entries[gShellHistory.count++] = copy;
-    shellHistoryTrimMemoryLimit();
-    if (shellRuntimeIsInteractive()) {
-        shellHistoryAppendToFile(copy);
+    gShellHistory.newest_is_prompt_line = !gShellRuntime.history_loading;
+    if (!gShellRuntime.history_loading) {
+        gShellHistory.session_lines++;
     }
+    shellHistoryTrimMemoryLimit();
+    if (shellRuntimeIsInteractive() && shellHistoryPersistenceEnabled() && !gShellRuntime.history_loading) {
+        /* Written as it is entered, so `history -a` has nothing more to add for it. */
+        shellHistoryAppendToFile(copy);
+        gShellHistory.session_lines = 0;
+        gShellHistory.lines_in_file++;
+    }
+}
+
+/* What `history -s` adds: one entry, with no file write of its own. */
+static void shellHistoryAddEntry(const char *line) {
+    if (!line || !shellHistoryEnsureCapacity(gShellHistory.count + 1)) {
+        return;
+    }
+    char *copy = strdup(line);
+    if (!copy) {
+        return;
+    }
+    gShellHistory.entries[gShellHistory.count++] = copy;
+    gShellHistory.session_lines++;
+    gShellHistory.newest_is_prompt_line = false;
+    shellHistoryTrimMemoryLimit();
+}
+
+static void shellHistoryDeleteAt(size_t index) {
+    if (index >= gShellHistory.count) {
+        return;
+    }
+    if (index >= gShellHistory.count - gShellHistory.session_lines && gShellHistory.session_lines > 0) {
+        gShellHistory.session_lines--;
+    }
+    if (index + 1 == gShellHistory.count) {
+        gShellHistory.newest_is_prompt_line = false;
+    }
+    free(gShellHistory.entries[index]);
+    memmove(gShellHistory.entries + index, gShellHistory.entries + index + 1,
+            (gShellHistory.count - index - 1) * sizeof(char *));
+    gShellHistory.count--;
+}
+
+static void shellHistoryClear(void) {
+    for (size_t i = 0; i < gShellHistory.count; ++i) {
+        free(gShellHistory.entries[i]);
+        gShellHistory.entries[i] = NULL;
+    }
+    gShellHistory.count = 0;
+    gShellHistory.dropped = 0;
+    gShellHistory.session_lines = 0;
+    gShellHistory.newest_is_prompt_line = false;
 }
 
 size_t shellRuntimeHistoryCount(void) {
