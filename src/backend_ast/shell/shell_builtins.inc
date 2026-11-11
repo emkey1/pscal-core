@@ -2600,10 +2600,8 @@ Value vmBuiltinShellCd(VM *vm, int arg_count, Value *args) {
     if (print_new_directory) {
         /* cd -: the path is set above. */
     } else if (remaining <= 0) {
-        path = shellSafeGetenv("PSCALI_REAL_HOME");
-        if (!path || !*path) {
-            path = shellSafeGetenv("HOME");
-        }
+        /* $HOME, as bash: `HOME=/x cd` goes to /x. In the app it is the app's name (/home). */
+        path = shellSafeGetenv("HOME");
         if (!path) {
             runtimeError(vm, "cd: HOME not set");
             shellUpdateStatus(1);

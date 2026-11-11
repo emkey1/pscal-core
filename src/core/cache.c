@@ -798,6 +798,11 @@ static void sanitizeCompilerId(const char* compiler_id, char* buffer, size_t buf
 static char* ensureCacheDirectory(const char* compiler_id, char* out_safe_id, size_t safe_id_size) {
     const char* home = getenv("HOME");
     if (!home) return NULL;
+    /* In the iOS app $HOME is the app's name for it (/home), and chmod below has no
+     * virtual form: work on the host's name, which every call here takes. */
+    char home_host[PATH_MAX];
+    const char* home_expanded = pscalPathVirtualized_hostPath(home, home_host);
+    if (home_expanded) home = home_expanded;
     size_t root_len = strlen(home) + 1 + strlen(CACHE_ROOT) + 1;
     char* root = (char*)malloc(root_len);
     if (!root) return NULL;
