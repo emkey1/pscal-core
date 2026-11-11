@@ -6197,21 +6197,8 @@ static void vmPrepareCanonicalInput(void) {
             term.c_lflag |= (ICANON | ECHO);
             changed = true;
         }
-#if defined(PSCAL_TARGET_IOS)
-        /* Keep control keys byte-oriented for virtual signal handling.
-         * With ISIG enabled, the tty layer can consume VSUSP/VINTR before
-         * vmReadLineInterruptible sees ^Z/^C bytes. */
-        if (vmStdinIsHostTerminal()) {
-            pthread_once(&g_vm_host_sigtstp_once, vmCatchHostSigtstp);
-            if (!(term.c_lflag & ISIG)) {
-                term.c_lflag |= ISIG;
-                changed = true;
-            }
-        } else if (term.c_lflag & ISIG) {
-            term.c_lflag &= ~ISIG;
-            changed = true;
-        }
-#endif
+        /* ISIG stays as it is: the terminal turns Ctrl-C and Ctrl-Z into signals to the
+         * foreground group, on iOS too (L20). */
         if ((term.c_iflag & ICRNL) == 0) {
             term.c_iflag |= ICRNL;
             changed = true;

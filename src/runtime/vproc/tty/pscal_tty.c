@@ -1328,7 +1328,21 @@ static ssize_t ttyReadSlaveLocked(struct tty *tty, unsigned char *out, size_t si
     }
 }
 
+static ssize_t ttyRead(struct pscal_fd *fd, void *buf, size_t bufsize, int mode);
+
 static ssize_t ttyFileRead(struct pscal_fd *fd, void *buf, size_t bufsize) {
+    return ttyRead(fd, buf, bufsize, -1);
+}
+
+ssize_t pscalTtyReadMode(struct pscal_fd *fd, void *buf, size_t bufsize, bool nonblocking) {
+    if (!fd || fd->ops != &pscal_tty_fd_ops) {
+        return _EBADF;
+    }
+    return ttyRead(fd, buf, bufsize, nonblocking ? 1 : 0);
+}
+
+/* mode -1 goes by the open's O_NONBLOCK, 0 waits, 1 doesn't. */
+static ssize_t ttyRead(struct pscal_fd *fd, void *buf, size_t bufsize, int mode) {
     struct tty *tty = fd->tty;
     if (!tty) {
         return bufsize == 0 ? 0 : _EBADF;
@@ -1350,7 +1364,7 @@ static ssize_t ttyFileRead(struct pscal_fd *fd, void *buf, size_t bufsize) {
     if (bufsize == 0) {
         return 0;
     }
-    const bool nonblocking = ttyFileIsNonBlocking(fd);
+    const bool nonblocking = mode < 0 ? ttyFileIsNonBlocking(fd) : mode == 1;
     lock(&tty->lock);
     const ssize_t result = master ? ttyReadMasterLocked(tty, (unsigned char *)buf, bufsize, nonblocking)
                                   : ttyReadSlaveLocked(tty, (unsigned char *)buf, bufsize, nonblocking);

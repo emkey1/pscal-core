@@ -3511,6 +3511,8 @@ static void vprocRegisterStartedThread(int pid, pthread_t tid);
 static void vprocThreadLeavesStarter(void *arg);
 static void vprocScratchTlsCleanupCurrentThread(void);
 static __thread bool gVprocPipelineStage = false;
+static void vprocPscalFdCloseCancelled(void *fd);
+static ssize_t vprocTerminalReadDone(ssize_t res);
 static __thread bool gVprocInterruptKeyRead = false;
 static __thread bool gVprocTerminalInterrupted = false;
 typedef void (*VprocStopWaitHookFn)(void);
@@ -6925,6 +6927,23 @@ ssize_t vprocSessionReadInputShimMode(void *buf, size_t count, bool nonblocking)
         errno = EBADF;
         return -1;
     }
+    if (session->pty_slave) {
+        if (gVprocTerminalInterrupted && gVprocPipelineStage) {
+            return 0;
+        }
+        struct pscal_fd *slave = pscal_fd_retain(session->pty_slave);
+        ssize_t res;
+        pthread_cleanup_push(vprocPscalFdCloseCancelled, slave);
+        res = pscalTtyReadMode(slave, buf, count, nonblocking);
+        pthread_cleanup_pop(0);
+        pscal_fd_close(slave);
+        /* A caller polling with reads that don't wait still has to hear of a signal, as a
+         * wait would have (L10). */
+        if (res == _EAGAIN && pscalTtySignalCheck() < 0) {
+            res = _EINTR;
+        }
+        return vprocTerminalReadDone(res);
+    }
     const bool tool_dbg = vprocToolDebugEnabled();
     int shell_pid = vprocResolveSessionShellPidForInput(session);
     VProcSessionInput *input = vprocSessionInputEnsure(session,
@@ -6987,6 +7006,10 @@ bool vprocSessionInjectInputShim(const void *data, size_t len) {
     VProcSessionStdio *session = vprocSessionStdioCurrent();
     if (!session) {
         return false;
+    }
+    if (session->pty_slave && session->pty_slave->tty) {
+        /* As if typed. */
+        return tty_input(session->pty_slave->tty, (const char *)data, len, false) == (ssize_t)len;
     }
     int shell_pid = vprocResolveSessionShellPidForInput(session);
     int kernel_pid = vprocGetKernelPid();
@@ -13937,7 +13960,8 @@ int vprocSessionStdioInitWithPty(VProcSessionStdio *stdio_ctx,
     stdio_ctx->stderr_pscal_fd = pscal_fd_retain(pty_slave);
     stdio_ctx->pty_active = true;
     stdio_ctx->control_bytes_passthrough = false;
-    pscalTtySetSessionReader(pty_slave);
+    /* No reader thread and no queue: a read reaches the terminal, and its keys signal the
+     * foreground group themselves (L20). */
     vprocIoTrace("[vproc-io] stdio init session=%llu master=%p slave=%p",
                  (unsigned long long)session_id,
                  (void *)pty_master,
@@ -15852,7 +15876,7 @@ int pscalTtySignalCheck(void) {
                 default:
                     /* One that stays queued until the task looks would only have a retried
                      * read spin: the task acts on it where it looks. */
-                    interrupt = !(entry->unwinds_itself || entry->shell_task);
+                    interrupt = !(entry->unwinds_itself || entry->shell_task) || gVprocPipelineStage;
                     break;
             }
         }
@@ -15959,6 +15983,46 @@ static bool vprocPromptTakesInterruptKey(void) {
     return true;
 }
 
+/* Holds the calling task a fatal signal it can't act on where it is: a command on the
+ * shell's own thread, or one that unwinds itself. */
+static bool vprocCurrentHoldsFatalSignal(void) {
+    VProc *vp = vprocCurrent();
+    const int pid = vp ? vprocPid(vp) : 0;
+    if (pid <= 0) {
+        return false;
+    }
+    bool holds = false;
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    if (entry && (entry->unwinds_itself || entry->shell_task)) {
+        for (int sig = 1; !holds && sig < 32; ++sig) {
+            holds = (entry->pending_signals & vprocSigMask(sig)) &&
+                    !vprocSignalBlockedLocked(entry, sig) && !vprocSignalIgnoredLocked(entry, sig) &&
+                    vprocEffectiveSignalActionLocked(entry, sig) == VPROC_SIG_KILL;
+        }
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    return holds;
+}
+
+/* What a read of the session's terminal gives (L20). A command on the shell's thread can't be
+ * ended where it reads when the interrupt key's signal comes, and many loops read again on
+ * EINTR, so its input ends instead, for good, and the shell turns that into the status of a
+ * command the signal ended (vprocTakeTerminalInterrupted). */
+static ssize_t vprocTerminalReadDone(ssize_t res) {
+    if (res >= 0) {
+        return res;
+    }
+    if (res == _EINTR && gVprocPipelineStage && vprocCurrentHoldsFatalSignal()) {
+        gVprocTerminalInterrupted = true;
+        return 0;
+    }
+    if (res == _EINTR) {
+        vprocDeliverPendingSignalsForCurrent();
+    }
+    return vprocSetCompatErrno((int)res);
+}
+
 ssize_t vprocReadShim(int fd, void *buf, size_t count) {
     vprocDeliverPendingSignalsForCurrent();
     VProc *vp = vprocForThread();
@@ -15966,6 +16030,18 @@ ssize_t vprocReadShim(int fd, void *buf, size_t count) {
     int host = vprocResolveFdForShim(vp, fd, 1, &pscal_fd);
     if (pscal_fd) {
         VProcSessionStdio *session = vprocSessionStdioCurrent();
+        if (vprocSessionFdIsTerminal(session, pscal_fd) && session->pty_slave) {
+            if (gVprocTerminalInterrupted && gVprocPipelineStage) {
+                pscal_fd_close(pscal_fd);
+                return 0;
+            }
+            ssize_t res;
+            pthread_cleanup_push(vprocPscalFdCloseCancelled, pscal_fd);
+            res = pscal_fd->ops->read(pscal_fd, buf, count);
+            pthread_cleanup_pop(0);
+            pscal_fd_close(pscal_fd);
+            return vprocTerminalReadDone(res);
+        }
         if (vprocSessionFdIsTerminal(session, pscal_fd)) {
             /* Whatever reads the terminal, a dup() of stdin as in OpenSSH or a
              * plain `cat`: a reader thread already drains this PTY stream, so
@@ -19116,7 +19192,8 @@ static short vprocSessionInputPollEvents(VProcSessionStdio *session,
                                          struct pscal_fd *pscal_fd,
                                          short requested_events) {
     (void)logical_fd;
-    if (!vprocSessionFdIsTerminal(session, pscal_fd)) {
+    /* A pty's own poll answers for it: there is no queue beside it (L20). */
+    if (!vprocSessionFdIsTerminal(session, pscal_fd) || session->pty_slave) {
         return 0;
     }
 

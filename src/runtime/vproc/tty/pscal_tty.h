@@ -239,6 +239,10 @@ extern const struct pscal_fd_ops pscal_tty_fd_ops;
  * threads serving the app's UI. The caller holds no terminal lock. */
 ssize_t tty_input(struct tty *tty, const char *input, size_t len, bool blocking);
 
+/* A read of a terminal that says for itself whether to wait, whatever the open's O_NONBLOCK:
+ * for callers that poll the session's terminal without changing how it was opened. */
+ssize_t pscalTtyReadMode(struct pscal_fd *fd, void *buf, size_t bufsize, bool nonblocking);
+
 /* Stores the size, and if that is a change sends SIGWINCH to the foreground group, if
  * there is one. May be called with the session registry's lock held and before any
  * session exists. */
