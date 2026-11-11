@@ -15888,39 +15888,23 @@ static bool vprocGroupOrphanedLocked(int pgid) {
     return true;
 }
 
-typedef struct {
-    int sid;
-    int fg;
-} VProcHangUp;
-
 static void *vprocHangUpThread(void *arg) {
-    VProcHangUp hangup = *(VProcHangUp *)arg;
-    free(arg);
-    (void)vprocKillLive(hangup.sid, SIGHUP);
-    (void)vprocKillLive(hangup.sid, SIGCONT);
-    if (hangup.fg > 0) {
-        (void)vprocKillLive(-hangup.fg, SIGHUP);
-    }
+    const int sid = (int)(intptr_t)arg;
+    pscalTtyDropSession((pid_t_)sid);
+    (void)vprocKillLive(sid, SIGHUP);
+    (void)vprocKillLive(sid, SIGCONT);
     return NULL;
 }
 
-void pscalTtyHangUpSession(int sid, int fg) {
+void pscalTtyHangUpSession(int sid) {
     if (sid <= 0) {
         return;
     }
-    VProcHangUp *hangup = (VProcHangUp *)malloc(sizeof(*hangup));
-    if (!hangup) {
-        return;
-    }
-    hangup->sid = sid;
-    hangup->fg = fg;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     pthread_t thread;
-    if (pthread_create(&thread, &attr, vprocHangUpThread, hangup) != 0) {
-        free(hangup);
-    }
+    (void)pthread_create(&thread, &attr, vprocHangUpThread, (void *)(intptr_t)sid);
     pthread_attr_destroy(&attr);
 }
 

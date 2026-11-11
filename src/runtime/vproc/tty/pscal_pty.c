@@ -377,12 +377,11 @@ void pscalPtyMasterGone(struct tty *master) {
     lock(&slave->lock);
     slave->pty.other = NULL;
     const pid_t_ session = slave->session;
-    const pid_t_ foreground = slave->fg_group;
     unlock(&slave->lock);
     ttyMarkHungUp(slave);
     /* The slave hung up: its session hears of it, as from a modem's carrier going. */
     if (session > 0) {
-        pscalTtyHangUpSession((int)session, (int)foreground);
+        pscalTtyHangUpSession((int)session);
     }
     /* Before the release, so that a number cannot be reused with this node still here. */
     ptyHostNodeRemove(master->num);

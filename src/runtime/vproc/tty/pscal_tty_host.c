@@ -70,7 +70,6 @@ __attribute__((weak)) bool pscalTtyCallerGaveUpTerminal(void) {
     return false;
 }
 
-__attribute__((weak)) void pscalTtyHangUpSession(int sid, int fg) {
+__attribute__((weak)) void pscalTtyHangUpSession(int sid) {
     (void)sid;
-    (void)fg;
 }
