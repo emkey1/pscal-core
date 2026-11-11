@@ -13845,7 +13845,10 @@ void vprocSessionStdioActivate(VProcSessionStdio *stdio_ctx) {
     if (gSessionStdioTls && gSessionStdioTls->pty_slave && gSessionStdioTls->pty_slave->tty &&
         (vprocForThread() || vprocSessionShellPidHint(gSessionStdioTls) > 0)) {
         struct tty *tty = gSessionStdioTls->pty_slave->tty;
-        int sid = pscalTtyCurrentSid();
+        /* With no task on this thread, getsid(0) answers for whoever the process last
+         * called the shell, which can be another tab's: ask for this tab's shell's. */
+        const int hint = vprocSessionShellPidHint(gSessionStdioTls);
+        int sid = vprocForThread() ? pscalTtyCurrentSid() : vprocGetSid(hint);
         if (sid > 0) {
             const int recorded = vprocGetForegroundPgid(sid);
             lock(&tty->lock);
