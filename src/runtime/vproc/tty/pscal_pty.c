@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "runtime/vproc/tty/pscal_pty.h"
+#include "runtime/vproc/tty/pscal_tty_host.h"
 
 #include <fcntl.h>
 #include <limits.h>
@@ -375,8 +376,14 @@ void pscalPtyMasterGone(struct tty *master) {
      * what lets that finish. */
     lock(&slave->lock);
     slave->pty.other = NULL;
+    const pid_t_ session = slave->session;
+    const pid_t_ foreground = slave->fg_group;
     unlock(&slave->lock);
     ttyMarkHungUp(slave);
+    /* The slave hung up: its session hears of it, as from a modem's carrier going. */
+    if (session > 0) {
+        pscalTtyHangUpSession((int)session, (int)foreground);
+    }
     /* Before the release, so that a number cannot be reused with this node still here. */
     ptyHostNodeRemove(master->num);
     ttyRelease(slave);

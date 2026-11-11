@@ -1687,6 +1687,32 @@ void pscalTtyDropSession(pid_t_ sid) {
     }
 }
 
+pid_t_ pscalTtySessionLeaderGone(pid_t_ sid) {
+    if (sid <= 0) {
+        return 0;
+    }
+    struct tty *removed = NULL;
+    lock(&gSessionsLock);
+    TtySessionEntry *entry = ttySessionFindLocked(sid);
+    if (entry) {
+        removed = ttySessionRemoveLocked(entry);
+    }
+    unlock(&gSessionsLock);
+    if (!removed) {
+        return 0;
+    }
+    pid_t_ fg = 0;
+    lock(&removed->lock);
+    if (removed->session == sid) {
+        fg = removed->fg_group;
+        removed->session = 0;
+        removed->fg_group = 0;
+    }
+    unlock(&removed->lock);
+    ttyRelease(removed);
+    return fg;
+}
+
 void pscalTtySetSessionForeground(pid_t_ sid, pid_t_ pgid) {
     if (sid <= 0) {
         return;
@@ -1969,14 +1995,21 @@ static int ttySetForeground(struct tty *side, const dword_t *value) {
     return 0;
 }
 
-/* The session's terminal is given up for good by its leader, and for itself by anyone
- * else. What else a leader's TIOCNOTTY does, to the foreground group, is yet to come. */
+/* The session's terminal is given up for good by its leader, whose foreground group then
+ * hears SIGHUP and SIGCONT, and for itself by anyone else. */
 static int ttyGiveUp(struct tty *tty) {
     if (ttyIsMaster(tty) || !pscalTtyIsControlling(tty)) {
         return _ENOTTY;
     }
     if (pscalTtyIsSessionLeader()) {
+        lock(&tty->lock);
+        const pid_t_ foreground = tty->fg_group;
+        unlock(&tty->lock);
         pscalTtyClearControlling(tty);
+        if (foreground > 0) {
+            (void)pscalTtySendGroupSignal(foreground, SIGHUP_);
+            (void)pscalTtySendGroupSignal(foreground, SIGCONT_);
+        }
     } else {
         pscalTtyCallerGiveUpTerminal();
     }

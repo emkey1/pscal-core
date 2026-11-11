@@ -89,6 +89,8 @@ static inline void unlock(lock_t *l) {
 #define SIGTTIN_ SIGTTIN
 #define SIGTTOU_ SIGTTOU
 #define SIGWINCH_ SIGWINCH
+#define SIGHUP_ SIGHUP
+#define SIGCONT_ SIGCONT
 #define NUM_SIGS 64
 
 /* The host's errno for a negative result, and 0 for a result that is not an error. A

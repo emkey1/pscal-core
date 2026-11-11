@@ -2139,6 +2139,7 @@ static int vprocSessionHostFdForStd(int std_fd);
 static bool vprocSessionStdioMatchFd(int session_fd, int std_fd);
 static int vprocHostIsatty(int fd);
 static int vprocSetCompatErrno(int err);
+static bool vprocGroupOrphanedLocked(int pgid);
 static void vprocPtyTrace(const char *format, ...);
 static int vprocForegroundPgidLocked(int sid);
 bool vprocGetShellJobControlState(int *shell_pid_out,
@@ -10364,14 +10365,75 @@ int vprocSpawnThread(VProc *vp, void *(*start_routine)(void *), void *arg, pthre
     return 0;
 }
 
+/* Groups whose link to the rest of their session an ending task was: its own, if its parent
+ * is in another group of the session, and each child's in another group. Asked before the
+ * children are passed on. */
+#define VPROC_EXIT_GROUPS_MAX 16
+static size_t vprocExitLinkedGroupsLocked(const VProcTaskEntry *entry, int *groups, size_t cap) {
+    size_t count = 0;
+    const int kernel_pid = vprocGetKernelPid();
+    const int parent_pid = (kernel_pid > 0 && entry->parent_pid == kernel_pid) ? entry->sid : entry->parent_pid;
+    const VProcTaskEntry *parent = vprocTaskFindLocked(parent_pid);
+    if (parent && parent->pid != entry->pid && !parent->exited && parent->sid == entry->sid &&
+        parent->pgid != entry->pgid && entry->pgid > 0) {
+        groups[count++] = entry->pgid;
+    }
+    for (size_t i = 0; i < entry->child_count && entry->children && count < cap; ++i) {
+        const VProcTaskEntry *child = vprocTaskFindLocked(entry->children[i]);
+        if (!child || child->exited || child->sid != entry->sid || child->pgid == entry->pgid ||
+            child->pgid <= 0) {
+            continue;
+        }
+        bool seen = false;
+        for (size_t j = 0; j < count; ++j) {
+            seen = seen || groups[j] == child->pgid;
+        }
+        if (!seen) {
+            groups[count++] = child->pgid;
+        }
+    }
+    return count;
+}
+
+static bool vprocGroupHasStoppedLocked(int pgid) {
+    for (size_t i = 0; i < gVProcTasks.count; ++i) {
+        const VProcTaskEntry *member = &gVProcTasks.items[i];
+        if (member->pid > 0 && member->pgid == pgid && !member->exited && member->stopped) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* A session leader's end: its terminal is no longer the session's, and the terminal's
+ * foreground group hears SIGHUP. */
+static void vprocLeaderExitHangUp(int sid) {
+#if defined(PSCAL_TARGET_IOS) || defined(VPROC_ENABLE_STUBS_FOR_TESTS)
+    const pid_t_ fg = pscalTtySessionLeaderGone((pid_t_)sid);
+    if (fg > 0) {
+        (void)vprocKillLive(-(pid_t)fg, SIGHUP);
+    }
+#else
+    (void)sid;
+#endif
+}
+
 void vprocMarkExit(VProc *vp, int status) {
     if (!vp || vp->pid <= 0) {
         return;
     }
+    int orphaned_groups[VPROC_EXIT_GROUPS_MAX];
+    size_t orphaned_count = 0;
+    int leader_sid = 0;
     pthread_mutex_lock(&gVProcTasks.mu);
     VProcTaskEntry *entry = vprocTaskFindLocked(vp->pid);
     if (entry) {
         int pgid = entry->pgid;
+        int linked[VPROC_EXIT_GROUPS_MAX];
+        const size_t linked_count = vprocExitLinkedGroupsLocked(entry, linked, VPROC_EXIT_GROUPS_MAX);
+        if (entry->sid == entry->pid && !entry->exited) {
+            leader_sid = entry->sid;
+        }
         if (entry->exit_signal == 0) {
             entry->status = status;
         }
@@ -10387,6 +10449,13 @@ void vprocMarkExit(VProc *vp, int status) {
         entry->real_timer_interval_ns = 0;
         int adopt_parent = vprocAdoptiveParentPidLocked(entry);
         vprocOrphanChildrenLocked(vp->pid, adopt_parent);
+        /* A group this end leaves orphaned, with a member stopped, would wait for ever:
+         * it hears SIGHUP and SIGCONT. */
+        for (size_t i = 0; i < linked_count; ++i) {
+            if (vprocGroupOrphanedLocked(linked[i]) && vprocGroupHasStoppedLocked(linked[i])) {
+                orphaned_groups[orphaned_count++] = linked[i];
+            }
+        }
 
         bool discard_zombie = entry->orphaned || vprocKernelReapsLocked(entry);
         if (entry->sid == entry->pid) {
@@ -10420,6 +10489,13 @@ void vprocMarkExit(VProc *vp, int status) {
         pthread_cond_broadcast(&gVProcTasks.cv);
     }
     pthread_mutex_unlock(&gVProcTasks.mu);
+    if (leader_sid > 0) {
+        vprocLeaderExitHangUp(leader_sid);
+    }
+    for (size_t i = 0; i < orphaned_count; ++i) {
+        (void)vprocKillLive(-(pid_t)orphaned_groups[i], SIGHUP);
+        (void)vprocKillLive(-(pid_t)orphaned_groups[i], SIGCONT);
+    }
 }
 
 void vprocMarkGroupExit(int pid, int status) {
@@ -15793,17 +15869,12 @@ bool pscalTtySignalIgnoredOrBlocked(int sig) {
 
 /* Orphaned: no live member has a parent alive in another group of the same session. A task
  * parented to the kernel counts as the session leader's, as waiting for it does. */
-bool pscalTtyCurrentGroupOrphaned(void) {
-    VProc *vp = vprocForThread();
-    if (!vp) {
+static bool vprocGroupOrphanedLocked(int pgid) {
+    if (pgid <= 0) {
         return false;
     }
     const int kernel_pid = vprocGetKernelPid();
-    bool orphaned = true;
-    pthread_mutex_lock(&gVProcTasks.mu);
-    const VProcTaskEntry *self = vprocTaskFindLocked(vprocPid(vp));
-    const int pgid = self ? self->pgid : 0;
-    for (size_t i = 0; pgid > 0 && i < gVProcTasks.count; ++i) {
+    for (size_t i = 0; i < gVProcTasks.count; ++i) {
         const VProcTaskEntry *member = &gVProcTasks.items[i];
         if (member->pid <= 0 || member->pgid != pgid || member->exited || member->adopted) {
             continue;
@@ -15811,10 +15882,56 @@ bool pscalTtyCurrentGroupOrphaned(void) {
         const int parent_pid = (kernel_pid > 0 && member->parent_pid == kernel_pid) ? member->sid : member->parent_pid;
         const VProcTaskEntry *parent = vprocTaskFindLocked(parent_pid);
         if (parent && !parent->exited && parent->sid == member->sid && parent->pgid != pgid) {
-            orphaned = false;
-            break;
+            return false;
         }
     }
+    return true;
+}
+
+typedef struct {
+    int sid;
+    int fg;
+} VProcHangUp;
+
+static void *vprocHangUpThread(void *arg) {
+    VProcHangUp hangup = *(VProcHangUp *)arg;
+    free(arg);
+    (void)vprocKillLive(hangup.sid, SIGHUP);
+    (void)vprocKillLive(hangup.sid, SIGCONT);
+    if (hangup.fg > 0) {
+        (void)vprocKillLive(-hangup.fg, SIGHUP);
+    }
+    return NULL;
+}
+
+void pscalTtyHangUpSession(int sid, int fg) {
+    if (sid <= 0) {
+        return;
+    }
+    VProcHangUp *hangup = (VProcHangUp *)malloc(sizeof(*hangup));
+    if (!hangup) {
+        return;
+    }
+    hangup->sid = sid;
+    hangup->fg = fg;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_t thread;
+    if (pthread_create(&thread, &attr, vprocHangUpThread, hangup) != 0) {
+        free(hangup);
+    }
+    pthread_attr_destroy(&attr);
+}
+
+bool pscalTtyCurrentGroupOrphaned(void) {
+    VProc *vp = vprocForThread();
+    if (!vp) {
+        return false;
+    }
+    pthread_mutex_lock(&gVProcTasks.mu);
+    const VProcTaskEntry *self = vprocTaskFindLocked(vprocPid(vp));
+    const bool orphaned = vprocGroupOrphanedLocked(self ? self->pgid : 0);
     pthread_mutex_unlock(&gVProcTasks.mu);
     return orphaned;
 }

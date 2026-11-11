@@ -47,6 +47,10 @@ int pscalTtySignalCheck(void);
 /* TIOCNOTTY by a process that doesn't lead its session: only that process lets go. */
 void pscalTtyCallerGiveUpTerminal(void);
 bool pscalTtyCallerGaveUpTerminal(void);
+/* A terminal hung up under its session (its master's last close): the leader `sid` hears
+ * SIGHUP then SIGCONT, and the foreground group `fg` SIGHUP. Called on the close path,
+ * where the caller may hold vproc's locks, so the signals go later, from elsewhere. */
+void pscalTtyHangUpSession(int sid, int fg);
 
 /* pscal_pty.c supplies this: wakes every wait on a terminal, to look for signals. vproc
  * calls it whenever it queues one, and may hold the task table's lock: it takes no

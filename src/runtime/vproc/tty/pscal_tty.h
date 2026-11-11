@@ -257,6 +257,9 @@ int pscalTtySessionPtyNum(pid_t_ sid);
 
 /* Called with the task-table lock held, so nothing under here may ask for it. */
 void pscalTtyDropSession(pid_t_ sid);
+/* A session leader ended: its terminal is no longer the session's. Returns the terminal's
+ * foreground group then, for the caller to send SIGHUP, or 0 if the session had none. */
+pid_t_ pscalTtySessionLeaderGone(pid_t_ sid);
 
 /* vproc saying which group is the foreground of a session whose terminal this layer knows.
  * Asks nothing about the caller, sends no signal, and doesn't call back: vproc holds no lock
