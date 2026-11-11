@@ -295,6 +295,27 @@ static struct timespec ttyTimeAfterTenths(unsigned tenths) {
     return at;
 }
 
+/* How often a wait looks for a signal on its own, in tenths of a second. vproc wakes waits
+ * when it queues one (pscalTtyWakeForSignal), so this is only for a wake that was missed. */
+#define TTY_SIGNAL_LOOK_TENTHS 5
+
+/* A wait that a signal can end (L10): 0 when woken, ETIMEDOUT once `until` has passed, or
+ * _EINTR when a signal has asked the call to give up. The lock is let go to ask, so whatever
+ * was looked at before has to be looked at again. */
+static int ttyWaitSignalledLocked(struct tty *tty, pthread_cond_t *cond, const struct timespec *until) {
+    const struct timespec look = ttyTimeAfterTenths(TTY_SIGNAL_LOOK_TENTHS);
+    const bool until_first = until && (until->tv_sec < look.tv_sec ||
+                                       (until->tv_sec == look.tv_sec && until->tv_nsec <= look.tv_nsec));
+    const int result = ttyWaitLocked(tty, cond, until_first ? until : &look);
+    if (result == ETIMEDOUT && until_first) {
+        return ETIMEDOUT;
+    }
+    unlock(&tty->lock);
+    const int signalled = pscalTtySignalCheck();
+    lock(&tty->lock);
+    return signalled < 0 ? signalled : 0;
+}
+
 /* --- output processing --- */
 
 #define TTY_TAB_STOP 8u
@@ -397,13 +418,15 @@ typedef struct {
     struct tty *tty;
     bool wake_pollers;
     bool announced; /* readers were told about the queue before this writer's wait */
-    unsigned signals; /* bits indexing kKeySignals */
+    /* One per key, in the order typed (L9): indexes into kKeySignals. */
+    unsigned signal_count;
+    byte_t signals[16];
     byte_t packet_status; /* for the master, if it wants to hear */
+    byte_t packet_clear;  /* what those events end */
     size_t echo_len;
     unsigned char echo[512];
 } TtyInputRun;
 
-/* In ascending signal number, on every host this runs on. */
 static const int kKeySignals[] = {SIGINT_, SIGQUIT_, SIGTSTP_};
 
 /* A byte of 0 never matches, which is how a cc entry is switched off. */
@@ -429,32 +452,59 @@ static void ttyPacketEvent(struct tty *master, byte_t set, byte_t clear) {
  * may be anything, so whatever depends on it has to be looked at again. Signals wait
  * for the end of the call if they can, to go once however many keys asked for them. */
 static void ttyRunFlushLocked(TtyInputRun *run, bool with_signals) {
-    const unsigned signals = with_signals ? run->signals : 0;
-    if (run->echo_len == 0 && !run->wake_pollers && signals == 0 && run->packet_status == 0) {
+    struct tty *tty = run->tty;
+    /* Echo is output, and stopped output keeps it until it starts again. What doesn't fit is
+     * lost, as nothing can wait here. */
+    if (tty->stopped && run->echo_len > 0) {
+        const size_t room = sizeof(tty->held) - tty->held_len;
+        const size_t kept = run->echo_len < room ? run->echo_len : room;
+        memcpy(tty->held + tty->held_len, run->echo, kept);
+        tty->held_len += kept;
+        run->echo_len = 0;
+    }
+    unsigned char released[sizeof(tty->held)];
+    size_t released_len = 0;
+    if (!tty->stopped && tty->held_len > 0) {
+        memcpy(released, tty->held, tty->held_len);
+        released_len = tty->held_len;
+        tty->held_len = 0;
+    }
+    const unsigned signal_count = with_signals ? run->signal_count : 0;
+    byte_t signals[sizeof(run->signals)];
+    memcpy(signals, run->signals, signal_count);
+    if (run->echo_len == 0 && released_len == 0 && !run->wake_pollers && signal_count == 0 &&
+        run->packet_status == 0 && run->packet_clear == 0) {
         return;
     }
-    struct tty *tty = run->tty;
     struct tty *peer = NULL;
-    if ((run->echo_len > 0 || run->packet_status != 0) && tty->pty.other) {
+    if ((run->echo_len > 0 || released_len > 0 || run->packet_status != 0 || run->packet_clear != 0) &&
+        tty->pty.other) {
         peer = tty->pty.other;
         ttyPin(peer);
     }
     const size_t echo_len = run->echo_len;
     const bool wake_pollers = run->wake_pollers;
     const byte_t packet_status = run->packet_status;
+    const byte_t packet_clear = run->packet_clear;
     const pid_t_ foreground = tty->fg_group;
     run->echo_len = 0;
     run->wake_pollers = false;
     run->packet_status = 0;
-    run->signals &= ~signals;
+    run->packet_clear = 0;
+    if (with_signals) {
+        run->signal_count = 0;
+    }
     unlock(&tty->lock);
 
     if (peer) {
-        if (packet_status != 0) {
-            ttyPacketEvent(peer, packet_status, 0);
+        if (packet_status != 0 || packet_clear != 0) {
+            ttyPacketEvent(peer, packet_status, packet_clear);
         }
         /* Never waits. If the other side is full the echo is lost, since whoever is
          * typing may be the UI. */
+        if (released_len > 0) {
+            (void)tty_input(peer, (const char *)released, released_len, false);
+        }
         if (echo_len > 0) {
             (void)tty_input(peer, (const char *)run->echo, echo_len, false);
         }
@@ -463,11 +513,10 @@ static void ttyRunFlushLocked(TtyInputRun *run, bool with_signals) {
     if (wake_pollers) {
         pscal_fd_poll_wakeup(NULL, 0);
     }
-    if (signals != 0 && foreground > 0) {
-        for (size_t i = 0; i < sizeof(kKeySignals) / sizeof(kKeySignals[0]); i++) {
-            if (signals & (1u << i)) {
-                (void)pscalTtySendGroupSignal(foreground, kKeySignals[i]);
-            }
+    /* Each to whatever the foreground is now, as the key would have reached it. */
+    if (foreground > 0) {
+        for (unsigned i = 0; i < signal_count; i++) {
+            (void)pscalTtySendGroupSignal(foreground, kKeySignals[signals[i]]);
         }
     }
     lock(&tty->lock);
@@ -490,12 +539,9 @@ static void ttyEchoOutputLocked(TtyInputRun *run, byte_t byte) {
 }
 
 static bool ttyShowsAsControl(const struct termios_ *termios, byte_t byte) {
-    if (!(termios->lflags & ECHOCTL_) || !ttyByteIsControl(byte) || byte == '\t') {
-        return false;
-    }
-    /* With IXON these two aren't handled as Linux has them yet: its keys never get here. */
-    const bool flow_key = ttyByteIs(termios, byte, VSTART_) || ttyByteIs(termios, byte, VSTOP_);
-    return !((termios->iflags & IXON_) && flow_key);
+    /* The flow control keys too: with IXON they never get this far, and without it they're
+     * bytes like any other. */
+    return (termios->lflags & ECHOCTL_) && ttyByteIsControl(byte) && byte != '\t';
 }
 
 /* A byte as it shows when typed. The two columns of ^X count with OPOST clear too. */
@@ -624,16 +670,27 @@ static bool ttyMakeRoomForLineEndLocked(struct tty *tty) {
 
 /* VINTR, VQUIT or VSUSP with ISIG on. The signal goes after the lock is let go,
  * because sending one takes the task table's. */
+static void ttyOutputStartLocked(TtyInputRun *run);
+
 static void ttySignalKeyLocked(TtyInputRun *run, int signal_index) {
     struct tty *tty = run->tty;
+    /* Stopped output starts again, and echo not yet out goes with the input. What is
+     * already on its way to the master stays. */
+    ttyOutputStartLocked(run);
     if (tty->fg_group == 0) {
         return;
     }
     if (!(tty->termios.lflags & NOFLSH_)) {
         ttyQueueClearLocked(tty);
+        run->echo_len = 0;
+        tty->held_len = 0;
         run->packet_status |= TIOCPKT_FLUSHREAD_ | TIOCPKT_FLUSHWRITE_;
     }
-    run->signals |= 1u << signal_index;
+    if (run->signal_count == sizeof(run->signals)) {
+        /* More keys than a run keeps: those before go now, in order. */
+        ttyRunFlushLocked(run, true);
+    }
+    run->signals[run->signal_count++] = (byte_t)signal_index;
 }
 
 static int ttyKeySignalIndex(const struct termios_ *termios, byte_t byte) {
@@ -647,6 +704,53 @@ static int ttyKeySignalIndex(const struct termios_ *termios, byte_t byte) {
         return 2;
     }
     return -1;
+}
+
+/* Output stopping and starting, from a key. The rest happens when the run lets go of the lock:
+ * held echo goes out then, and a writer waiting for output to start wakes now. */
+static void ttyOutputStopLocked(TtyInputRun *run) {
+    struct tty *tty = run->tty;
+    if (tty->stopped) {
+        return;
+    }
+    tty->stopped = true;
+    run->packet_status = (byte_t)((run->packet_status & ~TIOCPKT_START_) | TIOCPKT_STOP_);
+    run->packet_clear = (byte_t)((run->packet_clear & ~TIOCPKT_STOP_) | TIOCPKT_START_);
+}
+
+static void ttyOutputStartLocked(TtyInputRun *run) {
+    struct tty *tty = run->tty;
+    if (!tty->stopped) {
+        return;
+    }
+    tty->stopped = false;
+    pthread_cond_broadcast(&tty->writable);
+    run->wake_pollers = true;
+    run->packet_status = (byte_t)((run->packet_status & ~TIOCPKT_STOP_) | TIOCPKT_START_);
+    run->packet_clear = (byte_t)((run->packet_clear & ~TIOCPKT_START_) | TIOCPKT_STOP_);
+}
+
+/* IXON's keys, in either mode. True for one of them, which is used up and never data. With
+ * the two keys the same, it only starts. With IXANY any other key starts output too, and
+ * goes on to be what it is. */
+static bool ttyFlowKeyLocked(TtyInputRun *run, byte_t byte) {
+    struct tty *tty = run->tty;
+    const struct termios_ *termios = &tty->termios;
+    if (ttyIsMaster(tty) || !(termios->iflags & IXON_)) {
+        return false;
+    }
+    if (ttyByteIs(termios, byte, VSTART_)) {
+        ttyOutputStartLocked(run);
+        return true;
+    }
+    if (ttyByteIs(termios, byte, VSTOP_)) {
+        ttyOutputStopLocked(run);
+        return true;
+    }
+    if ((termios->iflags & IXANY_) && tty->stopped) {
+        ttyOutputStartLocked(run);
+    }
+    return false;
 }
 
 /* What a byte is before anything looks at it, in either mode. */
@@ -786,6 +890,9 @@ static bool ttyInputLineByteLocked(TtyInputRun *run, byte_t byte) {
         }
         return taken;
     }
+    if (ttyFlowKeyLocked(run, byte)) {
+        return true;
+    }
     if (byte == '\r') {
         if (termios->iflags & IGNCR_) {
             return true;
@@ -891,18 +998,41 @@ not_an_editing_key:
     return ttyInputPlainByteLocked(run, byte);
 }
 
-/* A byte for a master, or for a slave out of line mode: no line ends to turn it into and no
- * echo yet, since the prompt and the frontends leave ICRNL and ECHO set and don't expect
- * either. ISTRIP, IUCLC and PARMRK apply, as nobody sets those without meaning them. */
+/* A byte for a master, or for a slave out of line mode. A master's input is its slave's
+ * output and is taken as it comes. A slave out of line mode has no line editing, but its
+ * flow control, signal keys, translation and echo go by their own flags, as in line mode:
+ * a program that wants none of them clears them. */
 static bool ttyInputRawByteLocked(TtyInputRun *run, byte_t byte) {
     struct tty *tty = run->tty;
     TtyQueue *q = &tty->queue;
-    byte = ttyInputMapped(&tty->termios, byte);
-    if (!ttyIsMaster(tty) && (tty->termios.lflags & ISIG_)) {
-        const int signal_index = ttyKeySignalIndex(&tty->termios, byte);
-        if (signal_index >= 0) {
-            ttySignalKeyLocked(run, signal_index);
+    const struct termios_ *termios = &tty->termios;
+    const bool slave = !ttyIsMaster(tty);
+    bool from_return = false;
+    if (slave) {
+        byte = ttyInputMapped(termios, byte);
+        if (ttyFlowKeyLocked(run, byte)) {
             return true;
+        }
+        if (termios->lflags & ISIG_) {
+            const int signal_index = ttyKeySignalIndex(termios, byte);
+            if (signal_index >= 0) {
+                ttySignalKeyLocked(run, signal_index);
+                if (termios->lflags & ECHO_) {
+                    ttyEchoCharLocked(run, byte);
+                }
+                return true;
+            }
+        }
+        if (byte == '\r') {
+            if (termios->iflags & IGNCR_) {
+                return true;
+            }
+            if (termios->iflags & ICRNL_) {
+                byte = '\n';
+                from_return = true;
+            }
+        } else if (byte == '\n' && (termios->iflags & INLCR_)) {
+            byte = '\r';
         }
     }
     if (q->used == TTY_BUF_SIZE) {
@@ -913,8 +1043,17 @@ static bool ttyInputRawByteLocked(TtyInputRun *run, byte_t byte) {
         run->wake_pollers = true;
     }
     ttyQueuePush(q, byte, TTY_CELL_BYTE);
-    if (ttyInputDoubles(&tty->termios, byte) && q->used < TTY_BUF_SIZE) {
+    if (slave && ttyInputDoubles(termios, byte) && q->used < TTY_BUF_SIZE) {
         ttyQueuePush(q, byte, TTY_CELL_BYTE);
+    }
+    if (slave && (termios->lflags & ECHO_)) {
+        /* Out of line mode a newline is no line's end, and shows as ^J like other control
+         * bytes. One that Return became shows as the new line it was typed as. */
+        if (from_return) {
+            ttyEchoOutputLocked(run, '\n');
+        } else {
+            ttyEchoCharLocked(run, byte);
+        }
     }
     return true;
 }
@@ -930,11 +1069,13 @@ ssize_t tty_input(struct tty *tty, const char *input, size_t len, bool blocking)
     run.tty = tty;
     run.wake_pollers = false;
     run.announced = false;
-    run.signals = 0;
+    run.signal_count = 0;
     run.packet_status = 0;
+    run.packet_clear = 0;
     run.echo_len = 0;
 
     size_t consumed = 0;
+    bool interrupted = false;
     lock(&tty->lock);
     while (consumed < len) {
         const byte_t byte = (byte_t)input[consumed];
@@ -955,12 +1096,17 @@ ssize_t tty_input(struct tty *tty, const char *input, size_t len, bool blocking)
         }
         /* Everything goes out before the wait, as a `kill` may end it. A flush drops the
          * lock, so room may have appeared with no one left to say so: look again. */
-        if (run.echo_len > 0 || run.wake_pollers || run.signals != 0 || run.packet_status != 0) {
+        if (run.echo_len > 0 || run.wake_pollers || run.signal_count != 0 || run.packet_status != 0 ||
+            run.packet_clear != 0) {
             ttyRunFlushLocked(&run, true);
             continue;
         }
-        (void)ttyWaitLocked(tty, &tty->writable, NULL);
+        const int waited = ttyWaitSignalledLocked(tty, &tty->writable, NULL);
         run.announced = false;
+        if (waited < 0) {
+            interrupted = true;
+            break;
+        }
     }
     if (!ttyLineModeLocked(tty) && tty->queue.used > 0) {
         pthread_cond_broadcast(&tty->readable);
@@ -972,6 +1118,9 @@ ssize_t tty_input(struct tty *tty, const char *input, size_t len, bool blocking)
 
     if (consumed > 0) {
         return (ssize_t)consumed;
+    }
+    if (interrupted) {
+        return _EINTR;
     }
     return (blocking && hung_up) ? _EIO : _EAGAIN;
 }
@@ -1065,7 +1214,7 @@ static bool ttyFileIsNonBlocking(struct pscal_fd *fd) {
 static ssize_t ttyReadMasterLocked(struct tty *tty, unsigned char *out, size_t size, bool nonblocking) {
     TtyQueue *q = &tty->queue;
     for (;;) {
-        if (ttyIsDownLocked(tty)) {
+        if (tty->hung_up) {
             return 0;
         }
         const bool packet = tty->pty.packet_mode;
@@ -1081,10 +1230,18 @@ static ssize_t ttyReadMasterLocked(struct tty *tty, unsigned char *out, size_t s
             out[0] = 0;
             return 1 + (size > 1 ? ttyCopyRawLocked(tty, out + 1, size - 1) : 0);
         }
+        /* What the slave wrote before its last close has been read. Until it's opened
+         * again there's nothing behind this end. */
+        if (tty->pty.peer_hung_up) {
+            return _EIO;
+        }
         if (nonblocking) {
             return _EAGAIN;
         }
-        (void)ttyWaitLocked(tty, &tty->readable, NULL);
+        const int waited = ttyWaitSignalledLocked(tty, &tty->readable, NULL);
+        if (waited < 0) {
+            return waited;
+        }
     }
 }
 
@@ -1106,7 +1263,10 @@ static ssize_t ttyReadSlaveLocked(struct tty *tty, unsigned char *out, size_t si
             if (nonblocking) {
                 return _EAGAIN;
             }
-            (void)ttyWaitLocked(tty, &tty->readable, NULL);
+            const int waited = ttyWaitSignalledLocked(tty, &tty->readable, NULL);
+            if (waited < 0) {
+                return waited;
+            }
             continue;
         }
         const unsigned minimum = tty->termios.cc[VMIN_];
@@ -1126,7 +1286,11 @@ static ssize_t ttyReadSlaveLocked(struct tty *tty, unsigned char *out, size_t si
                 timing = true;
                 until = ttyTimeAfterTenths(tenths);
             }
-            if (ttyWaitLocked(tty, &tty->readable, &until) == ETIMEDOUT) {
+            const int waited = ttyWaitSignalledLocked(tty, &tty->readable, &until);
+            if (waited < 0) {
+                return waited;
+            }
+            if (waited == ETIMEDOUT) {
                 return ttyCopyRawLocked(tty, out, size);
             }
             continue;
@@ -1147,12 +1311,19 @@ static ssize_t ttyReadSlaveLocked(struct tty *tty, unsigned char *out, size_t si
                 timed_from = q->used;
                 until = ttyTimeAfterTenths(tenths);
             }
-            if (ttyWaitLocked(tty, &tty->readable, &until) == ETIMEDOUT) {
+            const int waited = ttyWaitSignalledLocked(tty, &tty->readable, &until);
+            if (waited < 0) {
+                return waited;
+            }
+            if (waited == ETIMEDOUT) {
                 return ttyCopyRawLocked(tty, out, size);
             }
         } else {
             timing = false;
-            (void)ttyWaitLocked(tty, &tty->readable, NULL);
+            const int waited = ttyWaitSignalledLocked(tty, &tty->readable, NULL);
+            if (waited < 0) {
+                return waited;
+            }
         }
     }
 }
@@ -1162,13 +1333,13 @@ static ssize_t ttyFileRead(struct pscal_fd *fd, void *buf, size_t bufsize) {
     if (!tty) {
         return bufsize == 0 ? 0 : _EBADF;
     }
+    const bool master = ttyIsMaster(tty);
     lock(&tty->lock);
-    const bool down = ttyIsDownLocked(tty);
+    const bool down = master ? tty->hung_up : ttyIsDownLocked(tty);
     unlock(&tty->lock);
     if (down) {
         return 0;
     }
-    const bool master = ttyIsMaster(tty);
     if (!master) {
         /* Asking for nothing is still asking. */
         const int err = ttyJobControlCheck(tty, SIGTTIN_);
@@ -1183,7 +1354,12 @@ static ssize_t ttyFileRead(struct pscal_fd *fd, void *buf, size_t bufsize) {
     lock(&tty->lock);
     const ssize_t result = master ? ttyReadMasterLocked(tty, (unsigned char *)buf, bufsize, nonblocking)
                                   : ttyReadSlaveLocked(tty, (unsigned char *)buf, bufsize, nonblocking);
+    /* A writer polling the other end waits for room, which this may have made. */
+    const bool had_been_full = result > 0 && tty->queue.used + (size_t)result >= TTY_BUF_SIZE;
     unlock(&tty->lock);
+    if (had_been_full) {
+        pscal_fd_poll_wakeup(NULL, 0);
+    }
     return result;
 }
 
@@ -1193,19 +1369,47 @@ static ssize_t ttyFileRead(struct pscal_fd *fd, void *buf, size_t bufsize) {
  * finds this thread waiting for room on the other side. */
 #define TTY_WRITE_CHUNK 1024
 
+/* The count of what was asked for that went, or the error if none did. */
+static ssize_t ttyWriteResult(size_t written, ssize_t err) {
+    return written > 0 ? (ssize_t)written : err;
+}
+
+/* Returns how many of `len` went, which a non-blocking write can leave short: what was asked
+ * for, never what it was expanded to. A byte whose expansion only partly fitted counts as
+ * gone, as its first part has. */
 static ssize_t ttyWriteThrough(struct tty *tty,
                                struct tty *peer,
                                const unsigned char *in,
                                size_t len,
                                bool blocking) {
     char chunk[TTY_WRITE_CHUNK];
+    /* Where each input byte's output ends in the chunk. */
+    unsigned short ends[TTY_WRITE_CHUNK];
     size_t offset = 0;
-    bool delivered = false;
     while (offset < len) {
         size_t out_len = 0;
+        size_t count = 0;
+        const size_t start = offset;
         lock(&tty->lock);
+        /* Stopped output: a writer waits for it to start, or goes no further. */
+        while (tty->stopped && !tty->hung_up) {
+            if (!blocking) {
+                unlock(&tty->lock);
+                return ttyWriteResult(start, _EAGAIN);
+            }
+            const int waited = ttyWaitSignalledLocked(tty, &tty->writable, NULL);
+            if (waited < 0) {
+                unlock(&tty->lock);
+                return ttyWriteResult(start, waited);
+            }
+        }
+        if (tty->hung_up) {
+            unlock(&tty->lock);
+            return ttyWriteResult(start, _EIO);
+        }
         while (offset < len && out_len + TTY_OUTPUT_MAX <= sizeof(chunk)) {
             out_len += ttyOutputByteLocked(tty, in[offset++], (unsigned char *)chunk + out_len);
+            ends[count++] = (unsigned short)out_len;
         }
         unlock(&tty->lock);
         if (out_len == 0) {
@@ -1213,16 +1417,17 @@ static ssize_t ttyWriteThrough(struct tty *tty,
         }
         const ssize_t taken = tty_input(peer, chunk, out_len, blocking);
         if (taken < 0) {
-            return delivered ? (ssize_t)len : taken;
+            return ttyWriteResult(start, taken);
         }
-        delivered = true;
         /* Only a queue that stopped a non-blocking write leaves some behind. */
         if ((size_t)taken < out_len) {
-            break;
+            size_t gone = 0;
+            while (gone < count && (gone == 0 ? 0u : ends[gone - 1]) < (size_t)taken) {
+                gone++;
+            }
+            return ttyWriteResult(start + gone, _EAGAIN);
         }
     }
-    /* What was asked for, not what was expanded to: more than was asked for would look
-     * like a bug to the caller. */
     return (ssize_t)len;
 }
 
@@ -1233,7 +1438,8 @@ static ssize_t ttyFileWrite(struct pscal_fd *fd, const void *buf, size_t bufsize
     }
     const bool blocking = !ttyFileIsNonBlocking(fd);
     lock(&tty->lock);
-    const bool down = ttyIsDownLocked(tty) || !tty->pty.other;
+    /* A master can still write with its slave closed: the keys wait there for its next open. */
+    const bool down = tty->hung_up || !tty->pty.other;
     const bool stoppable = !ttyIsMaster(tty) && (tty->termios.lflags & TOSTOP_);
     unlock(&tty->lock);
     if (down) {
@@ -1247,7 +1453,7 @@ static ssize_t ttyFileWrite(struct pscal_fd *fd, const void *buf, size_t bufsize
     }
     /* A stop can have been a long one. */
     lock(&tty->lock);
-    struct tty *peer = ttyIsDownLocked(tty) ? NULL : tty->pty.other;
+    struct tty *peer = tty->hung_up ? NULL : tty->pty.other;
     if (peer) {
         ttyPin(peer);
     }
@@ -1265,23 +1471,51 @@ static ssize_t ttyFileWrite(struct pscal_fd *fd, const void *buf, size_t bufsize
 
 /* --- poll --- */
 
+/* Is there room in a master's slave for a key? Asked with no lock held. */
+static bool ttyPeerHasRoom(struct tty *master) {
+    lock(&master->lock);
+    struct tty *slave = master->pty.other;
+    if (slave) {
+        ttyPin(slave);
+    }
+    unlock(&master->lock);
+    if (!slave) {
+        return true;
+    }
+    lock(&slave->lock);
+    const bool room = slave->queue.used < TTY_BUF_SIZE;
+    unlock(&slave->lock);
+    ttyUnpin(slave);
+    return room;
+}
+
 static int ttyFilePoll(struct pscal_fd *fd) {
     struct tty *tty = fd->tty;
     if (!tty) {
         return POLL_NVAL;
     }
-    int events = POLL_WRITE;
+    /* A slave says it can be written whenever output isn't stopped, as Linux has it; a write
+     * to one that is full takes what fits. A master says so only with room for a key. */
+    const bool master = ttyIsMaster(tty);
+    const bool room = !master || ttyPeerHasRoom(tty);
+    int events = 0;
     lock(&tty->lock);
+    if (!tty->stopped && room) {
+        events |= POLL_WRITE;
+    }
     if (tty->hung_up) {
-        events |= POLL_READ | POLL_ERR | POLL_HUP;
-    } else if (tty->pty.peer_hung_up) {
-        events |= POLL_READ | POLL_HUP;
-    } else if (ttyIsMaster(tty)) {
+        events |= POLL_WRITE | POLL_READ | POLL_ERR | POLL_HUP;
+    } else if (master) {
         if (tty->pty.packet_mode && tty->pty.packet_status != 0) {
             events |= POLL_READ | POLL_PRI;
         } else if (tty->queue.used > 0) {
             events |= POLL_READ;
         }
+        if (tty->pty.peer_hung_up) {
+            events |= POLL_HUP;
+        }
+    } else if (tty->pty.peer_hung_up) {
+        events |= POLL_READ | POLL_HUP;
     } else if (ttyLineModeLocked(tty)) {
         /* The unfinished part of a line must not count: callers poll before they read,
          * and would spin on a read that has to wait. */
@@ -1558,7 +1792,18 @@ struct pscal_fd *ttyOpenFile(struct tty *tty, int flags) {
     ttyRetain(tty);
     lock(&tty->lock);
     tty->opens++;
+    struct tty *master = tty->driver == &pty_slave ? tty->pty.other : NULL;
+    if (master) {
+        ttyPin(master);
+    }
     unlock(&tty->lock);
+    /* A slave opened again is a terminal behind its master once more. */
+    if (master) {
+        lock(&master->lock);
+        master->pty.peer_hung_up = false;
+        unlock(&master->lock);
+        ttyUnpin(master);
+    }
     /* A master is the terminal's other end, and never anyone's controlling terminal. */
     if (!(flags & O_NOCTTY) && !ttyIsMaster(tty)) {
         ttyClaimOnOpen(tty);
@@ -1744,6 +1989,65 @@ static void ttyTellMaster(struct tty *slave, byte_t set, byte_t clear) {
     }
 }
 
+/* Stops or starts this side's output, from a call holding no lock: TCXONC, or IXON going.
+ * Starting sends what echo was held, wakes writers, and tells a packet-mode master. */
+static void ttySetOutputStopped(struct tty *tty, bool stop) {
+    unsigned char released[sizeof(tty->held)];
+    size_t released_len = 0;
+    lock(&tty->lock);
+    const bool changed = tty->stopped != stop;
+    tty->stopped = stop;
+    if (!stop) {
+        memcpy(released, tty->held, tty->held_len);
+        released_len = tty->held_len;
+        tty->held_len = 0;
+        if (changed) {
+            pthread_cond_broadcast(&tty->writable);
+        }
+    }
+    struct tty *peer = released_len > 0 ? tty->pty.other : NULL;
+    if (peer) {
+        ttyPin(peer);
+    }
+    unlock(&tty->lock);
+    if (peer) {
+        (void)tty_input(peer, (const char *)released, released_len, false);
+        ttyUnpin(peer);
+    }
+    if (changed && !ttyIsMaster(tty)) {
+        ttyTellMaster(tty, stop ? TIOCPKT_STOP_ : TIOCPKT_START_, stop ? TIOCPKT_START_ : TIOCPKT_STOP_);
+    }
+    if (changed && !stop) {
+        pscal_fd_poll_wakeup(NULL, 0);
+    }
+}
+
+/* TCIOFF and TCION: a flow control key goes out as this side's output, stopped or not. */
+static void ttySendFlowKey(struct tty *tty, int index) {
+    lock(&tty->lock);
+    struct tty *side = ttyIsMaster(tty) ? tty->pty.other : tty;
+    struct tty *peer = tty->pty.other;
+    byte_t key = 0;
+    if (side == tty) {
+        key = tty->termios.cc[index];
+    }
+    if (peer) {
+        ttyPin(peer);
+    }
+    unlock(&tty->lock);
+    if (side && side != tty) {
+        lock(&side->lock);
+        key = side->termios.cc[index];
+        unlock(&side->lock);
+    }
+    if (peer) {
+        if (key != 0) {
+            (void)tty_input(peer, (const char *)&key, 1, false);
+        }
+        ttyUnpin(peer);
+    }
+}
+
 static void ttySetTermios(struct tty *side, const struct termios_ *wanted_in, bool flush_input) {
     struct termios_ wanted = *wanted_in;
     /* There's no line for these to mean anything on. */
@@ -1771,9 +2075,14 @@ static void ttySetTermios(struct tty *side, const struct termios_ *wanted_in, bo
         ttyWakeEveryoneLocked(side);
     }
     const bool newly_readable = mode_changed && side->queue.used > 0;
+    /* Without IXON there's nothing to start stopped output again. */
+    const bool restart = side->stopped && !(wanted.iflags & IXON_);
     unlock(&side->lock);
     if (newly_readable) {
         pscal_fd_poll_wakeup(NULL, 0);
+    }
+    if (restart) {
+        ttySetOutputStopped(side, false);
     }
     byte_t status = flush_input ? TIOCPKT_FLUSHREAD_ : 0;
     byte_t clear = 0;
@@ -1819,6 +2128,29 @@ static int ttyFileIoctl(struct pscal_fd *fd, int cmd, void *arg) {
      * terminal from its end. An open of the master keeps the slave there. */
     struct tty *side = ttyIsMaster(tty) ? tty->pty.other : tty;
     const bool master = ttyIsMaster(tty);
+
+    /* Changing the terminal from the background stops the group, as writing does with
+     * TOSTOP, but whatever TOSTOP says. A shell ignores SIGTTOU around its own changes. */
+    if (!master) {
+        switch (request) {
+            case TCSETS_:
+            case TCSETSW_:
+            case TCSETSF_:
+            case TCFLSH_:
+            case TCXONC_:
+            case TIOCSPGRP_:
+            case TCSBRK_:
+            case TCSBRKP_: {
+                const int err = ttyJobControlCheck(tty, SIGTTOU_);
+                if (err < 0) {
+                    return err;
+                }
+                break;
+            }
+            default:
+                break;
+        }
+    }
 
     switch (request) {
         case TCGETS_: {
@@ -1877,12 +2209,16 @@ static int ttyFileIoctl(struct pscal_fd *fd, int cmd, void *arg) {
             if (which != TCIFLUSH_ && which != TCOFLUSH_ && which != TCIOFLUSH_) {
                 return _EINVAL;
             }
-            /* Output is never held on the writer's side, so only input has anything to go. */
+            /* Output is never held on the writer's side, but for echo kept while output is
+             * stopped. */
+            lock(&tty->lock);
             if (which != TCOFLUSH_) {
-                lock(&tty->lock);
                 ttyQueueClearLocked(tty);
-                unlock(&tty->lock);
             }
+            if (which != TCIFLUSH_) {
+                tty->held_len = 0;
+            }
+            unlock(&tty->lock);
             if (!master) {
                 byte_t status = 0;
                 status |= which != TCOFLUSH_ ? TIOCPKT_FLUSHREAD_ : 0;
@@ -1928,6 +2264,23 @@ static int ttyFileIoctl(struct pscal_fd *fd, int cmd, void *arg) {
         case TCSBRKP_:
             /* There's no line to send a break on, and nothing to wait for. */
             return 0;
+        case TCXONC_:
+            switch ((intptr_t)arg) {
+                case TCOOFF_:
+                    ttySetOutputStopped(tty, true);
+                    return 0;
+                case TCOON_:
+                    ttySetOutputStopped(tty, false);
+                    return 0;
+                case TCIOFF_:
+                    ttySendFlowKey(tty, VSTOP_);
+                    return 0;
+                case TCION_:
+                    ttySendFlowKey(tty, VSTART_);
+                    return 0;
+                default:
+                    return _EINVAL;
+            }
         case TIOCSTI_:
             /* Refused on a Linux install left as it comes, unless to a privileged process,
              * and nothing here is one yet. */
@@ -2033,6 +2386,7 @@ static ssize_t ttyFileIoctlSize(int cmd) {
             return 4;
         case TIOCSTI_:
             return 1;
+        case TCXONC_:
         case TCFLSH_:
         case TIOCSCTTY_:
         case TIOCNOTTY_:

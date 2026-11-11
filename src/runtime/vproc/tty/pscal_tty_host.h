@@ -39,9 +39,19 @@ int pscalTtyAfterJobSignal(int sig);
 /* May this group be a foreground group of this session? 0, or _EPERM if it belongs to
  * another, or _ESRCH if there is no such group. */
 int pscalTtyCheckGroup(int sid, int pgid);
+/* A signal may have come for the caller while it waited on a terminal (L10). Delivers it:
+ * a handler runs, a stop stops here until continued. 0 to go on waiting, which is no
+ * signal, an ignored one, a stop now continued or a handler with SA_RESTART; _EINTR for the
+ * call to give up. Called holding no terminal lock. */
+int pscalTtySignalCheck(void);
 /* TIOCNOTTY by a process that doesn't lead its session: only that process lets go. */
 void pscalTtyCallerGiveUpTerminal(void);
 bool pscalTtyCallerGaveUpTerminal(void);
+
+/* pscal_pty.c supplies this: wakes every wait on a terminal, to look for signals. vproc
+ * calls it whenever it queues one, and may hold the task table's lock: it takes no
+ * terminal's lock. */
+void pscalTtyWakeForSignal(void);
 
 /* pscal_tty.c supplies these. */
 bool pscalTtyIsControlling(struct tty *tty);

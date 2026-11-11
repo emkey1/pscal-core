@@ -110,6 +110,7 @@ extern "C" {
 #define TCSETSW_ 0x5403
 #define TCSETSF_ 0x5404
 #define TCSBRK_ 0x5409
+#define TCXONC_ 0x540a
 #define TCFLSH_ 0x540b
 #define TIOCEXCL_ 0x540c
 #define TIOCNXCL_ 0x540d
@@ -135,12 +136,20 @@ extern "C" {
 /* What a read of a master in packet mode can report, with no data. */
 #define TIOCPKT_FLUSHREAD_ 1
 #define TIOCPKT_FLUSHWRITE_ 2
+#define TIOCPKT_STOP_ 4
+#define TIOCPKT_START_ 8
 #define TIOCPKT_NOSTOP_ 16
 #define TIOCPKT_DOSTOP_ 32
 
 #define TCIFLUSH_ 0
 #define TCOFLUSH_ 1
 #define TCIOFLUSH_ 2
+
+/* TCXONC's argument */
+#define TCOOFF_ 0
+#define TCOON_ 1
+#define TCIOFF_ 2
+#define TCION_ 3
 
 struct winsize_ {
     word_t row;
@@ -193,7 +202,8 @@ struct tty {
         struct tty *other;
         bool slave_locked; /* on a slave: opens fail until the master unlocks it */
         bool packet_mode;  /* on a master */
-        bool peer_hung_up; /* on a master: tty_hangup was called on its slave */
+        bool peer_hung_up; /* on a master: its slave has no opens left, or was hung up. Reads
+                            * return what's queued, then _EIO, until the slave is opened again */
         byte_t packet_status; /* on a master: the TIOCPKT_ events not yet read */
     } pty;
 
@@ -211,6 +221,11 @@ struct tty {
     unsigned column;      /* where output has left the cursor */
     unsigned line_column; /* where the line being typed began, for rubbing out a tab */
     unsigned eof_reads;
+    /* Flow control: this side's output is stopped, by the stop key or TCOOFF. Writers wait
+     * (or get _EAGAIN), and echo is held here until output starts again. */
+    bool stopped;
+    size_t held_len;
+    unsigned char held[1024];
     pthread_cond_t readable;
     pthread_cond_t writable;
     TtyQueue queue;

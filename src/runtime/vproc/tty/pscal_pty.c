@@ -134,6 +134,22 @@ static int ptyReserveNumber(mode_t_ *perms, uid_t_ *uid, gid_t_ *gid) {
     return num;
 }
 
+/* Without each terminal's lock, as the task table's may be held: a broadcast needs no mutex,
+ * and a waiter that misses this one finds the signal at its next timed look. A slave in a
+ * live slot is not freed while the slots' lock is held. Masters are read by the app, which
+ * is no process to signal. */
+void pscalTtyWakeForSignal(void) {
+    lock(&gPtySlotsLock);
+    for (int i = 0; i < PTY_LIMIT; i++) {
+        const PtySlot *slot = &gPtySlots[i];
+        if (slot->state == PTY_SLOT_LIVE && slot->slave) {
+            pthread_cond_broadcast(&slot->slave->readable);
+            pthread_cond_broadcast(&slot->slave->writable);
+        }
+    }
+    unlock(&gPtySlotsLock);
+}
+
 static void ptyGiveBackNumber(int num) {
     ptyHostNodeRemove(num);
     lock(&gPtySlotsLock);
@@ -327,6 +343,7 @@ int pscalPtySetSlaveInfo(int pty_num, const mode_t_ *perms, const uid_t_ *uid, c
  * These run on the close path. No hooks and no vproc locks: see the note on
  * pscal_fd_close. */
 
+/* The master reads what was written before this, then _EIO, until the slave opens again. */
 void pscalPtySlaveLastClosed(struct tty *slave) {
     lock(&slave->lock);
     struct tty *master = slave->pty.other;
@@ -335,7 +352,12 @@ void pscalPtySlaveLastClosed(struct tty *slave) {
     }
     unlock(&slave->lock);
     if (master) {
-        ttyMarkHungUp(master);
+        lock(&master->lock);
+        master->pty.peer_hung_up = true;
+        pthread_cond_broadcast(&master->readable);
+        pthread_cond_broadcast(&master->writable);
+        unlock(&master->lock);
+        pscal_fd_poll_wakeup(NULL, 0);
         ttyUnpin(master);
     }
 }

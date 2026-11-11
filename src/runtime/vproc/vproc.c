@@ -4560,6 +4560,10 @@ static void vprocQueuePendingSignalLocked(VProcTaskEntry *entry, int sig) {
                 entry->pending_counts[sig]++;
             }
         }
+#if defined(PSCAL_TARGET_IOS) || defined(VPROC_ENABLE_STUBS_FOR_TESTS)
+        /* A task waiting on a terminal looks at what came (L10). Takes no terminal lock. */
+        pscalTtyWakeForSignal();
+#endif
     }
 }
 
@@ -15798,6 +15802,59 @@ int pscalTtyAfterJobSignal(int sig) {
     return restarts ? 0 : _EINTR;
 }
 
+/* A terminal wait asking whether a signal ends it (L10). A stop stops here, and the call
+ * goes on once continued; a handler runs here, and the call goes on only with SA_RESTART;
+ * anything that ends the task ends the call, though a cancel usually gets there first. A
+ * task that unwinds itself, or a shell's own task, keeps a fatal signal queued until it
+ * looks, as vprocCurrentHasInterruptingSignal has it. */
+int pscalTtySignalCheck(void) {
+    VProc *vp = vprocForThread();
+    if (!vp) {
+        return 0;
+    }
+    const int pid = vprocPid(vp);
+    if (pid <= 0) {
+        return 0;
+    }
+    bool interrupt = false;
+    bool pending = false;
+    pthread_mutex_lock(&gVProcTasks.mu);
+    VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    if (entry) {
+        interrupt = entry->dying_since_ns != 0;
+        for (int sig = 1; !interrupt && sig < 32; ++sig) {
+            if (!(entry->pending_signals & vprocSigMask(sig)) ||
+                vprocSignalBlockedLocked(entry, sig) || vprocSignalIgnoredLocked(entry, sig)) {
+                continue;
+            }
+            pending = true;
+            switch (vprocEffectiveSignalActionLocked(entry, sig)) {
+                case VPROC_SIG_IGNORE:
+                case VPROC_SIG_STOP:
+                case VPROC_SIG_CONT:
+                    break;
+                case VPROC_SIG_HANDLER:
+                    interrupt = !(entry->actions[sig].sa_flags & SA_RESTART);
+                    break;
+                default:
+                    /* One that stays queued until the task looks would only have a retried
+                     * read spin: the task acts on it where it looks. */
+                    interrupt = !(entry->unwinds_itself || entry->shell_task);
+                    break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&gVProcTasks.mu);
+    if (pending && !interrupt) {
+        vprocDeliverPendingSignalsForCurrent();
+        (void)vprocWaitIfStopped(vp);
+    } else if (pending) {
+        /* Handlers run now; a fatal one is left for the caller's unwinding to act on. */
+        vprocDeliverPendingSignalsForCurrent();
+    }
+    return interrupt ? _EINTR : 0;
+}
+
 int pscalTtyCheckGroup(int sid, int pgid) {
     int result = _ESRCH;
     pthread_mutex_lock(&gVProcTasks.mu);
@@ -18739,6 +18796,18 @@ int vprocIoctlShim(int fd, unsigned long request, ...) {
             const int which = arg_val ? *(const int *)arg_val : 0;
             cmd = TCFLSH_;
             arg_val = (uintptr_t)(which == 1 ? TCIFLUSH_ : (which == 2 ? TCOFLUSH_ : TCIOFLUSH_));
+        }
+#endif
+#if defined(TIOCSTOP) && defined(TIOCSTART)
+        /* tcflow on Darwin: TCOOFF and TCOON are these. TCIOFF and TCION write the key. */
+        if (request == TIOCSTOP || request == TIOCSTART) {
+            cmd = TCXONC_;
+            arg_val = (uintptr_t)(request == TIOCSTOP ? TCOOFF_ : TCOON_);
+        }
+#endif
+#ifdef TCXONC
+        if (request == TCXONC) {
+            cmd = TCXONC_;
         }
 #endif
         if (cmd == TIOCGPTPEER_) {

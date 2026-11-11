@@ -59,6 +59,10 @@ __attribute__((weak)) int pscalTtyCheckGroup(int sid, int pgid) {
     return 0;
 }
 
+__attribute__((weak)) int pscalTtySignalCheck(void) {
+    return 0;
+}
+
 __attribute__((weak)) void pscalTtyCallerGiveUpTerminal(void) {
 }
 
