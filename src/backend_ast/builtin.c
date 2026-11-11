@@ -6199,6 +6199,15 @@ static void vmPrepareCanonicalInput(void) {
         }
         /* ISIG stays as it is: the terminal turns Ctrl-C and Ctrl-Z into signals to the
          * foreground group, on iOS too (L20). */
+#if defined(PSCAL_TARGET_IOS)
+        if (vmStdinIsHostTerminal()) {
+            pthread_once(&g_vm_host_sigtstp_once, vmCatchHostSigtstp);
+        }
+        if (vmStdinIsHostTerminal() && !(term.c_lflag & ISIG)) {
+            term.c_lflag |= ISIG;
+            changed = true;
+        }
+#endif
         if ((term.c_iflag & ICRNL) == 0) {
             term.c_iflag |= ICRNL;
             changed = true;
