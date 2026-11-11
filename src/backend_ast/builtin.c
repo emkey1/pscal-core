@@ -5852,6 +5852,12 @@ void pscalRuntimeRequestSigint(void) {
         return;
     }
 #endif
+    pscalRuntimeNoteSigint();
+}
+
+/* Only the flags a VM polls; the signal itself has gone already. A VM acts on them only while
+ * its group is the foreground (vmRuntimeSignalAppliesToCurrentVproc). */
+void pscalRuntimeNoteSigint(void) {
     vmEnsureSigintPipe();
     atomic_store(&g_vm_sigint_seen, 1);
     atomic_store(&g_vm_interrupt_broadcast, true);
@@ -6121,6 +6127,38 @@ static void vmEnableRawMode(void) {
     pthread_mutex_unlock(&vm_term_mutex);
 }
 
+#if defined(PSCAL_TARGET_IOS)
+/* The iOS build on a host terminal (the host-side test configuration): stdin is the host's
+ * terminal, not one of vproc's. In canonical mode that terminal holds a typed Ctrl-C or
+ * Ctrl-Z in its line until Enter, so the session reader never sees it: there the keys can
+ * only arrive as the host's signals. Asked once tcgetattr on stdin has worked, so a
+ * session with neither a pty nor a vproc descriptor for stdin is on a host terminal. */
+static bool vmStdinIsHostTerminal(void) {
+    VProcSessionStdio *session = vprocSessionStdioCurrent();
+    return session && !session->pty_active &&
+           !session->stdin_pscal_fd && session->stdin_host_fd >= 0;
+}
+
+/* The host's Ctrl-Z, there. The shell leads its own session, so its group is orphaned and
+ * the host drops a stop signal it would only have stopped with: caught, it arrives. The VM's
+ * read loops and instruction check take the request and stop the task through vproc. */
+static void vmHostSigtstpHandler(int signo) {
+    (void)signo;
+    atomic_store(&g_vm_suspend_requested, true);
+}
+
+static void vmCatchHostSigtstp(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = vmHostSigtstpHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    (void)vprocHostSigaction(SIGTSTP, &sa, NULL);
+}
+
+static pthread_once_t g_vm_host_sigtstp_once = PTHREAD_ONCE_INIT;
+#endif
+
 // Restore the terminal to a canonical, line-buffered state suitable for
 // Read()/ReadLn().  This undoes any prior ReadKey-induced raw mode,
 // discards leftover input, ensures echoing, and makes the cursor visible.
@@ -6149,7 +6187,13 @@ static void vmPrepareCanonicalInput(void) {
         /* Keep control keys byte-oriented for virtual signal handling.
          * With ISIG enabled, the tty layer can consume VSUSP/VINTR before
          * vmReadLineInterruptible sees ^Z/^C bytes. */
-        if (term.c_lflag & ISIG) {
+        if (vmStdinIsHostTerminal()) {
+            pthread_once(&g_vm_host_sigtstp_once, vmCatchHostSigtstp);
+            if (!(term.c_lflag & ISIG)) {
+                term.c_lflag |= ISIG;
+                changed = true;
+            }
+        } else if (term.c_lflag & ISIG) {
             term.c_lflag &= ~ISIG;
             changed = true;
         }
@@ -6266,18 +6310,20 @@ static void vmSuspendReacquireGlobalsMutex(int count) {
     }
 }
 
-static void vmWaitIfStoppedWithCheckpoint(void) {
+/* Whether the task was stopped, and so has been continued. */
+static bool vmWaitIfStoppedWithCheckpoint(void) {
     int released_globals_locks = vmSuspendReleaseGlobalsMutex();
     if (gVmSuspendBeforeWaitHook) {
         gVmSuspendBeforeWaitHook();
     }
-    (void)vprocWaitIfStopped(vprocCurrent());
+    const bool waited = vprocWaitIfStopped(vprocCurrent());
     if (gVmSuspendAfterWaitHook) {
         gVmSuspendAfterWaitHook();
     }
     if (released_globals_locks > 0) {
         vmSuspendReacquireGlobalsMutex(released_globals_locks);
     }
+    return waited;
 }
 
 static bool vmRequestHardSuspendCurrentVproc(void) {
@@ -6378,7 +6424,9 @@ static VmReadSignal vmTakeReadSignal(VM *vm) {
     /* If a frontend thread was hard-stopped while blocked in select/poll,
      * convert that stop into a cooperative pending signal so ReadLn can
      * unwind back to the shell prompt. */
-    vmWaitIfStoppedWithCheckpoint();
+    if (vmWaitIfStoppedWithCheckpoint()) {
+        return VM_READ_RESUMED;
+    }
 #endif
     if (pscalRuntimeConsumeSigint()) {
         if (vm) {
@@ -6626,6 +6674,12 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, VmLineBuf *line) {
             {
                 VmReadSignal read_signal = vmTakeReadSignal(vm);
                 if (read_signal == VM_READ_RESUMED) {
+                    /* Continued after a stop: the shell had the terminal meanwhile and gave
+                     * it back in its own modes. A program sets its own again on SIGCONT;
+                     * this read was in line mode. */
+                    if (is_stdin_stream) {
+                        vmPrepareCanonicalInput();
+                    }
                     continue;
                 }
                 if (read_signal == VM_READ_UNWIND) {
@@ -7374,7 +7428,6 @@ Value vmBuiltinReadkey(VM* vm, int arg_count, Value* args) {
     fflush(stdout);
     int c = 0;
     for (;;) {
-#if !defined(PSCAL_TARGET_IOS)
         /* Ctrl-C is left for the VM's own interrupt check, which ends the program as it does
          * anywhere else. Taken here as an Exit, it left only the procedure ReadKey was
          * called from, and a game in a loop carried on. */
@@ -7382,18 +7435,6 @@ Value vmBuiltinReadkey(VM* vm, int arg_count, Value* args) {
             c = 0;
             break;
         }
-#else
-        if (pscalRuntimeConsumeSigint()) {
-            if (vm) {
-                vm->abort_requested = false;
-                vm->exit_requested = true;
-                vm->suspend_unwind_requested = false;
-            }
-            shellRuntimeSetLastStatus(130);
-            c = 0;
-            break;
-        }
-#endif
 #if defined(PSCAL_TARGET_IOS)
         if (pscalRuntimeConsumeSigtstp()) {
             char scratch[1] = {'\0'};
@@ -7430,12 +7471,7 @@ Value vmBuiltinReadkey(VM* vm, int arg_count, Value* args) {
         if (gReadKeyPendingCaretControl) {
             gReadKeyPendingCaretControl = false;
             if (c == 'C' || c == 'c') {
-                if (vm) {
-                    vm->abort_requested = false;
-                    vm->exit_requested = true;
-                    vm->suspend_unwind_requested = false;
-                }
-                shellRuntimeSetLastStatus(130);
+                atomic_store(&g_vm_sigint_seen, 1);
                 c = 0;
                 break;
             }
@@ -7455,17 +7491,8 @@ Value vmBuiltinReadkey(VM* vm, int arg_count, Value* args) {
         }
 #endif
         if (c == 0x03) { // Ctrl-C
-#if !defined(PSCAL_TARGET_IOS)
             /* The key as a byte (isig off) is the same interrupt. */
             atomic_store(&g_vm_sigint_seen, 1);
-#else
-            if (vm) {
-                vm->abort_requested = false;
-                vm->exit_requested = true;
-                vm->suspend_unwind_requested = false;
-            }
-            shellRuntimeSetLastStatus(130);
-#endif
             c = 0;
             break;
         }

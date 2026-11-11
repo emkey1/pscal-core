@@ -541,6 +541,7 @@ void vmInitTerminalState(void);
 bool pscalRuntimeConsumeSigint(void);
 bool pscalRuntimeConsumeSigtstp(void);
 void pscalRuntimeRequestSigint(void);
+void pscalRuntimeNoteSigint(void);
 void pscalRuntimeRequestSigtstp(void);
 bool pscalRuntimeSigintPending(void);
 bool pscalRuntimeSigtstpPending(void);

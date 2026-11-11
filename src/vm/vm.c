@@ -4286,10 +4286,12 @@ static void vmMarkAbortRequested(VM* vm) {
     vm->abort_requested = true;
     vm->exit_requested = true;
     vm->suspend_unwind_requested = false;
+    vm->ended_by_interrupt = true;
     if (vm->threadOwner) {
         vm->threadOwner->abort_requested = true;
         vm->threadOwner->exit_requested = true;
         vm->threadOwner->suspend_unwind_requested = false;
+        vm->threadOwner->ended_by_interrupt = true;
     }
 }
 
@@ -4409,6 +4411,7 @@ static bool vmHandleGlobalInterrupt(VM* vm) {
     bool allow_runtime_signal = true;
 #endif
     bool pending = allow_runtime_signal && (pscalRuntimeInterruptFlag() || pscalRuntimeSigintPending());
+    const bool from_signal = pending;
     if (!pending && vm) {
         // A worker VM whose own job failed keeps abort_requested (with
         // runtime_error_raised) until its next job resets it. That failure is
@@ -4430,6 +4433,9 @@ static bool vmHandleGlobalInterrupt(VM* vm) {
         root->abort_requested = true;
         root->exit_requested = true;
         root->suspend_unwind_requested = false;
+        if (from_signal) {
+            root->ended_by_interrupt = true;
+        }
         atomic_store(&root->shuttingDownWorkers, true);
         if (root->jobQueue) {
             pthread_mutex_lock(&root->jobQueue->mutex);
@@ -6206,8 +6212,10 @@ static void aetherCodeTaskError(char *message, size_t size) {
     }
 }
 
+/* Whether Ctrl-C or a kill ended the run, rather than its end or an error. On a host the
+ * unwind halts with INTERPRET_OK and the abort flag cleared, so the mark carries it. */
 bool vmRunWasInterrupted(const VM* vm) {
-    return vm && vm->abort_requested && !vm->runtime_error_raised;
+    return vm && !vm->runtime_error_raised && (vm->abort_requested || vm->ended_by_interrupt);
 }
 
 void runtimeError(VM* vm, const char* format, ...) {
@@ -8335,6 +8343,7 @@ void initVM(VM* vm) { // As in all.txt, with frameCount
     // before any other VM state is built, not partway through.
     pscalObjRunPointerWidthCanary();
 
+    vm->ended_by_interrupt = false;
     vm->stack = NULL;
     vm->stackTop = NULL;
     vm->stackMappedBytes = 0;

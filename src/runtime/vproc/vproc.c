@@ -75,6 +75,9 @@ static void vprocResourceRemove(VProc *vp, int host_fd);
 
 #if defined(PSCAL_TARGET_IOS)
 __attribute__((weak)) void pscalRuntimeRequestSigint(void);
+/* The runtime's (builtin.c) replaces this; a binary without a VM has no flag to raise. */
+__attribute__((weak)) void pscalRuntimeNoteSigint(void) {
+}
 __attribute__((weak)) void pscalRuntimeRequestSigtstp(void);
 __attribute__((weak)) void pscalRuntimeDebugLog(const char *message);
 __attribute__((weak)) PSCALRuntimeContext *PSCALRuntimeGetCurrentRuntimeContext(void);
@@ -6043,6 +6046,13 @@ static bool vprocDispatchControlSignalToForeground(int shell_pid,
                     errno);
         }
         if (rc == 0) {
+#if defined(PSCAL_TARGET_IOS)
+            /* A VM program polls the runtime's flag, not its task's pending signals: the key's
+             * SIGINT was only queued on it, and a ReadKey or a busy loop never ended. */
+            if (sig == SIGINT) {
+                pscalRuntimeNoteSigint();
+            }
+#endif
             return true;
         }
 #if defined(PSCAL_TARGET_IOS)
