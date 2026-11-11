@@ -9863,7 +9863,9 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
             }
 
             if (isIntlikeType(lvalue->var_type) && isIntlikeType(rvalue->var_type)) {
-                int lrank = intTypeRank(lvalue->var_type);
+                /* A WideChar target holds any code point, so a Char or a
+                 * small integer widens into it. */
+                int lrank = lvalue->var_type == TYPE_WIDECHAR ? 32 : intTypeRank(lvalue->var_type);
                 int rrank = intTypeRank(rvalue->var_type);
                 if (rrank > lrank && !constantFitsInIntType(rvalue, lvalue->var_type)) {
                     fprintf(stderr, "L%d: Compiler warning: assigning %s to %s may lose precision.\n",
@@ -11875,7 +11877,9 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
             AST* rvalue = node->right;
 
             if (isIntlikeType(lvalue->var_type) && isIntlikeType(rvalue->var_type)) {
-                int lrank = intTypeRank(lvalue->var_type);
+                /* A WideChar target holds any code point, so a Char or a
+                 * small integer widens into it. */
+                int lrank = lvalue->var_type == TYPE_WIDECHAR ? 32 : intTypeRank(lvalue->var_type);
                 int rrank = intTypeRank(rvalue->var_type);
                 if (rrank > lrank && !constantFitsInIntType(rvalue, lvalue->var_type)) {
                     fprintf(stderr, "L%d: Compiler warning: assigning %s to %s may lose precision.\n",

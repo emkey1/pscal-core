@@ -1101,8 +1101,9 @@ static bool vmStoreUnicodeChar(VM* vm, PointerObj* po, const Value* value) {
     uint32_t codepoint = 0;
     if (VALUE_TYPE(*value) == TYPE_CHAR) {
         codepoint = (unsigned char)AS_CHAR(*value);
-    } else if (VALUE_TYPE(*value) == TYPE_WIDECHAR) {
-        long long wide = AS_CHAR(*value);
+    } else if (VALUE_TYPE(*value) == TYPE_WIDECHAR || isIntegerFamilyType(VALUE_TYPE(*value))) {
+        /* An integer is a character code: CLike's 'x' is an int, as in C. */
+        long long wide = VALUE_TYPE(*value) == TYPE_WIDECHAR ? AS_CHAR(*value) : AS_INTEGER(*value);
         if (wide < 0 || wide > 0x10FFFF) {
             runtimeError(vm, "VM Error: Invalid character code point %lld.", wide);
             return false;
@@ -12865,15 +12866,20 @@ comparison_error_label:
 
                     if (VALUE_TYPE(value_to_set) == TYPE_CHAR) {
                         *char_target_addr = AS_CHAR(value_to_set);
-                    } else if (VALUE_TYPE(value_to_set) == TYPE_WIDECHAR) {
-                        /* Rea's `str` type (and other Unicode-aware string
+                    } else if (VALUE_TYPE(value_to_set) == TYPE_WIDECHAR ||
+                               isIntegerFamilyType(VALUE_TYPE(value_to_set))) {
+                        /* An integer is a character code: CLike's 'x' is an
+                         * int, as in C, so `s[i] = '-'` stores one.
+                         * Rea's `str` type (and other Unicode-aware string
                          * contexts) is TYPE_UNICODE_STRING, so indexing any
                          * such string legitimately yields a WIDECHAR codepoint
                          * even when every character in it happens to be ASCII.
                          * Narrow it into the single raw byte here, the same
                          * way a single-char TYPE_STRING is narrowed above;
                          * only reject codepoints that can't fit in one byte. */
-                        long long codepoint = AS_CHAR(value_to_set);
+                        long long codepoint = VALUE_TYPE(value_to_set) == TYPE_WIDECHAR
+                                                  ? AS_CHAR(value_to_set)
+                                                  : AS_INTEGER(value_to_set);
                         if (codepoint < 0 || codepoint > PASCAL_CHAR_MAX) {
                             runtimeError(vm, "VM Error: Cannot assign multi-byte character (codepoint %lld) to a single-byte character location.", codepoint);
                             freeValue(&value_to_set);
