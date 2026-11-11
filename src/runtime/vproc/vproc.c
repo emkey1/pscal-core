@@ -1086,7 +1086,8 @@ static ssize_t vprocWriteInterposed(int fd, const void *buf, size_t count) {
         vprocThreadIsInterposeBypassed(pthread_self())) {
         return vprocHostWriteRaw(fd, buf, count);
     }
-    return vprocWriteShim(fd, buf, count);
+    /* Host code sets its signal dispositions on the host, not on a task. */
+    return vprocWriteShimNoSignal(fd, buf, count);
 }
 
 static ssize_t vprocReadNoCancelInterposed(int fd, void *buf, size_t count) {
@@ -5114,8 +5115,15 @@ static ssize_t vprocHostWriteKillable(int host, const void *buf, size_t count) {
     return vprocHostWriteKillableFor(host, buf, count, 0);
 }
 
+static void vprocRaiseClosedPipe(int pid);
+
+/* A stream of task PID's own, written on its behalf: its reader leaving is that task's SIGPIPE. */
 ssize_t vprocHostWriteForTask(int pid, int fd, const void *buf, size_t count) {
-    return vprocHostWriteKillableFor(fd, buf, count, pid);
+    ssize_t res = vprocHostWriteKillableFor(fd, buf, count, pid);
+    if (res < 0 && errno == EPIPE) {
+        vprocRaiseClosedPipe(pid);
+    }
+    return res;
 }
 
 typedef struct {
@@ -11475,7 +11483,7 @@ int vprocKillTree(pid_t pid, int sig) {
     return rc;
 }
 
-static int vprocKillTasks(pid_t pid, int sig, bool live_only) {
+static int vprocKillTasks(pid_t pid, int sig, bool live_only, bool die_later) {
     bool dbg = vprocKillDebugEnabled();
     if (sig < 0 || sig >= 32) {
         if (dbg) {
@@ -11602,7 +11610,7 @@ static int vprocKillTasks(pid_t pid, int sig, bool live_only) {
         pscalRuntimeRequestSigtstp();
     }
 
-    if (die_here) {
+    if (die_here && !die_later) {
         vprocDieHere(true);
     }
 
@@ -11623,11 +11631,25 @@ int vprocKillShim(pid_t pid, int sig) {
         errno = EPERM;
         return -1;
     }
-    return vprocKillTasks(pid, sig, false);
+    return vprocKillTasks(pid, sig, false, false);
 }
 
 int vprocKillLive(pid_t pid, int sig) {
-    return vprocKillTasks(pid, sig, true);
+    return vprocKillTasks(pid, sig, true, false);
+}
+
+/* A write to a pipe, FIFO or socket whose reader has gone. On Linux the writer takes SIGPIPE, which by
+ * default ends it, and only a writer that ignores, blocks or catches it sees EPIPE. Here the writer may
+ * hold a lock of its own, stdio's or the VM's, so a fatal one marks the task dying and it ends at its
+ * next check or cancellation point, as when it is killed from elsewhere: a VM before its next
+ * instruction, an applet when it returns, a shell before its next command. */
+static void vprocRaiseClosedPipe(int pid) {
+    if (pid <= 0) {
+        return;
+    }
+    int saved_errno = errno;
+    (void)vprocKillTasks(pid, SIGPIPE, true, true);
+    errno = saved_errno;
 }
 
 /* ... (Remaining functions for getters/setters/shell-self-pid are unchanged logically) ... */
@@ -15972,7 +15994,7 @@ int vprocStdioWriteError(int fd) {
     return 0;
 }
 
-ssize_t vprocWriteShim(int fd, const void *buf, size_t count) {
+static ssize_t vprocWriteShimImpl(int fd, const void *buf, size_t count, bool raise_sigpipe) {
     /* The interrupt key ended this command's input. On Linux its SIGINT ends the command
      * there, so what it would write after, such as wc's counts, never appears. */
     if (gVprocTerminalInterrupted) {
@@ -16001,6 +16023,9 @@ ssize_t vprocWriteShim(int fd, const void *buf, size_t count) {
             }
             if ((int)res == _EPIPE) {
                 gVprocClosedPipe = true;
+                if (raise_sigpipe && vp) {
+                    vprocRaiseClosedPipe(vprocPid(vp));
+                }
             }
             return vprocSetCompatErrno((int)res);
         }
@@ -16111,11 +16136,24 @@ ssize_t vprocWriteShim(int fd, const void *buf, size_t count) {
     ssize_t res = vprocHostWriteKillable(write_fd, buf, count);
     if (res < 0 && errno == EPIPE) {
         gVprocClosedPipe = true;
+        if (raise_sigpipe && vp) {
+            vprocRaiseClosedPipe(vprocPid(vp));
+        }
     }
     if (write_fd != host) {
+        int saved_errno = errno;
         vprocHostClose(write_fd);
+        errno = saved_errno;
     }
     return res;
+}
+
+ssize_t vprocWriteShim(int fd, const void *buf, size_t count) {
+    return vprocWriteShimImpl(fd, buf, count, true);
+}
+
+ssize_t vprocWriteShimNoSignal(int fd, const void *buf, size_t count) {
+    return vprocWriteShimImpl(fd, buf, count, false);
 }
 
 int vprocDupShim(int fd) {

@@ -297,6 +297,10 @@ int vprocSigaction(int pid, int sig, const struct sigaction *act, struct sigacti
 // otherwise fall back to real libc/syscall equivalents.
 ssize_t vprocReadShim(int fd, void *buf, size_t count);
 ssize_t vprocWriteShim(int fd, const void *buf, size_t count);
+/* write() as vprocWriteShim, but a reader that has gone is only EPIPE, never the writing task's
+ * SIGPIPE: for host code reached through the app's interposer, which sets its signal dispositions
+ * on the host and not on a task. */
+ssize_t vprocWriteShimNoSignal(int fd, const void *buf, size_t count);
 int vprocDupShim(int fd);
 int vprocDup2Shim(int fd, int target);
 int vprocCloseShim(int fd);
@@ -900,6 +904,7 @@ static inline int vprocSigaction(int pid, int sig, const struct sigaction *act, 
 }
 static inline ssize_t vprocReadShim(int fd, void *buf, size_t count) { return read(fd, buf, count); }
 static inline ssize_t vprocWriteShim(int fd, const void *buf, size_t count) { return write(fd, buf, count); }
+static inline ssize_t vprocWriteShimNoSignal(int fd, const void *buf, size_t count) { return write(fd, buf, count); }
 static inline int vprocDupShim(int fd) { return dup(fd); }
 static inline int vprocDup2Shim(int fd, int target) { return dup2(fd, target); }
 static inline int vprocCloseShim(int fd) { return close(fd); }

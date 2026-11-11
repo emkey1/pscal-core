@@ -319,8 +319,28 @@ Value vmBuiltinShellExec(VM *vm, int arg_count, Value *args) {
     }
     shellProcessSubstitutionsFinish(vm);
 #if defined(PSCAL_TARGET_IOS)
-    /* SIGPIPE cannot end one thread, and a builtin writing here is the subshell itself. */
-    if (gShellRuntime.in_subshell && vprocConsumeClosedPipe()) {
+    /* SIGPIPE cannot end one thread, and a builtin writing here is the subshell itself. Ignored or
+     * trapped, the write only failed and the subshell goes on. */
+    bool closed_pipe = vprocConsumeClosedPipe();
+    ShellTrapAction pipe_action = shellRuntimeGetSignalTrapAction(SIGPIPE);
+    if (closed_pipe && !runs_as_program && pipe_action != SHELL_TRAP_ACTION_IGNORE &&
+        (!gShellRuntime.in_subshell || pipe_action == SHELL_TRAP_ACTION_COMMAND)) {
+        /* A builtin such as echo or printf is an applet here, and the kernel ended only its own
+         * task. Under bash it is the shell, which takes the signal: by default the shell ends
+         * before its next command, as after `kill -PIPE $$`, and a trap runs. */
+        (void)vprocKillShim(shellRuntimeOwnPid(), SIGPIPE);
+        /* Trapped, bash's builtin lives on and its write fails: it says so, with status 1. Its
+         * applet's task took SIGPIPE's default, as a new task does with a caught signal. */
+        if (pipe_action == SHELL_TRAP_ACTION_COMMAND && gShellRuntime.last_status == 128 + SIGPIPE) {
+            shellReportRecoverableError(vm, true, "%s: write error: %s",
+                                        (cmd.argc > 0 && cmd.argv && cmd.argv[0]) ? cmd.argv[0] : "write",
+                                        strerror(EPIPE));
+            shellUpdateStatus(1);
+            if (gShellPipeStatusCount > 0) {
+                gShellPipeStatus[gShellPipeStatusCount - 1] = 1;
+            }
+        }
+    } else if (closed_pipe && gShellRuntime.in_subshell && pipe_action == SHELL_TRAP_ACTION_DEFAULT) {
         shellUpdateStatus(128 + SIGPIPE);
         if (gShellPipeStatusCount > 0) {
             gShellPipeStatus[gShellPipeStatusCount - 1] = 128 + SIGPIPE;
@@ -4858,11 +4878,10 @@ static int shellFlushBuiltinOutput(VM *vm, const char *name) {
     if (fflush(stdout) == 0 && !ferror(stdout)) {
         return 0;
     }
-    /* A reader that left would have ended a process with no message. The shell ignores
-     * the signal for itself and a stage on a thread cannot take it, so it looks the same
-     * from here. */
+    /* A reader that left: with SIGPIPE's default action the kernel has ended this shell or
+     * stage by now, with no message. Ignored or trapped, it is a write error like any other. */
     int status = 128 + SIGPIPE;
-    if (errno != EPIPE) {
+    if (errno != EPIPE || shellRuntimeGetSignalTrapAction(SIGPIPE) != SHELL_TRAP_ACTION_DEFAULT) {
         shellReportRecoverableError(vm, true, "%s: write error: %s", name, strerror(errno));
         status = 1;
     }
