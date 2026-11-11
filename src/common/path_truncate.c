@@ -2082,6 +2082,89 @@ static bool pathTruncateVprocFdTarget(pid_t pid, int fd, char *out, size_t size)
 #endif
 }
 
+/* Whether a task by that pid is running: only then is there a table to show. */
+static bool pathTruncateTaskHasFdTable(pid_t pid) {
+#if defined(PSCAL_TARGET_IOS) || defined(VPROC_ENABLE_STUBS_FOR_TESTS)
+    VProcFdSnapshot probe;
+    return vprocSnapshotFds((int)pid, &probe, 1) >= 0;
+#else
+    (void)pid;
+    return false;
+#endif
+}
+
+/* /proc/<pid>/fd and fdinfo, from the task's table as it is now. */
+static void pathTruncateWriteProcPidFds(const char *prefix, const char *pid_dir, pid_t pid) {
+    char fd_dir[PATH_MAX];
+    fd_dir[0] = '\0';
+    if (snprintf(fd_dir, sizeof(fd_dir), "%s/fd", pid_dir) > 0) {
+        pathTruncateEnsureDir(fd_dir);
+    }
+    char fdinfo_dir[PATH_MAX];
+    fdinfo_dir[0] = '\0';
+    if (snprintf(fdinfo_dir, sizeof(fdinfo_dir), "%s/fdinfo", pid_dir) > 0) {
+        pathTruncateEnsureDir(fdinfo_dir);
+    }
+
+    long open_max = sysconf(_SC_OPEN_MAX);
+    if (open_max <= 0 || open_max > 1024) {
+        open_max = 256;
+    }
+    bool *fd_keep = (bool *)calloc((size_t)open_max, sizeof(bool));
+    VProcFdSnapshot *fd_table = (VProcFdSnapshot *)calloc((size_t)open_max, sizeof(VProcFdSnapshot));
+    bool host_table = false;
+    size_t fd_count = fd_table ? pathTruncateCollectProcFds(pid, fd_table, (size_t)open_max, &host_table) : 0;
+    for (size_t row = 0; row < fd_count; ++row) {
+        long fd = fd_table[row].fd;
+        if (fd_keep) {
+            fd_keep[fd] = true;
+        }
+
+        char fd_entry[PATH_MAX];
+        if (snprintf(fd_entry, sizeof(fd_entry), "%s/%ld", fd_dir, fd) <= 0) {
+            continue;
+        }
+
+        char host_ref[64];
+        char host_target[PATH_MAX];
+        if (snprintf(host_ref, sizeof(host_ref), "/dev/fd/%ld", fd) <= 0) {
+            continue;
+        }
+        ssize_t n = host_table ? readlink(host_ref, host_target, sizeof(host_target) - 1) : -1;
+        if (n >= 0) {
+            host_target[n] = '\0';
+        } else if (host_table || !pathTruncateVprocFdTarget(pid, (int)fd, host_target, sizeof(host_target))) {
+            snprintf(host_target, sizeof(host_target), "/dev/fd/%ld", fd);
+        }
+        char virtual_target[PATH_MAX];
+        if (host_target[0] == '/') {
+            pathTruncateProcStripContainerPrefix(prefix, host_target, virtual_target, sizeof(virtual_target));
+        } else {
+            snprintf(virtual_target, sizeof(virtual_target), "%s", host_target);
+        }
+        pathTruncateEnsureSymlink(fd_entry, virtual_target[0] ? virtual_target : "/dev/null");
+
+        char fdinfo_path[PATH_MAX];
+        if (snprintf(fdinfo_path, sizeof(fdinfo_path), "%s/%ld", fdinfo_dir, fd) <= 0) {
+            continue;
+        }
+        FILE *f = fopen(fdinfo_path, "w");
+        if (!f) {
+            continue;
+        }
+        fprintf(f, "pos:\t%lld\n", (long long)fd_table[row].pos);
+        fprintf(f, "flags:\t0%o\n", fd_table[row].open_flags);
+        fprintf(f, "mnt_id:\t0\n");
+        fclose(f);
+    }
+    free(fd_table);
+    if (fd_keep) {
+        pathTruncatePruneNumericDirectoryChildren(fd_dir, fd_keep, open_max);
+        pathTruncatePruneNumericDirectoryChildren(fdinfo_dir, fd_keep, open_max);
+        free(fd_keep);
+    }
+}
+
 static void pathTruncateWriteProcPidEntries(const char *procdir,
                                             const char *prefix,
                                             pid_t pid,
@@ -2442,74 +2525,7 @@ static void pathTruncateWriteProcPidEntries(const char *procdir,
         pathTruncateEnsureSymlink(root_path, "/");
     }
 
-    char fd_dir[PATH_MAX];
-    fd_dir[0] = '\0';
-    if (snprintf(fd_dir, sizeof(fd_dir), "%s/fd", pid_dir) > 0) {
-        pathTruncateEnsureDir(fd_dir);
-    }
-    char fdinfo_dir[PATH_MAX];
-    fdinfo_dir[0] = '\0';
-    if (snprintf(fdinfo_dir, sizeof(fdinfo_dir), "%s/fdinfo", pid_dir) > 0) {
-        pathTruncateEnsureDir(fdinfo_dir);
-    }
-
-    long open_max = sysconf(_SC_OPEN_MAX);
-    if (open_max <= 0 || open_max > 1024) {
-        open_max = 256;
-    }
-    bool *fd_keep = (bool *)calloc((size_t)open_max, sizeof(bool));
-    VProcFdSnapshot *fd_table = (VProcFdSnapshot *)calloc((size_t)open_max, sizeof(VProcFdSnapshot));
-    bool host_table = false;
-    size_t fd_count = fd_table ? pathTruncateCollectProcFds(pid, fd_table, (size_t)open_max, &host_table) : 0;
-    for (size_t row = 0; row < fd_count; ++row) {
-        long fd = fd_table[row].fd;
-        if (fd_keep) {
-            fd_keep[fd] = true;
-        }
-
-        char fd_entry[PATH_MAX];
-        if (snprintf(fd_entry, sizeof(fd_entry), "%s/%ld", fd_dir, fd) <= 0) {
-            continue;
-        }
-
-        char host_ref[64];
-        char host_target[PATH_MAX];
-        if (snprintf(host_ref, sizeof(host_ref), "/dev/fd/%ld", fd) <= 0) {
-            continue;
-        }
-        ssize_t n = host_table ? readlink(host_ref, host_target, sizeof(host_target) - 1) : -1;
-        if (n >= 0) {
-            host_target[n] = '\0';
-        } else if (host_table || !pathTruncateVprocFdTarget(pid, (int)fd, host_target, sizeof(host_target))) {
-            snprintf(host_target, sizeof(host_target), "/dev/fd/%ld", fd);
-        }
-        char virtual_target[PATH_MAX];
-        if (host_target[0] == '/') {
-            pathTruncateProcStripContainerPrefix(prefix, host_target, virtual_target, sizeof(virtual_target));
-        } else {
-            snprintf(virtual_target, sizeof(virtual_target), "%s", host_target);
-        }
-        pathTruncateEnsureSymlink(fd_entry, virtual_target[0] ? virtual_target : "/dev/null");
-
-        char fdinfo_path[PATH_MAX];
-        if (snprintf(fdinfo_path, sizeof(fdinfo_path), "%s/%ld", fdinfo_dir, fd) <= 0) {
-            continue;
-        }
-        FILE *f = fopen(fdinfo_path, "w");
-        if (!f) {
-            continue;
-        }
-        fprintf(f, "pos:\t%lld\n", (long long)fd_table[row].pos);
-        fprintf(f, "flags:\t0%o\n", fd_table[row].open_flags);
-        fprintf(f, "mnt_id:\t0\n");
-        fclose(f);
-    }
-    free(fd_table);
-    if (fd_keep) {
-        pathTruncatePruneNumericDirectoryChildren(fd_dir, fd_keep, open_max);
-        pathTruncatePruneNumericDirectoryChildren(fdinfo_dir, fd_keep, open_max);
-        free(fd_keep);
-    }
+    pathTruncateWriteProcPidFds(prefix, pid_dir, pid);
 }
 
 static void pathTruncateRefreshProc(const char *prefix, const char *request_path) {
@@ -2579,6 +2595,18 @@ static void pathTruncateRefreshProc(const char *prefix, const char *request_path
                                             "proc",
                                             mem_total_kb,
                                             uptime_secs);
+        }
+    }
+
+    /* A task's descriptors change from one command to the next, and a name under /proc/<pid>/fd
+     * must say what it is now, as /proc/self's does: not wait for the next full refresh. */
+    if (request_proc_pid_path && !request_proc_self && request_proc_pid > 0 &&
+        !request_net && !request_device && !request_vm) {
+        char pid_dir[PATH_MAX];
+        if (pathTruncateTaskHasFdTable((pid_t)request_proc_pid) &&
+            snprintf(pid_dir, sizeof(pid_dir), "%s/%d", procdir, request_proc_pid) > 0) {
+            pathTruncateEnsureDir(pid_dir);
+            pathTruncateWriteProcPidFds(prefix, pid_dir, (pid_t)request_proc_pid);
         }
     }
 

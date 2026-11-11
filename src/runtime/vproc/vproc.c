@@ -15203,7 +15203,33 @@ static int vprocReopenHostFd(int host, int flags) {
 }
 
 /* A descriptor of another vproc, as /proc/<pid>/fd/N reaches it, copied to a slot of this one. */
+/* The pid whose table is task `pid`'s now. A `.`, `source` or `eval` the shell runs is the shell
+ * itself, as `$$` says, but it runs under a vproc of its own stacked above the shell's, and what it
+ * redirects is there: so `{ echo a > /proc/$$/fd/1; } > f` in a sourced file must find f there, not
+ * the shell's table below. Such a vproc is marked not a process and its parent is what it stands
+ * on, so this follows those up from `pid`, to the one running now. */
+static int vprocTaskTablePid(int pid) {
+    for (int hops = 0; pid > 0 && hops < 32; ++hops) {
+        int above = -1;
+        pthread_mutex_lock(&gVProcTasks.mu);
+        for (size_t i = 0; i < gVProcTasks.count; ++i) {
+            const VProcTaskEntry *entry = &gVProcTasks.items[i];
+            if (entry->pid > 0 && entry->not_a_process && entry->parent_pid == pid &&
+                !entry->exited && !entry->zombie) {
+                above = entry->pid;
+            }
+        }
+        pthread_mutex_unlock(&gVProcTasks.mu);
+        if (above <= 0 || !vprocFindByPid(above)) {
+            break;
+        }
+        pid = above;
+    }
+    return pid;
+}
+
 static int vprocCopyFdOfTask(VProc *vp, int pid, int fd) {
+    pid = vprocTaskTablePid(pid);
     struct pscal_fd *pscal_fd = NULL;
     int host = -1;
     /* fcntl is a cancellation point, and a thread killed there would keep both locks. */
@@ -15323,6 +15349,7 @@ bool vprocFdLinkTarget(int pid, int fd, char *out, size_t size) {
     if (pid <= 0 || fd < 0 || !out || size == 0) {
         return false;
     }
+    pid = vprocTaskTablePid(pid);
     out[0] = '\0';
     bool found = false;
     struct pscal_fd *pscal_fd = NULL;
@@ -15442,6 +15469,7 @@ ssize_t vprocSnapshotFds(int pid, VProcFdSnapshot *out, size_t capacity) {
         errno = EINVAL;
         return -1;
     }
+    pid = vprocTaskTablePid(pid);
     struct pscal_fd **pscal_fds = (struct pscal_fd **)calloc(capacity, sizeof(*pscal_fds));
     if (!pscal_fds) {
         return -1;
@@ -17205,13 +17233,18 @@ int vprocShellChdirShim(const char *path) {
     return rc;
 }
 
+/* What is left of a mode after `mask`, and whether the host's mask would take away more. */
+static bool vprocModeApplyMask(mode_t mask, mode_t *mode) {
+    *mode &= ~mask;
+    return (*mode & vprocHostMaskGet()) != 0;
+}
+
 static bool vprocCreateModeApply(mode_t *mode) {
     VProc *vp = vprocForThread();
     if (!vp) {
         return false;
     }
-    *mode &= ~vp->file_mask;
-    return (*mode & vprocHostMaskGet()) != 0;
+    return vprocModeApplyMask(vp->file_mask, mode);
 }
 
 mode_t vprocUmaskShim(mode_t mask) {
@@ -17398,6 +17431,41 @@ int vprocHostMkdiratMasked(int dirfd, const char *path, mode_t mode) {
         return vprocHostMkdirMasked(path, mode);
     }
     bool restore = vprocCreateModeApply(&mode);
+    int rc = (mkdirat)(dirfd, path, mode);
+    if (rc == 0 && restore) {
+        (void)fchmodat(dirfd, path, mode, 0);
+    }
+    return rc;
+}
+
+/* A thread with no task, such as one of the Go runtime's, makes files for the task that started
+ * the program it runs: `mask` is that task's. Only O_EXCL says the file is new, so a file already
+ * there keeps its mode. A negative mask is the host's own: the plain call. */
+int vprocHostOpenatWithMask(int mask, int dirfd, const char *path, int flags, mode_t mode) {
+    if (!(flags & O_CREAT)) {
+        return (openat)(dirfd, path, flags);
+    }
+    if (mask >= 0 && vprocModeApplyMask((mode_t)mask & 0777, &mode)) {
+        for (int tries = 0; tries < 4; ++tries) {
+            int fd = (openat)(dirfd, path, flags | O_EXCL, mode);
+            if (fd >= 0) {
+                (void)vprocHostFchmodRaw(fd, mode);
+                return fd;
+            }
+            if (errno != EEXIST || (flags & O_EXCL)) {
+                return -1;
+            }
+            fd = (openat)(dirfd, path, flags & ~O_CREAT);
+            if (fd >= 0 || errno != ENOENT) {
+                return fd;
+            }
+        }
+    }
+    return (openat)(dirfd, path, flags, mode);
+}
+
+int vprocHostMkdiratWithMask(int mask, int dirfd, const char *path, mode_t mode) {
+    bool restore = mask >= 0 && vprocModeApplyMask((mode_t)mask & 0777, &mode);
     int rc = (mkdirat)(dirfd, path, mode);
     if (rc == 0 && restore) {
         (void)fchmodat(dirfd, path, mode, 0);

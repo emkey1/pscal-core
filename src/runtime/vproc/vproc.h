@@ -340,6 +340,10 @@ int vprocHostOpenMasked(const char *path, int flags, ...);
 int vprocHostOpenatMasked(int dirfd, const char *path, int flags, ...);
 int vprocHostMkdiratMasked(int dirfd, const char *path, mode_t mode);
 FILE *vprocHostFopenMasked(const char *path, const char *mode);
+/* For a thread no task runs on, such as the Go runtime's: what it makes obeys `mask`, the file mask of
+ * the task that started its program, not the host's. A negative mask is the host's. */
+int vprocHostOpenatWithMask(int mask, int dirfd, const char *path, int flags, mode_t mode);
+int vprocHostMkdiratWithMask(int mask, int dirfd, const char *path, mode_t mode);
 int vprocMkfifoShim(const char *path, mode_t mode);
 int vprocMknodShim(const char *path, mode_t mode, dev_t dev);
 /* A task's user and group ids, kept with its file mask and handed to what it starts, by POSIX's
