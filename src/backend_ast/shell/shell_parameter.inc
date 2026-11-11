@@ -114,6 +114,28 @@ static void shellRefreshSpecialArray(const char *name, size_t len) {
             items[5] = info.machine;
         }
         shellArrayRegistryStore("BASH_VERSINFO", items, NULL, 6, SHELL_ARRAY_KIND_INDEXED);
+    } else if (len == 13 && strncmp(name, "EXSH_VERSINFO", 13) == 0) {
+        /* As BASH_VERSINFO is laid out: major, minor, patch, build, release status, machine. */
+        char parts[3][16] = {"0", "0", "0"};
+        const char *cursor = EXSH_RELEASE_VERSION;
+        for (int part = 0; part < 3 && *cursor; ++part) {
+            size_t n = 0;
+            while (cursor[n] && cursor[n] != '.' && n + 1 < sizeof(parts[part])) {
+                n++;
+            }
+            memcpy(parts[part], cursor, n);
+            parts[part][n] = '\0';
+            cursor += n;
+            if (*cursor == '.') {
+                cursor++;
+            }
+        }
+        struct utsname info;
+        char *items[6] = {parts[0], parts[1], parts[2], "0", "release", "unknown"};
+        if (uname(&info) == 0) {
+            items[5] = info.machine;
+        }
+        shellArrayRegistryStore("EXSH_VERSINFO", items, NULL, 6, SHELL_ARRAY_KIND_INDEXED);
     } else if (len == 11 && strncmp(name, "BASH_SOURCE", 11) == 0) {
         shellRefreshCallArray("BASH_SOURCE", SHELL_CALL_ARRAY_SOURCE);
     } else if (len == 11 && strncmp(name, "BASH_LINENO", 11) == 0) {

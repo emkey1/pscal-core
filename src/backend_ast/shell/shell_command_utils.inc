@@ -3018,6 +3018,10 @@ static char *shellJoinPositionalParameters(bool array_style, size_t *out_count) 
 }
 
 #define SHELL_BASH_COMPAT_VERSION "5.2.0(1)-exsh"
+/* exsh's own release, MAJOR.MINOR.PATCH from components/exsh/VERSION, given by the build. */
+#ifndef EXSH_RELEASE_VERSION
+#define EXSH_RELEASE_VERSION "unknown"
+#endif
 
 /* What bash has set by the time a script starts, for the names nothing else has set. */
 static char *shellDefaultVariableValue(const char *name) {
@@ -3027,6 +3031,9 @@ static char *shellDefaultVariableValue(const char *name) {
     /* Scripts ask before they use what bash has. This much of it is here. */
     if (strcmp(name, "BASH_VERSION") == 0) {
         return strdup(SHELL_BASH_COMPAT_VERSION);
+    }
+    if (strcmp(name, "EXSH_VERSION") == 0) {
+        return strdup(EXSH_RELEASE_VERSION);
     }
     struct utsname info;
     if (strcmp(name, "HOSTNAME") == 0) {
