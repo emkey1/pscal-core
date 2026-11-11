@@ -442,6 +442,11 @@ int vprocChownShim(const char *path, uid_t uid, gid_t gid);
 int vprocFchmodShim(int fd, mode_t mode);
 int vprocFchownShim(int fd, uid_t uid, gid_t gid);
 int vprocUtimesShim(const char *path, const struct timeval times[2]);
+int vprocLchownShim(const char *path, uid_t uid, gid_t gid);
+int vprocUtimensatShim(int dirfd, const char *path, const struct timespec times[2], int flags);
+int vprocLinkatShim(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, int flags);
+int vprocMkstempShim(char *templ);
+char *vprocMkdtempShim(char *templ);
 int vprocFutimesShim(int fd, const struct timeval times[2]);
 int vprocMkdirShim(const char *path, mode_t mode);
 int vprocRmdirShim(const char *path);
@@ -935,6 +940,15 @@ static inline int vprocChownShim(const char *path, uid_t uid, gid_t gid) { retur
 static inline int vprocFchmodShim(int fd, mode_t mode) { return fchmod(fd, mode); }
 static inline int vprocFchownShim(int fd, uid_t uid, gid_t gid) { return fchown(fd, uid, gid); }
 static inline int vprocUtimesShim(const char *path, const struct timeval times[2]) { return utimes(path, times); }
+static inline int vprocLchownShim(const char *path, uid_t uid, gid_t gid) { return lchown(path, uid, gid); }
+static inline int vprocUtimensatShim(int dirfd, const char *path, const struct timespec times[2], int flags) {
+    return utimensat(dirfd, path, times, flags);
+}
+static inline int vprocLinkatShim(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, int flags) {
+    return linkat(olddirfd, oldpath, newdirfd, newpath, flags);
+}
+static inline int vprocMkstempShim(char *templ) { return mkstemp(templ); }
+static inline char *vprocMkdtempShim(char *templ) { return mkdtemp(templ); }
 static inline int vprocFutimesShim(int fd, const struct timeval times[2]) { return futimes(fd, times); }
 static inline int vprocMkdirShim(const char *path, mode_t mode) { return mkdir(path, mode); }
 static inline int vprocRmdirShim(const char *path) { return rmdir(path); }

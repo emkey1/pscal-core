@@ -113,6 +113,11 @@
 #define fchmod(fd, mode) vprocFchmodShim((fd), (mode))
 #define fchown(fd, uid, gid) vprocFchownShim((fd), (uid), (gid))
 #define utimes(path, times) vprocUtimesShim((path), (times))
+#define lchown(path, uid, gid) vprocLchownShim((path), (uid), (gid))
+#define utimensat(dirfd, path, times, flags) vprocUtimensatShim((dirfd), (path), (times), (flags))
+#define linkat(olddirfd, oldpath, newdirfd, newpath, flags) vprocLinkatShim((olddirfd), (oldpath), (newdirfd), (newpath), (flags))
+#define mkstemp(templ) vprocMkstempShim((templ))
+#define mkdtemp(templ) vprocMkdtempShim((templ))
 #define futimes(fd, times) vprocFutimesShim((fd), (times))
 #define ioctl vprocIoctlShim
 #define lseek vprocLseekShim

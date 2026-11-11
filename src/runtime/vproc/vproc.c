@@ -17655,6 +17655,103 @@ int vprocUtimesShim(const char *path, const struct timeval times[2]) {
     return vprocHostUtimesRaw(target ? target : path, times);
 }
 
+/* lchown, utimensat, linkat, mkstemp and mkdtemp take the app's paths, as chown and utimes do.
+ * They had no shim, so an applet given /home/f, or ~/f now that $HOME is /home, reached the host's
+ * /home: `touch ~/f` on a file that exists, `cp -p`, `tar x`, `chown -h`, `ln -L`, `sed -i ~/f`. */
+int vprocLchownShim(const char *path, uid_t uid, gid_t gid) {
+    VProc *vp = vprocForThread();
+    if (!vp) {
+        return lchown(path, uid, gid);
+    }
+    char expanded[PATH_MAX];
+    const char *target = vprocPathExpandForShim(path, expanded, sizeof(expanded));
+    return vprocChownRecord(target ? target : path, uid, gid, false);
+}
+
+int vprocUtimensatShim(int dirfd, const char *path, const struct timespec times[2], int flags) {
+    if (dirfd != AT_FDCWD || !path || !vprocForThread()) {
+        return utimensat(dirfd, path, times, flags);
+    }
+    char expanded[PATH_MAX];
+    const char *target = vprocPathExpandForShim(path, expanded, sizeof(expanded));
+    return utimensat(dirfd, target ? target : path, times, flags);
+}
+
+int vprocLinkatShim(int olddirfd, const char *oldpath, int newdirfd, const char *newpath, int flags) {
+    if (!vprocForThread()) {
+        return linkat(olddirfd, oldpath, newdirfd, newpath, flags);
+    }
+    char old_expanded[PATH_MAX];
+    char new_expanded[PATH_MAX];
+    const char *old_target = oldpath;
+    const char *new_target = newpath;
+    if (olddirfd == AT_FDCWD && oldpath) {
+        const char *t = vprocPathExpandForShim(oldpath, old_expanded, sizeof(old_expanded));
+        if (t) old_target = t;
+    }
+    if (newdirfd == AT_FDCWD && newpath) {
+        const char *t = vprocPathExpandForShim(newpath, new_expanded, sizeof(new_expanded));
+        if (t) new_target = t;
+    }
+    return linkat(olddirfd, old_target, newdirfd, new_target, flags);
+}
+
+/* The template is filled in where it is: only its random part comes back, so the caller keeps the
+ * name it gave, which the other shims take. The descriptor is the host's, as libc's is. */
+static char *vprocMktempHostTemplate(char *templ, char *host, size_t host_size, size_t *out_xs) {
+    size_t len = strlen(templ);
+    size_t xs = 0;
+    while (xs < len && templ[len - 1 - xs] == 'X') {
+        xs++;
+    }
+    *out_xs = xs;
+    char expanded[PATH_MAX];
+    const char *target = vprocPathExpandForShim(templ, expanded, sizeof(expanded));
+    if (!target || target == templ || strcmp(target, templ) == 0) {
+        return NULL;
+    }
+    size_t tlen = strlen(target);
+    if (tlen + 1 > host_size || tlen < xs || strcmp(target + tlen - xs, templ + len - xs) != 0) {
+        return NULL;
+    }
+    memcpy(host, target, tlen + 1);
+    return host;
+}
+
+int vprocMkstempShim(char *templ) {
+    if (!templ || !vprocForThread()) {
+        return mkstemp(templ);
+    }
+    char host[PATH_MAX];
+    size_t xs = 0;
+    if (!vprocMktempHostTemplate(templ, host, sizeof(host), &xs)) {
+        return mkstemp(templ);
+    }
+    int fd = mkstemp(host);
+    if (fd >= 0) {
+        size_t len = strlen(templ);
+        memcpy(templ + len - xs, host + strlen(host) - xs, xs);
+    }
+    return fd;
+}
+
+char *vprocMkdtempShim(char *templ) {
+    if (!templ || !vprocForThread()) {
+        return mkdtemp(templ);
+    }
+    char host[PATH_MAX];
+    size_t xs = 0;
+    if (!vprocMktempHostTemplate(templ, host, sizeof(host), &xs)) {
+        return mkdtemp(templ);
+    }
+    if (!mkdtemp(host)) {
+        return NULL;
+    }
+    size_t len = strlen(templ);
+    memcpy(templ + len - xs, host + strlen(host) - xs, xs);
+    return templ;
+}
+
 int vprocFutimesShim(int fd, const struct timeval times[2]) {
     VProc *vp = vprocForThread();
     if (!vp) {
