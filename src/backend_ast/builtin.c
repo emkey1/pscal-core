@@ -6000,6 +6000,18 @@ bool pscalRuntimeConsumeSigtstp(void) {
     return atomic_exchange(&g_vm_suspend_requested, false);
 }
 
+/* Whether this program's group is the terminal's foreground group, or stdin is no terminal
+ * with one. Changing a terminal from the background stops the job with SIGTTOU. */
+static bool vmTerminalIsOurs(void) {
+#if defined(PSCAL_TARGET_IOS)
+    const pid_t foreground = vprocTcgetpgrpShim(STDIN_FILENO);
+    return foreground <= 0 || foreground == vprocGetpgrpShim();
+#else
+    const pid_t foreground = tcgetpgrp(STDIN_FILENO);
+    return foreground <= 0 || foreground == getpgrp();
+#endif
+}
+
 void vmInitTerminalState(void) {
     vmSetupTermHandlers();
     // The terminal's colours are no longer queried here: the OSC 10/11 query
@@ -6007,7 +6019,11 @@ void vmInitTerminalState(void) {
     // answer, and read away whatever input was already typed ahead -- on
     // every Pascal start, for programs that never touch the screen. Only the
     // screen stack needs them; PushScreen saves them on first use.
-    vmEnableRawMode();
+    // A program started in the background leaves the terminal alone: there the change
+    // would stop it, on Linux too, before it ran a line. ReadKey takes it when it reads.
+    if (vmTerminalIsOurs()) {
+        vmEnableRawMode();
+    }
     if (isatty(STDOUT_FILENO)) {
         setvbuf(stdout, NULL, _IOFBF, 65536);
     }
