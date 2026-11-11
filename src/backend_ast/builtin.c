@@ -2579,11 +2579,13 @@ static atomic_size_t g_extra_builtins_published_count = 0;
 static pthread_mutex_t builtin_registry_mutex;
 static pthread_once_t builtin_registry_once = PTHREAD_ONCE_INIT;
 
-/* Aether's view of what the shell registered (registerShellVmBuiltin). In the
- * iOS app the shell's builtins and smallclue's tools go into this one table
- * for every front end of the process, so Aether found `cat`, `[` and
- * `__shell_exec` as builtins, its pure `sum` took the effect of smallclue's
- * `sum` tool, and its `exit`, `exec` and `printf` ran the shell's. Per id:
+/* A language's view of what the shell registered (registerShellVmBuiltin).
+ * In the iOS app the shell's builtins and smallclue's tools go into this one
+ * table for every front end of the process, so Pascal, CLike, Rea and Aether
+ * found `cat`, `basename`, `[` and `__shell_exec` as builtins, a program's
+ * own `sum` collided with smallclue's `sum` tool, and `exit`, `exec` and
+ * `printf` ran the shell's. On a Mac or Linux the shell is a separate
+ * program and none of this is in their table. Per id:
  * SHELL_VIEW_ONLY for a name only the shell registered, SHELL_VIEW_REPLACED
  * for a builtin it replaced, whose own handler and effect g_shell_replaced
  * keeps. Ids past SHELL_VIEW_MAX_IDS are seen as registered. Nothing is set
@@ -2601,9 +2603,28 @@ static struct {
 } g_shell_replaced[SHELL_REPLACED_MAX];
 static _Atomic size_t g_shell_replaced_count = 0;
 
+/* The languages see only their own builtins; the shell (and code with no
+ * front end, an applet's thread) sees the table as registered. */
+bool vmFrontendHidesShellBuiltins(void) {
+    switch (frontendGetKind()) {
+        case FRONTEND_KIND_PASCAL:
+        case FRONTEND_KIND_REA:
+        case FRONTEND_KIND_AETHER:
+        case FRONTEND_KIND_CLIKE:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool extBuiltinCategoryHiddenFromFrontend(const char *category) {
+    return category && strcasecmp(category, "shell") == 0 &&
+           vmFrontendHidesShellBuiltins();
+}
+
 static unsigned char shellViewOfId(int id) {
     if (!atomic_load_explicit(&g_shell_view_used, memory_order_acquire) ||
-        id < 0 || id >= SHELL_VIEW_MAX_IDS || frontendGetKind() != FRONTEND_KIND_AETHER) {
+        id < 0 || id >= SHELL_VIEW_MAX_IDS || !vmFrontendHidesShellBuiltins()) {
         return SHELL_VIEW_NONE;
     }
     return atomic_load_explicit(&g_shell_view[id], memory_order_acquire);
@@ -13270,7 +13291,7 @@ int isBuiltin(const char *name) {
     if (!result) {
         result = getVmBuiltinID(name) != -1;
     } else if (shellViewOfId(builtinIdAsRegistered(name)) == SHELL_VIEW_ONLY) {
-        /* A shell command (cat, sum, [) is no builtin of Aether's. */
+        /* A shell command (cat, sum, [) is no builtin of a language's. */
         result = 0;
     }
 

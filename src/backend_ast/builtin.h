@@ -69,16 +69,26 @@ void registerVmBuiltin(const char *vm_name, VmBuiltinFn handler,
                        BuiltinRoutineType type, const char *display_name,
                        EffectMask effect_mask);
 /* registerVmBuiltin for the shell's builtins and its tools (exsh, smallclue).
- * In the iOS app they share the one table with every front end, and Aether
- * must see only its language there: under Aether a name only the shell
- * registered does not exist (getVmBuiltinID, getVmBuiltinHandlerById and the
+ * In the iOS app they share the one table with every front end, and each
+ * language (Pascal, CLike, Rea, Aether) must see only its own builtins there,
+ * as on a Mac or Linux: under a language a name only the shell registered
+ * does not exist (getVmBuiltinID, isBuiltin, getVmBuiltinHandlerById and the
  * listings), and a builtin the shell replaced (exit, exec, printf, the thread
- * builtins) keeps its own handler and effect. Other front ends, and
+ * builtins) keeps its own handler and effect. The shell, and
  * getVmBuiltinHandler by name, which only the shell and its tools use, see
  * the table as registered. */
 void registerShellVmBuiltin(const char *vm_name, VmBuiltinFn handler,
                             BuiltinRoutineType type, const char *display_name,
                             EffectMask effect_mask);
+/* True while a language front end runs on this thread (see above): the
+ * shell's builtins and its "shell" extended-builtin category are not its. */
+bool vmFrontendHidesShellBuiltins(void);
+/* The app's shell files its commands under the "shell" extended-builtin
+ * category, in the one registry every front end shares; to a language that
+ * category does not exist, as on a Mac or Linux, where only exsh registers
+ * it. True for "shell" while a language runs (the ExtBuiltin* queries,
+ * --dump-ext-builtins, the preprocessor's extended-builtin test). */
+bool extBuiltinCategoryHiddenFromFrontend(const char *category);
 
 /* Authoritative predicate: is this builtin effectful (touches the outside world,
  * is nondeterministic, or observes concurrent state)? Single source of truth for

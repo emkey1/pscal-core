@@ -734,6 +734,36 @@ static bool parseBoolLike(Value value, bool *out_value) {
   return false;
 }
 
+static bool extCategoryHidden(const char *category) {
+  return extBuiltinCategoryHiddenFromFrontend(category);
+}
+
+static size_t visibleExtCategoryCount(void) {
+  size_t count = extBuiltinGetCategoryCount();
+  size_t visible = 0;
+  for (size_t i = 0; i < count; ++i) {
+    if (!extCategoryHidden(extBuiltinGetCategoryName(i))) {
+      ++visible;
+    }
+  }
+  return visible;
+}
+
+static const char *visibleExtCategoryName(size_t index) {
+  size_t count = extBuiltinGetCategoryCount();
+  for (size_t i = 0; i < count; ++i) {
+    const char *name = extBuiltinGetCategoryName(i);
+    if (extCategoryHidden(name)) {
+      continue;
+    }
+    if (index == 0) {
+      return name;
+    }
+    --index;
+  }
+  return NULL;
+}
+
 static bool findExtBuiltinCategoryForFunction(const char *func,
                                               const char **out_category,
                                               const char **out_group) {
@@ -746,9 +776,9 @@ static bool findExtBuiltinCategoryForFunction(const char *func,
     if (!category || !extBuiltinHasFunction(category, func)) {
       continue;
     }
-    /* The app's shell lists exit, exec and printf among its commands; to
-     * Aether they are its own builtins (registerShellVmBuiltin). */
-    if (frontendIsAether() && strcasecmp(category, "shell") == 0) {
+    /* The app's shell lists exit, exec and printf among its commands; to a
+     * language they are its own builtins (registerShellVmBuiltin). */
+    if (extCategoryHidden(category)) {
       continue;
     }
     if (out_category) {
@@ -1049,6 +1079,9 @@ static Value vmBuiltinHasExtBuiltin(struct VM_s *vm, int arg_count,
   }
   const char *category = AS_STRING(args[0]);
   const char *func = AS_STRING(args[1]);
+  if (extCategoryHidden(category)) {
+    return makeBoolean(0);
+  }
   if (extBuiltinHasFunction(category, func)) {
     return hasBuiltinAnswer(func);
   }
@@ -1155,7 +1188,7 @@ static Value vmBuiltinExtBuiltinCategoryCount(struct VM_s *vm, int arg_count,
     runtimeError(vm, "ExtBuiltinCategoryCount expects no arguments.");
     return makeInt(0);
   }
-  size_t count = extBuiltinGetCategoryCount();
+  size_t count = visibleExtCategoryCount();
   return makeInt((long long)count);
 }
 
@@ -1170,7 +1203,7 @@ static Value vmBuiltinExtBuiltinCategoryName(struct VM_s *vm, int arg_count,
   if (idx < 0) {
     return makeString("");
   }
-  const char *name = extBuiltinGetCategoryName((size_t)idx);
+  const char *name = visibleExtCategoryName((size_t)idx);
   if (!name) {
     return makeString("");
   }
@@ -1182,6 +1215,9 @@ static Value vmBuiltinExtBuiltinGroupCount(struct VM_s *vm, int arg_count,
   if (arg_count != 1 || !isPascalStringType(VALUE_TYPE(args[0]))) {
     runtimeError(vm,
                  "ExtBuiltinGroupCount expects a single string argument.");
+    return makeInt(0);
+  }
+  if (extCategoryHidden(AS_STRING(args[0]))) {
     return makeInt(0);
   }
   size_t count = extBuiltinGetGroupCount(AS_STRING(args[0]));
@@ -1203,6 +1239,9 @@ static Value vmBuiltinExtBuiltinGroupName(struct VM_s *vm, int arg_count,
     return makeString("");
   }
   const char *category = AS_STRING(args[0]);
+  if (extCategoryHidden(category)) {
+    return makeString("");
+  }
   size_t default_groups = extBuiltinHasGroup(category, NULL) ? 1 : 0;
   if ((size_t)idx < default_groups) {
     return makeString(kDefaultGroupName);
@@ -1222,6 +1261,9 @@ static Value vmBuiltinExtBuiltinFunctionCount(struct VM_s *vm, int arg_count,
                  "ExtBuiltinFunctionCount expects a single string argument.");
     return makeInt(0);
   }
+  if (extCategoryHidden(AS_STRING(args[0]))) {
+    return makeInt(0);
+  }
   size_t count = countFunctionsAcrossGroups(AS_STRING(args[0]));
   return makeInt((long long)count);
 }
@@ -1238,6 +1280,9 @@ static Value vmBuiltinExtBuiltinFunctionName(struct VM_s *vm, int arg_count,
   if (idx < 0) {
     return makeString("");
   }
+  if (extCategoryHidden(AS_STRING(args[0]))) {
+    return makeString("");
+  }
   const char *name =
       getFunctionNameAcrossGroups(AS_STRING(args[0]), (size_t)idx, NULL);
   if (!name) {
@@ -1251,6 +1296,9 @@ static Value vmBuiltinExtBuiltinGroupFunctionCount(struct VM_s *vm,
                                                    Value *args) {
   if (arg_count != 2 || !isPascalStringType(VALUE_TYPE(args[0])) || !isPascalStringType(VALUE_TYPE(args[1]))) {
     runtimeError(vm, "ExtBuiltinGroupFunctionCount expects two string arguments.");
+    return makeInt(0);
+  }
+  if (extCategoryHidden(AS_STRING(args[0]))) {
     return makeInt(0);
   }
   size_t count = extBuiltinGetFunctionCount(AS_STRING(args[0]), AS_STRING(args[1]));
@@ -1274,6 +1322,9 @@ static Value vmBuiltinExtBuiltinGroupFunctionName(struct VM_s *vm,
   }
   const char *group = AS_STRING(args[1]);
   const char *category = AS_STRING(args[0]);
+  if (extCategoryHidden(category)) {
+    return makeString("");
+  }
   const char *name = NULL;
   if (strcasecmp(group, kDefaultGroupName) == 0) {
     name = extBuiltinGetFunctionName(category, NULL, (size_t)idx);

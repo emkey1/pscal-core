@@ -103,7 +103,8 @@ static bool evaluateExtendedCondition(const char *arg, bool *handled) {
 
     registerExtendedBuiltins();
 
-    bool present = extBuiltinHasCategory(category);
+    bool present = extBuiltinHasCategory(category) &&
+                   !extBuiltinCategoryHiddenFromFrontend(category);
     if (present && function) {
         present = extBuiltinHasFunction(category, function);
     }

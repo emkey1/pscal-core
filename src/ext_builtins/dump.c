@@ -1,6 +1,7 @@
 #include "ext_builtins/dump.h"
 
 #include "ext_builtins/registry.h"
+#include "backend_ast/builtin.h"
 
 void extBuiltinDumpInventory(FILE *out) {
     if (!out) {
@@ -10,7 +11,7 @@ void extBuiltinDumpInventory(FILE *out) {
     size_t category_count = extBuiltinGetCategoryCount();
     for (size_t i = 0; i < category_count; ++i) {
         const char *category = extBuiltinGetCategoryName(i);
-        if (!category) {
+        if (!category || extBuiltinCategoryHiddenFromFrontend(category)) {
             continue;
         }
         fprintf(out, "category %s\n", category);
