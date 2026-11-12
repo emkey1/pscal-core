@@ -214,13 +214,11 @@ struct tty {
                * a reason for the terminal to stay open. See ttyPin. */
     unsigned opens;
     bool hung_up;
-    bool session_reader;
     bool exclusive;    /* TIOCEXCL */
     bool literal_next; /* the VLNEXT key has been typed and the next byte is plain */
     bool erase_open;   /* ECHOPRT has shown a backslash and owes a slash */
     unsigned column;      /* where output has left the cursor */
     unsigned line_column; /* where the line being typed began, for rubbing out a tab */
-    unsigned eof_reads;
     /* Flow control: this side's output is stopped, by the stop key or TCOOFF. Writers wait
      * (or get _EAGAIN), and echo is held here until output starts again. */
     bool stopped;
@@ -266,17 +264,9 @@ pid_t_ pscalTtySessionLeaderGone(pid_t_ sid);
  * of its own for this, and has already written its side down. */
 void pscalTtySetSessionForeground(pid_t_ sid, pid_t_ pgid);
 
-/* Marks the terminal as read by a session's reader thread, for good. Such a reader
- * only sees finished lines, so line mode has to hand it the control keys at once. */
-void pscalTtySetSessionReader(struct pscal_fd *fd);
-
-/* Was the read of 0 just returned the end-of-file key? Other reads return 0 too, and a
- * session's reader must not take those for the end of the user's input. */
-bool pscalTtyTakeEofKey(struct pscal_fd *fd);
-
-/* The check a slave read starts with, for reads served from vproc's session queue
- * instead. 0 to go ahead, which a stopped caller gets once it has been continued; _EINTR
- * for a caller a handler interrupted; _EIO for one that can't be stopped. */
+/* The check a slave read starts with, on its own: 0 to go ahead, which a stopped caller gets
+ * once it has been continued; _EINTR for a caller a handler interrupted; _EIO for one that
+ * can't be stopped. */
 int pscalTtyCheckBackgroundRead(struct pscal_fd *fd);
 
 /* Between pscal_tty.c and pscal_pty.c; nothing else should call these. */

@@ -960,30 +960,6 @@ not_an_editing_key:
         return true;
     }
 
-    const bool interrupt_key = ttyByteIs(termios, byte, VINTR_);
-    const bool suspend_key = ttyByteIs(termios, byte, VSUSP_);
-    if ((interrupt_key || suspend_key) && tty->session_reader && !(lflags & ISIG_)) {
-        /* A session's reader only sees finished lines. Left in the line being typed, the
-         * key would do nothing until Return, and Ctrl-C at `cat` would look dead. It
-         * takes what was typed with it, so that lines typed ahead don't run afterwards. */
-        if (!(lflags & NOFLSH_)) {
-            ttyQueueClearLocked(tty);
-        }
-        if (!ttyMakeRoomForLineEndLocked(tty)) {
-            return false;
-        }
-        ttyQueuePush(q, byte, TTY_CELL_LINE_END);
-        ttyLineEndedLocked(run);
-        if (echo && ttyShowsAsControl(termios, byte)) {
-            ttyEchoCharLocked(run, byte);
-            if (interrupt_key) {
-                /* A real system's shell moves to a new line when its child dies from the
-                 * signal. This command is still alive, so nothing else would. */
-                ttyEchoOutputLocked(run, '\n');
-            }
-        }
-        return true;
-    }
     if (lflags & ISIG_) {
         const int signal_index = ttyKeySignalIndex(termios, byte);
         if (signal_index >= 0) {
@@ -1143,9 +1119,6 @@ static ssize_t ttyCopyLineLocked(struct tty *tty, unsigned char *out, size_t siz
     /* A mark with nothing before it is the end of the file, for this one read. One right
      * behind text is what released that text, and its work is done now. One behind a
      * finished line released nothing, and still means the end of the file. */
-    if (copied == 0) {
-        tty->eof_reads++;
-    }
     if (ttyQueueHeadIsMark(q) && !line_ended) {
         (void)ttyQueuePop(q);
     }
@@ -2456,31 +2429,7 @@ const struct pscal_fd_ops pscal_tty_fd_ops = {
     .close = ttyFileClose,
 };
 
-/* --- for the session's reader and queue in vproc.c --- */
-
-void pscalTtySetSessionReader(struct pscal_fd *fd) {
-    if (!fd || !fd->tty) {
-        return;
-    }
-    lock(&fd->tty->lock);
-    fd->tty->session_reader = true;
-    unlock(&fd->tty->lock);
-}
-
-bool pscalTtyTakeEofKey(struct pscal_fd *fd) {
-    if (!fd || !fd->tty) {
-        return false;
-    }
-    struct tty *tty = fd->tty;
-    lock(&tty->lock);
-    const bool was_key = tty->eof_reads > 0;
-    if (was_key) {
-        tty->eof_reads--;
-    }
-    unlock(&tty->lock);
-    return was_key;
-}
-
+/* The job-control check a slave read starts with, on its own. */
 int pscalTtyCheckBackgroundRead(struct pscal_fd *fd) {
     if (!fd || !fd->tty) {
         return 0;

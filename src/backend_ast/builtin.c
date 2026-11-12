@@ -224,7 +224,7 @@ static int vmVprocShimRead(void *cookie, char *buf, int len) {
             vprocSessionStdioActivate(session);
         }
     }
-    bool terminal = session && (session->input || session->stdin_pscal_fd);
+    bool terminal = session && session->stdin_pscal_fd;
     if (ctx->redirected_stdin || terminal) {
         /* Without waiting: see vmInputGetc. Not cancellable either, because Ctrl-C can
          * cancel this thread, and the FILE's lock would then stay held for good. */
@@ -6632,8 +6632,7 @@ static bool vmReadLineInterruptible(VM *vm, FILE *stream, VmLineBuf *line) {
         if (session_stdio) {
             bool has_host_stdin = (session_stdio->stdin_host_fd >= 0);
             bool has_pscal_stdin = (session_stdio->stdin_pscal_fd != NULL);
-            bool has_session_input = (session_stdio->input != NULL);
-            bool session_backed_input = has_host_stdin || has_pscal_stdin || has_session_input;
+            bool session_backed_input = has_host_stdin || has_pscal_stdin;
             /* Shared stdin streams in the iOS runtime should consume input
              * from the per-session buffer when they are attached to a real
              * runtime session, even if isatty(0) is false on the current

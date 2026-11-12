@@ -2229,7 +2229,6 @@ static VProcSessionStdio gSessionStdioDefault = {
     .stdout_host_fd = -1,
     .stderr_host_fd = -1,
     .kernel_pid = 0,
-    .input = NULL,
     .stdin_pscal_fd = NULL,
     .stdout_pscal_fd = NULL,
     .stderr_pscal_fd = NULL,
@@ -3515,7 +3514,6 @@ static void vprocScratchTlsCleanupCurrentThread(void);
 static __thread bool gVprocPipelineStage = false;
 static void vprocPscalFdCloseCancelled(void *fd);
 static ssize_t vprocTerminalReadDone(ssize_t res);
-static __thread bool gVprocInterruptKeyRead = false;
 static __thread bool gVprocTerminalInterrupted = false;
 typedef void (*VprocStopWaitHookFn)(void);
 static __thread VprocStopWaitHookFn gVprocStopWaitBeforeHook = NULL;
@@ -4962,6 +4960,12 @@ static bool vprocDeliverPendingSignalsLocked(VProcTaskEntry *entry) {
  * pipe op (vprocInvokeHandlerLocked drops the table lock before running
  * handlers), so the order pipe->mu -> gVProcTasks.mu never inverts.
  */
+/* Ended by a signal: dying while its thread unwinds, or, for a command on the shell's thread with
+ * no thread of its own, marked ended at once while its code still runs there. */
+static bool vprocEntryKilledLocked(const VProcTaskEntry *entry) {
+    return entry && (entry->dying_since_ns != 0 || (entry->exited && entry->exit_signal != 0));
+}
+
 static bool vprocCurrentHasInterruptingSignal(void) {
     VProc *vp = vprocCurrent();
     if (!vp) {
@@ -4974,7 +4978,7 @@ static bool vprocCurrentHasInterruptingSignal(void) {
     bool interrupt = false;
     pthread_mutex_lock(&gVProcTasks.mu);
     VProcTaskEntry *entry = vprocTaskFindLocked(pid);
-    if (entry && entry->dying_since_ns != 0) {
+    if (entry && vprocEntryKilledLocked(entry)) {
         interrupt = true;
     } else if (entry && entry->pending_signals) {
         for (int sig = 1; sig < 32; ++sig) {
@@ -5284,15 +5288,7 @@ ssize_t vprocHostWriteForTask(int pid, int fd, const void *buf, size_t count) {
 }
 #endif
 
-typedef struct {
-    VProcSessionStdio *session;
-    int shell_pid;
-    int kernel_pid;
-    uint64_t generation;
-} VProcSessionInputCtx;
 
-static VProcSessionInput *vprocSessionInputEnsure(VProcSessionStdio *session, int shell_pid, int kernel_pid);
-static ssize_t vprocSessionReadInput(VProcSessionStdio *session, void *buf, size_t count, bool nonblocking);
 static bool vprocRequestControlSignalForSessionInternal(uint64_t session_id,
                                                         int sig,
                                                         bool allow_runtime_fallback);
@@ -6106,490 +6102,11 @@ static bool vprocDispatchControlSignalToForeground(int shell_pid,
     return false;
 }
 
-static bool vprocEnsureSessionInputWritableLocked(VProcSessionInput *input, size_t append_len) {
-    if (!input || append_len == 0) {
-        return false;
-    }
-    if (input->off > input->cap || input->len > (input->cap - input->off)) {
-        return false;
-    }
-    size_t tail = input->off + input->len;
-    if (append_len <= (input->cap - tail)) {
-        return true;
-    }
-    if (input->off > 0 && append_len <= (input->cap - input->len)) {
-        if (input->len > 0) {
-            memmove(input->buf, input->buf + input->off, input->len);
-        }
-        input->off = 0;
-        return true;
-    }
-    size_t needed = input->len + append_len;
-    size_t new_cap = 0;
-    if (!vprocComputeGrowthCapacity(input->cap, needed, 256, sizeof(unsigned char), &new_cap)) {
-        return false;
-    }
-    unsigned char *resized = (unsigned char *)realloc(input->buf, new_cap);
-    if (!resized) {
-        return false;
-    }
-    if (input->len > 0 && input->off > 0) {
-        memmove(resized, resized + input->off, input->len);
-    }
-    input->buf = resized;
-    input->off = 0;
-    input->cap = new_cap;
-    return true;
-}
 
-static bool vprocSessionInputLockWithTimeout(VProcSessionInput *input,
-                                             int timeout_ms,
-                                             const char *context) {
-    if (!input) {
-        errno = EINVAL;
-        return false;
-    }
-    if (timeout_ms < 0) {
-        timeout_ms = 0;
-    }
-    const int sleep_us = 1000;
-    int waited_us = 0;
-    int budget_us = timeout_ms * 1000;
-    for (;;) {
-        int rc = pthread_mutex_trylock(&input->mu);
-        if (rc == 0) {
-            return true;
-        }
-        if (rc != EBUSY) {
-            errno = rc;
-            fprintf(stderr,
-                    "[session-input] lock-error ctx=%s rc=%d input=%p\n",
-                    context ? context : "?",
-                    rc,
-                    (void *)input);
-            return false;
-        }
-        if (waited_us >= budget_us) {
-            errno = EBUSY;
-            fprintf(stderr,
-                    "[session-input] lock-timeout ctx=%s waited_ms=%d input=%p\n",
-                    context ? context : "?",
-                    timeout_ms,
-                    (void *)input);
-            return false;
-        }
-        usleep(sleep_us);
-        waited_us += sleep_us;
-    }
-}
 
-static VProcSessionInput *vprocSessionInputRecoverStuck(VProcSessionStdio *session,
-                                                        VProcSessionInput *stuck,
-                                                        const char *context) {
-    if (!session || !stuck) {
-        return NULL;
-    }
 
-    pthread_mutex_lock(&gSessionInputInitMu);
-    if (session->input != stuck) {
-        VProcSessionInput *current = session->input;
-        pthread_mutex_unlock(&gSessionInputInitMu);
-        return current;
-    }
 
-    VProcSessionInput *replacement = (VProcSessionInput *)calloc(1, sizeof(VProcSessionInput));
-    if (!replacement) {
-        pthread_mutex_unlock(&gSessionInputInitMu);
-        return NULL;
-    }
-    pthread_mutex_init(&replacement->mu, NULL);
-    pthread_cond_init(&replacement->cv, NULL);
-    replacement->inited = true;
-    replacement->reader_fd = -1;
-    replacement->interrupt_pending = true;
-    session->input = replacement;
-    pthread_mutex_unlock(&gSessionInputInitMu);
 
-    fprintf(stderr,
-            "[session-input] recovered-stuck-lock ctx=%s session=%llu old=%p new=%p\n",
-            context ? context : "?",
-            (unsigned long long)session->session_id,
-            (void *)stuck,
-            (void *)replacement);
-    return replacement;
-}
-
-static bool vprocTtyInLineMode(struct pscal_fd *pscal_fd) {
-    if (!pscal_fd || !pscal_fd->tty) {
-        return false;
-    }
-    lock(&pscal_fd->tty->lock);
-    bool line_mode = (pscal_fd->tty->termios.lflags & ICANON_) != 0;
-    unlock(&pscal_fd->tty->lock);
-    return line_mode;
-}
-
-static void vprocSessionInputMarkEof(VProcSessionInput *input) {
-    pthread_mutex_lock(&input->mu);
-    if (input->eof_mark_count < VPROC_SESSION_EOF_MARKS) {
-        input->eof_mark[input->eof_mark_count++] = input->len;
-        pthread_cond_broadcast(&input->cv);
-    }
-    pthread_mutex_unlock(&input->mu);
-    pscal_fd_poll_wakeup(NULL, POLLIN);
-}
-
-static void *vprocSessionInputThread(void *arg) {
-    VProcSessionInputCtx *ctx = (VProcSessionInputCtx *)arg;
-    if (!ctx || !ctx->session) {
-        free(ctx);
-        return NULL;
-    }
-    VProcSessionStdio *session = ctx->session;
-    if (session) {
-        vprocSessionStdioActivate(session);
-    }
-    if (ctx->shell_pid > 0) {
-        vprocSetShellSelfPid(ctx->shell_pid);
-    }
-    if (ctx->kernel_pid > 0) {
-        vprocSetKernelPid(ctx->kernel_pid);
-    }
-
-    VProcSessionInput *input = session ? session->input : NULL;
-    int fd = session ? session->stdin_host_fd : -1;
-    struct pscal_fd *pscal_fd = session ? session->stdin_pscal_fd : NULL;
-    const bool tool_dbg = vprocToolDebugEnabled();
-    unsigned int retry_sleep_us = 1000;
-    if (pscal_fd) {
-        pscal_fd = pscal_fd_retain(pscal_fd);
-    }
-    if (pscal_fd && (!pscal_fd->ops || !pscal_fd->ops->read)) {
-        pscal_fd_close(pscal_fd);
-        pscal_fd = NULL;
-    }
-    unsigned char ch = 0;
-    if (tool_dbg) {
-        vprocDebugLogf(
-                "[session-input] reader start host_fd=%d pscal_fd=%p shell=%d kernel=%d\n",
-                fd,
-                (void *)pscal_fd,
-                ctx->shell_pid,
-                ctx->kernel_pid);
-    }
-    while (fd >= 0 || pscal_fd) {
-        if (input) {
-            pthread_mutex_lock(&input->mu);
-            bool stop_requested = input->stop_requested;
-            pthread_mutex_unlock(&input->mu);
-            if (stop_requested) {
-                if (tool_dbg) {
-                    vprocDebugLogf( "[session-input] reader stop fd=%d\n", fd);
-                }
-                break;
-            }
-        }
-        ssize_t r = 0;
-        if (fd >= 0) {
-            /* Look again now and then for a stop: on Darwin a close of the terminal waits for
-             * a read of it to end, and the shell closes its copy as it ends. */
-            struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
-            int ready = vprocHostPollRaw(&pfd, 1, 100);
-            if (ready == 0 || (ready < 0 && errno == EINTR)) {
-                continue;
-            }
-            r = vprocHostRead(fd, &ch, 1);
-            if (r <= 0) {
-                if (r < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                        usleep(retry_sleep_us);
-                        if (retry_sleep_us < 16000) {
-                            retry_sleep_us <<= 1;
-                        }
-                    }
-                    continue;
-                }
-                if (tool_dbg) {
-                    int saved_errno = errno;
-                    vprocDebugLogf(
-                            "[session-input] reader eof host_fd=%d r=%zd errno=%d\n",
-                            fd,
-                            r,
-                            saved_errno);
-                }
-                if (input) {
-                    pthread_mutex_lock(&input->mu);
-                    bool is_current = (input->reader_generation == ctx->generation);
-                    if (is_current) {
-                        input->eof = true;
-                        pthread_cond_broadcast(&input->cv);
-                    }
-                    pthread_mutex_unlock(&input->mu);
-                    pscal_fd_poll_wakeup(NULL, POLLIN);
-                }
-                break;
-            }
-        } else {
-            r = pscal_fd->ops->read(pscal_fd, &ch, 1);
-            if (r <= 0) {
-                if (r == 0 && input && pscalTtyTakeEofKey(pscal_fd)) {
-                    vprocSessionInputMarkEof(input);
-                    continue;
-                }
-                if (r == 0 && session && session->pty_active &&
-                    (pscal_fd == session->stdin_pscal_fd ||
-                     pscal_fd == session->pty_slave)) {
-                    /* PTY slave reads may return 0 transiently when no byte is
-                     * ready (e.g. VMIN=0). Treat that as "would block" instead
-                     * of EOF so nested ssh/scp password reads do not exit early. */
-                    usleep(retry_sleep_us);
-                    if (retry_sleep_us < 16000) {
-                        retry_sleep_us <<= 1;
-                    }
-                    continue;
-                }
-                if (r == _EIO && session && session->pty_active &&
-                    (pscal_fd == session->stdin_pscal_fd ||
-                     pscal_fd == session->pty_slave)) {
-                    /* Some PTY-backed readers surface transient EIO between
-                     * keystrokes; keep waiting so prompt loops don't terminate
-                     * after the first typed character. */
-                    usleep(retry_sleep_us);
-                    if (retry_sleep_us < 16000) {
-                        retry_sleep_us <<= 1;
-                    }
-                    continue;
-                }
-                if (r == _EINTR || r == _EAGAIN) {
-                    if (r == _EAGAIN) {
-                        usleep(retry_sleep_us);
-                        if (retry_sleep_us < 16000) {
-                            retry_sleep_us <<= 1;
-                        }
-                    }
-                    continue;
-                }
-                if (r < 0) {
-                    vprocSetCompatErrno((int)r);
-                }
-                if (tool_dbg) {
-                    int saved_errno = errno;
-                    vprocDebugLogf(
-                            "[session-input] reader eof pscal_fd=%p r=%zd errno=%d\n",
-                            (void *)pscal_fd,
-                            r,
-                            saved_errno);
-                }
-                if (input) {
-                    pthread_mutex_lock(&input->mu);
-                    bool is_current = (input->reader_generation == ctx->generation);
-                    if (is_current) {
-                        input->eof = true;
-                        pthread_cond_broadcast(&input->cv);
-                    }
-                    pthread_mutex_unlock(&input->mu);
-                    pscal_fd_poll_wakeup(NULL, POLLIN);
-                }
-                break;
-            }
-        }
-        retry_sleep_us = 1000;
-        if ((ch == 3 || ch == 26) &&
-            !vprocSessionPrefersControlBytePassthrough(session) &&
-            !vprocSoftSignalingDisabledByEnv()) {
-            int shell_pid = -1;
-            int shell_pgid = -1;
-            int sid = -1;
-            int fg_pgid = -1;
-            (void)vprocGetSessionJobControlState(session,
-                                                 &shell_pid,
-                                                 &shell_pgid,
-                                                 &sid,
-                                                 &fg_pgid);
-            bool shell_foreground = (shell_pgid > 0 && fg_pgid > 0 && fg_pgid == shell_pgid);
-            bool shell_prompt_read_active = vprocShellPromptReadActive(shell_pid);
-            if (tool_dbg) {
-                fprintf(stderr,
-                        "[session-input-ctrl] ch=%d shell_pid=%d shell_pgid=%d sid=%d fg=%d prompt=%d\n",
-                        (int)ch,
-                        shell_pid,
-                        shell_pgid,
-                        sid,
-                        fg_pgid,
-                        (int)shell_prompt_read_active);
-            }
-            if (shell_foreground && shell_prompt_read_active && input) {
-                /* When the shell owns the foreground, treat Ctrl-C/Z as shell
-                 * input control bytes (prompt/editor behavior) instead of
-                 * forcing vproc signal dispatch. */
-                if (!vprocSessionInputLockWithTimeout(input, 200, "reader.ctrl.shellfg")) {
-                    VProcSessionInput *replacement =
-                            vprocSessionInputRecoverStuck(session, input, "reader.ctrl.shellfg");
-                    if (replacement) {
-                        input = replacement;
-                    }
-                    continue;
-                }
-                if (vprocEnsureSessionInputWritableLocked(input, 1)) {
-                    input->buf[input->off + input->len] = ch;
-                    input->len++;
-                }
-                pthread_cond_broadcast(&input->cv);
-                pthread_mutex_unlock(&input->mu);
-                pscal_fd_poll_wakeup(NULL, POLLIN);
-                continue;
-            }
-            int sig = (ch == 3) ? SIGINT : SIGTSTP;
-            bool remote_passthrough = (fg_pgid > 0 &&
-                                       !shell_foreground &&
-                                       vprocForegroundGroupPrefersControlBytes(sid, fg_pgid, shell_pid, sig));
-            if (remote_passthrough && input) {
-                if (!vprocSessionInputLockWithTimeout(input, 200, "reader.ctrl.remote")) {
-                    VProcSessionInput *replacement =
-                            vprocSessionInputRecoverStuck(session, input, "reader.ctrl.remote");
-                    if (replacement) {
-                        input = replacement;
-                    }
-                    continue;
-                }
-                if (vprocEnsureSessionInputWritableLocked(input, 1)) {
-                    input->buf[input->off + input->len] = ch;
-                    input->len++;
-                }
-                pthread_cond_broadcast(&input->cv);
-                pthread_mutex_unlock(&input->mu);
-                pscal_fd_poll_wakeup(NULL, POLLIN);
-                continue;
-            }
-            int shell_hint = ctx->shell_pid;
-            if (shell_hint <= 0 && session && session->shell_pid > 0) {
-                shell_hint = session->shell_pid;
-                ctx->shell_pid = shell_hint;
-            }
-            bool dispatched = false;
-            if (session && session->session_id != 0) {
-                dispatched = vprocRequestControlSignalForSessionInternal(session->session_id, sig, true);
-            }
-            if (tool_dbg) {
-                fprintf(stderr,
-                        "[session-input-ctrl] dispatch sig=%d session=%llu shell=%d dispatched=%d\n",
-                        sig,
-                        (unsigned long long)(session ? session->session_id : 0),
-                        shell_hint,
-                        (int)dispatched);
-            }
-            if (!dispatched) {
-                dispatched = vprocDispatchControlSignalToForeground(shell_hint, sig, true);
-            }
-            bool buffered_control_byte = false;
-            if (!dispatched && input) {
-                /* Keep control bytes observable even if virtual dispatch cannot
-                 * resolve a foreground target. This preserves SSH passthrough
-                 * and avoids dropping ^C/^Z for frontends while session/job
-                 * metadata is still converging. */
-                if (!vprocSessionInputLockWithTimeout(input, 200, "reader.ctrl.buffer")) {
-                    VProcSessionInput *replacement =
-                            vprocSessionInputRecoverStuck(session, input, "reader.ctrl.buffer");
-                    if (replacement) {
-                        input = replacement;
-                    }
-                    continue;
-                }
-                if (vprocEnsureSessionInputWritableLocked(input, 1)) {
-                    input->buf[input->off + input->len] = ch;
-                    input->len++;
-                    buffered_control_byte = true;
-                }
-                pthread_cond_broadcast(&input->cv);
-                pthread_mutex_unlock(&input->mu);
-                pscal_fd_poll_wakeup(NULL, POLLIN);
-            }
-            if (input && !buffered_control_byte) {
-                const bool line_mode = vprocTtyInLineMode(pscal_fd);
-                if (!vprocSessionInputLockWithTimeout(input, 200, "reader.ctrl.interrupt")) {
-                    VProcSessionInput *replacement =
-                            vprocSessionInputRecoverStuck(session, input, "reader.ctrl.interrupt");
-                    if (replacement) {
-                        input = replacement;
-                    }
-                    continue;
-                }
-                /* As a terminal flushes its input on these keys in line mode:
-                 * lines typed ahead must not run after what was interrupted. */
-                if (line_mode) {
-                    input->off = 0;
-                    input->len = 0;
-                    input->eof_mark_count = 0;
-                }
-                input->interrupt_pending = true;
-                input->interrupt_key = (sig == SIGINT);
-                pthread_cond_broadcast(&input->cv);
-                pthread_mutex_unlock(&input->mu);
-                pscal_fd_poll_wakeup(NULL, POLLIN);
-            }
-            continue;
-        }
-        if (!input) {
-            continue;
-        }
-        if (!vprocSessionInputLockWithTimeout(input, 200, "reader.byte")) {
-            VProcSessionInput *replacement =
-                    vprocSessionInputRecoverStuck(session, input, "reader.byte");
-            if (replacement) {
-                input = replacement;
-            }
-            continue;
-        }
-        if (vprocEnsureSessionInputWritableLocked(input, 1)) {
-            input->buf[input->off + input->len] = ch;
-            input->len++;
-            pthread_cond_signal(&input->cv);
-        }
-        pthread_mutex_unlock(&input->mu);
-        pscal_fd_poll_wakeup(NULL, POLLIN);
-    }
-    if (input) {
-        if (!vprocSessionInputLockWithTimeout(input, 200, "reader.cleanup")) {
-            VProcSessionInput *replacement =
-                    vprocSessionInputRecoverStuck(session, input, "reader.cleanup");
-            if (replacement) {
-                input = replacement;
-            } else {
-                pscal_fd_poll_wakeup(NULL, POLLIN);
-                goto vproc_session_input_thread_done;
-            }
-            if (!vprocSessionInputLockWithTimeout(input, 200, "reader.cleanup.relock")) {
-                pscal_fd_poll_wakeup(NULL, POLLIN);
-                goto vproc_session_input_thread_done;
-            }
-        }
-        bool is_current = (input->reader_generation == ctx->generation);
-        if (is_current) {
-            input->reader_active = false;
-            input->reader_fd = -1;
-            input->stop_requested = false;
-            /* If a blocked reader raced this teardown while waiting for input
-             * (and we are not at EOF), force a retry path instead of letting
-             * it sleep forever with no active producer. */
-            if (!input->eof && input->len == 0) {
-                input->interrupt_pending = true;
-            }
-            pthread_cond_broadcast(&input->cv);
-        }
-        pthread_mutex_unlock(&input->mu);
-        pscal_fd_poll_wakeup(NULL, POLLIN);
-    }
-vproc_session_input_thread_done:
-    if (pscal_fd) {
-        pscal_fd_close(pscal_fd);
-        pscal_fd = NULL;
-    }
-    if (session) {
-        vprocSessionStdioActivate(NULL);
-    }
-    free(ctx);
-    return NULL;
-}
 
 static void *vprocSessionPtyOutputThread(void *arg) {
     VProcSessionStdio *session = (VProcSessionStdio *)arg;
@@ -6659,278 +6176,8 @@ static void *vprocSessionPtyOutputThread(void *arg) {
     return NULL;
 }
 
-static VProcSessionInput *vprocSessionInputEnsure(VProcSessionStdio *session, int shell_pid, int kernel_pid) {
-    if (!session) {
-        return NULL;
-    }
-    const bool tool_dbg = vprocToolDebugEnabled();
-    pthread_mutex_lock(&gSessionInputInitMu);
-    if (!session->input) {
-        session->input = (VProcSessionInput *)calloc(1, sizeof(VProcSessionInput));
-        if (session->input) {
-            pthread_mutex_init(&session->input->mu, NULL);
-            pthread_cond_init(&session->input->cv, NULL);
-            session->input->inited = true;
-            session->input->reader_fd = -1;
-        }
-    }
-    VProcSessionInput *input = session->input;
-    pthread_mutex_unlock(&gSessionInputInitMu);
-    if (!input) {
-        return NULL;
-    }
 
-    bool has_pscal_fd = session->stdin_pscal_fd &&
-            session->stdin_pscal_fd->ops &&
-            session->stdin_pscal_fd->ops->read;
-    bool spawn_reader = false;
-    uint32_t spawn_generation = 0;
-    int spawn_fd = -1;
-    if (!vprocSessionInputLockWithTimeout(input, 200, "ensure")) {
-        VProcSessionInput *replacement = vprocSessionInputRecoverStuck(session, input, "ensure");
-        if (replacement) {
-            input = replacement;
-            if (!vprocSessionInputLockWithTimeout(input, 200, "ensure.relock")) {
-                return input;
-            }
-        } else {
-            return input;
-        }
-    }
-    if (!input->reader_active && input->eof) {
-        input->eof = false;
-        input->off = 0;
-        input->len = 0;
-        input->eof_mark_count = 0;
-        input->interrupt_pending = false;
-        input->interrupt_key = false;
-    }
-    if (!input->reader_active &&
-        (session->stdin_host_fd >= 0 || has_pscal_fd)) {
-        input->reader_generation++;
-        spawn_generation = input->reader_generation;
-        input->stop_requested = false;
-        input->reader_active = true;
-        input->reader_fd = session->stdin_host_fd;
-        spawn_fd = session->stdin_host_fd;
-        spawn_reader = true;
-    }
-    pthread_mutex_unlock(&input->mu);
 
-    if (spawn_reader) {
-        VProcSessionInputCtx *ctx = (VProcSessionInputCtx *)calloc(1, sizeof(VProcSessionInputCtx));
-        if (!ctx) {
-            pthread_mutex_lock(&input->mu);
-            if (input->reader_generation == spawn_generation) {
-                input->reader_active = false;
-                input->reader_fd = -1;
-                input->stop_requested = false;
-            }
-            pthread_mutex_unlock(&input->mu);
-            return input;
-        }
-
-        ctx->session = session;
-        ctx->shell_pid = shell_pid;
-        ctx->kernel_pid = kernel_pid;
-        ctx->generation = spawn_generation;
-
-        pthread_t tid;
-        int create_rc = vprocHostPthreadCreate(&tid, NULL, vprocSessionInputThread, ctx);
-        if (create_rc == 0) {
-            pthread_detach(tid);
-            if (tool_dbg) {
-                fprintf(stderr,
-                        "[session-input] reader spawned host_fd=%d pscal_fd=%p\n",
-                        spawn_fd,
-                        (void *)session->stdin_pscal_fd);
-                vprocDebugLogf(
-                        "[session-input] reader spawned host_fd=%d pscal_fd=%p\n",
-                        spawn_fd,
-                        (void *)session->stdin_pscal_fd);
-            }
-        } else {
-            pthread_mutex_lock(&input->mu);
-            if (input->reader_generation == spawn_generation) {
-                input->reader_active = false;
-                input->reader_fd = -1;
-                input->stop_requested = false;
-            }
-            pthread_mutex_unlock(&input->mu);
-            if (tool_dbg) {
-                fprintf(stderr, "[session-input] reader spawn failed rc=%d\n", create_rc);
-                vprocDebugLogf(
-                        "[session-input] reader spawn failed rc=%d\n",
-                        create_rc);
-            }
-            free(ctx);
-        }
-    }
-    return input;
-}
-
-static int vprocResolveSessionShellPidForInput(VProcSessionStdio *session) {
-    if (!session || vprocSessionStdioIsDefault(session)) {
-        return vprocGetShellSelfPid();
-    }
-    if (session->shell_pid > 0) {
-        return session->shell_pid;
-    }
-    if (session->session_id != 0) {
-        int shell_pid = 0;
-        pthread_mutex_lock(&gVProcSessionPtys.mu);
-        VProcSessionPtyEntry *entry = vprocSessionPtyFindLocked(session->session_id, NULL);
-        if (entry && entry->shell_pid > 0) {
-            shell_pid = entry->shell_pid;
-        }
-        pthread_mutex_unlock(&gVProcSessionPtys.mu);
-        if (shell_pid > 0) {
-            session->shell_pid = shell_pid;
-            return shell_pid;
-        }
-    }
-
-    VProc *current = vprocCurrent();
-    if (current) {
-        int current_pid = vprocPid(current);
-        if (current_pid > 0) {
-            session->shell_pid = current_pid;
-            if (session->session_id != 0) {
-                vprocSessionPtySetShellPid(session->session_id, current_pid);
-            }
-            return current_pid;
-        }
-    }
-    return 0;
-}
-
-static ssize_t vprocSessionReadInput(VProcSessionStdio *session, void *buf, size_t count, bool nonblocking) {
-    if (!session || !session->input || !buf || count == 0) {
-        return 0;
-    }
-    VProcSessionInput *input = session->input;
-    const bool tool_dbg = vprocToolDebugEnabled();
-    const bool prompt_reader = vprocShellPromptReadActive(session->shell_pid);
-    /* The shell itself, reading at its prompt, whichever session it has. */
-    VProc *self_vp = vprocCurrent();
-    const int self_pid = self_vp ? vprocPid(self_vp) : 0;
-    const bool prompt_self = self_pid > 0 && vprocShellPromptReadActive(self_pid);
-    const bool line_mode = vprocTtyInLineMode(session->pty_slave);
-    if (tool_dbg) {
-        if (!vprocSessionInputLockWithTimeout(input, 200, "read.debug")) {
-            VProcSessionInput *replacement = vprocSessionInputRecoverStuck(session, input, "read.debug");
-            if (replacement) {
-                input = replacement;
-            }
-            errno = EINTR;
-            return -1;
-        }
-        vprocDebugLogf(
-                "[session-read] start off=%zu len=%zu eof=%d reader=%d fd=%d stdin=%d\n",
-                input->off,
-                input->len,
-                (int)input->eof,
-                (int)input->reader_active,
-                input->reader_fd,
-                session->stdin_host_fd);
-        pthread_mutex_unlock(&input->mu);
-    }
-    if (!vprocSessionInputLockWithTimeout(input, 200, "read")) {
-        VProcSessionInput *replacement = vprocSessionInputRecoverStuck(session, input, "read");
-        if (replacement && replacement != input) {
-            input = replacement;
-            if (!vprocSessionInputLockWithTimeout(input, 200, "read.relock")) {
-                errno = EINTR;
-                return -1;
-            }
-        } else {
-            errno = EINTR;
-            return -1;
-        }
-    }
-    for (;;) {
-        if (nonblocking && input->len == 0 && !input->eof && !input->interrupt_pending &&
-            input->eof_mark_count == 0) {
-            pthread_mutex_unlock(&input->mu);
-            errno = EAGAIN;
-            return -1;
-        }
-        while (input->len == 0 && !input->eof && !input->interrupt_pending &&
-               input->eof_mark_count == 0) {
-            if (!prompt_self) {
-                vprocCondWait(&input->cv, &input->mu);
-                continue;
-            }
-            /* halt from a job, or kill -HUP from another tab, ends the shell now, not at the
-             * next line typed. The prompt takes EINTR and acts on what came. */
-            struct timespec deadline;
-            vprocInprocPipeWaitDeadline(&deadline);
-            if (vprocCondTimedWait(&input->cv, &input->mu, &deadline) != ETIMEDOUT) {
-                continue;
-            }
-            pthread_mutex_unlock(&input->mu);
-            bool killed = vprocPromptKillPending(self_pid);
-            pthread_mutex_lock(&input->mu);
-            if (killed) {
-                pthread_mutex_unlock(&input->mu);
-                errno = EINTR;
-                return -1;
-            }
-        }
-        if (input->interrupt_pending) {
-            input->interrupt_pending = false;
-            gVprocInterruptKeyRead = input->interrupt_key;
-            input->interrupt_key = false;
-            pthread_mutex_unlock(&input->mu);
-            (void)vprocWaitIfStopped(vprocCurrent());
-            errno = EINTR;
-            return -1;
-        }
-        if (input->eof_mark_count == 0 || input->eof_mark[0] != 0) {
-            break;
-        }
-        /* The end-of-file key, now that the input before it has gone. One
-         * typed after its command ended means nothing to the prompt, which
-         * would take it as the end of the session. */
-        input->eof_mark_count--;
-        memmove(input->eof_mark, input->eof_mark + 1,
-                input->eof_mark_count * sizeof(input->eof_mark[0]));
-        if (!prompt_reader) {
-            pthread_mutex_unlock(&input->mu);
-            return 0;
-        }
-    }
-    if (input->len == 0 && input->eof) {
-        if (tool_dbg) {
-            vprocDebugLogf( "[session-read] eof\n");
-        }
-        pthread_mutex_unlock(&input->mu);
-        return 0;
-    }
-    size_t to_copy = (count < input->len) ? count : input->len;
-    if (input->eof_mark_count > 0 && to_copy > input->eof_mark[0]) {
-        to_copy = input->eof_mark[0];
-    }
-    if (line_mode) {
-        /* One line per read, as a terminal gives: what is typed ahead of the
-         * next line belongs to whoever reads next, not to this read's buffer. */
-        const unsigned char *newline = memchr(input->buf + input->off, '\n', to_copy);
-        if (newline) {
-            to_copy = (size_t)(newline - (input->buf + input->off)) + 1;
-        }
-    }
-    memcpy(buf, input->buf + input->off, to_copy);
-    input->off += to_copy;
-    input->len -= to_copy;
-    if (input->len == 0) {
-        input->off = 0;
-    }
-    for (size_t i = 0; i < input->eof_mark_count; ++i) {
-        input->eof_mark[i] -= to_copy;
-    }
-    pthread_mutex_unlock(&input->mu);
-    return (ssize_t)to_copy;
-}
 
 ssize_t vprocSessionReadInputShim(void *buf, size_t count) {
     return vprocSessionReadInputShimMode(buf, count, false);
@@ -6963,60 +6210,26 @@ ssize_t vprocSessionReadInputShimMode(void *buf, size_t count, bool nonblocking)
         }
         return vprocTerminalReadDone(res);
     }
-    const bool tool_dbg = vprocToolDebugEnabled();
-    int shell_pid = vprocResolveSessionShellPidForInput(session);
-    VProcSessionInput *input = vprocSessionInputEnsure(session,
-                                                       shell_pid,
-                                                       vprocGetKernelPid());
-    if (!input) {
-        errno = EBADF;
-        return -1;
+    /* No terminal: the session's stdin is a host descriptor, read as it is. */
+    const int host = session->stdin_host_fd;
+    if (host < 0) {
+        return 0;
     }
-    if (tool_dbg) {
-        vprocDebugLogf("[session-read] buffered stdin=%d nonblock=%d\n",
-                       session->stdin_host_fd,
-                       (int)nonblocking);
-    }
-    return vprocSessionReadInput(session, buf, count, nonblocking);
-}
-
-void vprocSessionInputStop(VProcSessionStdio *session) {
-    VProcSessionInput *input = session ? session->input : NULL;
-    if (!input) {
-        return;
-    }
-    struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME, &deadline);
-    deadline.tv_sec += 1;
-    pthread_mutex_lock(&input->mu);
-    input->stop_requested = true;
-    pthread_cond_broadcast(&input->cv);
-    while (input->reader_active) {
-        if (vprocCondTimedWait(&input->cv, &input->mu, &deadline) == ETIMEDOUT) {
-            break;
+    if (nonblocking) {
+        struct pollfd pfd = {.fd = host, .events = POLLIN, .revents = 0};
+        const int ready = vprocHostPoll(&pfd, 1, 0);
+        if (ready == 0) {
+            errno = EAGAIN;
+            return -1;
+        }
+        if (ready < 0) {
+            return -1;
         }
     }
-    pthread_mutex_unlock(&input->mu);
+    return vprocHostRead(host, buf, count);
 }
 
-VProcSessionInput *vprocSessionInputEnsureShim(void) {
-    VProcSessionStdio *session = vprocSessionStdioCurrent();
-    if (!session) {
-        return NULL;
-    }
-    int shell_pid = vprocResolveSessionShellPidForInput(session);
-    int kernel_pid = vprocGetKernelPid();
-    const bool tool_dbg = vprocToolDebugEnabled();
-    if (tool_dbg) {
-        vprocDebugLogf(
-                "[session-input] ensure shell=%d kernel=%d stdin_host=%d input=%p\n",
-                shell_pid,
-                kernel_pid,
-                session->stdin_host_fd,
-                (void *)session->input);
-    }
-    return vprocSessionInputEnsure(session, shell_pid, kernel_pid);
-}
+
 
 bool vprocSessionInjectInputShim(const void *data, size_t len) {
     if (!data || len == 0) {
@@ -7030,36 +6243,8 @@ bool vprocSessionInjectInputShim(const void *data, size_t len) {
         /* As if typed. */
         return tty_input(session->pty_slave->tty, (const char *)data, len, false) == (ssize_t)len;
     }
-    int shell_pid = vprocResolveSessionShellPidForInput(session);
-    int kernel_pid = vprocGetKernelPid();
-    VProcSessionInput *input = vprocSessionInputEnsure(session, shell_pid, kernel_pid);
-    if (!input) {
-        return false;
-    }
-    const bool tool_dbg = vprocToolDebugEnabled();
-    pthread_mutex_lock(&input->mu);
-    if (len > SIZE_MAX - input->len) {
-        pthread_mutex_unlock(&input->mu);
-        return false;
-    }
-    if (!vprocEnsureSessionInputWritableLocked(input, len)) {
-        pthread_mutex_unlock(&input->mu);
-        return false;
-    }
-    memcpy(input->buf + input->off + input->len, data, len);
-    input->len += len;
-    pthread_cond_broadcast(&input->cv);
-    if (tool_dbg) {
-        vprocDebugLogf(
-                "[session-input] injected len=%zu off=%zu total=%zu cap=%zu\n",
-                len,
-                input->off,
-                input->len,
-                input->cap);
-    }
-    pthread_mutex_unlock(&input->mu);
-    pscal_fd_poll_wakeup(NULL, POLLIN);
-    return true;
+    /* Input goes in as typed, through a terminal; there is no queue beside one. */
+    return false;
 }
 
 static void vprocRemoveChildLocked(VProcTaskEntry *parent, int child_pid) {
@@ -13922,7 +13107,6 @@ void vprocSessionStdioInit(VProcSessionStdio *stdio_ctx, int kernel_pid) {
     if (!stdio_ctx) {
         return;
     }
-    VProcSessionInput *input = stdio_ctx->input;
     stdio_ctx->kernel_pid = kernel_pid;
     stdio_ctx->shell_pid = 0;
     /* Duplicate current host stdio so this session owns stable copies. */
@@ -13941,7 +13125,6 @@ void vprocSessionStdioInit(VProcSessionStdio *stdio_ctx, int kernel_pid) {
     stdio_ctx->stdin_host_fd = in;
     stdio_ctx->stdout_host_fd = out;
     stdio_ctx->stderr_host_fd = err;
-    stdio_ctx->input = input;
     stdio_ctx->stdin_pscal_fd = NULL;
     stdio_ctx->stdout_pscal_fd = NULL;
     stdio_ctx->stderr_pscal_fd = NULL;
@@ -14003,7 +13186,6 @@ void vprocSessionStdioInitWithFds(VProcSessionStdio *stdio_ctx,
     if (!stdio_ctx) {
         return;
     }
-    VProcSessionInput *input = stdio_ctx->input;
     stdio_ctx->kernel_pid = kernel_pid;
     stdio_ctx->shell_pid = 0;
     int in = (stdin_fd >= 0) ? fcntl(stdin_fd, F_DUPFD_CLOEXEC, 0) : -1;
@@ -14018,7 +13200,6 @@ void vprocSessionStdioInitWithFds(VProcSessionStdio *stdio_ctx,
     stdio_ctx->stdin_host_fd = in;
     stdio_ctx->stdout_host_fd = out;
     stdio_ctx->stderr_host_fd = err;
-    stdio_ctx->input = input;
     stdio_ctx->stdin_pscal_fd = NULL;
     stdio_ctx->stdout_pscal_fd = NULL;
     stdio_ctx->stderr_pscal_fd = NULL;
@@ -14045,7 +13226,6 @@ int vprocSessionStdioInitWithPty(VProcSessionStdio *stdio_ctx,
     stdio_ctx->stdin_host_fd = -1;
     stdio_ctx->stdout_host_fd = -1;
     stdio_ctx->stderr_host_fd = -1;
-    stdio_ctx->input = NULL;
 
     stdio_ctx->pty_master = pty_master;
     stdio_ctx->pty_slave = pty_slave;
@@ -14099,7 +13279,6 @@ VProcSessionStdio *vprocSessionStdioCreate(void) {
     session->stderr_host_fd = -1;
     session->kernel_pid = 0;
     session->shell_pid = 0;
-    session->input = NULL;
     session->stdin_pscal_fd = NULL;
     session->stdout_pscal_fd = NULL;
     session->stderr_pscal_fd = NULL;
@@ -14132,19 +13311,6 @@ void vprocSessionStdioDestroy(VProcSessionStdio *stdio_ctx) {
         pthread_join(stdio_ctx->pty_out_thread, NULL);
         stdio_ctx->pty_out_thread = 0;
     }
-    VProcSessionInput *input = stdio_ctx->input;
-    if (input) {
-        pthread_mutex_lock(&input->mu);
-        input->stop_requested = true;
-        input->off = 0;
-        input->len = 0;
-        input->eof_mark_count = 0;
-        input->eof = true;
-        input->interrupt_pending = false;
-        input->interrupt_key = false;
-        pthread_cond_broadcast(&input->cv);
-        pthread_mutex_unlock(&input->mu);
-    }
     if (stdio_ctx->stdin_host_fd >= 0) {
         vprocHostClose(stdio_ctx->stdin_host_fd);
     }
@@ -14176,18 +13342,6 @@ void vprocSessionStdioDestroy(VProcSessionStdio *stdio_ctx) {
         /* The master's last close hangs up the session it was the terminal of: that is over
          * before the session is. */
         vprocHangUpsSettle();
-    }
-    if (input) {
-        pthread_mutex_lock(&input->mu);
-        while (input->reader_active) {
-            vprocCondWait(&input->cv, &input->mu);
-        }
-        pthread_mutex_unlock(&input->mu);
-        pthread_mutex_destroy(&input->mu);
-        pthread_cond_destroy(&input->cv);
-        free(input->buf);
-        free(input);
-        stdio_ctx->input = NULL;
     }
     free(stdio_ctx);
 }
@@ -14236,19 +13390,6 @@ void vprocSessionStdioRefresh(VProcSessionStdio *stdio_ctx, int kernel_pid) {
                 stdio_ctx->stdout_host_fd,
                 stdio_ctx->stderr_host_fd);
     }
-    VProcSessionInput *input = stdio_ctx->input;
-    if (input) {
-        pthread_mutex_lock(&input->mu);
-        input->stop_requested = true;
-        input->off = 0;
-        input->len = 0;
-        input->eof_mark_count = 0;
-        input->eof = false;
-        input->interrupt_pending = false;
-        input->interrupt_key = false;
-        pthread_cond_broadcast(&input->cv);
-        pthread_mutex_unlock(&input->mu);
-    }
     if (stdio_ctx->stdin_host_fd >= 0) {
         vprocHostClose(stdio_ctx->stdin_host_fd);
     }
@@ -14261,14 +13402,6 @@ void vprocSessionStdioRefresh(VProcSessionStdio *stdio_ctx, int kernel_pid) {
     stdio_ctx->stdin_host_fd = -1;
     stdio_ctx->stdout_host_fd = -1;
     stdio_ctx->stderr_host_fd = -1;
-    if (input) {
-        pthread_mutex_lock(&input->mu);
-        while (input->reader_active) {
-            vprocCondWait(&input->cv, &input->mu);
-        }
-        input->reader_fd = -1;
-        pthread_mutex_unlock(&input->mu);
-    }
     vprocSessionStdioInit(stdio_ctx, kernel_pid);
 }
 
@@ -14834,7 +13967,7 @@ int vprocCurrentDyingSignal(void) {
     int sig = 0;
     pthread_mutex_lock(&gVProcTasks.mu);
     VProcTaskEntry *entry = pid > 0 ? vprocTaskFindLocked(pid) : NULL;
-    if (entry && entry->dying_since_ns != 0) {
+    if (entry && vprocEntryKilledLocked(entry)) {
         sig = entry->exit_signal;
     }
     pthread_mutex_unlock(&gVProcTasks.mu);
@@ -16017,7 +15150,7 @@ int pscalTtySignalCheck(void) {
     if (entry) {
         /* Killed already: dying while its thread unwinds, or, for a stage on the shell's thread
          * with no thread of its own, marked ended at once while its code still runs here. */
-        interrupt = entry->dying_since_ns != 0 || (entry->exited && entry->exit_signal != 0);
+        interrupt = vprocEntryKilledLocked(entry);
         for (int sig = 1; !interrupt && sig < 32; ++sig) {
             if (!(entry->pending_signals & vprocSigMask(sig)) ||
                 vprocSignalBlockedLocked(entry, sig) || vprocSignalIgnoredLocked(entry, sig)) {
@@ -16124,25 +15257,6 @@ static bool vprocSessionFdIsTerminal(VProcSessionStdio *session, struct pscal_fd
     return pscal_fd->tty && session->pty_slave && session->pty_slave->tty == pscal_fd->tty;
 }
 
-/* The interrupt key, at the shell's own prompt, where the reader took it for a signal
- * to the foreground. The shell has that signal blocked, so it would only wait, and
- * the line being edited would run together with the next one. */
-static bool vprocPromptTakesInterruptKey(void) {
-    int pid = vprocGetPidShim();
-    if (!vprocShellPromptReadActive(pid)) {
-        return false;
-    }
-    sigset_t pending;
-    sigemptyset(&pending);
-    if (vprocSigpending(pid, &pending) == 0 && sigismember(&pending, SIGINT)) {
-        sigset_t watch;
-        sigemptyset(&watch);
-        sigaddset(&watch, SIGINT);
-        int signo = 0;
-        (void)vprocSigwait(pid, &watch, &signo);
-    }
-    return true;
-}
 
 /* Holds the calling task a fatal signal it can't act on where it is: a command on the
  * shell's own thread, or one that unwinds itself. */
@@ -16157,7 +15271,7 @@ static bool vprocCurrentHoldsFatalSignal(void) {
     VProcTaskEntry *entry = vprocTaskFindLocked(pid);
     /* A command the shell runs on its own thread, ended by the interrupt key: its signal was
      * acted on, and the task is dying, but its thread is the shell's and goes on. */
-    if (entry && (entry->dying_since_ns != 0 || entry->exited) && entry->exit_signal == SIGINT) {
+    if (entry && vprocEntryKilledLocked(entry) && entry->exit_signal == SIGINT) {
         holds = true;
     }
     if (entry && (entry->unwinds_itself || entry->shell_task)) {
@@ -16196,7 +15310,7 @@ ssize_t vprocReadShim(int fd, void *buf, size_t count) {
     int host = vprocResolveFdForShim(vp, fd, 1, &pscal_fd);
     if (pscal_fd) {
         VProcSessionStdio *session = vprocSessionStdioCurrent();
-        if (vprocSessionFdIsTerminal(session, pscal_fd) && session->pty_slave) {
+        if (vprocSessionFdIsTerminal(session, pscal_fd)) {
             if (gVprocTerminalInterrupted && gVprocPipelineStage) {
                 pscal_fd_close(pscal_fd);
                 return 0;
@@ -16207,47 +15321,6 @@ ssize_t vprocReadShim(int fd, void *buf, size_t count) {
             pthread_cleanup_pop(0);
             pscal_fd_close(pscal_fd);
             return vprocTerminalReadDone(res);
-        }
-        if (vprocSessionFdIsTerminal(session, pscal_fd)) {
-            /* Whatever reads the terminal, a dup() of stdin as in OpenSSH or a
-             * plain `cat`: a reader thread already drains this PTY stream, so
-             * read the session's queue. Reading the PTY as well would give
-             * each key to one of the two, and the ones the thread took would
-             * come out later, at whatever read next. */
-            if (gVprocPipelineStage) {
-                int err = pscalTtyCheckBackgroundRead(pscal_fd);
-                if (err < 0) {
-                    pscal_fd_close(pscal_fd);
-                    if (err == _EINTR) {
-                        vprocDeliverPendingSignalsForCurrent();
-                    }
-                    return vprocSetCompatErrno(err);
-                }
-            }
-            bool nonblocking = (pscal_fd->flags & O_NONBLOCK) != 0;
-            const bool line_mode = gVprocPipelineStage && vprocTtyInLineMode(pscal_fd);
-            pscal_fd_close(pscal_fd);
-            /* The interrupt key, where a command takes the terminal as it comes.
-             * Every read loop stops at the end of its input, and an applet on
-             * the shell's thread has no other way out: nothing can kill it, and
-             * many loops only read again on EINTR. The shell turns this into the
-             * status of a command the key ended. */
-            if (line_mode && gVprocTerminalInterrupted) {
-                return 0;
-            }
-            gVprocInterruptKeyRead = false;
-            ssize_t res = vprocSessionReadInputShimMode(buf, count, nonblocking);
-            if (res < 0 && errno == EINTR && gVprocInterruptKeyRead) {
-                if (line_mode) {
-                    gVprocTerminalInterrupted = true;
-                    return 0;
-                }
-                if (vprocPromptTakesInterruptKey()) {
-                    *(unsigned char *)buf = 0x03;
-                    return 1;
-                }
-            }
-            return res;
         }
         if (gVprocPipelineStage &&
             vprocVprocDebugEnabled() &&
@@ -16295,23 +15368,6 @@ ssize_t vprocReadShim(int fd, void *buf, size_t count) {
         return -1;
     }
 #if defined(PSCAL_TARGET_IOS)
-    if (controlling_stdin) {
-        VProcSessionStdio *session = vprocSessionStdioCurrent();
-        if (session &&
-            session->stdin_host_fd >= 0 &&
-            vprocSessionFdMatchesHost(host, session->stdin_host_fd)) {
-            /* In-process pipeline stages can still be foreground interactive
-             * tools/frontends. Route controlling stdin through the shared
-             * session buffer so virtual Ctrl-C/Z handling remains consistent. */
-            if (vprocToolDebugEnabled()) {
-                fprintf(stderr,
-                        "[vproc-read] route session stdin host=%d session_stdin=%d\n",
-                        host,
-                        session->stdin_host_fd);
-            }
-            return vprocSessionReadInputShimMode(buf, count, false);
-        }
-    }
     if (vprocHostFdBlocks(host) && vprocWaitHostFd(host, false) < 0) {
         return -1;
     }
@@ -19353,52 +18409,6 @@ static bool vprocSelectScratchEnsure(size_t needed) {
     return true;
 }
 
-static short vprocSessionInputPollEvents(VProcSessionStdio *session,
-                                         int logical_fd,
-                                         struct pscal_fd *pscal_fd,
-                                         short requested_events) {
-    (void)logical_fd;
-    /* A pty's own poll answers for it: there is no queue beside it (L20). */
-    if (!vprocSessionFdIsTerminal(session, pscal_fd) || session->pty_slave) {
-        return 0;
-    }
-
-    int read_mask = POLLIN;
-#ifdef POLLPRI
-    read_mask |= POLLPRI;
-#endif
-#ifdef POLLRDNORM
-    read_mask |= POLLRDNORM;
-#endif
-#ifdef POLLRDBAND
-    read_mask |= POLLRDBAND;
-#endif
-    if ((requested_events & read_mask) == 0) {
-        return 0;
-    }
-
-    VProcSessionInput *input = vprocSessionInputEnsure(session,
-                                                       vprocGetShellSelfPid(),
-                                                       vprocGetKernelPid());
-    if (!input) {
-        return 0;
-    }
-
-    short ready = 0;
-    pthread_mutex_lock(&input->mu);
-    bool has_data = input->len > 0 || input->eof_mark_count > 0;
-    bool is_eof = input->eof;
-    bool has_interrupt = input->interrupt_pending;
-    pthread_mutex_unlock(&input->mu);
-
-    if (has_data || has_interrupt || is_eof) {
-        ready |= (short)(requested_events & read_mask);
-    }
-    if (is_eof) {
-        ready |= POLLHUP;
-    }
-    return ready;
-}
 
 /* Not through vprocReadShim: it acts on a pending signal, and SIGINT's default action
  * ends the thread there, with the VM's frames and any lock it holds. Background job
@@ -19529,10 +18539,6 @@ int vprocPollShim(struct pollfd *fds, nfds_t nfds, int timeout) {
                 ? pscal_fd->ops->poll(pscal_fd)
                 : POLL_ERR;
             short ready = vprocPollMapReady(pscal_events, fds[i].events);
-            ready |= vprocSessionInputPollEvents(session_stdio,
-                                                 fds[i].fd,
-                                                 pscal_fd,
-                                                 fds[i].events);
             if (ready) {
                 fds[i].revents = ready;
                 ready_count++;
@@ -19653,10 +18659,6 @@ int vprocPollShim(struct pollfd *fds, nfds_t nfds, int timeout) {
                         ? pscal_fds[i]->ops->poll(pscal_fds[i])
                         : POLL_ERR;
                     short ready = vprocPollMapReady(pscal_events, fds[i].events);
-                    ready |= vprocSessionInputPollEvents(session_stdio,
-                                                         fds[i].fd,
-                                                         pscal_fds[i],
-                                                         fds[i].events);
                     fds[i].revents = ready;
                     if (ready) {
                         pscal_ready++;

@@ -201,9 +201,8 @@ ssize_t vprocLocationDeviceWrite(const void *data, size_t len);
 typedef void (*VprocLocationReadersChangedFn)(int readers, void *context);
 /* Register an observer for reader count changes on /dev/location. */
 void vprocLocationDeviceRegisterReaderObserver(VprocLocationReadersChangedFn cb, void *context);
-/* Read from the shared session input queue (stdin) on iOS. */
+/* Read the current session's stdin: its terminal (L20), or with none its host descriptor. */
 ssize_t vprocSessionReadInputShim(void *buf, size_t count);
-/* Read from the shared session input queue with nonblocking support. */
 ssize_t vprocSessionReadInputShimMode(void *buf, size_t count, bool nonblocking);
 /* Spawn a joinable host thread, bypassing vproc's pthread_create shim. */
 int vprocHostPthreadCreate(pthread_t *thread,
@@ -513,35 +512,12 @@ void vprocRunPathTruncationDefaultForTests(void);
 
 /* Per-session stdio ownership: duplicated host fds that define the
  * controlling stdio for a given shell window/session. */
-typedef struct VProcSessionInput {
-    pthread_mutex_t mu;
-    pthread_cond_t cv;
-    unsigned char *buf;
-    size_t off;
-    size_t len;
-    size_t cap;
-    int reader_fd;
-    uint64_t reader_generation;
-    bool inited;
-    bool eof;
-    bool reader_active;
-    bool interrupt_pending;
-    bool interrupt_key;   /* interrupt_pending is there for the interrupt key */
-    bool stop_requested;
-    /* End-of-file keys not yet read, oldest first: how many queued bytes come
-     * before each. Each one reads as 0 bytes, once, and input goes on after it. */
-#define VPROC_SESSION_EOF_MARKS 8
-    size_t eof_mark[VPROC_SESSION_EOF_MARKS];
-    size_t eof_mark_count;
-} VProcSessionInput;
-
 typedef struct VProcSessionStdio {
     int stdin_host_fd;
     int stdout_host_fd;
     int stderr_host_fd;
     int kernel_pid;
     int shell_pid;
-    VProcSessionInput *input;
     struct pscal_fd *stdin_pscal_fd;
     struct pscal_fd *stdout_pscal_fd;
     struct pscal_fd *stderr_pscal_fd;
@@ -612,12 +588,7 @@ ssize_t vprocSessionEmitOutput(uint64_t session_id, const void *buf, size_t len)
 /* Write input data directly to a session PTY master. */
 ssize_t vprocSessionWriteToMaster(uint64_t session_id, const void *buf, size_t len);
 ssize_t vprocSessionWriteToMasterMode(uint64_t session_id, const void *buf, size_t len, bool blocking);
-/* Ensure session input is initialized for the current session. */
-VProcSessionInput *vprocSessionInputEnsureShim(void);
-/* The session's reader stops, waiting up to a second for it: a shell ending does this before it
- * closes its copies of the terminal. */
-void vprocSessionInputStop(VProcSessionStdio *session);
-/* Inject input into the current session input queue. */
+/* Input into the current session's terminal, as if typed. False with no terminal. */
 bool vprocSessionInjectInputShim(const void *data, size_t len);
 
 /* Terminate and discard all vprocs in the given session (sid). */
