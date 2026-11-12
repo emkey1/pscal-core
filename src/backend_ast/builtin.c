@@ -5331,6 +5331,13 @@ static void vmNoteRawMode(bool raw) {
 static int vmTcgetattr(int fd, struct termios *term) {
     int res;
 #if defined(PSCAL_TARGET_IOS)
+    /* No terminal, no modes: ENOTTY, as on Linux. The fallbacks below reach the session's
+     * terminal, and changing it for a program reading a pipe from a pipeline not in the
+     * foreground (`... | pascal key.pas` in a script) stopped the whole job with SIGTTOU. */
+    if (vprocIsattyShim(fd) != 1) {
+        errno = ENOTTY;
+        return -1;
+    }
     if (term) {
 #if defined(TIOCGETA)
         do {
@@ -5362,6 +5369,13 @@ static int vmTcgetattr(int fd, struct termios *term) {
 static int vmTcsetattr(int fd, int optional_actions, const struct termios *term) {
     int res;
 #if defined(PSCAL_TARGET_IOS)
+    /* No terminal, no modes: ENOTTY, as on Linux. The fallbacks below reach the session's
+     * terminal, and changing it for a program reading a pipe from a pipeline not in the
+     * foreground (`... | pascal key.pas` in a script) stopped the whole job with SIGTTOU. */
+    if (vprocIsattyShim(fd) != 1) {
+        errno = ENOTTY;
+        return -1;
+    }
     int cmd = 0;
 #if defined(TCSETS)
     switch (optional_actions) {
