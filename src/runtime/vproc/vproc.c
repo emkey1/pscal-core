@@ -4368,9 +4368,20 @@ static void vprocInitEntryDefaultsLocked(VProcTaskEntry *entry, int pid, const V
                 entry->actions[sig].sa_flags = 0;
                 entry->ignored_signals &= ~vprocSigMask(sig);
             }
-            /* The shell blocks SIGINT for its own catcher; a command starts with it unblocked,
-             * as on Linux, or the terminal's Ctrl-C (L20) would only wait. SIGQUIT likewise. */
+            /* The shell blocks SIGINT for its own catcher and catches it; a command starts with
+             * it unblocked and, caught, back at the default, as across exec on Linux. Otherwise
+             * the terminal's Ctrl-C (L20) only waited, or ran the shell's catcher for the command
+             * and its read went on. SIGQUIT likewise. An ignored one stays ignored. */
             entry->blocked_signals &= ~(vprocSigMask(SIGINT) | vprocSigMask(SIGQUIT));
+            const int caught_sigs[] = { SIGINT, SIGQUIT };
+            for (size_t i = 0; i < sizeof(caught_sigs) / sizeof(caught_sigs[0]); ++i) {
+                const int sig = caught_sigs[i];
+                if (entry->actions[sig].sa_handler != SIG_IGN && entry->actions[sig].sa_handler != SIG_DFL) {
+                    sigemptyset(&entry->actions[sig].sa_mask);
+                    entry->actions[sig].sa_handler = SIG_DFL;
+                    entry->actions[sig].sa_flags = 0;
+                }
+            }
         }
     }
     entry->start_mono_ns = vprocNowMonoNs();
@@ -16001,7 +16012,9 @@ int pscalTtySignalCheck(void) {
     pthread_mutex_lock(&gVProcTasks.mu);
     VProcTaskEntry *entry = vprocTaskFindLocked(pid);
     if (entry) {
-        interrupt = entry->dying_since_ns != 0;
+        /* Killed already: dying while its thread unwinds, or, for a stage on the shell's thread
+         * with no thread of its own, marked ended at once while its code still runs here. */
+        interrupt = entry->dying_since_ns != 0 || (entry->exited && entry->exit_signal != 0);
         for (int sig = 1; !interrupt && sig < 32; ++sig) {
             if (!(entry->pending_signals & vprocSigMask(sig)) ||
                 vprocSignalBlockedLocked(entry, sig) || vprocSignalIgnoredLocked(entry, sig)) {
@@ -16141,7 +16154,7 @@ static bool vprocCurrentHoldsFatalSignal(void) {
     VProcTaskEntry *entry = vprocTaskFindLocked(pid);
     /* A command the shell runs on its own thread, ended by the interrupt key: its signal was
      * acted on, and the task is dying, but its thread is the shell's and goes on. */
-    if (entry && entry->dying_since_ns != 0 && entry->exit_signal == SIGINT) {
+    if (entry && (entry->dying_since_ns != 0 || entry->exited) && entry->exit_signal == SIGINT) {
         holds = true;
     }
     if (entry && (entry->unwinds_itself || entry->shell_task)) {
