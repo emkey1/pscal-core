@@ -4368,6 +4368,9 @@ static void vprocInitEntryDefaultsLocked(VProcTaskEntry *entry, int pid, const V
                 entry->actions[sig].sa_flags = 0;
                 entry->ignored_signals &= ~vprocSigMask(sig);
             }
+            /* The shell blocks SIGINT for its own catcher; a command starts with it unblocked,
+             * as on Linux, or the terminal's Ctrl-C (L20) would only wait. SIGQUIT likewise. */
+            entry->blocked_signals &= ~(vprocSigMask(SIGINT) | vprocSigMask(SIGQUIT));
         }
     }
     entry->start_mono_ns = vprocNowMonoNs();
