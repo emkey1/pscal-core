@@ -4044,13 +4044,26 @@ Value vmBuiltinFflush(VM* vm, int arg_count, Value* args) {
 }
 
 // fopen(path, mode) -> FILE
+/* A one-letter literal such as CLike's "w" arrives as a char, so a string
+ * argument here may be a char too. */
+static const char* fopenArgText(const Value* v, char buf[2]) {
+    if (VALUE_TYPE(*v) == TYPE_CHAR) {
+        buf[0] = (char)AS_CHAR(*v);
+        buf[1] = '\0';
+        return buf;
+    }
+    if (isPascalStringType(VALUE_TYPE(*v))) return AS_STRING(*v) ? AS_STRING(*v) : "";
+    return NULL;
+}
+
 Value vmBuiltinFopen(VM* vm, int arg_count, Value* args) {
-    if (arg_count != 2 || !isPascalStringType(VALUE_TYPE(args[0])) || !isPascalStringType(VALUE_TYPE(args[1]))) {
+    char pathBuf[2], modeBuf[2];
+    const char* path = arg_count == 2 ? fopenArgText(&args[0], pathBuf) : NULL;
+    const char* mode = arg_count == 2 ? fopenArgText(&args[1], modeBuf) : NULL;
+    if (!path || !mode) {
         runtimeError(vm, "fopen expects (path:string, mode:string).");
         return makeVoid();
     }
-    const char* path = AS_STRING(args[0]);
-    const char* mode = AS_STRING(args[1]);
     FILE* f = fopen(path, mode);
     if (!f) {
         runtimeError(vm, "fopen failed for '%s'", path);
