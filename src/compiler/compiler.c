@@ -6300,6 +6300,26 @@ static bool globalVariableExists(const char* name) {
     return false;
 }
 
+// Set while a call's bare callee name is compiled as a value (an indirect call).
+static PSCAL_THREAD_LOCAL bool compiling_call_target = false;
+
+/* Pascal declares every global, constant and routine before it is used, and
+ * its parser records them, so a bare name that reaches a global load without
+ * being one is undeclared. Say so when compiling, as for an assignment to it;
+ * the load used to compile and fail only when that line ran ("Undefined
+ * global variable"). `myself` and `my` are the implicit receiver, defined by
+ * the compiler on first use. The other front ends check names in their own
+ * semantic passes. */
+static bool pascalGlobalNameUndeclared(const char* name, AST* ref) {
+    if (!frontendIsPascal() || !name || !*name) return false;
+    if (strcasecmp(name, "myself") == 0 || strcasecmp(name, "my") == 0) return false;
+    const char* slotName = topLevelBlockSlotName(name, ref);
+    if (globalVariableExists(slotName) || lookupGlobalSymbol(slotName)) return false;
+    if (slotName != name && (globalVariableExists(name) || lookupGlobalSymbol(name))) return false;
+    if (lookupProcedure(name)) return false;
+    return true;
+}
+
 static bool resolveUnitQualifiedGlobal(AST* node, char* outName, size_t outSize, Symbol** outSymbol) {
     if (!node || node->type != AST_FIELD_ACCESS || !outName || outSize == 0) {
         return false;
@@ -11164,7 +11184,14 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                         calleeExpr.left->parent = &calleeExpr;
                     }
 
+                    compiling_call_target = (exprToCompile == &calleeExpr && calleeExpr.type == AST_VARIABLE);
+                    bool errorsBefore = compiler_had_error;
                     compileRValue(exprToCompile, chunk, line);
+                    compiling_call_target = false;
+                    if (!errorsBefore && compiler_had_error) {
+                        if (savedParent) calleeExpr.left->parent = savedParent;
+                        break;
+                    }
 
                     if (savedParent) {
                         calleeExpr.left->parent = savedParent;
@@ -11723,6 +11750,13 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                             emitConstant(chunk, addConstantToChunk(chunk, const_val_ptr), line);
                         } else {
                             if (emitImplicitMyselfFieldValue(chunk, line, varName)) {
+                                break;
+                            }
+                            if (pascalGlobalNameUndeclared(varName, node)) {
+                                fprintf(stderr, "L%d: Undefined %s '%s'.\n", line,
+                                        compiling_call_target ? "procedure or function" : "variable",
+                                        varName);
+                                compiler_had_error = true;
                                 break;
                             }
                             DBG_PRINTF("[dbg] RV %s -> global line=%d\n", varName, line);
@@ -12737,7 +12771,9 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                     AST tmpVar; memset(&tmpVar, 0, sizeof(AST));
                     tmpVar.type = AST_VARIABLE; tmpVar.token = node->token;
                     // Arguments are already compiled (above) and on the stack; now push callee address
+                    compiling_call_target = true;
                     compileRValue(&tmpVar, chunk, line);
+                    compiling_call_target = false;
                     writeBytecodeChunk(chunk, CALL_INDIRECT, line);
                     writeBytecodeChunk(chunk, (uint8_t)call_arg_count, line);
                 }
@@ -12790,7 +12826,9 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
                     // Fallback to indirect function pointer call: push callee address and perform indirect call
                     AST tmpVar; memset(&tmpVar, 0, sizeof(AST));
                     tmpVar.type = AST_VARIABLE; tmpVar.token = node->token;
+                    compiling_call_target = true;
                     compileRValue(&tmpVar, chunk, line);
+                    compiling_call_target = false;
                     writeBytecodeChunk(chunk, CALL_INDIRECT, line);
                     writeBytecodeChunk(chunk, (uint8_t)call_arg_count, line);
                 }
