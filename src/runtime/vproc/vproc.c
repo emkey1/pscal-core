@@ -16019,7 +16019,9 @@ int pscalTtySignalCheck(void) {
                 default:
                     /* One that stays queued until the task looks would only have a retried
                      * read spin: the task acts on it where it looks. */
-                    interrupt = !(entry->unwinds_itself || entry->shell_task) || gVprocPipelineStage;
+                    /* A shell waiting at its prompt wakes for it too: it acts on it there. */
+                    interrupt = !(entry->unwinds_itself || entry->shell_task) || gVprocPipelineStage ||
+                                entry->shell_prompt_read_active;
                     break;
             }
         }
@@ -16137,6 +16139,11 @@ static bool vprocCurrentHoldsFatalSignal(void) {
     bool holds = false;
     pthread_mutex_lock(&gVProcTasks.mu);
     VProcTaskEntry *entry = vprocTaskFindLocked(pid);
+    /* A command the shell runs on its own thread, ended by the interrupt key: its signal was
+     * acted on, and the task is dying, but its thread is the shell's and goes on. */
+    if (entry && entry->dying_since_ns != 0 && entry->exit_signal == SIGINT) {
+        holds = true;
+    }
     if (entry && (entry->unwinds_itself || entry->shell_task)) {
         for (int sig = 1; !holds && sig < 32; ++sig) {
             holds = (entry->pending_signals & vprocSigMask(sig)) &&
