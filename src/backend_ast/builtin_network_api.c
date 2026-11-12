@@ -247,8 +247,14 @@ static void setSocketError(int err) {
 #endif
 }
 
+/* A blocked socket call gives up on Ctrl-C. On macOS and Linux a front end's own
+ * SIGINT handler (pascal, clike, rea) sets the VM's abort flags and not the
+ * runtime's SIGINT flag, so look at both; a worker thread's VM answers to its
+ * owner's. Before, a server blocked in socketAccept outlived Ctrl-C. */
 static bool socketConsumeInterrupt(VM *vm) {
-    if (!pscalRuntimeConsumeSigint()) {
+    VM *root = vm ? (vm->threadOwner ? vm->threadOwner : vm) : NULL;
+    bool aborted = (vm && vm->abort_requested) || (root && root->abort_requested);
+    if (!aborted && !pscalRuntimeConsumeSigint()) {
         return false;
     }
     if (vm) {
