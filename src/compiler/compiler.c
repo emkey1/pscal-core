@@ -1203,6 +1203,50 @@ static void emitBuiltinProcedureCall(BytecodeChunk* chunk, const char* name, uin
     writeBytecodeChunk(chunk, arg_count, line);
 }
 
+static void compileLValue(AST* node, BytecodeChunk* chunk, int current_line_approx);
+static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_approx);
+static int getLine(AST* node);
+
+/* Pascal's Move(Source, Dest, Count). A VM variable holds values, not bytes,
+ * so the builtin copies whole elements and must know where each side's array
+ * ends: pass each side as (variable or array by reference, start index or
+ * nil) instead of an element's bare address. An argument a[i] or a[i, j]
+ * passes a (or a[i]) and the last index; anything else passes itself and nil.
+ * A program's own Move is compiled as any call. */
+static bool compilePascalMoveCall(AST* node, BytecodeChunk* chunk, int line) {
+    if (!frontendIsPascal() || !node || node->left || node->child_count != 3 ||
+        !node->token || !node->token->value || strcasecmp(node->token->value, "move") != 0 ||
+        lookupProcedure("move")) {
+        return false;
+    }
+    for (int k = 0; k < 2; k++) {
+        AST* arg = node->children[k];
+        if (arg && arg->type == AST_ARRAY_ACCESS && arg->child_count >= 1 && arg->left &&
+            arg->left->var_type != TYPE_STRING) {
+            AST* base = arg->left;
+            AST* partial = NULL;
+            if (arg->child_count > 1) {
+                partial = copyAST(arg);
+                if (!partial) return false;
+                AST* last = partial->children[partial->child_count - 1];
+                partial->children[--partial->child_count] = NULL;
+                freeAST(last);
+                partial->parent = arg->parent;
+                base = partial;
+            }
+            compileLValue(base, chunk, getLine(base));
+            compileRValue(arg->children[arg->child_count - 1], chunk, line);
+            if (partial) freeAST(partial);
+        } else {
+            compileLValue(arg, chunk, arg ? getLine(arg) : line);
+            emitConstant(chunk, addNilConstant(chunk), line);
+        }
+    }
+    compileRValue(node->children[2], chunk, line);
+    emitBuiltinProcedureCall(chunk, "move", 5, line);
+    return true;
+}
+
 static void ensureMyselfGlobalDefined(BytecodeChunk* chunk, int line) {
     if (compiler_defined_myself_global) return;
     int myself_idx = ensureMyselfGlobalNameIndex(chunk);
@@ -6310,6 +6354,43 @@ static PSCAL_THREAD_LOCAL bool compiling_call_target = false;
  * global variable"). `myself` and `my` are the implicit receiver, defined by
  * the compiler on first use. The other front ends check names in their own
  * semantic passes. */
+/* SizeOf(TypeName): a bare type name as SizeOf's only argument (SizeOf(Integer),
+ * SizeOf(TCell)). The name would otherwise compile as a value -- Integer as the
+ * conversion routine, measured as a pointer (8), a program's own type as an
+ * undeclared variable -- so the size is folded here, while the compiler knows
+ * the type. A local or global variable of that name is measured as itself. */
+static bool pascalSizeOfTypeArgument(AST* call, const char** out_name) {
+    if (!frontendIsPascal() || !call || call->left || call->child_count != 1 ||
+        !call->token || !call->token->value || strcasecmp(call->token->value, "sizeof") != 0) {
+        return false;
+    }
+    AST* arg = call->children[0];
+    if (!arg || !arg->token || !arg->token->value || !*arg->token->value) return false;
+    if (!(arg->type == AST_VARIABLE || (arg->type == AST_PROCEDURE_CALL && arg->child_count == 0 && !arg->left))) {
+        return false;
+    }
+    const char* name = arg->token->value;
+    if (current_function_compiler && resolveLocal(current_function_compiler, name) != -1) return false;
+    if (globalVariableExists(name)) return false;
+    static const char* const scalar_types[] = {
+        "integer", "longint", "real", "float", "char", "boolean", "byte", "word",
+    };
+    bool is_type = false;
+    for (size_t i = 0; i < sizeof(scalar_types) / sizeof(scalar_types[0]); i++) {
+        if (strcasecmp(name, scalar_types[i]) == 0) { is_type = true; break; }
+    }
+    if (!is_type) {
+        char lower[MAX_SYMBOL_LENGTH];
+        strncpy(lower, name, sizeof(lower) - 1);
+        lower[sizeof(lower) - 1] = '\0';
+        toLowerString(lower);
+        is_type = lookupType(lower) != NULL || lookupType(name) != NULL;
+    }
+    if (!is_type) return false;
+    *out_name = name;
+    return true;
+}
+
 static bool pascalGlobalNameUndeclared(const char* name, AST* ref) {
     if (!frontendIsPascal() || !name || !*name) return false;
     if (strcasecmp(name, "myself") == 0 || strcasecmp(name, "my") == 0) return false;
@@ -10163,6 +10244,9 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                     break;
                 }
             }
+            if (compilePascalMoveCall(node, chunk, line)) {
+                break;
+            }
             const char* calleeName = (node->token && node->token->value)
                                          ? node->token->value
                                          : NULL;
@@ -10950,6 +11034,9 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                         ((strcasecmp(calleeName, "blockread") == 0 || strcasecmp(calleeName, "blockwrite") == 0) && (param_index == 0 || param_index == 1 || param_index == 3)) ||
                         (strcasecmp(calleeName, "readln") == 0 && (param_index > 0 || (param_index == 0 && arg_node->var_type != TYPE_FILE))) ||
                         ((strcasecmp(calleeName, "val") == 0 || strcasecmp(calleeName, "valreal") == 0) && param_index >= 1) ||
+                        /* Pascal's Delete(var S; ...) and Insert(Source; var S; ...). */
+                        (frontendIsPascal() && param_index == 0 && strcasecmp(calleeName, "delete") == 0) ||
+                        (frontendIsPascal() && param_index == 1 && strcasecmp(calleeName, "insert") == 0) ||
                         // VM 2.0 Phase 5b checkpoint 5b-i (Docs/pscal_vm2_plan.md
                         // Sec 6.2): ChannelTryReceive(channel, var status, var
                         // outValue) needs two genuine var out-parameters -- unlike
@@ -12147,6 +12234,16 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
         case AST_PROCEDURE_CALL: {
             int line = getLine(node);
             if (line <= 0) line = current_line_approx;
+
+            const char* sizeof_type_name = NULL;
+            long long sizeof_type_bytes = 0;
+            if (pascalSizeOfTypeArgument(node, &sizeof_type_name) &&
+                pscalSizeOfTypeName(sizeof_type_name, &sizeof_type_bytes)) {
+                Value sz = makeInt64(sizeof_type_bytes);
+                emitConstant(chunk, addConstantToChunk(chunk, &sz), line);
+                freeValue(&sz);
+                break;
+            }
 
             const char* functionName = NULL;
             const char* methodIdentifier = NULL;

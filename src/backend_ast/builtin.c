@@ -1530,6 +1530,11 @@ static bool computeSizeFromTypeName(const char *type_name, long long *out_bytes)
     return ok;
 }
 
+/* SizeOf of a type named in the program, for the compiler to fold. */
+bool pscalSizeOfTypeName(const char *type_name, long long *out_bytes) {
+    return computeSizeFromTypeName(type_name, out_bytes);
+}
+
 static bool computeValueSizeBytesInternal(const Value *value, long long *out_bytes, int depth) {
     if (!value || !out_bytes || depth > 16) {
         return false;
@@ -2553,6 +2558,13 @@ static VmBuiltinMapping vmBuiltinDispatchTable[] = {
     {"channeltryreceive", vmBuiltinChannelTryReceive},
     {"channelclose", vmBuiltinChannelClose},
     {"channelisclosed", vmBuiltinChannelIsClosed},
+    /* Pascal's standard Delete, Insert, Assigned, GetTickCount and Move;
+     * Pascal-only, see pascalOnlyBuiltinNames. */
+    {"delete", vmBuiltinPascalDelete},
+    {"insert", vmBuiltinPascalInsert},
+    {"assigned", vmBuiltinPascalAssigned},
+    {"gettickcount", vmBuiltinPascalGetTickCount},
+    {"move", vmBuiltinPascalMove},
 };
 
 static const size_t num_vm_builtins = sizeof(vmBuiltinDispatchTable) / sizeof(vmBuiltinDispatchTable[0]);
@@ -2620,6 +2632,48 @@ bool vmFrontendHidesShellBuiltins(void) {
 bool extBuiltinCategoryHiddenFromFrontend(const char *category) {
     return category && strcasecmp(category, "shell") == 0 &&
            vmFrontendHidesShellBuiltins();
+}
+
+/* Pascal's standard routines that are only Pascal's: CLike, Rea and Aether
+ * programs (and the shell) keep these names for their own functions. A thread
+ * that has no front end of its own (a Pascal program's worker) sees them. */
+static const char *const pascalOnlyBuiltinNames[] = {
+    "delete", "insert", "assigned", "gettickcount", "move",
+};
+#define PASCAL_ONLY_BUILTIN_COUNT (sizeof(pascalOnlyBuiltinNames) / sizeof(pascalOnlyBuiltinNames[0]))
+static int g_pascal_only_ids[PASCAL_ONLY_BUILTIN_COUNT];
+static pthread_once_t g_pascal_only_once = PTHREAD_ONCE_INIT;
+
+/* They are static dispatch-table entries, whose id is their index there. */
+static void initPascalOnlyIds(void) {
+    size_t table_count = sizeof(vmBuiltinDispatchTable) / sizeof(vmBuiltinDispatchTable[0]);
+    for (size_t k = 0; k < PASCAL_ONLY_BUILTIN_COUNT; ++k) {
+        g_pascal_only_ids[k] = -1;
+        for (size_t i = 0; i < table_count; ++i) {
+            if (strcasecmp(vmBuiltinDispatchTable[i].name, pascalOnlyBuiltinNames[k]) == 0) {
+                g_pascal_only_ids[k] = (int)i;
+                break;
+            }
+        }
+    }
+}
+
+bool vmBuiltinHiddenFromFrontend(int id) {
+    if (id < 0) return false;
+    switch (frontendGetKind()) {
+        case FRONTEND_KIND_REA:
+        case FRONTEND_KIND_AETHER:
+        case FRONTEND_KIND_CLIKE:
+        case FRONTEND_KIND_SHELL:
+            break;
+        default:
+            return false;
+    }
+    pthread_once(&g_pascal_only_once, initPascalOnlyIds);
+    for (size_t k = 0; k < PASCAL_ONLY_BUILTIN_COUNT; ++k) {
+        if (g_pascal_only_ids[k] == id) return true;
+    }
+    return false;
 }
 
 static unsigned char shellViewOfId(int id) {
@@ -2882,7 +2936,7 @@ static const EffectClassification kEffectClassifiedNames[] = {
     {"exit", FX_PROC}, {"halt", FX_PROC}, {"store", FX_PROC}, {"swap", FX_PROC},
     {"fetch", FX_PROC},
     /* timing (raw + Aether alias) */
-    {"delay", FX_CLOCK}, {"sleep", FX_CLOCK},
+    {"delay", FX_CLOCK}, {"sleep", FX_CLOCK}, {"gettickcount", FX_CLOCK},
     /* AI (raw + Aether alias) -- goes over the network */
     {"openaichatcompletions", FX_NET}, {"ai_chat", FX_NET},
     /* tasks / threads (Aether aliases + raw) */
@@ -3133,7 +3187,7 @@ static VmBuiltinFn handlerByIdAsRegistered(int id) {
 VmBuiltinFn getVmBuiltinHandlerById(int id) {
     if (id < 0) return NULL;
     unsigned char view = shellViewOfId(id);
-    if (view == SHELL_VIEW_ONLY) {
+    if (view == SHELL_VIEW_ONLY || vmBuiltinHiddenFromFrontend(id)) {
         return NULL;
     }
     if (view == SHELL_VIEW_REPLACED) {
@@ -3346,7 +3400,7 @@ static int builtinIdAsRegistered(const char *name) {
 
 int getVmBuiltinID(const char *name) {
     int id = builtinIdAsRegistered(name);
-    return shellViewOfId(id) == SHELL_VIEW_ONLY ? -1 : id;
+    return (shellViewOfId(id) == SHELL_VIEW_ONLY || vmBuiltinHiddenFromFrontend(id)) ? -1 : id;
 }
 
 void registerShellVmBuiltin(const char *name, VmBuiltinFn handler,
@@ -4090,6 +4144,272 @@ Value vmBuiltinFclose(VM* vm, int arg_count, Value* args) {
         return makeVoid();
     }
     vmMaybeCloseFileValue(farg);
+    return makeVoid();
+}
+
+/* ---- Pascal's standard routines Delete, Insert, Assigned, GetTickCount and
+ * Move. Only Pascal sees them (see pascalOnlyBuiltinNames): CLike, Rea, Aether
+ * and the shell keep these names for their own use. ---- */
+
+/* The text of a string-or-char argument, in buf for a char. */
+static const char *pascalStringArgText(const Value *v, char buf[5]) {
+    if (!v) return NULL;
+    if (VALUE_TYPE(*v) == TYPE_CHAR) {
+        buf[0] = (char)AS_CHAR(*v);
+        buf[1] = '\0';
+        return buf;
+    }
+    if (VALUE_TYPE(*v) == TYPE_WIDECHAR) {
+        memset(buf, 0, 5);
+        encodeUtf8Codepoint((uint32_t)AS_CHAR(*v), buf);
+        return buf;
+    }
+    if (isPascalStringType(VALUE_TYPE(*v))) return AS_STRING(*v) ? AS_STRING(*v) : "";
+    return NULL;
+}
+
+/* A string variable a var parameter points at, unshared so it can be edited. */
+static Value *pascalStringVarTarget(VM *vm, const Value *arg, const char *who) {
+    Value *target = (VALUE_TYPE(*arg) == TYPE_POINTER) ? (Value *)AS_POINTER(*arg) : NULL;
+    if (!target || !isPascalStringType(VALUE_TYPE(*target))) {
+        runtimeError(vm, "%s expects a string variable.", who);
+        return NULL;
+    }
+    valueEnsureUnique(target);
+    return target;
+}
+
+/* Byte offsets of character positions [from, from+count) of s, clipped to it;
+ * positions count code points in a UnicodeString and bytes otherwise. */
+static void pascalCharSpan(const char *s, bool unicode, size_t from, size_t count,
+                           size_t *out_begin, size_t *out_end) {
+    size_t len = strlen(s);
+    if (!unicode) {
+        size_t b = from < len ? from : len;
+        size_t e = (count > len - b) ? len : b + count;
+        *out_begin = b; *out_end = e;
+        return;
+    }
+    size_t cps = utf8CodepointCount(s, len);
+    size_t b = from < cps ? from : cps;
+    size_t e = (count > cps - b) ? cps : b + count;
+    *out_begin = utf8ByteOffsetForCodepointIndex(s, len, b);
+    *out_end = utf8ByteOffsetForCodepointIndex(s, len, e);
+}
+
+/* Delete(var S: string; Index, Count: Integer): removes Count characters from
+ * S starting at Index. An Index outside S or a Count below 1 changes nothing. */
+Value vmBuiltinPascalDelete(VM* vm, int arg_count, Value* args) {
+    if (arg_count != 3 || !IS_INTLIKE(args[1]) || !IS_INTLIKE(args[2])) {
+        runtimeError(vm, "Delete expects (var string, Integer, Integer).");
+        return makeVoid();
+    }
+    Value *target = pascalStringVarTarget(vm, &args[0], "Delete");
+    if (!target) return makeVoid();
+    long long base = frontendIsZeroBasedStrings() ? 0 : 1;
+    long long index = AS_INTEGER(args[1]);
+    long long count = AS_INTEGER(args[2]);
+    char *s = AS_STRING(*target);
+    if (!s || index < base || count < 1) return makeVoid();
+    bool unicode = (VALUE_TYPE(*target) == TYPE_UNICODE_STRING);
+    size_t begin = 0, end = 0;
+    pascalCharSpan(s, unicode, (size_t)(index - base), (size_t)count, &begin, &end);
+    if (end > begin) {
+        memmove(s + begin, s + end, strlen(s + end) + 1);
+    }
+    return makeVoid();
+}
+
+/* Insert(Source: string; var S: string; Index: Integer): puts Source into S
+ * before position Index. Index below 1 inserts at the front, past the end
+ * appends; a string[N] keeps its first N characters. */
+Value vmBuiltinPascalInsert(VM* vm, int arg_count, Value* args) {
+    char srcbuf[5];
+    const char *src = (arg_count == 3) ? pascalStringArgText(&args[0], srcbuf) : NULL;
+    if (!src || !IS_INTLIKE(args[2])) {
+        runtimeError(vm, "Insert expects (string, var string, Integer).");
+        return makeVoid();
+    }
+    Value *target = pascalStringVarTarget(vm, &args[1], "Insert");
+    if (!target) return makeVoid();
+    long long base = frontendIsZeroBasedStrings() ? 0 : 1;
+    long long index = AS_INTEGER(args[2]);
+    const char *s = AS_STRING(*target) ? AS_STRING(*target) : "";
+    bool unicode = (VALUE_TYPE(*target) == TYPE_UNICODE_STRING);
+    size_t at = 0, unused = 0;
+    pascalCharSpan(s, unicode, index > base ? (size_t)(index - base) : 0, 0, &at, &unused);
+    size_t slen = strlen(s), ilen = strlen(src);
+    size_t total = slen + ilen;
+    int max_len = STRING_MAX_LENGTH(*target);
+    if (max_len > 0 && !unicode && total > (size_t)max_len) {
+        total = (size_t)max_len;
+    }
+    char *buf = (char *)malloc(slen + ilen + 1);
+    if (!buf) {
+        runtimeError(vm, "Insert: memory allocation failed.");
+        return makeVoid();
+    }
+    memcpy(buf, s, at);
+    memcpy(buf + at, src, ilen);
+    memcpy(buf + at + ilen, s + at, slen - at);
+    buf[total] = '\0';
+    free(AS_STRING(*target));
+    AS_STRING(*target) = buf;
+    return makeVoid();
+}
+
+/* Assigned(P): whether a pointer, procedure variable or object reference is
+ * not nil. */
+Value vmBuiltinPascalAssigned(VM* vm, int arg_count, Value* args) {
+    if (arg_count != 1) {
+        runtimeError(vm, "Assigned expects 1 argument.");
+        return makeBoolean(false);
+    }
+    switch (VALUE_TYPE(args[0])) {
+        case TYPE_NIL:
+        case TYPE_VOID:
+        case TYPE_UNKNOWN:
+            return makeBoolean(false);
+        case TYPE_POINTER:
+            return makeBoolean(AS_POINTER(args[0]) != NULL);
+        default:
+            return makeBoolean(true);
+    }
+}
+
+/* GetTickCount: milliseconds on a clock that never goes back, for timing. */
+Value vmBuiltinPascalGetTickCount(VM* vm, int arg_count, Value* args) {
+    (void)args;
+    if (arg_count != 0) {
+        runtimeError(vm, "GetTickCount expects no arguments.");
+        return makeInt64(0);
+    }
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return makeInt64((long long)ts.tv_sec * 1000LL + (long long)(ts.tv_nsec / 1000000L));
+}
+
+/* One side of a Move: a whole variable, or the elements of a one-dimensional
+ * array from a start index on. */
+typedef struct {
+    Value *cell;        /* the variable, or the array */
+    bool is_array;
+    bool packed;        /* a packed byte array */
+    long long start;    /* first element's flat offset */
+    long long avail;    /* elements from start to the array's end */
+    long long elem_size;
+} PascalMoveSide;
+
+static bool pascalMoveSide(VM *vm, const Value *ref, const Value *index, PascalMoveSide *out,
+                           const char *which) {
+    Value *cell = (VALUE_TYPE(*ref) == TYPE_POINTER) ? (Value *)AS_POINTER(*ref) : NULL;
+    if (!cell) {
+        runtimeError(vm, "Move: the %s must be a variable.", which);
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    out->cell = cell;
+    if (VALUE_TYPE(*cell) != TYPE_ARRAY) {
+        if (VALUE_TYPE(index[0]) != TYPE_NIL) {
+            runtimeError(vm, "Move: the %s is not an array.", which);
+            return false;
+        }
+        if (!computeValueSizeBytes(cell, &out->elem_size) || out->elem_size <= 0) {
+            runtimeError(vm, "Move: cannot size the %s (%s).", which, varTypeToString(VALUE_TYPE(*cell)));
+            return false;
+        }
+        out->avail = 1;
+        return true;
+    }
+    ArrayObj *arr = PSCAL_VALUE_PTR(*cell, ArrayObj);
+    if (!arr || arr->dimensions != 1) {
+        runtimeError(vm, "Move: the %s must be a one-dimensional array or one of its elements.", which);
+        return false;
+    }
+    out->is_array = true;
+    out->packed = arr->is_packed;
+    long long total = calculateArrayTotalSize(cell);
+    if (VALUE_TYPE(index[0]) == TYPE_NIL) {
+        out->start = 0;
+    } else if (IS_INTLIKE(index[0])) {
+        int idx = (int)AS_INTEGER(index[0]);
+        out->start = computeFlatOffset(cell, &idx);
+        if (out->start < 0 || out->start > total) {
+            runtimeError(vm, "Move: index %d is outside the %s.", idx, which);
+            return false;
+        }
+    } else {
+        runtimeError(vm, "Move: the %s's index must be an integer.", which);
+        return false;
+    }
+    out->avail = total - out->start;
+    if (out->packed) {
+        out->elem_size = 1;
+    } else if (total > 0 && computeValueSizeBytes(&arr->elements[out->start < total ? out->start : 0], &out->elem_size)) {
+        /* sized from an element */
+    } else if (!builtinSizeForVarType(arr->element_type, &out->elem_size)) {
+        out->elem_size = 0;
+    }
+    if (out->elem_size <= 0) {
+        runtimeError(vm, "Move: cannot size the %s's elements.", which);
+        return false;
+    }
+    return true;
+}
+
+/* Move(const Source; var Dest; Count): copies Count bytes' worth of whole
+ * elements from Source to Dest, as Pascal's Move copies memory. Here a
+ * variable holds values rather than bytes, so Count must be a whole number
+ * of elements of the same size on both sides, and the copy stays inside both
+ * arrays (an overlap is copied as memmove would). The compiler passes each
+ * side as (variable or array, start index or nil). */
+Value vmBuiltinPascalMove(VM* vm, int arg_count, Value* args) {
+    if (arg_count != 5 || !IS_INTLIKE(args[4])) {
+        runtimeError(vm, "Move expects (source, var dest, Integer).");
+        return makeVoid();
+    }
+    long long count = AS_INTEGER(args[4]);
+    if (count <= 0) return makeVoid();
+    PascalMoveSide src, dst;
+    if (!pascalMoveSide(vm, &args[0], &args[1], &src, "source") ||
+        !pascalMoveSide(vm, &args[2], &args[3], &dst, "destination")) {
+        return makeVoid();
+    }
+    if (src.elem_size != dst.elem_size || src.is_array != dst.is_array || src.packed != dst.packed) {
+        runtimeError(vm, "Move: the source and destination hold different kinds of element.");
+        return makeVoid();
+    }
+    if (count % src.elem_size != 0) {
+        runtimeError(vm, "Move: %lld bytes is not a whole number of %lld-byte elements.", count, src.elem_size);
+        return makeVoid();
+    }
+    long long n = count / src.elem_size;
+    if (n > src.avail || n > dst.avail) {
+        runtimeError(vm, "Move: %lld elements run past the end of the %s.", n,
+                     n > src.avail ? "source" : "destination");
+        return makeVoid();
+    }
+    if (!src.is_array) {
+        if (src.cell == dst.cell) return makeVoid();
+        Value copy = makeCopyOfValue(src.cell);
+        freeValue(dst.cell);
+        *dst.cell = copy;
+        return makeVoid();
+    }
+    valueEnsureUnique(dst.cell);
+    ArrayObj *sa = PSCAL_VALUE_PTR(*src.cell, ArrayObj);
+    ArrayObj *da = PSCAL_VALUE_PTR(*dst.cell, ArrayObj);
+    if (src.packed) {
+        memmove(da->raw + dst.start, sa->raw + src.start, (size_t)n);
+        return makeVoid();
+    }
+    bool backward = (sa == da && dst.start > src.start);
+    for (long long k = 0; k < n; k++) {
+        long long i = backward ? n - 1 - k : k;
+        Value copy = makeCopyOfValue(&sa->elements[src.start + i]);
+        freeValue(&da->elements[dst.start + i]);
+        da->elements[dst.start + i] = copy;
+    }
     return makeVoid();
 }
 
@@ -13302,9 +13622,13 @@ int isBuiltin(const char *name) {
 
     if (!result) {
         result = getVmBuiltinID(name) != -1;
-    } else if (shellViewOfId(builtinIdAsRegistered(name)) == SHELL_VIEW_ONLY) {
-        /* A shell command (cat, sum, [) is no builtin of a language's. */
-        result = 0;
+    } else {
+        int id = builtinIdAsRegistered(name);
+        /* A shell command (cat, sum, [) is no builtin of a language's, and
+         * Pascal's Delete or Move is no builtin of the others'. */
+        if (shellViewOfId(id) == SHELL_VIEW_ONLY || vmBuiltinHiddenFromFrontend(id)) {
+            result = 0;
+        }
     }
 
     return result;
@@ -13372,6 +13696,12 @@ static void populateBuiltinRegistry(void) {
     /* General built-in functions and procedures */
     // Rea/CLike: object allocation helper
     registerBuiltinFunctionUnlocked("newobj", AST_FUNCTION_DECL, NULL);
+    /* Pascal's standard routines; only Pascal sees them (pascalOnlyBuiltinNames). */
+    registerBuiltinFunctionUnlocked("Delete", AST_PROCEDURE_DECL, NULL);
+    registerBuiltinFunctionUnlocked("Insert", AST_PROCEDURE_DECL, NULL);
+    registerBuiltinFunctionUnlocked("Assigned", AST_FUNCTION_DECL, NULL);
+    registerBuiltinFunctionUnlocked("GetTickCount", AST_FUNCTION_DECL, NULL);
+    registerBuiltinFunctionUnlocked("Move", AST_PROCEDURE_DECL, NULL);
     registerBuiltinFunctionUnlocked("Abs", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("apiReceive", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("apiSend", AST_FUNCTION_DECL, NULL);

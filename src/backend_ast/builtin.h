@@ -83,6 +83,12 @@ void registerShellVmBuiltin(const char *vm_name, VmBuiltinFn handler,
 /* True while a language front end runs on this thread (see above): the
  * shell's builtins and its "shell" extended-builtin category are not its. */
 bool vmFrontendHidesShellBuiltins(void);
+/* Whether builtin `id` is one of Pascal's own routines (Delete, Insert,
+ * Assigned, GetTickCount, Move) that the running front end must not see:
+ * CLike, Rea, Aether and the shell keep those names for themselves. */
+bool vmBuiltinHiddenFromFrontend(int id);
+/* SizeOf(TypeName) in bytes, for the compiler to fold; false for no such type. */
+bool pscalSizeOfTypeName(const char *type_name, long long *out_bytes);
 /* The app's shell files its commands under the "shell" extended-builtin
  * category, in the one registry every front end shares; to a language that
  * category does not exist, as on a Mac or Linux, where only exsh registers
@@ -175,6 +181,12 @@ Value vmBuiltinFopen(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinFclose(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinFilesize(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinCopy(struct VM_s* vm, int arg_count, Value* args);
+// Pascal's standard routines, seen only by Pascal (see vmBuiltinHiddenFromFrontend).
+Value vmBuiltinPascalDelete(struct VM_s* vm, int arg_count, Value* args);
+Value vmBuiltinPascalInsert(struct VM_s* vm, int arg_count, Value* args);
+Value vmBuiltinPascalAssigned(struct VM_s* vm, int arg_count, Value* args);
+Value vmBuiltinPascalGetTickCount(struct VM_s* vm, int arg_count, Value* args);
+Value vmBuiltinPascalMove(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinStringOfChar(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinTrim(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinSetlength(struct VM_s* vm, int arg_count, Value* args);

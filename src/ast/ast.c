@@ -1822,6 +1822,9 @@ resolved_field: ;
                                     verifyProcPointerTypesCompatible(lhsType, rhsType);
                                 } else if (rhs->var_type == TYPE_POINTER) {
                                     rhsIsProcPointer = true;
+                                } else if (rhs->type == AST_NIL || rhs->var_type == TYPE_NIL) {
+                                    /* `cb := nil` clears a procedure variable, as in Pascal. */
+                                    rhsIsProcPointer = true;
                                 }
                             }
                         }
