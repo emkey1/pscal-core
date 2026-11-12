@@ -99,6 +99,21 @@ static bool shellToolTcsetattr(int fd, int action, const struct termios *termios
     return tcsetattr(fd, action, termios) == 0;
 }
 
+/* Puts back the modes a tool found, only where the tool left them changed. Setting them
+ * unchanged is still a terminal change, and from a background job (`pascal x &`) it stops
+ * the job with SIGTTOU, as on Linux, so the job never ends. */
+static bool shellToolRestoreTermios(int fd, const struct termios *saved) {
+    struct termios now;
+    if (saved && shellToolTcgetattr(fd, &now) &&
+        now.c_iflag == saved->c_iflag && now.c_oflag == saved->c_oflag &&
+        now.c_cflag == saved->c_cflag && now.c_lflag == saved->c_lflag &&
+        memcmp(now.c_cc, saved->c_cc, sizeof(now.c_cc)) == 0 &&
+        cfgetispeed(&now) == cfgetispeed(saved) && cfgetospeed(&now) == cfgetospeed(saved)) {
+        return true;
+    }
+    return shellToolTcsetattr(fd, SHELL_TOOL_RESTORE_ACTION, saved);
+}
+
 #ifdef PSCAL_TARGET_IOS
 #include <signal.h>
 #include <dirent.h>
@@ -3421,7 +3436,7 @@ static int shellRunToolInlineWithRestore(ShellToolEntryFn entry,
     if (manage_process_state) {
         shellRestoreStandardFds(&fd_backup, dbg);
         if (stdin_termios_valid) {
-            shellToolTcsetattr(STDIN_FILENO, SHELL_TOOL_RESTORE_ACTION, &stdin_termios);
+            shellToolRestoreTermios(STDIN_FILENO, &stdin_termios);
         }
         shellCloseVprocStreams();
         if (dbg) {
@@ -3959,7 +3974,7 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
         if (!use_shell_context) {
             int status = entry(argc, argv);
             if (stdin_termios_valid) {
-                shellToolTcsetattr(STDIN_FILENO, SHELL_TOOL_RESTORE_ACTION, &stdin_termios);
+                shellToolRestoreTermios(STDIN_FILENO, &stdin_termios);
             }
             free(context);
             return status;
@@ -3970,7 +3985,7 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
         shellRuntimeActivateContext(prev);
         shellRuntimeDestroyContext(ctx);
         if (stdin_termios_valid) {
-            shellToolTcsetattr(STDIN_FILENO, SHELL_TOOL_RESTORE_ACTION, &stdin_termios);
+            shellToolRestoreTermios(STDIN_FILENO, &stdin_termios);
         }
         free(context);
         return status;
@@ -3983,7 +3998,7 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
         pthread_join(context->worker_thread, NULL);
         pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
         if (stdin_termios_valid) {
-            shellToolTcsetattr(STDIN_FILENO, SHELL_TOOL_RESTORE_ACTION, &stdin_termios);
+            shellToolRestoreTermios(STDIN_FILENO, &stdin_termios);
         }
         int waiter_failed_status = context->status;
         free(context);
@@ -4043,7 +4058,7 @@ static int shellRunToolInThread(ShellToolEntryFn entry,
     pthread_join(waiter_thread, NULL);
     pthread_sigmask(SIG_SETMASK, &old_mask, NULL);
     if (stdin_termios_valid) {
-        shellToolTcsetattr(STDIN_FILENO, SHELL_TOOL_RESTORE_ACTION, &stdin_termios);
+        shellToolRestoreTermios(STDIN_FILENO, &stdin_termios);
     }
     if (out_frontend_reset) {
         *out_frontend_reset = context->frontend_reset_done;
