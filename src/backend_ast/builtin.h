@@ -83,9 +83,9 @@ void registerShellVmBuiltin(const char *vm_name, VmBuiltinFn handler,
 /* True while a language front end runs on this thread (see above): the
  * shell's builtins and its "shell" extended-builtin category are not its. */
 bool vmFrontendHidesShellBuiltins(void);
-/* Whether builtin `id` is one of Pascal's own routines (Delete, Insert,
- * Assigned, GetTickCount, Move) that the running front end must not see:
- * CLike, Rea, Aether and the shell keep those names for themselves. */
+/* Whether builtin `id` belongs to other languages than the running front end:
+ * Pascal's Delete, Insert, Assigned, GetTickCount and Move, and CLike's and
+ * Rea's strinsert and strdelete. The others keep those names for themselves. */
 bool vmBuiltinHiddenFromFrontend(int id);
 /* SizeOf(TypeName) in bytes, for the compiler to fold; false for no such type. */
 bool pscalSizeOfTypeName(const char *type_name, long long *out_bytes);
@@ -188,6 +188,9 @@ Value vmBuiltinPascalAssigned(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinPascalGetTickCount(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinPascalMove(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinPascalToOrdinal(struct VM_s* vm, int arg_count, Value* args);
+// CLike's and Rea's string insert/delete, seen only by those two.
+Value vmBuiltinStrInsert(struct VM_s* vm, int arg_count, Value* args);
+Value vmBuiltinStrDelete(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinStringOfChar(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinTrim(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinSetlength(struct VM_s* vm, int arg_count, Value* args);

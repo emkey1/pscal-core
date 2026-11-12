@@ -2559,13 +2559,16 @@ static VmBuiltinMapping vmBuiltinDispatchTable[] = {
     {"channelclose", vmBuiltinChannelClose},
     {"channelisclosed", vmBuiltinChannelIsClosed},
     /* Pascal's standard Delete, Insert, Assigned, GetTickCount and Move;
-     * Pascal-only, see pascalOnlyBuiltinNames. */
+     * Pascal-only, see languageOnlyBuiltins. */
     {"delete", vmBuiltinPascalDelete},
     {"insert", vmBuiltinPascalInsert},
     {"assigned", vmBuiltinPascalAssigned},
     {"gettickcount", vmBuiltinPascalGetTickCount},
     {"move", vmBuiltinPascalMove},
     {"__pascal_to_ordinal", vmBuiltinPascalToOrdinal},
+    /* CLike's and Rea's string insert/delete; see languageOnlyBuiltins. */
+    {"strinsert", vmBuiltinStrInsert},
+    {"strdelete", vmBuiltinStrDelete},
 };
 
 static const size_t num_vm_builtins = sizeof(vmBuiltinDispatchTable) / sizeof(vmBuiltinDispatchTable[0]);
@@ -2635,24 +2638,37 @@ bool extBuiltinCategoryHiddenFromFrontend(const char *category) {
            vmFrontendHidesShellBuiltins();
 }
 
-/* Pascal's standard routines that are only Pascal's: CLike, Rea and Aether
- * programs (and the shell) keep these names for their own functions. A thread
- * that has no front end of its own (a Pascal program's worker) sees them. */
-static const char *const pascalOnlyBuiltinNames[] = {
-    "delete", "insert", "assigned", "gettickcount", "move", "__pascal_to_ordinal",
+/* Builtins that belong to some languages only: Pascal's standard Delete,
+ * Insert, Assigned, GetTickCount and Move (and the compiler's
+ * __pascal_to_ordinal), and CLike's and Rea's strinsert and strdelete. Another language (and the shell) keeps those names for its
+ * own functions. A thread with no front end of its own (a program's worker)
+ * sees them all. */
+#define LANG_BIT(kind) (1u << (unsigned)(kind))
+static const struct {
+    const char *name;
+    unsigned kinds;
+} languageOnlyBuiltins[] = {
+    {"delete", LANG_BIT(FRONTEND_KIND_PASCAL)},
+    {"insert", LANG_BIT(FRONTEND_KIND_PASCAL)},
+    {"assigned", LANG_BIT(FRONTEND_KIND_PASCAL)},
+    {"gettickcount", LANG_BIT(FRONTEND_KIND_PASCAL)},
+    {"move", LANG_BIT(FRONTEND_KIND_PASCAL)},
+    {"__pascal_to_ordinal", LANG_BIT(FRONTEND_KIND_PASCAL)},
+    {"strinsert", LANG_BIT(FRONTEND_KIND_CLIKE) | LANG_BIT(FRONTEND_KIND_REA)},
+    {"strdelete", LANG_BIT(FRONTEND_KIND_CLIKE) | LANG_BIT(FRONTEND_KIND_REA)},
 };
-#define PASCAL_ONLY_BUILTIN_COUNT (sizeof(pascalOnlyBuiltinNames) / sizeof(pascalOnlyBuiltinNames[0]))
-static int g_pascal_only_ids[PASCAL_ONLY_BUILTIN_COUNT];
-static pthread_once_t g_pascal_only_once = PTHREAD_ONCE_INIT;
+#define LANGUAGE_ONLY_BUILTIN_COUNT (sizeof(languageOnlyBuiltins) / sizeof(languageOnlyBuiltins[0]))
+static int g_language_only_ids[LANGUAGE_ONLY_BUILTIN_COUNT];
+static pthread_once_t g_language_only_once = PTHREAD_ONCE_INIT;
 
 /* They are static dispatch-table entries, whose id is their index there. */
-static void initPascalOnlyIds(void) {
+static void initLanguageOnlyIds(void) {
     size_t table_count = sizeof(vmBuiltinDispatchTable) / sizeof(vmBuiltinDispatchTable[0]);
-    for (size_t k = 0; k < PASCAL_ONLY_BUILTIN_COUNT; ++k) {
-        g_pascal_only_ids[k] = -1;
+    for (size_t k = 0; k < LANGUAGE_ONLY_BUILTIN_COUNT; ++k) {
+        g_language_only_ids[k] = -1;
         for (size_t i = 0; i < table_count; ++i) {
-            if (strcasecmp(vmBuiltinDispatchTable[i].name, pascalOnlyBuiltinNames[k]) == 0) {
-                g_pascal_only_ids[k] = (int)i;
+            if (strcasecmp(vmBuiltinDispatchTable[i].name, languageOnlyBuiltins[k].name) == 0) {
+                g_language_only_ids[k] = (int)i;
                 break;
             }
         }
@@ -2661,7 +2677,9 @@ static void initPascalOnlyIds(void) {
 
 bool vmBuiltinHiddenFromFrontend(int id) {
     if (id < 0) return false;
-    switch (frontendGetKind()) {
+    FrontendKind kind = frontendGetKind();
+    switch (kind) {
+        case FRONTEND_KIND_PASCAL:
         case FRONTEND_KIND_REA:
         case FRONTEND_KIND_AETHER:
         case FRONTEND_KIND_CLIKE:
@@ -2670,9 +2688,11 @@ bool vmBuiltinHiddenFromFrontend(int id) {
         default:
             return false;
     }
-    pthread_once(&g_pascal_only_once, initPascalOnlyIds);
-    for (size_t k = 0; k < PASCAL_ONLY_BUILTIN_COUNT; ++k) {
-        if (g_pascal_only_ids[k] == id) return true;
+    pthread_once(&g_language_only_once, initLanguageOnlyIds);
+    for (size_t k = 0; k < LANGUAGE_ONLY_BUILTIN_COUNT; ++k) {
+        if (g_language_only_ids[k] == id) {
+            return (languageOnlyBuiltins[k].kinds & LANG_BIT(kind)) == 0;
+        }
     }
     return false;
 }
@@ -4149,7 +4169,7 @@ Value vmBuiltinFclose(VM* vm, int arg_count, Value* args) {
 }
 
 /* ---- Pascal's standard routines Delete, Insert, Assigned, GetTickCount and
- * Move. Only Pascal sees them (see pascalOnlyBuiltinNames): CLike, Rea, Aether
+ * Move. Only Pascal sees them (see languageOnlyBuiltins): CLike, Rea, Aether
  * and the shell keep these names for their own use. ---- */
 
 /* The text of a string-or-char argument, in buf for a char. */
@@ -4429,6 +4449,67 @@ Value vmBuiltinPascalToOrdinal(VM* vm, int arg_count, Value* args) {
         return makeInt64(AS_INTEGER(args[0]));
     }
     SET_INT_VALUE(&out, AS_INTEGER(args[0]));
+    return out;
+}
+
+/* ---- CLike's and Rea's strinsert(s, pos, t) and strdelete(s, pos, n): a new
+ * string with t put before position pos, or n characters removed from pos.
+ * Positions follow the language's string base (1 here, as copy and pos) and
+ * are clipped as Pascal's Insert and Delete clip them. ---- */
+
+Value vmBuiltinStrInsert(VM* vm, int arg_count, Value* args) {
+    char sbuf[5], tbuf[5];
+    const char *s = (arg_count == 3) ? pascalStringArgText(&args[0], sbuf) : NULL;
+    const char *t = (arg_count == 3) ? pascalStringArgText(&args[2], tbuf) : NULL;
+    if (!s || !t || !IS_INTLIKE(args[1])) {
+        runtimeError(vm, "strinsert expects (string, int, string).");
+        return makeString("");
+    }
+    long long base = frontendIsZeroBasedStrings() ? 0 : 1;
+    long long pos = AS_INTEGER(args[1]);
+    bool unicode = (VALUE_TYPE(args[0]) == TYPE_UNICODE_STRING || VALUE_TYPE(args[2]) == TYPE_UNICODE_STRING);
+    size_t at = 0, unused = 0;
+    pascalCharSpan(s, unicode, pos > base ? (size_t)(pos - base) : 0, 0, &at, &unused);
+    size_t slen = strlen(s), tlen = strlen(t);
+    char *buf = (char *)malloc(slen + tlen + 1);
+    if (!buf) {
+        runtimeError(vm, "strinsert: memory allocation failed.");
+        return makeString("");
+    }
+    memcpy(buf, s, at);
+    memcpy(buf + at, t, tlen);
+    memcpy(buf + at + tlen, s + at, slen - at + 1);
+    Value out = unicode ? makeUnicodeString(buf) : makeString(buf);
+    free(buf);
+    return out;
+}
+
+Value vmBuiltinStrDelete(VM* vm, int arg_count, Value* args) {
+    char sbuf[5];
+    const char *s = (arg_count == 3) ? pascalStringArgText(&args[0], sbuf) : NULL;
+    if (!s || !IS_INTLIKE(args[1]) || !IS_INTLIKE(args[2])) {
+        runtimeError(vm, "strdelete expects (string, int, int).");
+        return makeString("");
+    }
+    bool unicode = (VALUE_TYPE(args[0]) == TYPE_UNICODE_STRING);
+    long long base = frontendIsZeroBasedStrings() ? 0 : 1;
+    long long pos = AS_INTEGER(args[1]);
+    long long count = AS_INTEGER(args[2]);
+    if (pos < base || count < 1) {
+        return unicode ? makeUnicodeString(s) : makeString(s);
+    }
+    size_t begin = 0, end = 0;
+    pascalCharSpan(s, unicode, (size_t)(pos - base), (size_t)count, &begin, &end);
+    size_t slen = strlen(s);
+    char *buf = (char *)malloc(slen + 1);
+    if (!buf) {
+        runtimeError(vm, "strdelete: memory allocation failed.");
+        return makeString("");
+    }
+    memcpy(buf, s, begin);
+    memcpy(buf + begin, s + end, slen - end + 1);
+    Value out = unicode ? makeUnicodeString(buf) : makeString(buf);
+    free(buf);
     return out;
 }
 
@@ -13715,13 +13796,16 @@ static void populateBuiltinRegistry(void) {
     /* General built-in functions and procedures */
     // Rea/CLike: object allocation helper
     registerBuiltinFunctionUnlocked("newobj", AST_FUNCTION_DECL, NULL);
-    /* Pascal's standard routines; only Pascal sees them (pascalOnlyBuiltinNames). */
+    /* Pascal's standard routines; only Pascal sees them (languageOnlyBuiltins). */
     registerBuiltinFunctionUnlocked("Delete", AST_PROCEDURE_DECL, NULL);
     registerBuiltinFunctionUnlocked("Insert", AST_PROCEDURE_DECL, NULL);
     registerBuiltinFunctionUnlocked("Assigned", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("GetTickCount", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("Move", AST_PROCEDURE_DECL, NULL);
     registerBuiltinFunctionUnlocked("__pascal_to_ordinal", AST_FUNCTION_DECL, NULL);
+    /* CLike's and Rea's string insert/delete (languageOnlyBuiltins). */
+    registerBuiltinFunctionUnlocked("strinsert", AST_FUNCTION_DECL, NULL);
+    registerBuiltinFunctionUnlocked("strdelete", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("Abs", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("apiReceive", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("apiSend", AST_FUNCTION_DECL, NULL);

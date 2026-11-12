@@ -1996,6 +1996,7 @@ VarType getBuiltinReturnType(const char* name) {
     if (strcasecmp(name, "httpgetasynctotal") == 0) return TYPE_INTEGER;
     if (strcasecmp(name, "httpawait") == 0) return TYPE_INTEGER;
     if (strcasecmp(name, "httperrorcode") == 0) return TYPE_INTEGER;
+    if (strcasecmp(name, "strinsert") == 0 || strcasecmp(name, "strdelete") == 0) return TYPE_STRING;
     if (strcasecmp(name, "httpgetheader") == 0) return TYPE_STRING;
     if (strcasecmp(name, "httpgetlastheaders") == 0) return TYPE_STRING;
     if (strcasecmp(name, "httplasterror") == 0) return TYPE_STRING;
