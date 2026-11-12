@@ -6810,6 +6810,14 @@ static void shellJobControlRestoreForeground(void) {
 #if defined(PSCAL_TARGET_IOS)
     int shell_pid = vprocGetShellSelfPid();
     int sid = (shell_pid > 0) ? vprocGetSid(shell_pid) : -1;
+    /* The shell's group as it is now. The one kept from when job control started can be from
+     * before the shell's setsid: a second tab's shell starts in its parent's group, so the
+     * terminal went back to the first tab's shell after every command, and the shell's own
+     * changes to its terminal were then a background job's (SIGTTOU). */
+    const int live_pgid = (shell_pid > 0) ? vprocGetPgid(shell_pid) : -1;
+    if (live_pgid > 0) {
+        gShellRuntime.shell_pgid = live_pgid;
+    }
     if (sid > 0 && gShellRuntime.shell_pgid > 0) {
         vprocSetForegroundPgid(sid, (int)gShellRuntime.shell_pgid);
     }
