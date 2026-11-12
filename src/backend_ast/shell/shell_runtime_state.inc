@@ -6810,11 +6810,14 @@ static void shellJobControlRestoreForeground(void) {
 #if defined(PSCAL_TARGET_IOS)
     int shell_pid = vprocGetShellSelfPid();
     int sid = (shell_pid > 0) ? vprocGetSid(shell_pid) : -1;
-    /* The shell's group as it is now. The one kept from when job control started can be from
-     * before the shell's setsid: a second tab's shell starts in its parent's group, so the
-     * terminal went back to the first tab's shell after every command, and the shell's own
-     * changes to its terminal were then a background job's (SIGTTOU). */
-    const int live_pgid = (shell_pid > 0) ? vprocGetPgid(shell_pid) : -1;
+    /* The group of the shell taking the terminal back, as it is now: the task that is this
+     * shell. The one kept from when job control started can be from before the shell's setsid
+     * (a second tab's shell starts in its parent's group), and the tab's shell is not the one
+     * running when a shell runs as a command (`sh`, a script): giving the terminal to either made
+     * the running shell a background job of its own terminal (SIGTTOU on its mode changes; under
+     * L20 SIGTTIN on its reads), and Ctrl-C stopped reaching its commands. */
+    const int own_pid = shellRuntimeOwnPid();
+    const int live_pgid = (own_pid > 0) ? vprocGetPgid(own_pid) : -1;
     if (live_pgid > 0) {
         gShellRuntime.shell_pgid = live_pgid;
     }
