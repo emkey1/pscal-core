@@ -2478,6 +2478,7 @@ typedef struct {
 /* Forward declaration; defined later. */
 static void vprocDeliverPendingSignalsForCurrent(void);
 static void vprocDieHere(bool now);
+static void vprocHangUpsSettle(void);
 static bool vprocCurrentHasInterruptingSignal(void);
 static const struct pscal_fd_ops kVprocLocationFdOps;
 typedef void (*VprocLocationReadersChangedFn)(int readers, void *context);
@@ -14155,6 +14156,9 @@ void vprocSessionStdioDestroy(VProcSessionStdio *stdio_ctx) {
     if (stdio_ctx->pty_master) {
         pscal_fd_close(stdio_ctx->pty_master);
         stdio_ctx->pty_master = NULL;
+        /* The master's last close hangs up the session it was the terminal of: that is over
+         * before the session is. */
+        vprocHangUpsSettle();
     }
     if (input) {
         pthread_mutex_lock(&input->mu);
@@ -15888,24 +15892,59 @@ static bool vprocGroupOrphanedLocked(int pgid) {
     return true;
 }
 
+/* Hang-ups sent from a thread of their own, not yet delivered. */
+static pthread_mutex_t gVprocHangUpsMu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t gVprocHangUpsCv = PTHREAD_COND_INITIALIZER;
+static int gVprocHangUpsInFlight = 0;
+
+static void vprocHangUpDone(void) {
+    pthread_mutex_lock(&gVprocHangUpsMu);
+    gVprocHangUpsInFlight--;
+    pthread_cond_broadcast(&gVprocHangUpsCv);
+    pthread_mutex_unlock(&gVprocHangUpsMu);
+}
+
 static void *vprocHangUpThread(void *arg) {
     const int sid = (int)(intptr_t)arg;
     pscalTtyDropSession((pid_t_)sid);
     (void)vprocKillLive(sid, SIGHUP);
     (void)vprocKillLive(sid, SIGCONT);
+    vprocHangUpDone();
     return NULL;
 }
 
+/* The close that hangs up holds terminal locks, so the signals go from a thread of their own. */
 void pscalTtyHangUpSession(int sid) {
     if (sid <= 0) {
         return;
     }
+    pthread_mutex_lock(&gVprocHangUpsMu);
+    gVprocHangUpsInFlight++;
+    pthread_mutex_unlock(&gVprocHangUpsMu);
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     pthread_t thread;
-    (void)pthread_create(&thread, &attr, vprocHangUpThread, (void *)(intptr_t)sid);
+    if (pthread_create(&thread, &attr, vprocHangUpThread, (void *)(intptr_t)sid) != 0) {
+        vprocHangUpDone();
+    }
     pthread_attr_destroy(&attr);
+}
+
+/* Waits for the hang-ups already sent to arrive, so that one lands while its session is still
+ * the one that hung up, not at some later moment on whatever that leader's thread runs next.
+ * Bounded, as a caller holding a task lock would otherwise wait for ever. */
+static void vprocHangUpsSettle(void) {
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += 2;
+    pthread_mutex_lock(&gVprocHangUpsMu);
+    while (gVprocHangUpsInFlight > 0) {
+        if (pthread_cond_timedwait(&gVprocHangUpsCv, &gVprocHangUpsMu, &deadline) == ETIMEDOUT) {
+            break;
+        }
+    }
+    pthread_mutex_unlock(&gVprocHangUpsMu);
 }
 
 bool pscalTtyCurrentGroupOrphaned(void) {
