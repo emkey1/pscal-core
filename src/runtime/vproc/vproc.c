@@ -4368,10 +4368,13 @@ static void vprocInitEntryDefaultsLocked(VProcTaskEntry *entry, int pid, const V
                 entry->actions[sig].sa_flags = 0;
                 entry->ignored_signals &= ~vprocSigMask(sig);
             }
-            /* The shell blocks SIGINT for its own catcher and catches it; a command starts with
-             * it unblocked and, caught, back at the default, as across exec on Linux. Otherwise
-             * the terminal's Ctrl-C (L20) only waited, or ran the shell's catcher for the command
-             * and its read went on. SIGQUIT likewise. An ignored one stays ignored. */
+        }
+        if ((shell_pid > 0 && inherit_parent->pid == shell_pid) || inherit_parent->shell_task) {
+            /* A shell, the tab's or one run as a command (`sh -c cat`), blocks SIGINT for its own
+             * catcher and catches it; a command it starts has it unblocked and, caught, back at the
+             * default, as across exec on Linux. Otherwise the terminal's Ctrl-C (L20) only waited,
+             * or ran the shell's catcher for the command and its read went on. SIGQUIT likewise.
+             * An ignored one stays ignored. */
             entry->blocked_signals &= ~(vprocSigMask(SIGINT) | vprocSigMask(SIGQUIT));
             const int caught_sigs[] = { SIGINT, SIGQUIT };
             for (size_t i = 0; i < sizeof(caught_sigs) / sizeof(caught_sigs[0]); ++i) {
