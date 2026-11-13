@@ -1247,6 +1247,55 @@ static bool compilePascalMoveCall(AST* node, BytecodeChunk* chunk, int line) {
     return true;
 }
 
+/* Rea's string methods s.insert(pos, t) and s.remove(pos, n) change s in
+ * place: s = strinsert(s, pos, t) or s = strdelete(s, pos, n), with s's
+ * address taken once. The parser gives a method call the receiver as `left`
+ * and as the first argument. Returns the builtin's name for such a call. */
+static const char* reaStringMethodBuiltin(AST* node) {
+    if (!frontendIsRea() || !node || node->type != AST_PROCEDURE_CALL || !node->left ||
+        !node->token || !node->token->value) {
+        return NULL;
+    }
+    VarType t = node->left->var_type;
+    if (t != TYPE_STRING && t != TYPE_UNICODE_STRING) return NULL;
+    if (strcasecmp(node->token->value, "insert") == 0) return "strinsert";
+    if (strcasecmp(node->token->value, "remove") == 0) return "strdelete";
+    return NULL;
+}
+
+static bool compileReaStringMethodCall(AST* node, BytecodeChunk* chunk, int line) {
+    const char* builtin = reaStringMethodBuiltin(node);
+    if (!builtin) return false;
+    const char* method = node->token->value;
+    if (node->child_count != 3) {
+        fprintf(stderr, "L%d: Compiler error: '%s' takes two arguments: %s.\n", line, method,
+                strcmp(builtin, "strinsert") == 0 ? "a position and the text to insert"
+                                                  : "a position and a count");
+        compiler_had_error = true;
+        return true;
+    }
+    AST* recv = node->left;
+    if (recv->type != AST_VARIABLE && recv->type != AST_FIELD_ACCESS &&
+        recv->type != AST_ARRAY_ACCESS && recv->type != AST_DEREFERENCE) {
+        fprintf(stderr,
+                "L%d: Compiler error: '%s' changes a string variable; use %s() for a new string.\n",
+                line, method, builtin);
+        compiler_had_error = true;
+        return true;
+    }
+    compileLValue(recv, chunk, getLine(recv));
+    writeBytecodeChunk(chunk, DUP, line);
+    writeBytecodeChunk(chunk, GET_INDIRECT, line);
+    compileRValue(node->children[1], chunk, line);
+    compileRValue(node->children[2], chunk, line);
+    int nameIndex = ensureBuiltinStringConstants(chunk, builtin, NULL);
+    writeBytecodeChunk(chunk, CALL_BUILTIN, line);
+    emitShort(chunk, (uint16_t)nameIndex, line);
+    writeBytecodeChunk(chunk, 3, line);
+    writeBytecodeChunk(chunk, SET_INDIRECT, line);
+    return true;
+}
+
 static void ensureMyselfGlobalDefined(BytecodeChunk* chunk, int line) {
     if (compiler_defined_myself_global) return;
     int myself_idx = ensureMyselfGlobalNameIndex(chunk);
@@ -10448,7 +10497,8 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                     break;
                 }
             }
-            if (compilePascalMoveCall(node, chunk, line)) {
+            if (compilePascalMoveCall(node, chunk, line) ||
+                compileReaStringMethodCall(node, chunk, line)) {
                 break;
             }
             const char* calleeName = (node->token && node->token->value)
@@ -12445,6 +12495,17 @@ static void compileRValue(AST* node, BytecodeChunk* chunk, int current_line_appr
         case AST_PROCEDURE_CALL: {
             int line = getLine(node);
             if (line <= 0) line = current_line_approx;
+
+            const char* reaStrMethod = reaStringMethodBuiltin(node);
+            if (reaStrMethod) {
+                fprintf(stderr,
+                        "L%d: Compiler error: '%s' changes the string in place and returns nothing; "
+                        "use %s() for a new string.\n",
+                        line, node->token->value, reaStrMethod);
+                compiler_had_error = true;
+                emitConstant(chunk, addNilConstant(chunk), line);
+                break;
+            }
 
             const char* sizeof_type_name = NULL;
             long long sizeof_type_bytes = 0;
