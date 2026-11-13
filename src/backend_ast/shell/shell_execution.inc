@@ -2904,6 +2904,8 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
     ctx->prev_worker_flag = gShellBackgroundWorkerActive;
     gShellCurrentBuiltinBackground = true;
     gShellBackgroundWorkerActive = true;
+    const bool prev_in_background_job = gShellInBackgroundJob;
+    gShellInBackgroundJob = true;
     if (PSCALRuntimeSetCurrentRuntimeContext && ctx->runtime_ctx) {
         ctx->prev_runtime_ctx = PSCALRuntimeGetCurrentRuntimeContext
             ? PSCALRuntimeGetCurrentRuntimeContext()
@@ -3087,6 +3089,7 @@ static void *__attribute__((unused)) shellInProcessBackgroundMain(void *arg) {
     pthread_cleanup_pop(0);
 #endif
     gShellCurrentBuiltinBackground = ctx->prev_bg_flag;
+    gShellInBackgroundJob = prev_in_background_job;
     free(ctx);
     return NULL;
 }

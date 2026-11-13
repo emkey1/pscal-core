@@ -3231,6 +3231,11 @@ static __thread size_t gShellContextCapacity = 0;
 static __thread size_t gShellContextDepth = 0;
 static __thread bool gShellCurrentBuiltinBackground = false;
 static __thread bool gShellBackgroundWorkerActive = false;
+/* This thread runs a background job, the whole of it. Such a job has job control off, as a background
+ * process does on Linux: it never takes the terminal or gives it back. Taking it back for the shell
+ * when a background job finished gave the terminal to the tab's shell while a script still ran in
+ * the foreground, so Ctrl-C reached the tab's shell and the script went on. */
+static __thread bool gShellInBackgroundJob = false;
 static __thread bool gShellSkipHostStdio = false;
 /* Per-thread to avoid cross-session stdio restoration on iOS. */
 static __thread int gShellSavedStdFds[3] = { -1, -1, -1 };
@@ -6654,6 +6659,11 @@ static void shellInitJobControlState(void) {
 }
 
 static void shellEnsureJobControl(void) {
+    /* A background job's thread starts a runtime of its own, and starting job control in it took
+     * the terminal for the tab's shell (on iOS the shell this thread names is the tab's). */
+    if (gShellInBackgroundJob) {
+        return;
+    }
     bool allow_headless_jc = shellJobControlAllowedHeadless();
 #if !defined(PSCAL_TARGET_IOS)
     /* A subshell has none unless it asked with `set -m`, which a script's subshells keep. In one in
@@ -6755,6 +6765,9 @@ static bool shellMonitorShown(void) {
  * terminal knows and `kill 0` names, so a key reaches the shell and its command alike.
  * RUN_VPROC_TESTS turns on the rest of the machinery for a script, and not this. */
 static bool shellMonitorOn(void) {
+    if (gShellInBackgroundJob) {
+        return false;
+    }
     if (gShellRuntime.monitor_request == 0 && !gShellRuntime.in_subshell && shellRuntimeIsInteractive()) {
         shellEnsureJobControl();
     }
@@ -6778,6 +6791,9 @@ static bool shellGroupIsItsOwn(pid_t pgid) {
 }
 
 static void shellJobControlSetForeground(pid_t pgid) {
+    if (gShellInBackgroundJob) {
+        return;
+    }
     if (!gShellRuntime.job_control_enabled || !gShellRuntime.job_control_caps.has_foreground_control ||
         gShellRuntime.tty_fd < 0 || pgid <= 0) {
         return;
@@ -6802,6 +6818,9 @@ static void shellJobControlSetForeground(pid_t pgid) {
 }
 
 static void shellJobControlRestoreForeground(void) {
+    if (gShellInBackgroundJob) {
+        return;
+    }
     if (!gShellRuntime.job_control_enabled || !gShellRuntime.job_control_caps.has_foreground_control ||
         gShellRuntime.tty_fd < 0) {
         return;
