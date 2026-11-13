@@ -32,6 +32,10 @@ typedef struct AST {
     // for this type (core/utils.c, RecordTypeLayout), reused while the symbol
     // and type tables are unchanged. Owned by this node; not copied.
     struct RecordTypeLayout *record_layout;
+    // A Pascal routine whose open-array parameters' uses have been rebased on
+    // 0 (compiler.c, pascalRebaseOpenArrayParams), so a second compile of it
+    // (an inline routine's, another tab's) does not rebase them again.
+    bool open_arrays_rebased;
 } AST;
 
 AST *newASTNode(ASTNodeType type, Token *token);

@@ -8,7 +8,6 @@
 #include <strings.h>
 #include <limits.h>
 #include <stdint.h>
-#include <pthread.h>
 
 #include "compiler/compiler.h"
 #include "backend_ast/builtin.h" // For isBuiltin
@@ -8914,32 +8913,9 @@ static void pascalRebaseOpenArrayUses(AST* node, const char* name) {
     for (int i = 0; i < node->child_count; i++) pascalRebaseOpenArrayUses(node->children[i], name);
 }
 
-static AST** g_open_array_rebased = NULL;
-static int g_open_array_rebased_count = 0;
-static int g_open_array_rebased_cap = 0;
-static pthread_mutex_t g_open_array_rebased_mu = PTHREAD_MUTEX_INITIALIZER;
-
 static void pascalRebaseOpenArrayParams(AST* func_decl_node) {
-    if (!frontendIsPascal() || !func_decl_node) return;
-    pthread_mutex_lock(&g_open_array_rebased_mu);
-    for (int i = 0; i < g_open_array_rebased_count; i++) {
-        if (g_open_array_rebased[i] == func_decl_node) {
-            pthread_mutex_unlock(&g_open_array_rebased_mu);
-            return;
-        }
-    }
-    if (g_open_array_rebased_count == g_open_array_rebased_cap) {
-        int cap = g_open_array_rebased_cap ? g_open_array_rebased_cap * 2 : 32;
-        AST** grown = (AST**)realloc(g_open_array_rebased, sizeof(AST*) * (size_t)cap);
-        if (!grown) {
-            pthread_mutex_unlock(&g_open_array_rebased_mu);
-            return;
-        }
-        g_open_array_rebased = grown;
-        g_open_array_rebased_cap = cap;
-    }
-    g_open_array_rebased[g_open_array_rebased_count++] = func_decl_node;
-    pthread_mutex_unlock(&g_open_array_rebased_mu);
+    if (!frontendIsPascal() || !func_decl_node || func_decl_node->open_arrays_rebased) return;
+    func_decl_node->open_arrays_rebased = true;
 
     AST* body = (func_decl_node->type == AST_PROCEDURE_DECL) ? func_decl_node->right : func_decl_node->extra;
     if (!body) return;

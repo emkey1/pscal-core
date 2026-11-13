@@ -401,6 +401,7 @@ AST *newASTNode(ASTNodeType type, Token *token) {
     node->is_global_scope = false;
     node->is_inline = false;
     node->is_forward_decl = false;
+    node->open_arrays_rebased = false;
     node->is_virtual = false;
     /* Only ever set to true (by the rea/aether parsers, on `export`ed module
      * decls), so leaving it uninitialised left every other node reading
@@ -2094,6 +2095,7 @@ static AST *copyASTRecursive(AST *node, ASTCopyContext *ctx) {
     newNode->is_global_scope = node->is_global_scope;
     newNode->is_inline = node->is_inline;
     newNode->is_forward_decl = node->is_forward_decl;
+    newNode->open_arrays_rebased = node->open_arrays_rebased;
     newNode->is_virtual = node->is_virtual;
     newNode->i_val = node->i_val;
     newNode->unit_list = node->unit_list;
