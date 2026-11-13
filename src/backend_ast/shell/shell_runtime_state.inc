@@ -6624,7 +6624,14 @@ static void shellInitJobControlState(void) {
     (void)sigaction(SIGTTOU, &ignore_action, NULL);
 
 #if defined(PSCAL_TARGET_IOS)
-    pid_t shell_pid = (pid_t)vprocGetShellSelfPid();
+    /* This shell's own task, as getpgrp() means it. The shell a thread names is the tab's, also
+     * for a shell run as a command (`sh script`, with `set -m` or RUN_VPROC_TESTS): taking the
+     * terminal for that one left the script in the background of its own terminal until a
+     * command took it, and Ctrl-C in between reached the tab's shell instead of the script. */
+    pid_t shell_pid = (pid_t)vprocGetPidShim();
+    if (shell_pid <= 0) {
+        shell_pid = (pid_t)vprocGetShellSelfPid();
+    }
     if (shell_pid <= 0) {
         shell_pid = getpid();
     }
