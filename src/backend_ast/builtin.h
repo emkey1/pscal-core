@@ -187,6 +187,7 @@ Value vmBuiltinPascalInsert(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinPascalAssigned(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinPascalGetTickCount(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinPascalMove(struct VM_s* vm, int arg_count, Value* args);
+Value vmBuiltinPascalToOrdinal(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinStringOfChar(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinTrim(struct VM_s* vm, int arg_count, Value* args);
 Value vmBuiltinSetlength(struct VM_s* vm, int arg_count, Value* args);

@@ -8,6 +8,7 @@
 #include <strings.h>
 #include <limits.h>
 #include <stdint.h>
+#include <pthread.h>
 
 #include "compiler/compiler.h"
 #include "backend_ast/builtin.h" // For isBuiltin
@@ -4737,6 +4738,66 @@ static int pscalIntWidthRank(VarType t) {
     }
 }
 
+/* Pascal passes any integer value to a narrower integer (Byte, Word, a
+ * subrange) value parameter, as Free Pascal does: a variable's value wraps to
+ * the parameter's type, and a constant out of range draws Free Pascal's
+ * warning. */
+static bool pascalOrdinalParamRange(AST* param_type, VarType* out_vt, long long* lo, long long* hi) {
+    AST* actual = resolveTypeAlias(param_type);
+    if (!actual) return false;
+    if (actual->type == AST_SUBRANGE && actual->left && actual->right) {
+        Value l = evaluateCompileTimeValue(actual->left);
+        Value r = evaluateCompileTimeValue(actual->right);
+        bool ok = isIntlikeType(VALUE_TYPE(l)) && isIntlikeType(VALUE_TYPE(r));
+        if (ok) { *lo = VAL_INT(l); *hi = VAL_INT(r); *out_vt = actual->var_type; }
+        freeValue(&l);
+        freeValue(&r);
+        return ok;
+    }
+    *out_vt = actual->var_type;
+    switch (actual->var_type) {
+        case TYPE_BYTE: case TYPE_UINT8:  *lo = 0; *hi = UINT8_MAX; return true;
+        case TYPE_WORD: case TYPE_UINT16: *lo = 0; *hi = UINT16_MAX; return true;
+        case TYPE_INT8:   *lo = INT8_MIN;  *hi = INT8_MAX;  return true;
+        case TYPE_INT16:  *lo = INT16_MIN; *hi = INT16_MAX; return true;
+        case TYPE_INT32:  *lo = INT32_MIN; *hi = INT32_MAX; return true;
+        case TYPE_UINT32: *lo = 0; *hi = UINT32_MAX; return true;
+        default: return false;
+    }
+}
+
+static void pascalWarnConstantArgRange(AST* param_type, AST* arg, int line) {
+    if (!frontendIsPascal() || !arg) return;
+    VarType vt = TYPE_VOID;
+    long long lo = 0, hi = 0;
+    if (!pascalOrdinalParamRange(param_type, &vt, &lo, &hi)) return;
+    Value c = evaluateCompileTimeValue(arg);
+    if (isIntlikeType(VALUE_TYPE(c)) && VALUE_TYPE(c) != TYPE_BOOLEAN && VALUE_TYPE(c) != TYPE_CHAR) {
+        long long v = VAL_INT(c);
+        if (v < lo || v > hi) {
+            fprintf(stderr, "L%d: Compiler warning: range check error while evaluating constants (%lld must be between %lld and %lld)\n",
+                    line, v, lo, hi);
+        }
+    }
+    freeValue(&c);
+}
+
+/* The type a value argument must be converted to on the way into a narrower
+ * integer parameter, or TYPE_VOID when it passes as it is (the same type, a
+ * widening, or a constant that fits). */
+static VarType pascalNarrowedArgType(AST* param_type, AST* arg) {
+    if (!frontendIsPascal() || !param_type || !arg) return TYPE_VOID;
+    AST* actual = resolveTypeAlias(param_type);
+    VarType pvt = actual ? actual->var_type : param_type->var_type;
+    AST* arg_actual = resolveTypeAlias(arg->type_def);
+    VarType avt = arg_actual ? arg_actual->var_type : arg->var_type;
+    int pr = pscalIntWidthRank(pvt), ar = pscalIntWidthRank(avt);
+    if (pr == 0 || ar == 0 || pr == 64 || pvt == avt) return TYPE_VOID;
+    bool narrowing = ar > pr || (ar == pr && isUnsignedIntVarType(pvt) != isUnsignedIntVarType(avt));
+    if (!narrowing || constantFitsInIntType(arg, pvt)) return TYPE_VOID;
+    return pvt;
+}
+
 static bool typesMatch(AST* param_type, AST* arg_node, bool allow_coercion) {
     if (!param_type || !arg_node) return false;
 
@@ -6685,6 +6746,15 @@ static void compileCallArgumentRValueForParam(AST* node, AST* param_type_hint,
         return;
     }
     compileCallArgumentRValue(node, chunk, current_line_approx);
+    VarType narrowed = pascalNarrowedArgType(param_type_hint, node);
+    if (narrowed != TYPE_VOID) {
+        int line = getLine(node) > 0 ? getLine(node) : current_line_approx;
+        emitConstant(chunk, addIntConstant(chunk, (long long)narrowed), line);
+        int nameIndex = ensureBuiltinStringConstants(chunk, "__pascal_to_ordinal", NULL);
+        writeBytecodeChunk(chunk, CALL_BUILTIN, line);
+        emitShort(chunk, (uint16_t)nameIndex, line);
+        writeBytecodeChunk(chunk, 2, line);
+    }
 }
 
 static bool isFormatOpenArrayCall(const char* calleeName, AST* node, int receiver_offset) {
@@ -8730,7 +8800,165 @@ static void compileNode(AST* node, BytecodeChunk* chunk, int current_line_approx
     }
 }
 
+/* ---- Pascal open-array parameters ------------------------------------
+ * A parameter written `v: array of T` is indexed from 0 inside the routine,
+ * whatever bounds the caller's array has (a static array[1..n] passes
+ * as it is). Before the body compiles, each use is rebased on the
+ * array's own low bound: v[i] reads v[i + Low(v)], Low(v) is 0 and High(v)
+ * is High(v) - Low(v). A dynamic array starts at 0, so for one nothing
+ * changes. Nested routines reach v as an upvalue and are rewritten too,
+ * unless they declare a v of their own. */
+static AST* pascalOpenArrayBoundCall(const char* which, AST* var, int line) {
+    Token* t = newToken(TOKEN_IDENTIFIER, which, line, 0);
+    AST* call = newASTNode(AST_PROCEDURE_CALL, t);
+    freeToken(t);
+    addChild(call, copyAST(var));
+    call->var_type = TYPE_INTEGER;
+    return call;
+}
+
+static AST* pascalOpenArrayBinary(TokenType op, const char* text, AST* left, AST* right, int line) {
+    Token* t = newToken(op, text, line, 0);
+    AST* b = newASTNode(AST_BINARY_OP, t);
+    freeToken(t);
+    setLeft(b, left);
+    setRight(b, right);
+    b->var_type = TYPE_INTEGER;
+    return b;
+}
+
+static bool pascalNameDeclaredIn(AST* routine, const char* name) {
+    if (!routine) return false;
+    for (int i = 0; i < routine->child_count; i++) {
+        AST* p = routine->children[i];
+        for (int j = 0; p && j < p->child_count; j++) {
+            AST* v = p->children[j];
+            if (v && v->token && v->token->value && strcasecmp(v->token->value, name) == 0) return true;
+        }
+    }
+    AST* block = (routine->type == AST_PROCEDURE_DECL) ? routine->right : routine->extra;
+    if (block && block->type == AST_BLOCK && block->child_count > 0 && block->children[0]) {
+        AST* decls = block->children[0];
+        for (int i = 0; i < decls->child_count; i++) {
+            AST* d = decls->children[i];
+            if (!d || d->type != AST_VAR_DECL) continue;
+            for (int j = 0; j < d->child_count; j++) {
+                AST* v = d->children[j];
+                if (v && v->token && v->token->value && strcasecmp(v->token->value, name) == 0) return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool pascalIsOpenArrayVar(AST* n, const char* name) {
+    return n && n->type == AST_VARIABLE && n->token && n->token->value &&
+           strcasecmp(n->token->value, name) == 0;
+}
+
+static void pascalRebaseOpenArrayUses(AST* node, const char* name) {
+    if (!node) return;
+    if ((node->type == AST_PROCEDURE_DECL || node->type == AST_FUNCTION_DECL) &&
+        pascalNameDeclaredIn(node, name)) {
+        return;
+    }
+    if (node->type == AST_PROCEDURE_CALL && !node->left && node->child_count == 1 &&
+        node->token && node->token->value && pascalIsOpenArrayVar(node->children[0], name)) {
+        bool is_low = strcasecmp(node->token->value, "low") == 0;
+        bool is_high = strcasecmp(node->token->value, "high") == 0;
+        if (is_low || is_high) {
+            int line = node->token->line;
+            AST* var = node->children[0];
+            if (is_low) {
+                /* Low(v) -> 0 */
+                Token* zero = newToken(TOKEN_INTEGER_CONST, "0", line, 0);
+                freeAST(var);
+                node->children[0] = NULL;
+                node->child_count = 0;
+                freeToken(node->token);
+                node->token = zero;
+                node->type = AST_NUMBER;
+                node->var_type = TYPE_INTEGER;
+            } else {
+                /* High(v) -> High(v) - Low(v) */
+                AST* hi = pascalOpenArrayBoundCall("high", var, line);
+                AST* lo = pascalOpenArrayBoundCall("low", var, line);
+                freeAST(var);
+                node->children[0] = NULL;
+                node->child_count = 0;
+                freeToken(node->token);
+                node->token = newToken(TOKEN_MINUS, "-", line, 0);
+                node->type = AST_BINARY_OP;
+                node->var_type = TYPE_INTEGER;
+                setLeft(node, hi);
+                setRight(node, lo);
+            }
+            return;
+        }
+    }
+    if (node->type == AST_ARRAY_ACCESS && pascalIsOpenArrayVar(node->left, name) &&
+        node->child_count >= 1 && node->children[0]) {
+        int line = node->left->token->line;
+        AST* index = node->children[0];
+        pascalRebaseOpenArrayUses(index, name);
+        AST* sum = pascalOpenArrayBinary(TOKEN_PLUS, "+", index,
+                                         pascalOpenArrayBoundCall("low", node->left, line), line);
+        node->children[0] = sum;
+        sum->parent = node;
+        for (int i = 1; i < node->child_count; i++) pascalRebaseOpenArrayUses(node->children[i], name);
+        return;
+    }
+    pascalRebaseOpenArrayUses(node->left, name);
+    pascalRebaseOpenArrayUses(node->right, name);
+    pascalRebaseOpenArrayUses(node->extra, name);
+    for (int i = 0; i < node->child_count; i++) pascalRebaseOpenArrayUses(node->children[i], name);
+}
+
+static AST** g_open_array_rebased = NULL;
+static int g_open_array_rebased_count = 0;
+static int g_open_array_rebased_cap = 0;
+static pthread_mutex_t g_open_array_rebased_mu = PTHREAD_MUTEX_INITIALIZER;
+
+static void pascalRebaseOpenArrayParams(AST* func_decl_node) {
+    if (!frontendIsPascal() || !func_decl_node) return;
+    pthread_mutex_lock(&g_open_array_rebased_mu);
+    for (int i = 0; i < g_open_array_rebased_count; i++) {
+        if (g_open_array_rebased[i] == func_decl_node) {
+            pthread_mutex_unlock(&g_open_array_rebased_mu);
+            return;
+        }
+    }
+    if (g_open_array_rebased_count == g_open_array_rebased_cap) {
+        int cap = g_open_array_rebased_cap ? g_open_array_rebased_cap * 2 : 32;
+        AST** grown = (AST**)realloc(g_open_array_rebased, sizeof(AST*) * (size_t)cap);
+        if (!grown) {
+            pthread_mutex_unlock(&g_open_array_rebased_mu);
+            return;
+        }
+        g_open_array_rebased = grown;
+        g_open_array_rebased_cap = cap;
+    }
+    g_open_array_rebased[g_open_array_rebased_count++] = func_decl_node;
+    pthread_mutex_unlock(&g_open_array_rebased_mu);
+
+    AST* body = (func_decl_node->type == AST_PROCEDURE_DECL) ? func_decl_node->right : func_decl_node->extra;
+    if (!body) return;
+    for (int i = 0; i < func_decl_node->child_count; i++) {
+        AST* param = func_decl_node->children[i];
+        if (!param || param->type != AST_VAR_DECL) continue;
+        AST* ptype = param->right;
+        if (!ptype || ptype->type != AST_ARRAY_TYPE || ptype->child_count != 0) continue;
+        for (int j = 0; j < param->child_count; j++) {
+            AST* v = param->children[j];
+            if (v && v->token && v->token->value) {
+                pascalRebaseOpenArrayUses(body, v->token->value);
+            }
+        }
+    }
+}
+
 static void compileDefinedFunction(AST* func_decl_node, BytecodeChunk* chunk, int line) {
+    pascalRebaseOpenArrayParams(func_decl_node);
     SymbolEnvSnapshot env_snap;
     saveLocalEnv(&env_snap);
 
@@ -10748,6 +10976,9 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                     if (isInterfaceParameterNode(param_node, param_type)) {
                         continue;
                     }
+                    if (!param_node->by_ref && !callee_is_builtin) {
+                        pascalWarnConstantArgRange(param_type, arg_node, line);
+                    }
                     bool match = typesMatch(param_type, arg_node, callee_is_builtin);
                     if (!match) {
                         /* Integer-family coercion for arguments (see note above): one
@@ -10760,9 +10991,13 @@ static void compileStatement(AST* node, BytecodeChunk* chunk, int current_line_a
                             VarType pvt_i = pa_i ? pa_i->var_type : (param_type ? param_type->var_type : TYPE_UNKNOWN);
                             VarType avt_i = aa_i ? aa_i->var_type : (arg_node ? arg_node->var_type : TYPE_UNKNOWN);
                             /* widening only: a narrower int into a wider param is
-                             * safe; never narrow a wider int (would truncate). */
+                             * safe; never narrow a wider int (would truncate) --
+                             * except in Pascal, which passes any integer to a
+                             * narrower value parameter and converts it on the way
+                             * (pascalNarrowedArgType). */
                             if (pscalIntWidthRank(avt_i) > 0 &&
-                                pscalIntWidthRank(pvt_i) >= pscalIntWidthRank(avt_i)) {
+                                (pscalIntWidthRank(pvt_i) >= pscalIntWidthRank(avt_i) ||
+                                 (frontendIsPascal() && !param_node->by_ref && pscalIntWidthRank(pvt_i) > 0))) {
                                 continue;
                             }
                         }

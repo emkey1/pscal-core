@@ -2565,6 +2565,7 @@ static VmBuiltinMapping vmBuiltinDispatchTable[] = {
     {"assigned", vmBuiltinPascalAssigned},
     {"gettickcount", vmBuiltinPascalGetTickCount},
     {"move", vmBuiltinPascalMove},
+    {"__pascal_to_ordinal", vmBuiltinPascalToOrdinal},
 };
 
 static const size_t num_vm_builtins = sizeof(vmBuiltinDispatchTable) / sizeof(vmBuiltinDispatchTable[0]);
@@ -2638,7 +2639,7 @@ bool extBuiltinCategoryHiddenFromFrontend(const char *category) {
  * programs (and the shell) keep these names for their own functions. A thread
  * that has no front end of its own (a Pascal program's worker) sees them. */
 static const char *const pascalOnlyBuiltinNames[] = {
-    "delete", "insert", "assigned", "gettickcount", "move",
+    "delete", "insert", "assigned", "gettickcount", "move", "__pascal_to_ordinal",
 };
 #define PASCAL_ONLY_BUILTIN_COUNT (sizeof(pascalOnlyBuiltinNames) / sizeof(pascalOnlyBuiltinNames[0]))
 static int g_pascal_only_ids[PASCAL_ONLY_BUILTIN_COUNT];
@@ -4411,6 +4412,24 @@ Value vmBuiltinPascalMove(VM* vm, int arg_count, Value* args) {
         da->elements[dst.start + i] = copy;
     }
     return makeVoid();
+}
+
+/* __pascal_to_ordinal(value, VarType): an integer value converted to a
+ * narrower integer type, wrapping as Free Pascal's value parameters do; the
+ * compiler calls it for an argument passed to a Byte, Word or similar
+ * parameter (pascalNarrowedArgType). */
+Value vmBuiltinPascalToOrdinal(VM* vm, int arg_count, Value* args) {
+    if (arg_count != 2 || !IS_INTLIKE(args[0]) || !IS_INTLIKE(args[1])) {
+        runtimeError(vm, "__pascal_to_ordinal expects (integer, type).");
+        return makeInt(0);
+    }
+    Value out = makeValueForType((VarType)AS_INTEGER(args[1]), NULL, NULL);
+    if (!IS_INTLIKE(out)) {
+        freeValue(&out);
+        return makeInt64(AS_INTEGER(args[0]));
+    }
+    SET_INT_VALUE(&out, AS_INTEGER(args[0]));
+    return out;
 }
 
 Value vmBuiltinCopy(VM* vm, int arg_count, Value* args) {
@@ -13702,6 +13721,7 @@ static void populateBuiltinRegistry(void) {
     registerBuiltinFunctionUnlocked("Assigned", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("GetTickCount", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("Move", AST_PROCEDURE_DECL, NULL);
+    registerBuiltinFunctionUnlocked("__pascal_to_ordinal", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("Abs", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("apiReceive", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("apiSend", AST_FUNCTION_DECL, NULL);
