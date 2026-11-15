@@ -1394,7 +1394,36 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinGetmousestate) {
     bool inside_window = false;
     bool has_focus = false;
 
-#ifdef __APPLE__
+#if defined(PSCAL_TARGET_IOS)
+    // iOS has no global mouse to speak of, and SDL_GetWindowPosition answers
+    // with the nominal centred position it worked out for the size InitGraph
+    // asked for -- not where the drawing actually is. The window is the whole
+    // screen, the canvas is drawn 1:1 at its top-left and clipped to it, so
+    // subtracting that position threw every touch off by half the difference
+    // between the canvas and the screen: on an 834x1210 screen a 1200x900
+    // canvas moved touches +183 across and -155 down, which is why zooming
+    // landed somewhere other than where the finger was. The window-relative
+    // position SDL already holds for the touch is the canvas coordinate.
+    sdl_buttons = SDL_GetMouseState(&mse_x, &mse_y);
+    int win_w = 0, win_h = 0;
+    SDL_GetWindowSize(gSdlWindow, &win_w, &win_h);
+    has_focus = true;
+    // "Inside" means inside the canvas here. Where the canvas is smaller than
+    // the screen the rest of the window is not the program's to be touched,
+    // and a touch there used to clamp to an edge and act as if it had landed
+    // on the drawing.
+    inside_window = (mse_x >= 0 && (gSdlWidth <= 0 || mse_x < gSdlWidth) &&
+                     mse_y >= 0 && (gSdlHeight <= 0 || mse_y < gSdlHeight) &&
+                     (win_w <= 0 || mse_x < win_w) && (win_h <= 0 || mse_y < win_h));
+    if (mse_x < 0) {
+        mse_x = 0;
+    }
+    if (mse_y < 0) {
+        mse_y = 0;
+    }
+    if (gSdlWidth > 0 && mse_x >= gSdlWidth) mse_x = gSdlWidth - 1;
+    if (gSdlHeight > 0 && mse_y >= gSdlHeight) mse_y = gSdlHeight - 1;
+#elif defined(__APPLE__)
     // On macOS avoid SDL_PumpEvents from non-main threads. Use global mouse
     // state and convert to window-relative coordinates with border and HiDPI
     // adjustments.
@@ -2326,6 +2355,9 @@ bool sdlPollNextKey(SDL_Keycode* outCode) {
     }
 
     SDL_Keycode queuedCode;
+    /* A printable keycode seen on KEYDOWN while text input is on, kept until
+     * the matching SDL_TEXTINPUT arrives -- or delivered as-is if none does. */
+    SDL_Keycode heldPrintable = 0;
     if (dequeuePendingKeycode(&queuedCode)) {
         if (queuedCode == SDLK_q) {
             SDL_DEBUG_SET_BREAK_REQUESTED(1, "PollNextKey queued SDLK_q");
@@ -2369,6 +2401,21 @@ bool sdlPollNextKey(SDL_Keycode* outCode) {
             bool textActive = sdlTextInputActive();
             if (!textActive || !isPrintableKeycode(sym)) {
                 enqueuePendingKeycode(sym);
+            } else {
+                /* A printable key while text input is on: the character is
+                 * meant to arrive as SDL_TEXTINPUT, which carries the shifted
+                 * form the keycode does not ("Q", not SDLK_q). So hold the
+                 * keycode rather than queueing it, and let the text event a
+                 * moment later win.
+                 *
+                 * Dropping it outright is what this did before, and where no
+                 * text event follows -- an iOS window whose text field never
+                 * became first responder is one way -- the key simply vanished:
+                 * 'q' would not quit a graphics program on a device, while the
+                 * arrow keys in the same loop still worked because they are not
+                 * printable. Holding it means the key is delivered exactly
+                 * once either way. */
+                heldPrintable = sym;
             }
 
             if (dequeuePendingKeycode(&queuedCode)) {
@@ -2377,11 +2424,21 @@ bool sdlPollNextKey(SDL_Keycode* outCode) {
             }
         } else if (event.type == SDL_TEXTINPUT) {
             enqueueUtf8Text(event.text.text);
+            heldPrintable = 0;
             if (dequeuePendingKeycode(&queuedCode)) {
                 *outCode = queuedCode;
                 return true;
             }
         }
+    }
+
+    /* The events ran out with a printable key held and no text event for it:
+     * this platform is not going to send one, so deliver the keycode. */
+    if (heldPrintable != 0) {
+        SDL_Keycode code = heldPrintable;
+        heldPrintable = 0;
+        *outCode = code;
+        return true;
     }
 
     return false;
