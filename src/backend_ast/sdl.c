@@ -517,8 +517,47 @@ static void handleSysWmEvent(const SDL_Event* event) {
 }
 #endif
 
+/* A printable keycode seen on KEYDOWN while text input is on. SDL is expected
+ * to follow it with an SDL_TEXTINPUT carrying the character in the case the
+ * keycode does not have ("Q", not SDLK_q), so the keycode is held back rather
+ * than queued and the text event supersedes it.
+ *
+ * It used to be dropped outright, and where no text event follows the key was
+ * simply gone: on a device 'q' would not quit a graphics program, while the
+ * arrow keys in the same loop still worked because they are not printable.
+ * Holding it costs nothing when the text event comes and saves the key when it
+ * does not -- dequeuePendingKeycode below hands it over once the queue is
+ * empty, so every caller gets it without each event loop having to flush. */
+static SDL_Keycode gHeldPrintableKeycode = 0;
+
+static void sdlNoteKeyDown(SDL_Keycode sym) {
+    if (!sdlTextInputActive() || !isPrintableKeycode(sym)) {
+        enqueuePendingKeycode(sym);
+        return;
+    }
+    if (gHeldPrintableKeycode != 0) {
+        /* Two printable keys with no text event between them: the first one is
+         * not going to get one either. */
+        enqueuePendingKeycode(gHeldPrintableKeycode);
+    }
+    gHeldPrintableKeycode = sym;
+}
+
+static void sdlNoteTextInput(const char* text) {
+    gHeldPrintableKeycode = 0;
+    enqueueUtf8Text(text);
+}
+
 static bool dequeuePendingKeycode(SDL_Keycode* outCode) {
     if (gPendingKeyCount == 0) {
+        if (gHeldPrintableKeycode != 0) {
+            SDL_Keycode held = gHeldPrintableKeycode;
+            gHeldPrintableKeycode = 0;
+            if (outCode) {
+                *outCode = held;
+            }
+            return true;
+        }
         return false;
     }
 
@@ -2355,9 +2394,6 @@ bool sdlPollNextKey(SDL_Keycode* outCode) {
     }
 
     SDL_Keycode queuedCode;
-    /* A printable keycode seen on KEYDOWN while text input is on, kept until
-     * the matching SDL_TEXTINPUT arrives -- or delivered as-is if none does. */
-    SDL_Keycode heldPrintable = 0;
     if (dequeuePendingKeycode(&queuedCode)) {
         if (queuedCode == SDLK_q) {
             SDL_DEBUG_SET_BREAK_REQUESTED(1, "PollNextKey queued SDLK_q");
@@ -2398,33 +2434,14 @@ bool sdlPollNextKey(SDL_Keycode* outCode) {
                 SDL_DEBUG_SET_BREAK_REQUESTED(1, "PollNextKey SDL_KEYDOWN q");
             }
 
-            bool textActive = sdlTextInputActive();
-            if (!textActive || !isPrintableKeycode(sym)) {
-                enqueuePendingKeycode(sym);
-            } else {
-                /* A printable key while text input is on: the character is
-                 * meant to arrive as SDL_TEXTINPUT, which carries the shifted
-                 * form the keycode does not ("Q", not SDLK_q). So hold the
-                 * keycode rather than queueing it, and let the text event a
-                 * moment later win.
-                 *
-                 * Dropping it outright is what this did before, and where no
-                 * text event follows -- an iOS window whose text field never
-                 * became first responder is one way -- the key simply vanished:
-                 * 'q' would not quit a graphics program on a device, while the
-                 * arrow keys in the same loop still worked because they are not
-                 * printable. Holding it means the key is delivered exactly
-                 * once either way. */
-                heldPrintable = sym;
-            }
+            sdlNoteKeyDown(sym);
 
             if (dequeuePendingKeycode(&queuedCode)) {
                 *outCode = queuedCode;
                 return true;
             }
         } else if (event.type == SDL_TEXTINPUT) {
-            enqueueUtf8Text(event.text.text);
-            heldPrintable = 0;
+            sdlNoteTextInput(event.text.text);
             if (dequeuePendingKeycode(&queuedCode)) {
                 *outCode = queuedCode;
                 return true;
@@ -2432,12 +2449,8 @@ bool sdlPollNextKey(SDL_Keycode* outCode) {
         }
     }
 
-    /* The events ran out with a printable key held and no text event for it:
-     * this platform is not going to send one, so deliver the keycode. */
-    if (heldPrintable != 0) {
-        SDL_Keycode code = heldPrintable;
-        heldPrintable = 0;
-        *outCode = code;
+    if (dequeuePendingKeycode(&queuedCode)) {
+        *outCode = queuedCode;
         return true;
     }
 
@@ -2493,13 +2506,10 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinWaitkeyevent) {
                     SDL_DEBUG_SET_BREAK_REQUESTED(1, "WaitKey(iOS) SDL_KEYDOWN q");
                 }
 
-                bool textActive = sdlTextInputActive();
-                if (!textActive || !isPrintableKeycode(sym)) {
-                    enqueuePendingKeycode(sym);
-                    waiting = 0;
-                }
+                sdlNoteKeyDown(sym);
+                waiting = 0;
             } else if (event.type == SDL_TEXTINPUT) {
-                enqueueUtf8Text(event.text.text);
+                sdlNoteTextInput(event.text.text);
                 waiting = 0;
             }
 #else
@@ -2514,13 +2524,10 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinWaitkeyevent) {
                 SDL_DEBUG_SET_BREAK_REQUESTED(1, "WaitKey SDL_KEYDOWN q");
             }
 
-            bool textActive = sdlTextInputActive();
-            if (!textActive || !isPrintableKeycode(sym)) {
-                enqueuePendingKeycode(sym);
-                waiting = 0;
-            }
+            sdlNoteKeyDown(sym);
+            waiting = 0;
             } else if (event.type == SDL_TEXTINPUT) {
-                enqueueUtf8Text(event.text.text);
+                sdlNoteTextInput(event.text.text);
                 waiting = 0;
             }
 #endif
@@ -2673,12 +2680,9 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinGraphloop) {
                         SDL_DEBUG_SET_BREAK_REQUESTED(1, "GraphLoop SDL_KEYDOWN q");
                     }
 
-                    bool textActive = sdlTextInputActive();
-                    if (!textActive || !isPrintableKeycode(sym)) {
-                        enqueuePendingKeycode(sym);
-                    }
+                    sdlNoteKeyDown(sym);
                 } else if (event.type == SDL_TEXTINPUT) {
-                    enqueueUtf8Text(event.text.text);
+                    sdlNoteTextInput(event.text.text);
                 }
             }
 
@@ -2777,12 +2781,9 @@ static void pumpKeyEvents(void) {
                 SDL_DEBUG_SET_BREAK_REQUESTED(1, "PumpKeyEvents SDL_KEYDOWN q");
             }
 
-            bool textActive = sdlTextInputActive();
-            if (!textActive || !isPrintableKeycode(sym)) {
-                enqueuePendingKeycode(sym);
-            }
+            sdlNoteKeyDown(sym);
         } else if (event.type == SDL_TEXTINPUT) {
-            enqueueUtf8Text(event.text.text);
+            sdlNoteTextInput(event.text.text);
         }
     }
 }
@@ -2836,16 +2837,13 @@ SDL_Keycode sdlWaitNextKeycode(void) {
                 SDL_DEBUG_SET_BREAK_REQUESTED(1, "WaitNextKey SDL_KEYDOWN q");
             }
 
-            bool textActive = sdlTextInputActive();
-            if (!textActive || !isPrintableKeycode(sym)) {
-                enqueuePendingKeycode(sym);
-            }
+            sdlNoteKeyDown(sym);
 
             if (dequeuePendingKeycode(&code)) {
                 return code;
             }
         } else if (event.type == SDL_TEXTINPUT) {
-            enqueueUtf8Text(event.text.text);
+            sdlNoteTextInput(event.text.text);
             if (dequeuePendingKeycode(&code)) {
                 return code;
             }
