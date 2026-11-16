@@ -5,6 +5,7 @@
 #include "core/utils.h" // For EXIT_FAILURE_HANDLER
 #include "common/path_virtualization.h"
 #include <pscal_paths.h>
+#include <errno.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +18,12 @@
 Mix_Chunk* gLoadedSounds[MAX_SOUNDS];
 bool gSoundSystemInitialized = false;
 
+static char gAudioLastOpenError[PATH_MAX + 256];
+/* 64 MB is far past any sound shipped with PSCAL and keeps a wrong path from
+ * trying to read a whole device into memory. */
+#define AUDIO_MAX_SOUND_BYTES (64L * 1024L * 1024L)
+
+
 static bool audioPathHasDirectorySeparator(const char* path) {
     if (!path) {
         return false;
@@ -24,13 +31,85 @@ static bool audioPathHasDirectorySeparator(const char* path) {
     return strchr(path, '/') != NULL || strchr(path, '\\') != NULL;
 }
 
+/* Hand SDL the bytes rather than the path.
+ *
+ * SDL opens a file with its own fopen and then refuses anything that is not a
+ * regular file or a pipe, testing it with fstat(fileno(fp)). In the app that
+ * check says no for a perfectly ordinary file, so every sound failed to load
+ * -- the message was only ever "Mix_LoadWAV_RW with NULL src", which named
+ * neither the path nor the reason. The sounds are small and we have to resolve
+ * the path through the virtual filesystem for SDL anyway, so read the file the
+ * way the rest of the VM reads files and give SDL memory it cannot refuse. */
+static SDL_RWops* audioOpenRWops(const char* candidate, const char* target, void** owned) {
+    *owned = NULL;
+#if defined(PSCAL_TARGET_IOS)
+    (void)target;
+    FILE* f = pscalPathVirtualized_fopen(candidate, "rb");
+    if (!f) {
+        SDL_SetError("could not open %s: %s", candidate, strerror(errno));
+        return NULL;
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        SDL_SetError("could not measure %s: %s", candidate, strerror(errno));
+        return NULL;
+    }
+    long size = ftell(f);
+    if (size <= 0 || size > AUDIO_MAX_SOUND_BYTES) {
+        fclose(f);
+        SDL_SetError("%s is empty or too large (%ld bytes)", candidate, size);
+        return NULL;
+    }
+    rewind(f);
+    void* buffer = malloc((size_t)size);
+    if (!buffer) {
+        fclose(f);
+        SDL_SetError("out of memory reading %s", candidate);
+        return NULL;
+    }
+    size_t got = fread(buffer, 1, (size_t)size, f);
+    fclose(f);
+    if (got != (size_t)size) {
+        free(buffer);
+        SDL_SetError("short read on %s", candidate);
+        return NULL;
+    }
+    /* freesrc frees the RWops; SDL_RWFromMem does not own the buffer, so the
+     * caller frees it once Mix has decoded the chunk. */
+    SDL_RWops* rw = SDL_RWFromConstMem(buffer, (int)size);
+    if (!rw) {
+        free(buffer);
+        return NULL;
+    }
+    *owned = buffer;
+    return rw;
+#else
+    (void)candidate;
+    return SDL_RWFromFile(target, "rb");
+#endif
+}
+
 static Mix_Chunk* audioTryLoadChunk(const char* candidate, char* resolved, size_t resolved_size) {
     if (!candidate || candidate[0] == '\0') {
         return NULL;
     }
     char host_path[PATH_MAX];
-    Mix_Chunk* chunk = Mix_LoadWAV(pscalPathVirtualized_hostPath(candidate, host_path));
+    const char* target = pscalPathVirtualized_hostPath(candidate, host_path);
+    /* Open the file here rather than through the Mix_LoadWAV macro: when the
+     * open fails, Mix only ever says "Mix_LoadWAV_RW with NULL src", which
+     * names neither the reason nor the path SDL actually tried. */
+    void* owned_buffer = NULL;
+    SDL_RWops* rw = audioOpenRWops(candidate, target, &owned_buffer);
+    if (!rw) {
+        snprintf(gAudioLastOpenError, sizeof(gAudioLastOpenError),
+                 "%s (as '%s'): %s", candidate, target ? target : "(null)", SDL_GetError());
+        return NULL;
+    }
+    Mix_Chunk* chunk = Mix_LoadWAV_RW(rw, 1);
+    free(owned_buffer);
     if (!chunk) {
+        snprintf(gAudioLastOpenError, sizeof(gAudioLastOpenError),
+                 "%s (as '%s'): %s", candidate, target ? target : "(null)", Mix_GetError());
         return NULL;
     }
     if (resolved && resolved_size > 0) {
@@ -258,7 +337,8 @@ int audioLoadSound(const char* filename) {
     resolved_path[0] = '\0';
     Mix_Chunk* chunk = audioResolveAndLoadChunk(filename, resolved_path, sizeof(resolved_path));
     if (!chunk) {
-        fprintf(stderr, "Runtime error: Mix_LoadWAV failed for '%s': %s\n", filename, Mix_GetError());
+        fprintf(stderr, "Runtime error: could not load sound '%s': %s\n", filename,
+                gAudioLastOpenError[0] ? gAudioLastOpenError : Mix_GetError());
         return -1; // Indicate error
     }
 
