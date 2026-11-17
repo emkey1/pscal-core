@@ -3004,6 +3004,7 @@ static const EffectClassification kEffectClassifiedNames[] = {
     {"gettime", FX_CLOCK}, {"getdate", FX_CLOCK}, {"realtimeclock", FX_CLOCK},
     /* console input */
     {"readkey", FX_IO}, {"keypressed", FX_IO},
+    {"pollkeyany", FX_IO}, /* reads the keyboard too; it was left pure, so --deny io let it through */
     /* network */
     {"dnslookup", FX_NET}, {"apisend", FX_NET}, {"apireceive", FX_NET},
     {"httpsession", FX_NET}, {"httpclose", FX_NET}, {"httperrorcode", FX_NET},
