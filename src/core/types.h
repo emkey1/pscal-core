@@ -281,6 +281,12 @@ typedef struct ArrayObj {
     // releases view_of and frees only the view struct itself instead of
     // running the normal full teardown.
     struct ArrayObj *view_of;
+    // References that keep this array alive without sharing its value: a
+    // reader on one thread copying the elements while VM threads run (vm.c's
+    // copyValueForStack). valueEnsureUnique leaves them out of its shared
+    // test, as it does a string's pins, so a writer never clones the array
+    // away from other writers because of them.
+    _Atomic uint32_t pins;
 } ArrayObj;
 
 // Definition of Type struct for enum metadata

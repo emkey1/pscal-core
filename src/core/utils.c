@@ -5473,7 +5473,10 @@ static ObjHeader *valueCowHeader(const Value *target, uint32_t *out_pins) {
             // CoW-cloning a dynamic array on write would silently turn
             // that into value semantics -- a regression, not a fix.
             ArrayObj *a = PSCAL_VALUE_PTR(*target, ArrayObj);
-            if (a && !a->is_dynamic) hdr = &a->header;
+            if (a && !a->is_dynamic) {
+                hdr = &a->header;
+                pins = atomic_load_explicit(&a->pins, memory_order_acquire);
+            }
             break;
         }
         // Permanent exemption: TYPE_FILE's OS handle is identity-bearing

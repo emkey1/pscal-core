@@ -337,6 +337,45 @@ static pthread_mutex_t gVmProcRegistryLock = PTHREAD_MUTEX_INITIALIZER;
 // this same mutex -- see the extern declaration and comment in
 // core/utils.h.
 pthread_mutex_t value_cell_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* Thread jobs running now, in every VM of the process. While there is one,
+ * copyValueForStack copies a copy-on-write payload instead of sharing it.
+ *
+ * A share makes the next write to the cell clone: valueEnsureUnique gives the
+ * cell new storage and leaves the old to the sharer. That check and the write
+ * it guards are not one step, so a second thread that had passed the check
+ * was still writing into the old storage -- its writes never reached the
+ * cell, and the storage was freed under it when the sharer let go. Four
+ * workers filling a global pixel array while the main loop passed it to
+ * UpdateTexture did this (a segmentation fault in the interpreter on an
+ * iPad). A cell that is never shared while threads run keeps its storage,
+ * so there is nothing to clone. The copy is what a clone would have cost.
+ *
+ * A job cancelled outside its cleanup would leave this raised, which only
+ * costs copies. */
+static atomic_int gVmThreadJobsRunning = 0;
+
+static void vmThreadJobRunEnded(void *unused) {
+    (void)unused;
+    atomic_fetch_sub(&gVmThreadJobsRunning, 1);
+}
+
+/* The types valueEnsureUnique clones on a write, less the map: an Aether map
+ * shares through its own calls (pscalMapShareValue). A dynamic array stays a
+ * reference: makeCopyOfValue shares it. */
+static inline bool vmTypeClonesOnWrite(VarType t) {
+    switch (t) {
+        case TYPE_STRING:
+        case TYPE_UNICODE_STRING:
+        case TYPE_SET:
+        case TYPE_RECORD:
+        case TYPE_ENUM:
+        case TYPE_ARRAY:
+            return true;
+        default:
+            return false;
+    }
+}
 static VM* gVmProcRegistry[VM_PROC_REGISTRY_CAPACITY];
 static size_t gVmProcRegistryCount = 0;
 // Every VM between initVM and freeVM, guarded by gVmProcRegistryLock. The
@@ -3424,6 +3463,8 @@ static void* threadStart(void* arg) {
             canceled = true;
         }
 
+        atomic_fetch_add(&gVmThreadJobsRunning, 1);
+        pthread_cleanup_push(vmThreadJobRunEnded, NULL);
         switch (job->kind) {
             case THREAD_JOB_CALLBACK:
                 if (!canceled && !killed && job->callback && workerVm) {
@@ -3607,6 +3648,7 @@ static void* threadStart(void* arg) {
             default:
                 break;
         }
+        pthread_cleanup_pop(1);
 
         // The worker may wait a long time for its next job, or never get one.
         pscalRuntimeVmFlushOutput();
@@ -6472,7 +6514,39 @@ static Value copyValueForStack(const Value* src) {
     }
 
     pthread_mutex_lock(&value_cell_mutex);
-    Value copy = copyValueForStackUnlocked(src);
+    if (atomic_load(&gVmThreadJobsRunning) == 0 || !vmTypeClonesOnWrite(VALUE_TYPE(*src))) {
+        Value shared = copyValueForStackUnlocked(src);
+        pthread_mutex_unlock(&value_cell_mutex);
+        return shared;
+    }
+
+    /* VM threads are running: take a real copy. A retain-share here would
+     * make the next writer clone the payload and swap it into the cell while
+     * another thread still holds an element address into the old one, whose
+     * write is then lost or lands in freed memory
+     * (Tests/vm_stack_growth_stress/mt_static_array_cow_race.pas). */
+    if (VALUE_TYPE(*src) == TYPE_ARRAY) {
+        ArrayObj *arr = PSCAL_VALUE_PTR(*src, ArrayObj);
+        if (arr && !arr->is_dynamic && !arr->view_of &&
+            (arr->is_packed || vmTypeIsInlineScalar(arr->element_type))) {
+            /* Scalar elements: copy outside the lock, or a large array holds
+             * every writer for the length of the copy. The pin keeps the
+             * payload alive without counting as a share. A racing writer
+             * changes single scalars, so the copy is some mix of old and new
+             * elements, as any by-value read beside writers is. */
+            Value pinned = *src;
+            pscalObjRetain(&arr->header);
+            atomic_fetch_add_explicit(&arr->pins, 1, memory_order_release);
+            pthread_mutex_unlock(&value_cell_mutex);
+            Value snapshot_copy = makeCopyOfValue(&pinned);
+            pthread_mutex_lock(&value_cell_mutex);
+            atomic_fetch_sub_explicit(&arr->pins, 1, memory_order_release);
+            pscalObjRelease(&arr->header);
+            pthread_mutex_unlock(&value_cell_mutex);
+            return snapshot_copy;
+        }
+    }
+    Value copy = makeCopyOfValue(src);
     pthread_mutex_unlock(&value_cell_mutex);
     return copy;
 }
