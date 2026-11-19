@@ -529,6 +529,23 @@ static void handleSysWmEvent(const SDL_Event* event) {
  * does not -- dequeuePendingKeycode below hands it over once the queue is
  * empty, so every caller gets it without each event loop having to flush. */
 static SDL_Keycode gHeldPrintableKeycode = 0;
+static Uint32 gHeldPrintableAt = 0;
+/* A held keycode that was handed over with no text event, and when. Where the
+ * text event does come, it comes after the key, and the reader can ask between
+ * the two: the key was then given twice, once as the keycode and once as the
+ * text. A program that quit on the first 'q' left the second for the next
+ * program run, which read it and quit at once -- every other run. */
+static SDL_Keycode gHeldDeliveredKeycode = 0;
+static Uint32 gHeldDeliveredAt = 0;
+/* How long a held keycode waits for its text event before it is given as it
+ * is, and how long after that a text event for the same key is still its own. */
+#define SDL_HELD_KEY_GRACE_MS 40u
+#define SDL_HELD_KEY_LATE_TEXT_MS 500u
+
+static bool sdlHeldKeyDue(void) {
+    return gHeldPrintableKeycode != 0 &&
+           (Uint32)(SDL_GetTicks() - gHeldPrintableAt) >= SDL_HELD_KEY_GRACE_MS;
+}
 
 static void sdlNoteKeyDown(SDL_Keycode sym) {
     if (!sdlTextInputActive() || !isPrintableKeycode(sym)) {
@@ -541,18 +558,29 @@ static void sdlNoteKeyDown(SDL_Keycode sym) {
         enqueuePendingKeycode(gHeldPrintableKeycode);
     }
     gHeldPrintableKeycode = sym;
+    gHeldPrintableAt = SDL_GetTicks();
 }
 
 static void sdlNoteTextInput(const char* text) {
+    if (gHeldPrintableKeycode == 0 && gHeldDeliveredKeycode != 0 && text && text[0] != '\0' && text[1] == '\0' &&
+        (Uint32)(SDL_GetTicks() - gHeldDeliveredAt) < SDL_HELD_KEY_LATE_TEXT_MS &&
+        tolower((unsigned char)text[0]) == tolower((int)gHeldDeliveredKeycode)) {
+        /* The text of a key already given as its keycode. */
+        gHeldDeliveredKeycode = 0;
+        return;
+    }
     gHeldPrintableKeycode = 0;
+    gHeldDeliveredKeycode = 0;
     enqueueUtf8Text(text);
 }
 
 static bool dequeuePendingKeycode(SDL_Keycode* outCode) {
     if (gPendingKeyCount == 0) {
-        if (gHeldPrintableKeycode != 0) {
+        if (sdlHeldKeyDue()) {
             SDL_Keycode held = gHeldPrintableKeycode;
             gHeldPrintableKeycode = 0;
+            gHeldDeliveredKeycode = held;
+            gHeldDeliveredAt = SDL_GetTicks();
             if (outCode) {
                 *outCode = held;
             }
@@ -571,12 +599,25 @@ static bool dequeuePendingKeycode(SDL_Keycode* outCode) {
 }
 
 static bool hasPendingKeycode(void) {
-    return gPendingKeyCount > 0;
+    return gPendingKeyCount > 0 || sdlHeldKeyDue();
 }
 
 static void resetPendingKeycodes(void) {
     gPendingKeyStart = 0;
     gPendingKeyCount = 0;
+    gHeldPrintableKeycode = 0;
+    gHeldDeliveredKeycode = 0;
+}
+
+/* Keys typed at the last program are not for this one. SDL's queue outlives a
+ * window, so what was still in it when a program ended was read by the next. */
+void sdlDiscardStaleKeyInput(void) {
+    resetPendingKeycodes();
+    if (gSdlInitialized) {
+        SDL_FlushEvent(SDL_KEYDOWN);
+        SDL_FlushEvent(SDL_KEYUP);
+        SDL_FlushEvent(SDL_TEXTINPUT);
+    }
 }
 
 static int sdlInputWatch(void* userdata, SDL_Event* event) {
@@ -753,7 +794,7 @@ static void cleanupSdlWindowResourcesInternal(void) {
 #if defined(PSCAL_TARGET_IOS)
     bool hadWindow = (gSdlWindow != NULL);
 #endif
-    resetPendingKeycodes();
+    sdlDiscardStaleKeyInput();
 
     if (gSdlInitialized && sdlTextInputActive()) {
         sdlStopTextInput();
@@ -1105,6 +1146,7 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinInitgraph) {
 
     sdlEnsureInputWatch();
     sdlFlushSpuriousQuitEvents();
+    sdlDiscardStaleKeyInput();
 
     if (!sdlTextInputActive()) {
         sdlStartTextInput();
@@ -2812,7 +2854,18 @@ SDL_Keycode sdlWaitNextKeycode(void) {
     }
 
     SDL_Event event;
-    while (SDL_WaitEvent(&event)) {
+    for (;;) {
+        /* With a key held for its text event, wait only as long as that is given. */
+        if (gHeldPrintableKeycode != 0) {
+            if (!SDL_WaitEventTimeout(&event, (int)SDL_HELD_KEY_GRACE_MS)) {
+                if (dequeuePendingKeycode(&code)) {
+                    return code;
+                }
+                continue;
+            }
+        } else if (!SDL_WaitEvent(&event)) {
+            break;
+        }
         if (event.type == SDL_SYSWMEVENT) {
             handleSysWmEvent(&event);
             continue;

@@ -44,6 +44,7 @@ bool sdlTextInputActive(void);
 void sdlStartTextInput(void);
 void sdlStopTextInput(void);
 void sdlFlushSpuriousQuitEvents(void);
+void sdlDiscardStaleKeyInput(void);
 
 
 // System Functions

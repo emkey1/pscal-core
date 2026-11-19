@@ -248,6 +248,7 @@ PSCAL_DEFINE_IOS_SDL_BUILTIN(vmBuiltinInitgraph3d) {
 #endif
     sdlEnsureInputWatch();
     sdlFlushSpuriousQuitEvents();
+    sdlDiscardStaleKeyInput();
 
     if (!sdlTextInputActive()) {
         sdlStartTextInput();
