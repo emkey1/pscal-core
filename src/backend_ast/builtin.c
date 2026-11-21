@@ -13922,6 +13922,8 @@ static void populateBuiltinRegistry(void) {
     registerBuiltinFunctionUnlocked("Odd", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("ParamCount", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("ParamStr", AST_FUNCTION_DECL, NULL);
+    /* A routine in every build: it reads the terminal, and SDL's keys where there are any. */
+    registerBuiltinFunctionUnlocked("PollKeyAny", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("PopScreen", AST_PROCEDURE_DECL, NULL);
     registerBuiltinFunctionUnlocked("Pos", AST_FUNCTION_DECL, NULL);
     registerBuiltinFunctionUnlocked("Power", AST_FUNCTION_DECL, NULL);
