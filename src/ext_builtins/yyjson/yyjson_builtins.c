@@ -282,12 +282,26 @@ static yyjson_doc *jsonDetachDocHandle(int handle) {
     return doc;
 }
 
+/* A JSON integer from 2^63 to 2^64-1 parses as an unsigned value. Read as a
+ * signed one it came back negative (10000000000000000000 as
+ * -8446744073709551616), with type "int". It does not fit an Int, so it is a
+ * real here: the Int getters treat it as any other non-integer, and the Real
+ * getters give its value. */
+static bool jsonIsInt64(yyjson_val *val) {
+    if (yyjson_is_sint(val)) return true;
+    return yyjson_is_uint(val) && yyjson_get_uint(val) <= (uint64_t)INT64_MAX;
+}
+
+static double jsonIntAsDouble(yyjson_val *val) {
+    return yyjson_is_uint(val) ? (double)yyjson_get_uint(val) : (double)yyjson_get_sint(val);
+}
+
 static const char *jsonTypeToString(yyjson_val *val) {
     switch (yyjson_get_type(val)) {
         case YYJSON_TYPE_NULL: return "null";
         case YYJSON_TYPE_BOOL: return "bool";
         case YYJSON_TYPE_NUM:
-            return yyjson_is_int(val) ? "int" : "real";
+            return jsonIsInt64(val) ? "int" : "real";
         case YYJSON_TYPE_STR: return "string";
         case YYJSON_TYPE_ARR: return "array";
         case YYJSON_TYPE_OBJ: return "object";
@@ -725,7 +739,7 @@ static Value vmBuiltinYyjsonGetNumber(struct VM_s *vm, int arg_count, Value *arg
         goto cleanup;
     }
     if (yyjson_is_int(val)) {
-        result = makeDouble((double)yyjson_get_sint(val));
+        result = makeDouble(jsonIntAsDouble(val));
         goto cleanup;
     }
 
@@ -750,7 +764,7 @@ static Value vmBuiltinYyjsonGetInt(struct VM_s *vm, int arg_count, Value *args) 
     }
 
     Value result = makeInt64(0);
-    if (!yyjson_is_int(val)) {
+    if (!jsonIsInt64(val)) {
         /* Type mismatch degrades to the default (0), mirroring the missing-key /
            invalid-handle degrade from c30d16260. */
         goto cleanup;
@@ -860,12 +874,12 @@ static Value jsonGetOrCommon(struct VM_s *vm, int arg_count, Value *args,
     if (child && kind == JSON_GET_OR_TEXT && yyjson_is_str(child)) {
         const char *str = yyjson_get_str(child);
         result = makeString(str ? str : "");
-    } else if (child && kind == JSON_GET_OR_INT && yyjson_is_int(child)) {
+    } else if (child && kind == JSON_GET_OR_INT && jsonIsInt64(child)) {
         result = makeInt64(yyjson_get_sint(child));
     } else if (child && kind == JSON_GET_OR_REAL && yyjson_is_real(child)) {
         result = makeDouble(yyjson_get_real(child));
     } else if (child && kind == JSON_GET_OR_REAL && yyjson_is_int(child)) {
-        result = makeDouble((double)yyjson_get_sint(child));
+        result = makeDouble(jsonIntAsDouble(child));
     } else if (child && kind == JSON_GET_OR_BOOL && yyjson_is_bool(child)) {
         result = makeBoolean(yyjson_get_bool(child) ? 1 : 0);
     } else {

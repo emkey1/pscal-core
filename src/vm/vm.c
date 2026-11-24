@@ -5628,6 +5628,23 @@ static void assignRealToIntChecked(VM* vm, Value* dest, long double real_val) {
             break;
         }
     }
+    if (frontendIsAether() && (was_nan || range_error)) {
+        /* Under Aether a Real with no Int value stops the program, as int(x)
+         * of it does. It used to store the nearest bound (or 0 for NaN) and
+         * print a warning with no code, and the program went on with
+         * 9223372036854775807. */
+        if (was_nan) {
+            runtimeError(vm, "[AETH-RUNTIME-INT-RANGE] a Real that is not a number (NaN) has no "
+                             "Int value.\n"
+                             "hint: test the value before storing it in an Int, or keep it Real.");
+        } else {
+            runtimeError(vm, "[AETH-RUNTIME-INT-RANGE] the Real %.16Lg has no Int value: Int is "
+                             "64-bit.\n"
+                             "hint: test the value before storing it in an Int, or keep it Real.",
+                         real_val);
+        }
+        return;
+    }
     if (was_nan) {
         runtimeWarning(vm, "Warning: Range check error assigning REAL NaN to %s.",
                        varTypeToString(VALUE_TYPE(*dest)));

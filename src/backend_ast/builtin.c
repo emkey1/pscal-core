@@ -4539,6 +4539,20 @@ Value vmBuiltinCopy(VM* vm, int arg_count, Value* args) {
      * codepoint offsets, so normalise once here. */
     const long long start_base = frontendIsZeroBasedStrings() ? 0 : 1;
 
+    /* Aether lowers a Text slice `s[a..b]` to copy(s, a, b - a). A negative
+     * bound is not "from the end" there: `s[-3..]` and `s[..-1]` both gave ""
+     * with no message. An end before the start (`s[3..1]`) stays "". */
+    if (frontendIsAether() && source && (start_idx < 0 || start_idx + count < 0)) {
+        runtimeError(vm,
+                     "[ARR-003] slice bound %lld is negative: a Text slice counts from the "
+                     "start, so both bounds of `s[a..b]` are 0 or more.\n"
+                     "hint: the last n characters are `s[length(s) - n..]`, and all but the "
+                     "last n are `s[..length(s) - n]`.\n"
+                     "help: see ARR-003 in the Aether guide",
+                     start_idx < 0 ? start_idx : start_idx + count);
+        return (VALUE_TYPE(args[0]) == TYPE_UNICODE_STRING) ? makeUnicodeString("") : makeString("");
+    }
+
     if (!source || start_idx < start_base || count < 0) {
         return (VALUE_TYPE(args[0]) == TYPE_UNICODE_STRING) ? makeUnicodeString("") : makeString("");
     }
