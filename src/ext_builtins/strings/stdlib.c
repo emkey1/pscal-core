@@ -533,7 +533,7 @@ static Value vmBuiltinStdJoin(struct VM_s *vm, int arg_count, Value *args) {
         const char *e = stdText(&elems[i], eb);
         if (!e) {
             free(b.data);
-            runtimeError(vm, "join expects a Text[]; convert numbers first with int_to_text or formatfloat.");
+            runtimeError(vm, "join expects a Text[]; convert numbers first with int_to_text or format_float.");
             return stdTextValue("");
         }
         if (i > 0) stdBufAppend(&b, sep, sepLen);

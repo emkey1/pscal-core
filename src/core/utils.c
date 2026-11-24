@@ -302,6 +302,27 @@ bool decodeUtf8Codepoint(const char *text, size_t len, uint32_t *out_codepoint, 
     return false;
 }
 
+/* Length of the run of ASCII bytes at the start of text[0..len): eight at a
+ * time, then one at a time. Each such byte is one code point, which is what
+ * decodeUtf8Codepoint says of it, so the callers below skip the run without
+ * decoding it. Text is mostly ASCII, and a character index or a length used
+ * to decode every byte before it, one call per byte. */
+static inline size_t utf8AsciiRunLength(const char *text, size_t len) {
+    size_t i = 0;
+    while (i + sizeof(uint64_t) <= len) {
+        uint64_t word;
+        memcpy(&word, text + i, sizeof(word));
+        if (word & UINT64_C(0x8080808080808080)) break;
+        i += sizeof(word);
+    }
+    while (i < len && (unsigned char)text[i] < 0x80) i++;
+    return i;
+}
+
+bool utf8IsAscii(const char *text, size_t len) {
+    return !text || utf8AsciiRunLength(text, len) == len;
+}
+
 size_t utf8CodepointCount(const char *text, size_t len) {
     if (!text || len == 0) {
         return 0;
@@ -310,6 +331,10 @@ size_t utf8CodepointCount(const char *text, size_t len) {
     size_t count = 0;
     size_t offset = 0;
     while (offset < len) {
+        size_t run = utf8AsciiRunLength(text + offset, len - offset);
+        offset += run;
+        count += run;
+        if (offset >= len) break;
         uint32_t codepoint = 0;
         size_t advance = 0;
         if (!decodeUtf8Codepoint(text + offset, len - offset, &codepoint, &advance)) {
@@ -330,6 +355,12 @@ size_t utf8ByteOffsetForCodepointIndex(const char *text, size_t len, size_t inde
     size_t offset = 0;
     size_t current = 0;
     while (offset < len && current < index) {
+        size_t want = index - current;
+        size_t left = len - offset;
+        size_t run = utf8AsciiRunLength(text + offset, want < left ? want : left);
+        offset += run;
+        current += run;
+        if (offset >= len || current >= index) break;
         uint32_t codepoint = 0;
         size_t advance = 0;
         if (!decodeUtf8Codepoint(text + offset, len - offset, &codepoint, &advance)) {

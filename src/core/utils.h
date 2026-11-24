@@ -556,6 +556,7 @@ size_t encodePascalCharUtf8(int value, char out[5]);
 bool isValidUtf8Bytes(const char *text, size_t len);
 bool decodeUtf8Codepoint(const char *text, size_t len, uint32_t *out_codepoint, size_t *out_advance);
 size_t utf8CodepointCount(const char *text, size_t len);
+bool utf8IsAscii(const char *text, size_t len);
 size_t utf8ByteOffsetForCodepointIndex(const char *text, size_t len, size_t index);
 bool isShellIdentifierStartCodepoint(uint32_t codepoint);
 bool isShellIdentifierContinueCodepoint(uint32_t codepoint, bool allow_hash);

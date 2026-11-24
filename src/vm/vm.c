@@ -6030,6 +6030,23 @@ void runtimeWarning(VM* vm, const char* format, ...) {
     }
 }
 
+/* An element address that vmCheckArrayIndexBounds could not judge: an array
+ * with no bounds yet (`let xs: Int[] = [];` then `xs[0]`), or a row of a
+ * table that holds nothing. Under Aether this is the ARR-003 the guides
+ * describe, and it used to print with no code. */
+static void vmReportArrayElementOutOfBounds(VM* vm) {
+    if (frontendIsAether()) {
+        runtimeError(vm,
+                     "[ARR-003] array index is out of bounds: the array (or the row) is empty "
+                     "there.\n"
+                     "hint: nothing has been appended yet -- append with `xs = xs + [v];` before "
+                     "reading or writing `xs[i]`, and check the loop bound.\n"
+                     "help: see ARR-003 in the Aether guide");
+        return;
+    }
+    runtimeError(vm, "VM Error: Array element index out of bounds.");
+}
+
 /* Per-dimension bounds check for an indexed array access.
  *
  * computeFlatOffset() (core/utils.c) already bounds-checks every dimension, but
@@ -12106,7 +12123,7 @@ comparison_error_label:
                     if (indices != indices_inline) free(indices);
                     if (!slice_ok) {
                         free(slice);
-                        runtimeError(vm, "VM Error: Array element index out of bounds.");
+                        vmReportArrayElementOutOfBounds(vm);
                         freeValue(&operand);
                         if (using_wrapper) {
                             vmFreeArrayIndexWrapper(&temp_wrapper);
@@ -12153,7 +12170,7 @@ comparison_error_label:
 
                 int total_size = calculateArrayTotalSize(array_val_ptr);
                 if (offset < 0 || offset >= total_size) {
-                    runtimeError(vm, "VM Error: Array element index out of bounds.");
+                    vmReportArrayElementOutOfBounds(vm);
                     freeValue(&operand);
                     if (using_wrapper) {
                         vmFreeArrayIndexWrapper(&temp_wrapper);
@@ -12382,7 +12399,7 @@ comparison_error_label:
 
                 int total_size = calculateArrayTotalSize(array_val_ptr);
                 if (flat_offset >= (uint32_t)total_size) {
-                    runtimeError(vm, "VM Error: Array element index out of bounds.");
+                    vmReportArrayElementOutOfBounds(vm);
                     if (VALUE_TYPE(operand) == TYPE_POINTER) {
                         freeValue(&operand);
                     }
@@ -12659,7 +12676,7 @@ comparison_error_label:
                     bool slice_ok = makeDynamicArraySliceValue(array_val_ptr, dimension_count, indices, &sliceVal, &slice_oob);
                     if (indices != indices_inline) free(indices);
                     if (!slice_ok) {
-                        runtimeError(vm, "VM Error: Array element index out of bounds.");
+                        vmReportArrayElementOutOfBounds(vm);
                         if (VALUE_TYPE(operand) == TYPE_POINTER) freeValue(&operand);
                         if (using_wrapper) {
                             vmFreeArrayIndexWrapper(&temp_wrapper);
@@ -12700,7 +12717,7 @@ comparison_error_label:
 
                 int total_size = calculateArrayTotalSize(array_val_ptr);
                 if (offset < 0 || offset >= total_size) {
-                    runtimeError(vm, "VM Error: Array element index out of bounds.");
+                    vmReportArrayElementOutOfBounds(vm);
                     if (VALUE_TYPE(operand) == TYPE_POINTER) freeValue(&operand);
                     if (using_wrapper) {
                         vmFreeArrayIndexWrapper(&temp_wrapper);
@@ -12872,7 +12889,7 @@ comparison_error_label:
 
                 int total_size = calculateArrayTotalSize(array_val_ptr);
                 if (flat_offset >= (uint32_t)total_size) {
-                    runtimeError(vm, "VM Error: Array element index out of bounds.");
+                    vmReportArrayElementOutOfBounds(vm);
                     freeValue(&operand);
                     if (using_wrapper) {
                         vmFreeArrayIndexWrapper(&temp_wrapper);
@@ -13217,7 +13234,9 @@ comparison_error_label:
                  if (VALUE_TYPE(base_val) == TYPE_UNICODE_STRING) {
                      const char* str = AS_STRING(base_val) ? AS_STRING(base_val) : "";
                      size_t len = strlen(str);
-                     size_t cp_count = utf8CodepointCount(str, len);
+                     /* All ASCII: character i is byte i, with nothing to count or decode. */
+                     bool ascii = utf8IsAscii(str, len);
+                     size_t cp_count = ascii ? len : utf8CodepointCount(str, len);
                      long long expected_index = frontendIsZeroBasedStrings() ? 0 : 1;
                      if (pscal_index < expected_index ||
                          (size_t)(pscal_index - expected_index) >= cp_count) {
@@ -13227,6 +13246,12 @@ comparison_error_label:
                          return INTERPRET_RUNTIME_ERROR;
                      }
                      size_t cp_index = (size_t)(pscal_index - expected_index);
+                     if (ascii) {
+                         push(vm, makeWideChar((int)(unsigned char)str[cp_index]));
+                         freeValue(&index_val);
+                         freeValue(&base_val);
+                         break;
+                     }
                      size_t byte_offset = utf8ByteOffsetForCodepointIndex(str, len, cp_index);
                      uint32_t codepoint = 0;
                      size_t advance = 0;
