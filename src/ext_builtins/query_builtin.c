@@ -1079,10 +1079,15 @@ static Value vmBuiltinHasExtBuiltin(struct VM_s *vm, int arg_count,
   }
   const char *category = AS_STRING(args[0]);
   const char *func = AS_STRING(args[1]);
-  if (extCategoryHidden(category)) {
-    return makeBoolean(0);
-  }
-  if (extBuiltinHasFunction(category, func)) {
+  /* A category hidden from the running front end ("shell" while a language
+   * runs) hides only its own extended functions. The lookups below are not
+   * filed by category, as at 1.0 and as the Aether guide states ("a core
+   * builtin matches on the function name whatever category you pass"); the
+   * shell's own builtins stay out of them because getVmBuiltinID applies the
+   * shell view. Returning false here at once made has_builtin("shell",
+   * "socket_create") false under Aether on every build, where 1.0 said true. */
+  const bool category_hidden = extCategoryHidden(category);
+  if (!category_hidden && extBuiltinHasFunction(category, func)) {
     return hasBuiltinAnswer(func);
   }
   /* The front end's own spelling of a builtin (Aether's "file_exists",
@@ -1091,7 +1096,7 @@ static Value vmBuiltinHasExtBuiltin(struct VM_s *vm, int arg_count,
    * engine spellings D72 removed from the language answered true. */
   const char *engine = resolveBuiltinNameAlias(func);
   if (engine) {
-    if (extBuiltinHasFunction(category, engine) || getVmBuiltinID(engine) >= 0) {
+    if ((!category_hidden && extBuiltinHasFunction(category, engine)) || getVmBuiltinID(engine) >= 0) {
       return hasBuiltinAnswer(engine);
     }
     /* println and print compile to the writeln/write statements, which are
